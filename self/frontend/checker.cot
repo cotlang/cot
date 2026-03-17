@@ -211,8 +211,7 @@ struct GenericInstInfo {
 // passes to each Checker. After checkFile(), caller syncs back.
 
 struct SharedCheckerState {
-    global_map: *Map(string, int),
-    symbols: *List(Symbol),
+    global_scope: *Scope,
     generic_structs: *Map(string, *GenericInfo),
     generic_functions: *Map(string, *GenericInfo),
     instantiation_cache: *Map(string, int),
@@ -224,8 +223,7 @@ struct SharedCheckerState {
     static fn init() SharedCheckerState {
         var generic_impl_entries: List(GenericImplEntry) = .{}
         return SharedCheckerState {
-            global_map: new Map(string, int) { keys: 0, values: 0, states: 0, count: 0, capacity: 0 },
-            symbols: allocSymbolList(),
+            global_scope: newScope(null),
             generic_structs: new Map(string, *GenericInfo) { keys: 0, values: 0, states: 0, count: 0, capacity: 0 },
             generic_functions: new Map(string, *GenericInfo) { keys: 0, values: 0, states: 0, count: 0, capacity: 0 },
             instantiation_cache: new Map(string, int) { keys: 0, values: 0, states: 0, count: 0, capacity: 0 },
@@ -245,12 +243,8 @@ struct Checker {
     types: *TypeRegistry,
     ast: *Ast,
     err: *ErrorReporter,
-    symbols: *List(Symbol),
-    // Scope chain (parallel List(int) arrays)
-    scope_parents: List(int),
-    scope_maps: List(int),       // raw pointers to heap-allocated Map(string, int)
-    current_scope: int,
-    global_scope: int,
+    scope: *Scope,
+    global_scope: *Scope,
     expr_types: Map(int, int),
     trait_defs: *Map(string, int),
     current_return_type: int,
@@ -278,14 +272,7 @@ struct Checker {
     body_check_depth: int,
 
     static fn init(ast: *Ast, types: *TypeRegistry, err: *ErrorReporter) Checker {
-        var symbols = allocSymbolList()
-        var scope_parents: List(int) = .{}
-        var scope_maps: List(int) = .{}
-
-        // Create global scope (index 0)
-        var global_map = allocMap()
-        scope_parents.append(-1)
-        scope_maps.append(global_map)
+        var gs = newScope(null)
 
         var expr_types: Map(int, int) = .{}
         var generic_impl_entries: List(GenericImplEntry) = .{}
@@ -297,11 +284,8 @@ struct Checker {
             types: types,
             ast: ast,
             err: err,
-            symbols: symbols,
-            scope_parents: scope_parents,
-            scope_maps: scope_maps,
-            current_scope: 0,
-            global_scope: 0,
+            scope: gs,
+            global_scope: gs,
             expr_types: expr_types,
             trait_defs: new Map(string, int) { keys: 0, values: 0, states: 0, count: 0, capacity: 0 },
             current_return_type: VOID,
@@ -329,20 +313,16 @@ struct Checker {
     /// For multi-file mode: all Checkers share the same global scope map
     /// (scope_maps[0]) so symbols from File A are visible in File B.
     /// Uses the regular init pattern but overrides scope_maps[0].
-    static fn initShared(ast: *Ast, types: *TypeRegistry, err: *ErrorReporter, global_map_ptr: int) Checker {
+    static fn initShared(ast: *Ast, types: *TypeRegistry, err: *ErrorReporter, shared_global: *Scope) Checker {
         var c = Checker.init(ast, types, err)
-        // Replace the fresh global scope map with the shared one
-        // scope_maps[0] is a raw pointer to a heap Map(string, int)
-        @intToPtr(*int, c.scope_maps.items).* = global_map_ptr
+        c.global_scope = shared_global
+        c.scope = shared_global
         return c
     }
 
-    /// Load shared state from SharedCheckerState for multi-file mode.
-    /// Zig pattern: all checkers share the SAME Maps via raw pointer.
-    /// The checker's Map fields are raw pointers to the shared Maps.
-    /// All mutations go directly to shared data — no copy-sync needed.
     fn loadSharedState(shared: *SharedCheckerState) void {
-        self.symbols = shared.symbols
+        self.global_scope = shared.global_scope
+        self.scope = shared.global_scope
         self.generic_structs = shared.generic_structs
         self.generic_functions = shared.generic_functions
         self.instantiation_cache = shared.instantiation_cache
@@ -354,7 +334,6 @@ struct Checker {
 
     /// Write checker state back to SharedCheckerState after checkFile().
     fn syncToShared(shared: *SharedCheckerState) void {
-        shared.symbols = self.symbols
         shared.generic_structs = self.generic_structs
         shared.generic_functions = self.generic_functions
         shared.instantiation_cache = self.instantiation_cache
@@ -373,42 +352,26 @@ struct Checker {
         self.pushScope()
     }
 
-    /// Return the file scope map pointer (scope_maps[1]) for import copying.
-    /// Only valid after pushFileScope() + checkFile().
-    fn getFileScopeMapPtr() int {
-        if (self.scope_maps.count > 1) {
-            return self.scope_maps.get(1)
-        }
-        return self.scope_maps.get(0)
+    fn getFileScope() *Scope {
+        return self.scope
     }
 
-    /// Copy ALL symbols from an imported file's scope map into the current scope.
-    /// Includes transitive imports — matches Cot's flat import semantics.
-    /// Name collisions are resolved by import order (last wins).
-    fn copyImportedSymbols(source_map_ptr: int, source_ast_ptr: int) void {
-        const src_map = @intToPtr(*Map(string, int), source_map_ptr)
-        const key_list = src_map.keys()
+    fn copyImportedSymbols(source_scope: *Scope) void {
+        const key_list = source_scope.symbols.keys()
         var ki = 0
         while (ki < key_list.count) {
             const key = key_list.get(ki)
-            const sym_idx = src_map.get(key)
-            var map = self.getScopeMap(self.current_scope)
-            map.set(key, sym_idx)
+            self.scope.symbols.set(key, source_scope.symbols.get(key))
             ki += 1
         }
     }
 
-    fn pushScope() int {
-        const idx = self.scope_parents.count
-        var new_map = allocMap()
-        self.scope_parents.append(self.current_scope)
-        self.scope_maps.append(new_map)
-        self.current_scope = idx
-        return idx
+    fn pushScope() void {
+        self.scope = newScope(self.scope)
     }
 
     fn popScope() void {
-        self.current_scope = self.scope_parents.get(self.current_scope)
+        if (self.scope.parent) |p| { self.scope = p }
     }
 
     // ---- Type substitution (active during generic instantiation) ----
@@ -438,49 +401,23 @@ struct Checker {
     fn defineSymbol(sym: Symbol) void {
         var s = sym
         s.source_tree = @ptrToInt(self.ast)
-        const idx = self.symbols.count
-        self.symbols.append(s)
-        // Register in current scope's map
-        var map = self.getScopeMap(self.current_scope)
-        map.set(s.name, idx)
+        self.scope.define(s)
     }
 
     fn isDefined(name: string) bool {
-        var map = self.getScopeMap(self.current_scope)
-        return map.contains(name)
+        return self.scope.isDefined(name)
     }
 
-    /// Check if name is defined in the SAME file (source_tree matches self.ast).
-    /// Cross-file redefinitions are allowed in multi-file mode.
     fn isDefinedInSameFile(name: string) bool {
-        var map = self.getScopeMap(self.current_scope)
-        if (!map.contains(name)) { return false }
-        const sym_idx = map.get(name)
-        const sym = self.getSymbol(sym_idx)
-        return sym.source_tree == @ptrToInt(self.ast)
-    }
-
-    fn lookupSymbol(name: string) int {
-        var scope_idx = self.current_scope
-        while (scope_idx >= 0) {
-            var map = self.getScopeMap(scope_idx)
-            if (map.contains(name)) {
-                const sym_idx = map.get(name)
-                // Mark as used for lint checks
-                self.getSymbol(sym_idx).used = true
-                return sym_idx
-            }
-            scope_idx = self.scope_parents.get(scope_idx)
+        if (self.scope.lookup(name)) |sym| {
+            if (sym.source_tree == 0) { return true }
+            return sym.source_tree == @ptrToInt(self.ast)
         }
-        return -1
+        return false
     }
 
-    fn getSymbol(idx: int) *Symbol {
-        return @intToPtr(*Symbol, self.symbols.items + idx * @sizeOf(Symbol))
-    }
-
-    fn getScopeMap(scope_idx: int) *Map(string, int) {
-        return @intToPtr(*Map(string, int), self.scope_maps.get(scope_idx))
+    fn lookupSymbol(name: string) ?*Symbol {
+        return self.scope.lookup(name)
     }
 
     // ---- Main entry point ----
