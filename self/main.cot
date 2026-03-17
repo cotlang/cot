@@ -751,10 +751,8 @@ fn writeByteList(path: string, bytes: List(int)) void {
 }
 
 /// Multi-file check: recursively parse and check all imports.
-/// Per-file scope entry: scope_map_ptr and ast_ptr for import copying.
 struct CheckedScopeEntry {
-    scope_map_ptr: int,
-    ast_ptr: int,
+    file_scope: *Scope,
 }
 
 fn cmdCheckMultiFile(path: string) void {
@@ -820,7 +818,7 @@ fn checkFileRecursive(file_path: string, shared: SharedCheckerState, types: Type
 
     // Type check with shared state (all dependencies already checked)
     var check_errs = ErrorReporter.initWithSource(file_path, content)
-    var checker = Checker.initShared(ast, types, check_errs, @ptrToInt(shared.global_map))
+    var checker = Checker.initShared(ast, types, check_errs, shared.global_scope)
     checker.loadSharedState(shared)
 
     // Per-file scope: push file scope, copy imported symbols (driver.zig createFileScope pattern)
@@ -829,7 +827,7 @@ fn checkFileRecursive(file_path: string, shared: SharedCheckerState, types: Type
         const resolved = resolveImportPath(imports.get(i), source_dir)
         if (checked_scopes.contains(resolved)) {
             const entry = checked_scopes.get(resolved)
-            checker.copyImportedSymbols(entry.scope_map_ptr, entry.ast_ptr)
+            checker.copyImportedSymbols(entry.file_scope)
         }
     }
 
@@ -838,8 +836,7 @@ fn checkFileRecursive(file_path: string, shared: SharedCheckerState, types: Type
 
     // Save this file's scope for importing files to copy from
     checked_scopes.set(file_path, CheckedScopeEntry {
-        scope_map_ptr: checker.getFileScopeMapPtr(),
-        ast_ptr: @ptrToInt(ast),
+        file_scope: checker.getFileScope(),
     })
 
     if (check_errs.hasErrors()) {
@@ -896,7 +893,7 @@ fn checkAllFilesRecursive(file_path: string, shared: SharedCheckerState, types: 
 
     // Check with shared state + per-file scope
     var check_errs = ErrorReporter.initWithSource(file_path, content)
-    var checker = Checker.initShared(ast, types, check_errs, @ptrToInt(shared.global_map))
+    var checker = Checker.initShared(ast, types, check_errs, shared.global_scope)
     checker.loadSharedState(shared)
 
     checker.pushFileScope()
@@ -904,7 +901,7 @@ fn checkAllFilesRecursive(file_path: string, shared: SharedCheckerState, types: 
         const resolved = resolveImportPath(imports.get(i), source_dir)
         if (checked_scopes.contains(resolved)) {
             const entry = checked_scopes.get(resolved)
-            checker.copyImportedSymbols(entry.scope_map_ptr, entry.ast_ptr)
+            checker.copyImportedSymbols(entry.file_scope)
         }
     }
 
@@ -912,8 +909,7 @@ fn checkAllFilesRecursive(file_path: string, shared: SharedCheckerState, types: 
     checker.syncToShared(shared)
 
     checked_scopes.set(file_path, CheckedScopeEntry {
-        scope_map_ptr: checker.getFileScopeMapPtr(),
-        ast_ptr: @ptrToInt(ast),
+        file_scope: checker.getFileScope(),
     })
 
     if (check_errs.hasErrors()) { exit(1) }
@@ -975,7 +971,7 @@ fn parseFileRecursive(file_path: string, parsed_files: *List(ParsedFile), seen: 
 /// Zig reference: driver.zig lines 431-449 (check + append to checkers ArrayList).
 fn checkAndStoreChecker(pf: ParsedFile, types: TypeRegistry, shared: *SharedCheckerState, checked_scopes: *Map(string, CheckedScopeEntry), checkers: *List(int), checker_errs: *List(int)) void {
     var check_errs = ErrorReporter.initWithSource(pf.path, pf.content)
-    var checker = Checker.initShared(pf.ast, types, check_errs, @ptrToInt(shared.global_map))
+    var checker = Checker.initShared(pf.ast, types, check_errs, shared.global_scope)
     checker.loadSharedState(shared)
 
     checker.pushFileScope()
@@ -985,7 +981,7 @@ fn checkAndStoreChecker(pf: ParsedFile, types: TypeRegistry, shared: *SharedChec
         const resolved = resolveImportPath(imports.get(i), source_dir)
         if (checked_scopes.contains(resolved)) {
             const entry = checked_scopes.get(resolved)
-            checker.copyImportedSymbols(entry.scope_map_ptr, entry.ast_ptr)
+            checker.copyImportedSymbols(entry.file_scope)
         }
     }
 
@@ -993,8 +989,7 @@ fn checkAndStoreChecker(pf: ParsedFile, types: TypeRegistry, shared: *SharedChec
     checker.syncToShared(shared)
 
     checked_scopes.set(pf.path, CheckedScopeEntry {
-        scope_map_ptr: checker.getFileScopeMapPtr(),
-        ast_ptr: @ptrToInt(pf.ast),
+        file_scope: checker.getFileScope(),
     })
 
     if (check_errs.hasErrors()) { exit(1) }

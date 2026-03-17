@@ -196,9 +196,7 @@ struct Lowerer {
         if (self.module_name == "") { return bare }
         if (shouldSkipQualification(bare)) { return bare }
         // Look up in checker scope to find which module defined this function
-        const sym_idx = self.chk.lookupSymbol(bare)
-        if (sym_idx >= 0) {
-            const sym = self.chk.getSymbol(sym_idx)
+        if (self.chk.lookupSymbol(bare)) |sym| {
             if (sym.is_extern or sym.is_export) { return bare }
             if (sym.source_tree != 0) {
                 if (self.tree_module_map.contains(sym.source_tree)) {
@@ -214,9 +212,7 @@ struct Lowerer {
     /// Used for ARC metadata names and auto-deinit function names.
     fn qualifyTypeName(type_name: string) string {
         if (self.module_name == "") { return type_name }
-        const sym_idx = self.chk.lookupSymbol(type_name)
-        if (sym_idx >= 0) {
-            const sym = self.chk.getSymbol(sym_idx)
+        if (self.chk.lookupSymbol(type_name)) |sym| {
             if (sym.source_tree != 0) {
                 if (self.tree_module_map.contains(sym.source_tree)) {
                     return self.tree_module_map.get(sym.source_tree) ++ "." ++ type_name
@@ -238,9 +234,7 @@ struct Lowerer {
             }
         }
         // Fallback 1: Look up the TYPE symbol in scope
-        const sym_idx = self.chk.lookupSymbol(type_name)
-        if (sym_idx >= 0) {
-            const sym = self.chk.getSymbol(sym_idx)
+        if (self.chk.lookupSymbol(type_name)) |sym| {
             if (sym.is_extern or sym.is_export) { return func_name }
             if (sym.source_tree != 0) {
                 if (self.tree_module_map.contains(sym.source_tree)) {
@@ -248,10 +242,7 @@ struct Lowerer {
                 }
             }
         }
-        // Fallback 2: Look up the FUNCTION synth name in scope
-        const fn_sym_idx = self.chk.lookupSymbol(func_name)
-        if (fn_sym_idx >= 0) {
-            const fn_sym = self.chk.getSymbol(fn_sym_idx)
+        if (self.chk.lookupSymbol(func_name)) |fn_sym| {
             if (fn_sym.is_extern or fn_sym.is_export) { return func_name }
             if (fn_sym.source_tree != 0) {
                 if (self.tree_module_map.contains(fn_sym.source_tree)) {
@@ -782,9 +773,7 @@ struct Lowerer {
 
         if (var_decl.is_const) {
             // Check for compile-time known integer constant
-            const sym_idx = self.chk.lookupSymbol(var_decl.name)
-            if (sym_idx >= 0) {
-                const sym = self.chk.getSymbol(sym_idx)
+            if (self.chk.lookupSymbol(var_decl.name)) |sym| {
                 if (sym.is_const_val) {
                     self.const_values.set(var_decl.name, sym.const_value)
                     return
@@ -1849,9 +1838,7 @@ struct Lowerer {
                     return self.const_values.get(id.name)
                 }
                 // Check checker's const symbols
-                const sym_idx = self.chk.lookupSymbol(id.name)
-                if (sym_idx >= 0) {
-                    const sym = self.chk.getSymbol(sym_idx)
+                if (self.chk.lookupSymbol(id.name)) |sym| {
                     if (sym.is_const_val) { return sym.const_value }
                 }
             },
