@@ -334,16 +334,16 @@ cursor --uninstall-extension cot-lang.cot-lang 2>/dev/null; cursor --install-ext
 |----------|---------|
 | `VERSION` | **Version single source of truth** (edit to bump) |
 | `TROUBLESHOOTING.md` | **Debugging methodology — read before any debugging** |
+| `claude/SELF_HOSTING.md` | **Self-hosting status, blocker, and path to 0.4** |
 | `claude/PIPELINE_ARCHITECTURE.md` | **Full pipeline map, reference for every stage** |
 | `claude/BR_TABLE_ARCHITECTURE.md` | Why br_table appears in generated code |
 | `claude/specs/WASM_3_0_REFERENCE.md` | Wasm 3.0 opcodes and adoption plan |
 | `claude/ROADMAP.md` | Forward-looking roadmap: 0.4→1.0, competitive positioning |
 | `claude/VERSION_TRAJECTORY.md` | **Self-hosting trajectory** — benchmarked against Zig, inspirational |
-| `claude/SELF_HOSTING_FEATURES.md` | Feature gap analysis for self-hosting (Zig→Cot patterns) |
 | `docs/syntax.md` | Complete language syntax reference with examples |
 | `VISION.md` | Language vision, design principles, execution roadmap |
-| `claude/CONCURRENCY_DESIGN.md` | Concurrency roadmap: spawn, channels, work-stealing, atomic ARC |
 | `claude/BUSINESS_MODEL.md` | Licensing, trademark, revenue model, funding strategy |
 | `claude/RELEASE_PLAN.md` | 0.4 release plan: branding, distribution, polish, criteria |
 | `claude/TESTING.md` | Test system: 70 files, ~1,670 tests, error-union isolation |
+| `claude/LINUX_X64_PARITY.md` | Linux x86_64 backend investigation notes |
 | `claude/archive/` | Historical: archived docs (completed milestones, past plans) |
