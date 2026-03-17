@@ -2790,7 +2790,7 @@ pub const Lowerer = struct {
                         // ARC Phase 4: Retain +0 managed values stored in struct fields during init.
                         // Swift: ManagedValue::hasCleanup() — only retain if source is managed.
                         // Raw pointers (&x, @intToPtr) have no cleanup and must not be retained.
-                        if (!self.target.isWasm() and self.type_reg.couldBeARC(struct_field.type_idx)) {
+                        if (!self.target.isWasm() and self.type_reg.get(struct_field.type_idx) == .pointer and self.type_reg.get(struct_field.type_idx).pointer.managed) {
                             const fi_node = self.tree.getNode(field_init.value);
                             const fi_expr = if (fi_node) |n| n.asExpr() else null;
                             const fi_owned = if (fi_expr) |e| (e == .new_expr or e == .call) else false;
@@ -2854,7 +2854,7 @@ pub const Lowerer = struct {
             } else {
                 // ARC Phase 4: Retain +0 managed default values stored in struct fields.
                 // Swift: ManagedValue::hasCleanup() — only retain if source is managed.
-                if (!self.target.isWasm() and self.type_reg.couldBeARC(struct_field.type_idx)) {
+                if (!self.target.isWasm() and self.type_reg.get(struct_field.type_idx) == .pointer and self.type_reg.get(struct_field.type_idx).pointer.managed) {
                     const def_node = self.tree.getNode(struct_field.default_value);
                     const def_expr = if (def_node) |n| n.asExpr() else null;
                     const def_owned = if (def_expr) |e| (e == .new_expr or e == .call) else false;
@@ -5837,7 +5837,7 @@ pub const Lowerer = struct {
                         }
                         // ARC Phase 4: Retain +0 managed values stored in struct fields during init.
                         // Swift: ManagedValue::hasCleanup() — only retain if source is managed.
-                        if (!self.target.isWasm() and self.type_reg.couldBeARC(struct_field.type_idx)) {
+                        if (!self.target.isWasm() and self.type_reg.get(struct_field.type_idx) == .pointer and self.type_reg.get(struct_field.type_idx).pointer.managed) {
                             const fi_node = self.tree.getNode(field_init.value);
                             const fi_expr = if (fi_node) |n| n.asExpr() else null;
                             const fi_owned = if (fi_expr) |e| (e == .new_expr or e == .call) else false;
@@ -5896,7 +5896,7 @@ pub const Lowerer = struct {
             } else {
                 // ARC Phase 4: Retain +0 managed default values stored in struct fields.
                 // Swift: ManagedValue::hasCleanup() — only retain if source is managed.
-                if (!self.target.isWasm() and self.type_reg.couldBeARC(struct_field.type_idx)) {
+                if (!self.target.isWasm() and self.type_reg.get(struct_field.type_idx) == .pointer and self.type_reg.get(struct_field.type_idx).pointer.managed) {
                     const def_node = self.tree.getNode(struct_field.default_value);
                     const def_expr = if (def_node) |n| n.asExpr() else null;
                     const def_owned = if (def_expr) |e| (e == .new_expr or e == .call) else false;
@@ -6192,7 +6192,7 @@ pub const Lowerer = struct {
                         // Simple field: store value at offset
                         // ARC Phase 4: Retain +0 managed values stored in struct fields during init.
                         // Swift: ManagedValue::hasCleanup() — only retain if source is managed.
-                        if (!self.target.isWasm() and self.type_reg.couldBeARC(struct_field.type_idx)) {
+                        if (!self.target.isWasm() and self.type_reg.get(struct_field.type_idx) == .pointer and self.type_reg.get(struct_field.type_idx).pointer.managed) {
                             const fi_node = self.tree.getNode(field_init.value);
                             const fi_expr = if (fi_node) |n| n.asExpr() else null;
                             const fi_owned = if (fi_expr) |e| (e == .new_expr or e == .call) else false;
@@ -6256,7 +6256,7 @@ pub const Lowerer = struct {
                 // ARC Phase 4: Retain +0 ARC default values stored in struct fields.
                 // Swift: ManagedValue::hasCleanup() — only retain if source is managed.
                 // Raw pointers (&x, @intToPtr) have no cleanup and must not be retained.
-                if (!self.target.isWasm() and self.type_reg.couldBeARC(struct_field.type_idx)) {
+                if (!self.target.isWasm() and self.type_reg.get(struct_field.type_idx) == .pointer and self.type_reg.get(struct_field.type_idx).pointer.managed) {
                     const def_node = self.tree.getNode(struct_field.default_value);
                     const def_expr = if (def_node) |n| n.asExpr() else null;
                     const def_owned = if (def_expr) |e| (e == .new_expr or e == .call) else false;
