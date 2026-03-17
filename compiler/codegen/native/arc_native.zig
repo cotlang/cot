@@ -361,6 +361,12 @@ fn generateDealloc(
         .signature = free_sig_ref,
         .colocated = false,
     });
+    // Scribble ARC magic with poison value before free.
+    // Makes use-after-free immediately detectable — the magic check in
+    // retain/release will see 0xDEADDEADDEADDEAD instead of ARC_HEAP_MAGIC.
+    // Reference: macOS MallocScribble, Zig's 0xAA undefined fill pattern.
+    const v_poison = try ins2.iconst(clif.Type.I64, @bitCast(@as(u64, 0xDEAD_DEAD_DEAD_DEAD)));
+    _ = try ins2.store(clif.MemFlags.DEFAULT, v_poison, header_ptr, MAGIC_OFFSET);
     _ = try ins2.call(free_ref, &[_]clif.Value{header_ptr});
     _ = try ins2.return_(&[_]clif.Value{});
 

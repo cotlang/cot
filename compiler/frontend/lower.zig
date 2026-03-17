@@ -9851,13 +9851,14 @@ pub const Lowerer = struct {
                     // Source location: use err.src only if the span is within bounds (same file).
                     // For cross-file generics, self.err.src is the host file but bc.span is
                     // from the generic's defining file — offset would be out of range.
+                    const fn_name = if (fb.name.len > 0) fb.name else "?";
                     const loc_str = if (bc.span.start.offset < self.err.src.content.len) blk: {
                         const pos = self.err.src.position(bc.span.start);
-                        break :blk try std.fmt.allocPrint(self.allocator, "{s}:{d}: trap\n", .{ pos.filename, pos.line });
+                        break :blk try std.fmt.allocPrint(self.allocator, "{s}:{d}: trap in {s}\n", .{ pos.filename, pos.line, fn_name });
                     } else blk: {
                         // Cross-file generic: use tree filename + raw offset
                         const fname = if (self.tree.file) |f| f.filename else "unknown";
-                        break :blk try std.fmt.allocPrint(self.allocator, "{s}:offset({d}): trap\n", .{ fname, bc.span.start.offset });
+                        break :blk try std.fmt.allocPrint(self.allocator, "{s}:offset({d}): trap in {s}\n", .{ fname, bc.span.start.offset, fn_name });
                     };
                     const loc_idx = try fb.addStringLiteral(loc_str);
                     const loc_val = try fb.emitConstSlice(loc_idx, bc.span);
