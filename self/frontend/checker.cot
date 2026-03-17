@@ -955,12 +955,7 @@ struct Checker {
         if (self.body_check_depth > 1) { return }
         self.body_check_depth = self.body_check_depth + 1
 
-        const sym_idx = self.lookupSymbol(lookup_name)
-        if (sym_idx < 0) {
-            // Symbol not found — skip re-checking (function will be lowered without body check)
-            return
-        }
-        const sym = self.getSymbol(sym_idx)
+        const sym = self.lookupSymbol(lookup_name) orelse return
 
         // Get return type from func type
         var return_type: int = VOID
@@ -1055,18 +1050,17 @@ struct Checker {
             }
 
             // Update symbol with resolved type
-            const sym_idx = self.lookupSymbol(v.name)
-            if (sym_idx >= 0) {
-                // Try to evaluate const value
+            if (self.lookupSymbol(v.name)) |sym_ref| {
                 if (v.is_const and v.value != null_node) {
                     const cv = self.evalConstExpr(v.value)
                     if (cv.0 != 0) {
-                        self.updateSymbolType(sym_idx, var_type)
-                        self.updateSymbolConst(sym_idx, cv.1)
+                        sym_ref.type_idx = var_type
+                        sym_ref.is_const_val = true
+                        sym_ref.const_value = cv.1
                         return
                     }
                 }
-                self.updateSymbolType(sym_idx, var_type)
+                sym_ref.type_idx = var_type
             }
 
             // Register error set consts as named types for use in type positions
@@ -1081,16 +1075,8 @@ struct Checker {
         }, else => {} }, else => {} }
     }
 
-    fn updateSymbolType(sym_idx: int, type_idx: int) void {
-        var sym_ptr = self.getSymbol(sym_idx)
-        sym_ptr.type_idx = type_idx
-    }
 
-    fn updateSymbolConst(sym_idx: int, value: int) void {
-        var sym_ptr = self.getSymbol(sym_idx)
-        sym_ptr.is_const_val = true
-        sym_ptr.const_value = value
-    }
+
 
     // ---- Statement checking ----
 
