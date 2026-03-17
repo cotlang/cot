@@ -162,7 +162,7 @@ pub fn generate(
     });
     try result.append(allocator, .{
         .name = "retain",
-        .compiled = try generateRetain(allocator, isa, ctrl_plane),
+        .compiled = try generateRetain(allocator, isa, ctrl_plane, func_index_map),
     });
     try result.append(allocator, .{
         .name = "release",
@@ -382,6 +382,7 @@ fn generateRetain(
     allocator: Allocator,
     isa: native_compile.TargetIsa,
     ctrl_plane: *native_compile.ControlPlane,
+    func_index_map: *const std.StringHashMapUnmanaged(u32),
 ) !native_compile.CompiledCode {
     var clif_func = clif.Function.init(allocator);
     defer clif_func.deinit();
@@ -431,6 +432,7 @@ fn generateRetain(
 
     // Check magic: verify ARC_HEAP_MAGIC at header to guard against non-heap pointers.
     // Stack pointers from &expr (addr_of) won't have the magic → return obj unchanged.
+    // Swift: isValidPointerForNativeRetain guards all retain/release paths.
     builder.switchToBlock(block_check_magic);
     try builder.ensureInsertedBlock();
     {
@@ -441,7 +443,71 @@ fn generateRetain(
         const magic = try ins.load(clif.Type.I64, clif.MemFlags.DEFAULT, header_ptr, MAGIC_OFFSET);
         const v_expected = try ins.iconst(clif.Type.I64, ARC_HEAP_MAGIC);
         const is_heap = try ins.icmp(.eq, magic, v_expected);
-        _ = try ins.brif(is_heap, block_check_immortal, &.{}, block_return_obj, &.{});
+
+        // ARC diagnostic: if magic doesn't match AND magic != 0 (not uninitialized),
+        // print warning with the bad pointer value. Helps identify use-after-free
+        // (freed memory has wrong magic) vs non-heap pointers (stack/global addresses).
+        // Reference: Swift SWIFT_RT_TRACK_INVOCATION for retain/release tracking.
+        const v_zero_magic = try ins.iconst(clif.Type.I64, 0);
+        const magic_is_zero = try ins.icmp(.eq, magic, v_zero_magic);
+        const is_heap_or_uninit = try ins.bor(is_heap, magic_is_zero);
+
+        // Create diagnostic block for non-heap, non-zero magic (likely use-after-free)
+        const block_arc_warn = try builder.createBlock();
+        _ = try ins.brif(is_heap_or_uninit, block_check_immortal, &.{}, block_arc_warn, &.{});
+
+        // Diagnostic block: print "ARC: bad ptr 0xNNNN\n" to stderr, then return obj
+        builder.switchToBlock(block_arc_warn);
+        try builder.ensureInsertedBlock();
+        {
+            const warn_ins = builder.ins();
+            // Import eprint_int to print the bad pointer value
+            const eprint_idx = func_index_map.get("eprint_int") orelse 0;
+            var eprint_sig = clif.Signature.init(.system_v);
+            try eprint_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+            const eprint_sig_ref = try builder.importSignature(eprint_sig);
+            const eprint_func = try builder.importFunction(.{
+                .name = .{ .user = .{ .namespace = 0, .index = eprint_idx } },
+                .signature = eprint_sig_ref,
+                .colocated = false,
+            });
+
+            // Print: "ARC: bad ptr " + value + "\n" using write(2, msg, len)
+            const write_idx = func_index_map.get("write") orelse 0;
+            var write_sig = clif.Signature.init(.system_v);
+            try write_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+            try write_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+            try write_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+            try write_sig.addReturn(allocator, clif.AbiParam.init(clif.Type.I64));
+            const write_sig_ref = try builder.importSignature(write_sig);
+            const write_func = try builder.importFunction(.{
+                .name = .{ .user = .{ .namespace = 0, .index = write_idx } },
+                .signature = write_sig_ref,
+                .colocated = false,
+            });
+
+            // Stack slot for message prefix "ARC: bad ptr " (13 chars)
+            const warn_slot = try clif_func.createStackSlot(allocator, .{
+                .kind = .explicit_slot,
+                .size = 16,
+                .align_shift = 3,
+            });
+            const warn_addr = try warn_ins.stackAddr(clif.Type.I64, warn_slot, 0);
+            const prefix = "ARC: bad ptr ";
+            for (prefix, 0..) |byte, offset| {
+                const ch = try warn_ins.iconst(clif.Type.I8, @intCast(byte));
+                _ = try warn_ins.store(clif.MemFlags.DEFAULT, ch, warn_addr, @intCast(offset));
+            }
+            const fd = try warn_ins.iconst(clif.Type.I64, 2);
+            const prefix_len = try warn_ins.iconst(clif.Type.I64, @intCast(prefix.len));
+            _ = try warn_ins.call(write_func, &[_]clif.Value{ fd, warn_addr, prefix_len });
+
+            // Print the pointer value as decimal
+            const warn_obj = builder.blockParams(block_entry)[0];
+            _ = try warn_ins.call(eprint_func, &[_]clif.Value{warn_obj});
+
+            _ = try warn_ins.jump(block_return_obj, &.{});
+        }
     }
 
     // Check immortal: header_ptr = obj - HEADER_SIZE, load refcount
@@ -605,6 +671,7 @@ fn generateRelease(
     }
 
     // ---- Check magic: verify ARC_HEAP_MAGIC to guard against non-heap pointers ----
+    // ARC diagnostic: warn when magic doesn't match (likely use-after-free or wrong pointer).
     builder.switchToBlock(block_check_magic);
     try builder.ensureInsertedBlock();
     {
@@ -615,7 +682,62 @@ fn generateRelease(
         const magic = try ins.load(clif.Type.I64, clif.MemFlags.DEFAULT, header_ptr, MAGIC_OFFSET);
         const v_expected = try ins.iconst(clif.Type.I64, ARC_HEAP_MAGIC);
         const is_heap = try ins.icmp(.eq, magic, v_expected);
-        _ = try ins.brif(is_heap, block_check_immortal, &.{}, block_return, &.{});
+
+        const v_zero_magic = try ins.iconst(clif.Type.I64, 0);
+        const magic_is_zero = try ins.icmp(.eq, magic, v_zero_magic);
+        const is_heap_or_uninit = try ins.bor(is_heap, magic_is_zero);
+
+        const block_release_warn = try builder.createBlock();
+        _ = try ins.brif(is_heap_or_uninit, block_check_immortal, &.{}, block_release_warn, &.{});
+
+        // Diagnostic: print bad pointer value then return
+        builder.switchToBlock(block_release_warn);
+        try builder.ensureInsertedBlock();
+        {
+            const warn_ins = builder.ins();
+            const eprint_idx = func_index_map.get("eprint_int") orelse 0;
+            var eprint_sig = clif.Signature.init(.system_v);
+            try eprint_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+            const eprint_sig_ref = try builder.importSignature(eprint_sig);
+            const eprint_func = try builder.importFunction(.{
+                .name = .{ .user = .{ .namespace = 0, .index = eprint_idx } },
+                .signature = eprint_sig_ref,
+                .colocated = false,
+            });
+
+            const write_idx2 = func_index_map.get("write") orelse 0;
+            var write_sig2 = clif.Signature.init(.system_v);
+            try write_sig2.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+            try write_sig2.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+            try write_sig2.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+            try write_sig2.addReturn(allocator, clif.AbiParam.init(clif.Type.I64));
+            const write_sig_ref2 = try builder.importSignature(write_sig2);
+            const write_func2 = try builder.importFunction(.{
+                .name = .{ .user = .{ .namespace = 0, .index = write_idx2 } },
+                .signature = write_sig_ref2,
+                .colocated = false,
+            });
+
+            const warn_slot = try clif_func.createStackSlot(allocator, .{
+                .kind = .explicit_slot,
+                .size = 16,
+                .align_shift = 3,
+            });
+            const warn_addr = try warn_ins.stackAddr(clif.Type.I64, warn_slot, 0);
+            const prefix = "ARC: bad rel ";
+            for (prefix, 0..) |byte, offset| {
+                const ch = try warn_ins.iconst(clif.Type.I8, @intCast(byte));
+                _ = try warn_ins.store(clif.MemFlags.DEFAULT, ch, warn_addr, @intCast(offset));
+            }
+            const fd = try warn_ins.iconst(clif.Type.I64, 2);
+            const prefix_len = try warn_ins.iconst(clif.Type.I64, @intCast(prefix.len));
+            _ = try warn_ins.call(write_func2, &[_]clif.Value{ fd, warn_addr, prefix_len });
+
+            const warn_obj = builder.blockParams(block_entry)[0];
+            _ = try warn_ins.call(eprint_func, &[_]clif.Value{warn_obj});
+
+            _ = try warn_ins.jump(block_return, &.{});
+        }
     }
 
     // ---- Return block (null, not-heap, immortal, or rc > 0) ----
