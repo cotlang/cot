@@ -427,8 +427,9 @@ pub const TypeRegistry = struct {
         return switch (t) {
             // All basic types are trivial (primitives, void)
             .basic => true,
-            // Raw pointers are trivial (no ownership)
-            .pointer => true,
+            // Raw pointers are trivial, managed pointers are non-trivial.
+            // Swift TypeLowering: class references (heap pointers) are non-trivial.
+            .pointer => |p| !p.managed,
             // Functions are trivial (just code pointers)
             .func => true,
             // Error sets are trivial (just integer indices)
