@@ -149,16 +149,16 @@ After freeing an object, overwrite the user data with a pattern (0xDEADBEEF). Th
 
 ## Priority Order
 
-| # | Fix | Impact | Effort | Blocks |
+| # | Fix | Impact | Effort | Status |
 |---|-----|--------|--------|--------|
-| 1 | Signal handler calls backtrace | Critical | 5 min | All crash debugging |
-| 2 | ARC pointer range check | Critical | 30 min | Optional ?*T crashes |
-| 3 | ARC diagnostic messages | High | 1 hour | ARC use-after-free |
-| 4 | Phase tracking in selfcot | High | 30 min | Selfcot dogfooding |
-| 5 | Refcount underflow detection | Medium | 30 min | Double-free bugs |
-| 6 | Function name in @trap | Medium | 15 min | Bounds check crashes |
-| 7 | Debug build mode | Low | 1 hour | Development experience |
-| 8 | MallocScribble in dealloc | Low | 30 min | Use-after-free |
+| 1 | Signal handler calls backtrace | Critical | 5 min | DONE (51546d1) |
+| 2 | ARC pointer range check | Critical | 30 min | DONE (25ece9c) |
+| 3 | ARC diagnostic messages | High | 1 hour | DONE (3b87ffc) |
+| 4 | Phase tracking in selfcot | High | 30 min | DONE (b954e2f) |
+| 5 | Refcount underflow detection | Medium | 30 min | Not started |
+| 6 | Function name in @trap | Medium | 15 min | DONE (9a8106b) |
+| 7 | Debug build mode | Low | 1 hour | Not started |
+| 8 | MallocScribble in dealloc | Low | 30 min | DONE (9a8106b) |
 
 ## Key Reference Files
 
