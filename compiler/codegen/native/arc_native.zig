@@ -460,7 +460,9 @@ fn generateRetain(
 
         // Create diagnostic block for non-heap, non-zero magic (likely use-after-free)
         const block_arc_warn = try builder.createBlock();
-        _ = try ins.brif(is_heap_or_uninit, block_check_immortal, &.{}, block_arc_warn, &.{});
+        // Skip diagnostic print for now — the write() call during compilation
+        // corrupts stack state. Just return obj unchanged for non-heap pointers.
+        _ = try ins.brif(is_heap_or_uninit, block_check_immortal, &.{}, block_return_obj, &.{});
 
         // Diagnostic block: print "ARC: bad ptr 0xNNNN\n" to stderr, then return obj
         builder.switchToBlock(block_arc_warn);
@@ -694,7 +696,7 @@ fn generateRelease(
         const is_heap_or_uninit = try ins.bor(is_heap, magic_is_zero);
 
         const block_release_warn = try builder.createBlock();
-        _ = try ins.brif(is_heap_or_uninit, block_check_immortal, &.{}, block_release_warn, &.{});
+        _ = try ins.brif(is_heap_or_uninit, block_check_immortal, &.{}, block_return, &.{});
 
         // Diagnostic: print bad pointer value then return
         builder.switchToBlock(block_release_warn);
