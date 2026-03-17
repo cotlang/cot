@@ -3349,6 +3349,22 @@ pub const Lowerer = struct {
                         const fld_info = self.type_reg.get(field.type_idx);
                         if (fld_info == .optional and !self.isPtrLikeOptional(field.type_idx)) {
                             try self.storeCompoundOptField(fb, local_idx, field_idx, field_offset, value_node, rhs_ast, span);
+                        } else if (self.type_reg.couldBeARC(field.type_idx) and !self.target.isWasm()) {
+                            // ARC: Same retain-before-release as pointer-base path (line ~3306).
+                            // Swift SILGen: field assign always does copy_value + store + destroy_value.
+                            const old_val = try fb.emitFieldLocal(local_idx, field_idx, field_offset, field.type_idx, span);
+                            const rhs_node = self.tree.getNode(rhs_ast);
+                            const rhs_expr2 = if (rhs_node) |n| n.asExpr() else null;
+                            const is_owned2 = if (rhs_expr2) |e| (e == .new_expr or e == .call) else false;
+                            if (!is_owned2) {
+                                var retain_args = [_]ir.NodeIndex{value_node};
+                                const retained = try fb.emitCall("retain", &retain_args, false, field.type_idx, span);
+                                _ = try fb.emitStoreLocalField(local_idx, field_idx, field_offset, retained, span);
+                            } else {
+                                _ = try fb.emitStoreLocalField(local_idx, field_idx, field_offset, value_node, span);
+                            }
+                            var release_args2 = [_]ir.NodeIndex{old_val};
+                            _ = try fb.emitCall("release", &release_args2, false, TypeRegistry.VOID, span);
                         } else {
                             _ = try fb.emitStoreLocalField(local_idx, field_idx, field_offset, value_node, span);
                         }
@@ -3358,6 +3374,21 @@ pub const Lowerer = struct {
                         const fld_info = self.type_reg.get(field.type_idx);
                         if (fld_info == .optional and !self.isPtrLikeOptional(field.type_idx)) {
                             try self.storeCompoundOptFieldPtr(fb, global_addr, field_idx, field_offset, value_node, rhs_ast, span);
+                        } else if (self.type_reg.couldBeARC(field.type_idx) and !self.target.isWasm()) {
+                            // ARC: retain-before-release for global field assignment (Swift SILGen pattern)
+                            const old_val = try fb.emitFieldValue(global_addr, field_idx, field_offset, field.type_idx, span);
+                            const rhs_node = self.tree.getNode(rhs_ast);
+                            const rhs_expr2 = if (rhs_node) |n| n.asExpr() else null;
+                            const is_owned2 = if (rhs_expr2) |e| (e == .new_expr or e == .call) else false;
+                            if (!is_owned2) {
+                                var retain_args = [_]ir.NodeIndex{value_node};
+                                const retained = try fb.emitCall("retain", &retain_args, false, field.type_idx, span);
+                                _ = try fb.emitStoreFieldValue(global_addr, field_idx, field_offset, retained, span);
+                            } else {
+                                _ = try fb.emitStoreFieldValue(global_addr, field_idx, field_offset, value_node, span);
+                            }
+                            var release_args2 = [_]ir.NodeIndex{old_val};
+                            _ = try fb.emitCall("release", &release_args2, false, TypeRegistry.VOID, span);
                         } else if ((fld_info == .struct_type or fld_info == .tuple or fld_info == .union_type) and self.type_reg.sizeOf(field.type_idx) > 8) {
                             const fld_size = self.type_reg.sizeOf(field.type_idx);
                             const num_words = fld_size / 8;
@@ -3380,6 +3411,21 @@ pub const Lowerer = struct {
                         const fld_info = self.type_reg.get(field.type_idx);
                         if (fld_info == .optional and !self.isPtrLikeOptional(field.type_idx)) {
                             try self.storeCompoundOptFieldPtr(fb, base_addr, field_idx, field_offset, value_node, rhs_ast, span);
+                        } else if (self.type_reg.couldBeARC(field.type_idx) and !self.target.isWasm()) {
+                            // ARC: retain-before-release for nested field assignment (Swift SILGen pattern)
+                            const old_val = try fb.emitFieldValue(base_addr, field_idx, field_offset, field.type_idx, span);
+                            const rhs_node = self.tree.getNode(rhs_ast);
+                            const rhs_expr2 = if (rhs_node) |n| n.asExpr() else null;
+                            const is_owned2 = if (rhs_expr2) |e| (e == .new_expr or e == .call) else false;
+                            if (!is_owned2) {
+                                var retain_args = [_]ir.NodeIndex{value_node};
+                                const retained = try fb.emitCall("retain", &retain_args, false, field.type_idx, span);
+                                _ = try fb.emitStoreFieldValue(base_addr, field_idx, field_offset, retained, span);
+                            } else {
+                                _ = try fb.emitStoreFieldValue(base_addr, field_idx, field_offset, value_node, span);
+                            }
+                            var release_args2 = [_]ir.NodeIndex{old_val};
+                            _ = try fb.emitCall("release", &release_args2, false, TypeRegistry.VOID, span);
                         } else if ((fld_info == .struct_type or fld_info == .tuple or fld_info == .union_type) and self.type_reg.sizeOf(field.type_idx) > 8) {
                             const fld_size = self.type_reg.sizeOf(field.type_idx);
                             const num_words = fld_size / 8;
