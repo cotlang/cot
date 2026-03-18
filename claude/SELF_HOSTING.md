@@ -79,29 +79,36 @@ Lines: 2793, 2857, 5840, 5899, 6195, 6259 in `compiler/frontend/lower.zig`.
 
 ---
 
-## Blocker 2: Self-Referential Struct Support in Selfcot
+## Blocker 2: body_check_depth Counter Leak (DIAGNOSED)
 
-**Status:** Not started. Blocks checker.cot and lower.cot.
+**Status:** Root cause identified. Blocks all 13 files. Requires Zig compiler fix.
 
-The selfcot's checker doesn't support self-referential struct types. The Scope struct (`struct Scope { parent: ?*Scope, ... }`) triggers "undefined type 'Scope'" because the selfcot resolves field types before registering the struct name.
+**Root cause:** `checkFnDeclBody` in `self/check/checker.cot:955` increments `body_check_depth` at line 956 but the `orelse return` at line 958 doesn't decrement it. After a single failed `lookupSymbol`, the counter permanently leaks, causing ALL subsequent function body checks to be skipped (depth > 1 → return at line 955). This means params (including `self`) are never defined in scope.
 
-The Zig compiler has this support (commit 137149a): register a placeholder type BEFORE resolving fields, then update the placeholder after. This needs to be ported to `self/frontend/checker.cot`.
+**Evidence:** `stdlib/map.cot:35: undefined identifier 'self'` — the `impl Hashable for i64 { fn hash(self: *i64) }` body check is skipped because `body_check_depth` leaked from a previous failed lookup.
 
-**Impact:** checker.cot and lower.cot can't be compiled because they import checker.cot which defines the Scope struct. Once self-referential support is ported, these 2 files should compile (they already pass with the Zig compiler).
+**Fix required:** Decrement `body_check_depth` on ALL early return paths. The natural fix is:
+```cot
+const sym = self.lookupSymbol(lookup_name) orelse {
+    self.body_check_depth = self.body_check_depth - 1
+    return
+}
+```
+But this triggers `error.NoCurrentBlock` in the Zig compiler — the Zig compiler doesn't handle `orelse { block with return }`. **This is a Zig compiler bug that must be fixed before the selfcot checker works.**
 
----
+**Workaround attempted:** Split into two functions (`checkFnDeclBody` + `checkFnDeclBodyInner`). This compiled but caused other regressions due to the optional-to-value parameter passing in @safe mode.
 
-## Blocker 3: Struct Method Lowering Crash
+**Impact:** ALL 13 files fail because `body_check_depth` leaks during stdlib checking (map.cot's trait impl methods trigger the first leak, then all subsequent function body checks in the target file are skipped).
 
-**Status:** Diagnosed but not fixed. Blocks arc_insertion.cot and ssa_builder.cot.
+## Blocker 3: Scope Chain Corruption During Multi-File Lowering
 
-When the selfcot compiles files containing struct methods with non-trivial bodies (var declarations, function calls, etc.), the Phase 3 lowering crashes. Free functions with identical code work fine.
+**Status:** Diagnosed via signal handler. Secondary to Blocker 2.
 
-**Evidence:** `struct Bar { x: i64, fn method() i64 { var a: i64 = 42; return a } }` — check passes, build crashes.
+When selfcot lowers a file, `Scope_lookup` calls `Map.getOrNull` with garbage pointers (x0=`0x83cf...`, fault=`0x6eb6...`). The scope chain's parent pointers are corrupted — ASCII text like "Undefine" (0x656e696665646e55) appears as pointer values.
 
-**Diagnosis:** The ARC diagnostics show thousands of "ARC: bad ptr" messages with sequential heap addresses (incrementing by 32 bytes). These are List element addresses being passed to retain/release — the struct field init ARC paths are retaining elements inside List backing buffers that don't have ARC headers.
+**Evidence:** Signal handler output shows `at self/main.cot:316` and register dump with `x0=0x83cf8e8f9081468b` (garbage). Backtrace: `Scope_lookup → Map.getOrNull` crash.
 
-**Fix:** The 6 struct field init sites (blocker 1 remaining items) need the `!= .optional` guard. This would eliminate the flood of bad retain/release calls on list elements.
+This is likely a SECONDARY effect of Blocker 2 — when function body checks are skipped, scope push/pop becomes unbalanced, corrupting the scope chain for subsequent operations.
 
 ---
 
