@@ -8846,7 +8846,14 @@ pub const Lowerer = struct {
         // Three-tier: shape_only (alias), dict_stencil (shared body + fn-ptr args), not_stencilable (full mono).
         // Reference: Go shapify() — groups *User/*Order/*Product into one *T stencil.
         var stencil_result: StencilResult = .not_stencilable;
-        if (inst_info.type_args.len > 0) stencil_check: {
+        // Shape stenciling DISABLED: dict param passing between call sites and
+        // function bodies is incomplete — call sites don't prepend dict function
+        // pointer args but function bodies expect them (Go stencil.go pattern).
+        // Disabling forces all generics to monomorphize directly with concrete
+        // type calls (no indirect dispatch). Re-enable after implementing dict
+        // arg passing at ALL call sites.
+        // Reference: Go 1.18 conservative approach — minimal stenciling initially.
+        if (false and inst_info.type_args.len > 0) stencil_check: {
             // Check shape analysis cache, or compute and cache
             stencil_result = if (self.shape_analysis_cache.get(inst_info.generic_node)) |cached|
                 cached
