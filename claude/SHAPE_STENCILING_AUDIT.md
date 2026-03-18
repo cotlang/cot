@@ -1,7 +1,7 @@
 # Shape Stenciling Audit: Cot vs Go's Dictionary-Based Generics
 
 **Date:** 2026-03-18
-**Status:** Stenciling disabled (line 8856: `if (false and ...`). 6 gaps identified.
+**Status:** Stenciling ENABLED and working. All 27 shape_stencil.cot tests pass. Key fixes: wrapper functions handle dict injection (not call sites/SSA builder), shape_aliases only for shape_only (not dict_stencil), type_substitution active during aliased wrapper generation.
 
 ---
 

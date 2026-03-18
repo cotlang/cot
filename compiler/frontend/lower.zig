@@ -8196,6 +8196,10 @@ pub const Lowerer = struct {
                     }
                 }
                 const ret_type = if (concrete_info == .func) concrete_info.func.return_type else TypeRegistry.VOID;
+                // Shape stenciling: call sites always use the concrete name.
+                // For dict_stencil: concrete name → wrapper → stencil with dict args.
+                // For shape_only: concrete name → aliased directly in SSA builder.
+                const call_target = inst_info.concrete_name;
                 // SRET for generic function calls — reuse shared SRET local
                 if (self.needsSret(ret_type)) {
                     const ret_size = self.type_reg.sizeOf(ret_type);
@@ -8205,10 +8209,10 @@ pub const Lowerer = struct {
                     defer sret_args.deinit(self.allocator);
                     try sret_args.append(self.allocator, sret_addr);
                     try sret_args.appendSlice(self.allocator, gen_args.items);
-                    _ = try fb.emitCall(inst_info.concrete_name, sret_args.items, false, TypeRegistry.VOID, call.span);
+                    _ = try fb.emitCall(call_target, sret_args.items, false, TypeRegistry.VOID, call.span);
                     return try fb.emitLoadLocal(sret_local, ret_type, call.span);
                 }
-                return try fb.emitCall(inst_info.concrete_name, gen_args.items, false, ret_type, call.span);
+                return try fb.emitCall(call_target, gen_args.items, false, ret_type, call.span);
             }
         }
 
@@ -8847,12 +8851,8 @@ pub const Lowerer = struct {
         // Reference: Go shapify() — groups *User/*Order/*Product into one *T stencil.
         var stencil_result: StencilResult = .not_stencilable;
         // Shape stenciling with Go-style wrapper functions.
-        // DISABLED: dict dispatch inside stencil body passes string values to
-        // hash/eq helpers that expect *string (@safe auto-pointer). The wrapper
-        // functions work correctly but the dict indirect calls need @safe auto-ref
-        // matching the normal method call path. Re-enable after fixing dict dispatch.
         // Reference: Go cmd/compile/internal/noder/reader.go:1377-1396.
-        if (false and inst_info.type_args.len > 0) stencil_check: {
+        if (inst_info.type_args.len > 0) stencil_check: {
             // Check shape analysis cache, or compute and cache
             stencil_result = if (self.shape_analysis_cache.get(inst_info.generic_node)) |cached|
                 cached
@@ -8884,17 +8884,21 @@ pub const Lowerer = struct {
 
                 if (self.shape_stencils.get(shape_key)) |existing_stencil_name| {
                     // Already stenciled for this shape.
-                    // Go pattern (reader.go:1377-1396): generate a thin wrapper that
-                    // tail-calls the canonical stencil with the correct dictionary.
-                    self.shape_aliases.put(inst_info.concrete_name, existing_stencil_name) catch break :stencil_check;
                     if (stencil_result == .dict_stencil) {
+                        // Dict-stencil: wrapper handles redirection. Don't alias in shape_aliases
+                        // because the SSA builder would bypass the wrapper.
                         self.generateDictHelpers(inst_info, stencil_result.dict_stencil) catch break :stencil_check;
                         self.buildDictArgNames(inst_info, stencil_result.dict_stencil) catch break :stencil_check;
-                        // Generate wrapper: concrete_name(params...) → stencil_name(dict_args..., params...)
+                        // Generate wrapper with type substitution active so resolveTypeNode(T)
+                        // resolves to the concrete type (u64, not T).
+                        const saved_sub = self.type_substitution;
+                        self.type_substitution = sub_map;
+                        defer self.type_substitution = saved_sub;
                         try self.generateDictWrapper(inst_info, existing_stencil_name, f);
                     } else {
-                        // shape_only: direct alias, no wrapper needed
-                        // The function bodies are identical — just redirect the name
+                        // shape_only: direct alias, no wrapper needed.
+                        // SSA builder resolves this alias to redirect calls.
+                        self.shape_aliases.put(inst_info.concrete_name, existing_stencil_name) catch break :stencil_check;
                     }
                     return;
                 }
@@ -9544,39 +9548,15 @@ pub const Lowerer = struct {
         }
 
         // Go LinkFuncName: qualify method call target (skip for generic instances)
-        const method_link_name = if (self.chk.generics.generic_inst_by_name.contains(method_info.func_name))
+        const method_link_name_raw = if (self.chk.generics.generic_inst_by_name.contains(method_info.func_name))
             method_info.func_name // generic instance: keep bare (TypeIndex makes it unique)
         else
             try self.resolveMethodName(receiver_type_name, method_info.func_name, method_info.source_tree);
 
-        // Go stenciling: if the target is a dict-stenciled function, prepend
-        // dict function pointer args. Go cmd/compile/internal/noder/stencil.go
-        // passes the "dictionary" (type info + method pointers) as the first arg.
-        // We pass individual fn-ptr args (one per dict entry) before regular args.
-        if (self.dict_arg_names.get(method_info.func_name)) |dict_names| {
-            var full_args = std.ArrayListUnmanaged(ir.NodeIndex){};
-            defer full_args.deinit(self.allocator);
-            // Prepend dict function pointer addresses
-            for (dict_names) |helper_name| {
-                const fn_addr = try fb.emitFuncAddr(helper_name, TypeRegistry.I64, call.span);
-                try full_args.append(self.allocator, fn_addr);
-            }
-            // Append regular args
-            try full_args.appendSlice(self.allocator, args.items);
-
-            if (self.needsSret(return_type)) {
-                const ret_size = self.type_reg.sizeOf(return_type);
-                const sret_local = try fb.getOrCreateSretLocal(return_type, ret_size);
-                const sret_addr = try fb.emitAddrLocal(sret_local, TypeRegistry.I64, call.span);
-                var sret_args = std.ArrayListUnmanaged(ir.NodeIndex){};
-                defer sret_args.deinit(self.allocator);
-                try sret_args.append(self.allocator, sret_addr);
-                try sret_args.appendSlice(self.allocator, full_args.items);
-                _ = try fb.emitCall(method_link_name, sret_args.items, false, TypeRegistry.VOID, call.span);
-                return try fb.emitLoadLocal(sret_local, return_type, call.span);
-            }
-            return try fb.emitCall(method_link_name, full_args.items, false, return_type, call.span);
-        }
+        // Shape stenciling: call sites use the concrete name.
+        // For dict_stencil: concrete name → wrapper → stencil with dict args.
+        // For shape_only: SSA builder resolves aliases.
+        const method_link_name = method_link_name_raw;
 
         // SRET for method calls returning large types — reuse shared SRET local
         if (self.needsSret(return_type)) {
