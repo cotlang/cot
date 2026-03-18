@@ -6,31 +6,34 @@
 
 ---
 
-## Current Status: 10 of 13 Frontend Files Produce Valid Wasm
+## Current Status: 5 of 13 Frontend Files Produce Valid Wasm
 
-| File | Lines | Wasm Output | Check | Build Exit | Blocker |
-|------|-------|-------------|-------|------------|---------|
-| token.cot | 448 | 6,214 bytes | Pass | 139 (cleanup) | ARC cleanup |
-| scanner.cot | 774 | 29,325 bytes | Pass | 139 (cleanup) | ARC cleanup |
-| source.cot | 315 | 13,152 bytes | Pass | 139 (cleanup) | ARC cleanup |
-| errors.cot | 545 | 21,362 bytes | Pass | 139 (cleanup) | ARC cleanup |
-| types.cot | 1,575 | 55,943 bytes | Pass | 139 (cleanup) | ARC cleanup |
-| ast.cot | 1,541 | 27,499 bytes | Pass | 139 (cleanup) | ARC cleanup |
-| ir.cot | 1,451 | 91,942 bytes | Pass | 139 (cleanup) | ARC cleanup |
-| parser.cot | 3,235 | 180,321 bytes | Pass | 139 (cleanup) | ARC cleanup |
-| ssa.cot | 619 | 75,994 bytes | Pass | 139 (cleanup) | ARC cleanup |
-| arc_insertion.cot | 414 | — | Pass | 139 | ARC ?*T in lowering |
-| ssa_builder.cot | 2,337 | — | Pass | 139 | ARC ?*T in lowering |
-| checker.cot | 5,947 | — | Fail | 139 | Self-referential struct |
-| lower.cot | 9,177 | — | Fail | 139 | Self-referential struct |
+**Audited 2026-03-18** — verified with clean selfcot build + test of each file.
+
+| File | Lines | Build | Blocker |
+|------|------:|-------|---------|
+| token.cot | 448 | **OK** | — |
+| source.cot | 315 | **OK** | — |
+| errors.cot | 545 | **OK** | — |
+| ast.cot | 1,532 | **OK** | — |
+| arc_insertion.cot | 443 | **OK** | — |
+| scanner.cot | 774 | SIGILL (132) | Crash during check phase (pre-existing) |
+| types.cot | 1,572 | SIGSEGV (139) | Crash during lowerChecked |
+| ir.cot | 1,467 | SIGILL (132) | Crash during check phase |
+| parser.cot | 3,258 | SIGILL (132) | Crash during check phase |
+| ssa.cot | 625 | SIGSEGV (139) | Crash during lowerChecked |
+| ssa_builder.cot | 2,364 | SIGSEGV (11) | Map.getOrNull crash in checker.Scope_lookup |
+| checker.cot | 5,909 | SIGILL (132) | Crash during check phase |
+| lower.cot | 9,201 | SIGILL (132) | Crash during check phase |
 
 **Key facts:**
-- 10 files produce valid wasm (verified with `wasmtime`)
-- ALL files exit 139 (SIGSEGV) during process cleanup — the wasm output is correct
-- 2 files (checker, lower) fail because selfcot's checker can't resolve `?*Scope` in the self-referential `Scope` struct
-- 2 files (arc_insertion, ssa_builder) pass check but crash during Phase 3 lowering
+- 5 files produce valid wasm: token, source, errors, ast, arc_insertion
+- 5 files crash with SIGILL (132) during check — likely illegal instruction from miscompiled code
+- 3 files crash with SIGSEGV during lowering or checking — Map/Scope corruption
+- selfcot check passes for all 38+ files (`/tmp/selfcot check self/main.cot` exits 0)
+- Previous "9 of 13" status was inaccurate — many files had regressed
 
-After frontend, codegen/ (16 files) and main.cot still need to compile.
+After frontend, codegen/ (17 files) and main.cot still need to compile.
 
 ---
 

@@ -1,7 +1,7 @@
 # Shape Stenciling Audit: Cot vs Go's Dictionary-Based Generics
 
 **Date:** 2026-03-18
-**Status:** Stenciling ENABLED and working. All 27 shape_stencil.cot tests pass. Key fixes: wrapper functions handle dict injection (not call sites/SSA builder), shape_aliases only for shape_only (not dict_stencil), type_substitution active during aliased wrapper generation.
+**Status:** Stenciling DISABLED (analyzeStencilability returns not_stencilable). Infrastructure works for targeted tests (shape_stencil.cot: 27/27 pass) but `analyzeStencilability` has false positives: basic types like i64 match non-parameter expressions (e.g., `self.capacity == 0` in Map with V=i64 flagged as V-dependent). Root cause: type-matching uses resolved types, not Go-style AST provenance tracking. Needs OTYPE-like provenance before re-enabling.
 
 ---
 
