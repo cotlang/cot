@@ -1,0 +1,52 @@
+import "std/list"
+import "std/map"
+
+struct Builder {
+    name: string,
+    locals: List(int),
+    nodes: List(int),
+    local_map: Map(string, int),
+    count: int,
+}
+
+impl Builder {
+    static fn create(n: string) *Builder {
+        return new Builder {
+            name: n, locals: .{}, nodes: .{},
+            local_map: .{}, count: 0,
+        }
+    }
+
+    fn addParam(self: *Builder, param_name: string, idx: int) void {
+        self.locals.append(idx)
+        self.local_map.set(param_name, idx)
+        self.count = self.count + 1
+    }
+
+    fn lookupLocal(self: *Builder, param_name: string) ?int {
+        return self.local_map.getOrNull(param_name)
+    }
+}
+
+test "struct method map" {
+    var b = Builder.create("test")
+    b.addParam("self", 0)
+    const r = b.lookupLocal("self")
+    if (r) |v| { @assertEq(v, 0) }
+    else { @assert(false) }
+}
+
+test "struct method map after growth" {
+    var b = Builder.create("test")
+    b.addParam("x", 0)
+    var i: int = 0
+    while (i < 20) {
+        b.nodes.append(i)
+        i += 1
+    }
+    b.addParam("y", 1)
+    const r1 = b.lookupLocal("x")
+    const r2 = b.lookupLocal("y")
+    if (r1) |v| { @assertEq(v, 0) } else { @assert(false) }
+    if (r2) |v| { @assertEq(v, 1) } else { @assert(false) }
+}

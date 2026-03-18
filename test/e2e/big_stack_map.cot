@@ -16,13 +16,17 @@ struct FuncBuilder {
     string_literals: List(string), current_block: int,
     local_map: Map(string, int), shadow_stack: List(ShadowEntry),
     sret_return_type: ?int, is_destructor: bool, is_export: bool,
+}
 
+impl FuncBuilder {
     static fn initHeap(n: string) *FuncBuilder {
         var blocks: List(Block) = .{}
-        blocks.append(Block { idx: 0 })
+        var b0 = Block { .idx = 0 }
+        blocks.append(b0)
+        var sp = Span { .start = 0, .end = 0 }
         return new FuncBuilder {
             name: n, type_idx: 0, return_type: 0,
-            span: Span { start: 0, end: 0 },
+            span: sp,
             locals: .{}, blocks: blocks, nodes: .{},
             string_literals: .{}, current_block: 0,
             local_map: .{}, shadow_stack: .{},
@@ -30,17 +34,20 @@ struct FuncBuilder {
         }
     }
 
-    fn addParam(param_name: string, t: int, idx: int, sz: int) int {
+    fn addParam(self: *FuncBuilder, param_name: string, t: int, idx: int, sz: int) int {
         const i = self.locals.count
-        self.locals.append(Local { name: param_name, type_idx: t, mutable: false, is_param: true, param_idx: idx, size: sz, alignment: 8, offset: 0 })
+        var loc = Local { .name = param_name, .type_idx = t, .mutable = false, .is_param = true, .param_idx = idx, .size = sz, .alignment = 8, .offset = 0 }
+        self.locals.append(loc)
         self.local_map.set(param_name, i)
         return i
     }
 
-    fn addLocalWithSize(param_name: string, t: int, mutable: bool, sz: int) int {
+    fn addLocalWithSize(self: *FuncBuilder, param_name: string, t: int, mutable: bool, sz: int) int {
         const i = self.locals.count
-        self.locals.append(Local { name: param_name, type_idx: t, mutable: mutable, is_param: false, param_idx: 0, size: sz, alignment: 8, offset: 0 })
-        self.shadow_stack.append(ShadowEntry { name: param_name, old_idx: self.local_map.getOrNull(param_name) })
+        var loc = Local { .name = param_name, .type_idx = t, .mutable = mutable, .is_param = false, .param_idx = 0, .size = sz, .alignment = 8, .offset = 0 }
+        self.locals.append(loc)
+        var se = ShadowEntry { .name = param_name, .old_idx = self.local_map.getOrNull(param_name) }
+        self.shadow_stack.append(se)
         self.local_map.set(param_name, i)
         return i
     }

@@ -99,9 +99,10 @@ const PURE_SWIFT_DEALLOC: i64 = 1; // 0x0000000000000001
 // Swift RefCount.h:751 — RefCountBits(0, 1) = (0 << 33) | (1 << 0) | (1 << 1) = 3
 // NOTE: Unowned uses DIRECT count (physical=logical), NOT extra count.
 // Only StrongExtra uses extra count (physical 0 = logical 1).
-// Swift HeapObject.cpp: swift_allocObject sets refcount to STRONG_RC_ONE (one strong retain).
-// The allocation IS the first ownership — the object starts with refcount 1.
-const INITIAL_REFCOUNT: i64 = STRONG_RC_ONE | PURE_SWIFT_DEALLOC | UNOWNED_RC_ONE;
+// Swift HeapObject.cpp: swift_allocObject sets refcount to RefCountBits(0, 1).
+// StrongExtra uses EXTRA count: physical 0 = logical 1. New object has 1 strong ref.
+// Don't include STRONG_RC_ONE — that would make physical=1 = logical 2 (wrong).
+const INITIAL_REFCOUNT: i64 = PURE_SWIFT_DEALLOC | UNOWNED_RC_ONE;
 // Immortal: all 64 bits set — passes Swift's IsImmortal mask (low 32 bits all set)
 const IMMORTAL_REFCOUNT: i64 = @bitCast(@as(u64, 0xFFFFFFFF_FFFFFFFF));
 const STRONG_EXTRA_MASK: i64 = @bitCast(@as(u64, 0x7FFFFFFE_00000000)); // bits 33-62
@@ -570,7 +571,11 @@ fn generateReallocRaw(
             .signature = memcpy_sig_ref,
             .colocated = false,
         });
-        _ = try copy_ins.call(memcpy_func, &[_]clif.Value{ new_ptr, old_ptr, old_size });
+        // Copy min(old_size, new_size) bytes — when shrinking, don't overrun the new buffer.
+        // Go growslice (slice.go:285) copies old_len elements, not old_cap.
+        const is_shrink = try copy_ins.icmp(.slt, new_size, old_size);
+        const copy_size = try copy_ins.select(clif.Type.I64, is_shrink, new_size, old_size);
+        _ = try copy_ins.call(memcpy_func, &[_]clif.Value{ new_ptr, old_ptr, copy_size });
 
         // 3. dealloc_raw(old_ptr) — validates redzones on old buffer, catches overflow
         const dealloc_raw_idx = func_index_map.get("dealloc_raw") orelse 0;
