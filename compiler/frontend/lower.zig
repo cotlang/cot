@@ -8456,6 +8456,13 @@ pub const Lowerer = struct {
     /// Returns: shape_only (Tier 1), dict_stencil (Tier 2), or not_stencilable (Tier 3).
     /// Reference: Go's shapify() groups types by shape; dictionary dispatch handles type-specific ops.
     fn analyzeStencilability(self: *Lowerer, body_node: ast.NodeIndex, type_param_types: []const TypeIndex) StencilResult {
+        // Stenciling disabled: dict dispatch has false positives (basic types match
+        // non-param expressions) and shape_only aliases break Map method dispatch.
+        // Infrastructure is correct (wrappers, SSA builder, tests pass) but the
+        // type-matching analysis needs Go-style AST provenance tracking before
+        // it can be safely enabled for production code like selfcot.
+        // shape_stencil.cot tests verify the infrastructure works when analysis is correct.
+        if (true) return .not_stencilable;
         if (type_param_types.len == 0) return .not_stencilable;
 
         // Collect dict entries (Tier 2 operations) while walking the AST.
