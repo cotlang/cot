@@ -399,6 +399,15 @@ fn generateDealloc(
 // Swift pattern: swift_slowAlloc (Heap.cpp) — plain malloc for non-objects.
 // ============================================================================
 
+// Redzone constants for debug heap safety checks.
+// Zig pattern: 0xAA for undefined. Go pattern: asanpoison for freed spans.
+// We use distinct patterns so corruption source is identifiable.
+const REDZONE_SIZE: i64 = 16;
+const REDZONE_LEFT_BYTE: i64 = 0xFA; // left guard (matches LLVM ASan left redzone)
+const REDZONE_RIGHT_BYTE: i64 = 0xFB; // right guard (matches LLVM ASan right redzone)
+const ALLOC_RAW_HEADER: i64 = 8; // 8 bytes to store requested size before left redzone
+// Total overhead per allocation: 8 (size) + 16 (left) + 16 (right) = 40 bytes
+
 fn generateAllocRaw(
     allocator: Allocator,
     isa: native_compile.TargetIsa,
@@ -411,7 +420,7 @@ fn generateAllocRaw(
     defer func_ctx.deinit();
     var builder = FunctionBuilder.init(&clif_func, &func_ctx);
 
-    // Signature: (i64) -> i64
+    // Signature: (size: i64) -> i64 (user data pointer)
     try clif_func.signature.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
     try clif_func.signature.addReturn(allocator, clif.AbiParam.init(clif.Type.I64));
 
@@ -423,6 +432,7 @@ fn generateAllocRaw(
     const ins = builder.ins();
     const size = builder.blockParams(block_entry)[0];
 
+    // Import malloc and memset
     const malloc_idx = func_index_map.get("malloc") orelse func_index_map.get("_malloc") orelse 0;
     var malloc_sig = clif.Signature.init(.system_v);
     try malloc_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
@@ -434,8 +444,46 @@ fn generateAllocRaw(
         .colocated = false,
     });
 
-    const result = try ins.call(malloc_func, &[_]clif.Value{size});
-    _ = try ins.return_(&[_]clif.Value{result.results[0]});
+    const memset_idx = func_index_map.get("memset") orelse 0;
+    var memset_sig = clif.Signature.init(.system_v);
+    try memset_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64)); // ptr
+    try memset_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64)); // value
+    try memset_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64)); // size
+    try memset_sig.addReturn(allocator, clif.AbiParam.init(clif.Type.I64)); // returns ptr
+    const memset_sig_ref = try builder.importSignature(memset_sig);
+    const memset_func = try builder.importFunction(.{
+        .name = .{ .user = .{ .namespace = 0, .index = memset_idx } },
+        .signature = memset_sig_ref,
+        .colocated = false,
+    });
+
+    // Layout: [size:8][LEFT_REDZONE:16][user_data:N][RIGHT_REDZONE:16]
+    // total_size = size + 8 + 16 + 16 = size + 40
+    // Zig GPA pattern: guard pages around allocations.
+    // LLVM ASan pattern: 128-byte redzones. We use 16 (sufficient for our use).
+    const v_overhead = try ins.iconst(clif.Type.I64, ALLOC_RAW_HEADER + REDZONE_SIZE + REDZONE_SIZE);
+    const total_size = try ins.iadd(size, v_overhead);
+    const malloc_result = try ins.call(malloc_func, &[_]clif.Value{total_size});
+    const raw_ptr = malloc_result.results[0];
+
+    // Store requested size at raw_ptr[0..8] (for redzone validation on free)
+    _ = try ins.store(clif.MemFlags.DEFAULT, size, raw_ptr, 0);
+
+    // Fill left redzone: raw_ptr+8, 16 bytes of 0xFA
+    const v_left_start = try ins.iaddImm(raw_ptr, ALLOC_RAW_HEADER);
+    const v_left_byte = try ins.iconst(clif.Type.I64, REDZONE_LEFT_BYTE);
+    const v_rz_size = try ins.iconst(clif.Type.I64, REDZONE_SIZE);
+    _ = try ins.call(memset_func, &[_]clif.Value{ v_left_start, v_left_byte, v_rz_size });
+
+    // Fill right redzone: raw_ptr+8+16+size, 16 bytes of 0xFB
+    const v_user_offset = try ins.iconst(clif.Type.I64, ALLOC_RAW_HEADER + REDZONE_SIZE);
+    const v_user_start = try ins.iadd(raw_ptr, v_user_offset);
+    const v_right_start = try ins.iadd(v_user_start, size);
+    const v_right_byte = try ins.iconst(clif.Type.I64, REDZONE_RIGHT_BYTE);
+    _ = try ins.call(memset_func, &[_]clif.Value{ v_right_start, v_right_byte, v_rz_size });
+
+    // Return user data pointer: raw_ptr + 8 + 16 = raw_ptr + 24
+    _ = try ins.return_(&[_]clif.Value{v_user_start});
 
     try builder.sealAllBlocks();
     builder.finalize();
@@ -449,8 +497,8 @@ fn generateAllocRaw(
 // ============================================================================
 
 /// realloc_raw(old_ptr: i64, old_size: i64, new_size: i64) → i64
-/// Go pattern: malloc(new_size) + memcpy(new, old, old_size) + free(old).
-/// Avoids libc realloc naming collision with cot_realloc.
+/// Allocates new buffer with redzones via alloc_raw, copies data, frees old via dealloc_raw.
+/// dealloc_raw validates redzones on the old buffer — any heap overflow is caught HERE.
 /// Go reference: runtime/slice.go growslice — allocates new, copies, returns.
 fn generateReallocRaw(
     allocator: Allocator,
@@ -481,19 +529,19 @@ fn generateReallocRaw(
     const old_size = params[1];
     const new_size = params[2];
 
-    // 1. new_ptr = malloc(new_size)
-    const malloc_idx = func_index_map.get("malloc") orelse func_index_map.get("_malloc") orelse 0;
-    var malloc_sig = clif.Signature.init(.system_v);
-    try malloc_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
-    try malloc_sig.addReturn(allocator, clif.AbiParam.init(clif.Type.I64));
-    const malloc_sig_ref = try builder.importSignature(malloc_sig);
-    const malloc_func = try builder.importFunction(.{
-        .name = .{ .user = .{ .namespace = 0, .index = malloc_idx } },
-        .signature = malloc_sig_ref,
-        .colocated = false,
+    // 1. new_ptr = alloc_raw(new_size) — creates new buffer WITH redzones
+    const alloc_raw_idx = func_index_map.get("alloc_raw") orelse 0;
+    var alloc_raw_sig = clif.Signature.init(.system_v);
+    try alloc_raw_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+    try alloc_raw_sig.addReturn(allocator, clif.AbiParam.init(clif.Type.I64));
+    const alloc_raw_sig_ref = try builder.importSignature(alloc_raw_sig);
+    const alloc_raw_func = try builder.importFunction(.{
+        .name = .{ .user = .{ .namespace = 0, .index = alloc_raw_idx } },
+        .signature = alloc_raw_sig_ref,
+        .colocated = true,
     });
-    const malloc_result = try ins.call(malloc_func, &[_]clif.Value{new_size});
-    const new_ptr = malloc_result.results[0];
+    const alloc_result = try ins.call(alloc_raw_func, &[_]clif.Value{new_size});
+    const new_ptr = alloc_result.results[0];
 
     // 2. memcpy(new_ptr, old_ptr, old_size) — if old_ptr != null
     const v_zero = try ins.iconst(clif.Type.I64, 0);
@@ -520,17 +568,17 @@ fn generateReallocRaw(
         });
         _ = try copy_ins.call(memcpy_func, &[_]clif.Value{ new_ptr, old_ptr, old_size });
 
-        // 3. free(old_ptr)
-        const free_idx = func_index_map.get("free") orelse func_index_map.get("_free") orelse 0;
-        var free_sig = clif.Signature.init(.system_v);
-        try free_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
-        const free_sig_ref = try builder.importSignature(free_sig);
-        const free_func = try builder.importFunction(.{
-            .name = .{ .user = .{ .namespace = 0, .index = free_idx } },
-            .signature = free_sig_ref,
-            .colocated = false,
+        // 3. dealloc_raw(old_ptr) — validates redzones on old buffer, catches overflow
+        const dealloc_raw_idx = func_index_map.get("dealloc_raw") orelse 0;
+        var dealloc_raw_sig = clif.Signature.init(.system_v);
+        try dealloc_raw_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+        const dealloc_raw_sig_ref = try builder.importSignature(dealloc_raw_sig);
+        const dealloc_raw_func = try builder.importFunction(.{
+            .name = .{ .user = .{ .namespace = 0, .index = dealloc_raw_idx } },
+            .signature = dealloc_raw_sig_ref,
+            .colocated = true,
         });
-        _ = try copy_ins.call(free_func, &[_]clif.Value{old_ptr});
+        _ = try copy_ins.call(dealloc_raw_func, &[_]clif.Value{old_ptr});
         _ = try copy_ins.jump(block_done, &.{});
     }
 
@@ -547,7 +595,10 @@ fn generateReallocRaw(
 // ============================================================================
 // dealloc_raw(ptr: i64) -> void
 //
-// Raw free without ARC header.
+// Free with redzone validation. Checks left and right redzones for corruption.
+// Layout: [size:8][LEFT_REDZONE:16][user_data:N][RIGHT_REDZONE:16]
+// ptr points to user_data. raw_ptr = ptr - 24.
+// Zig GPA: validates guard pages on free. LLVM ASan: validates redzones.
 // ============================================================================
 
 fn generateDeallocRaw(
@@ -556,19 +607,18 @@ fn generateDeallocRaw(
     ctrl_plane: *native_compile.ControlPlane,
     func_index_map: *const std.StringHashMapUnmanaged(u32),
 ) !native_compile.CompiledCode {
-
     var clif_func = clif.Function.init(allocator);
     defer clif_func.deinit();
     var func_ctx = FunctionBuilderContext.init(allocator);
     defer func_ctx.deinit();
     var builder = FunctionBuilder.init(&clif_func, &func_ctx);
 
-    // Signature: (i64) -> void
+    // Signature: (ptr: i64) -> void
     try clif_func.signature.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
 
     const block_entry = try builder.createBlock();
     const block_return = try builder.createBlock();
-    const block_free = try builder.createBlock();
+    const block_check = try builder.createBlock();
 
     builder.switchToBlock(block_entry);
     try builder.appendBlockParamsForFunctionParams(block_entry);
@@ -578,25 +628,125 @@ fn generateDeallocRaw(
     const ptr = builder.blockParams(block_entry)[0];
     const v_zero = try ins.iconst(clif.Type.I64, 0);
     const is_null = try ins.icmp(.eq, ptr, v_zero);
-    _ = try ins.brif(is_null, block_return, &.{}, block_free, &.{});
+    _ = try ins.brif(is_null, block_return, &.{}, block_check, &.{});
 
+    // Return block (null case)
     builder.switchToBlock(block_return);
     try builder.ensureInsertedBlock();
     _ = try builder.ins().return_(&[_]clif.Value{});
 
-    builder.switchToBlock(block_free);
+    // Check redzones then free
+    builder.switchToBlock(block_check);
     try builder.ensureInsertedBlock();
-    const free_idx = func_index_map.get("free") orelse func_index_map.get("_free") orelse 0;
-    var free_sig = clif.Signature.init(.system_v);
-    try free_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
-    const free_sig_ref = try builder.importSignature(free_sig);
-    const free_func = try builder.importFunction(.{
-        .name = .{ .user = .{ .namespace = 0, .index = free_idx } },
-        .signature = free_sig_ref,
-        .colocated = false,
-    });
-    _ = try builder.ins().call(free_func, &[_]clif.Value{ptr});
-    _ = try builder.ins().return_(&[_]clif.Value{});
+    {
+        const chk = builder.ins();
+
+        // raw_ptr = ptr - 24 (skip back over left redzone + size field)
+        const v_header_offset = try chk.iconst(clif.Type.I64, ALLOC_RAW_HEADER + REDZONE_SIZE);
+        const raw_ptr = try chk.isub(ptr, v_header_offset);
+
+        // Load stored size from raw_ptr[0..8]
+        const stored_size = try chk.load(clif.Type.I64, clif.MemFlags.DEFAULT, raw_ptr, 0);
+
+        // Validate left redzone: check first byte at ptr-16 == 0xFA
+        const v_left_offset = try chk.iconst(clif.Type.I64, REDZONE_SIZE);
+        const left_rz = try chk.isub(ptr, v_left_offset);
+        const left_byte = try chk.load(clif.Type.I8, clif.MemFlags.DEFAULT, left_rz, 0);
+        const left_ext = try chk.uextend(clif.Type.I64, left_byte);
+        const v_left_expected = try chk.iconst(clif.Type.I64, REDZONE_LEFT_BYTE);
+        const left_ok = try chk.icmp(.eq, left_ext, v_left_expected);
+
+        // Validate right redzone: check first byte at ptr+size == 0xFB
+        const right_rz = try chk.iadd(ptr, stored_size);
+        const right_byte = try chk.load(clif.Type.I8, clif.MemFlags.DEFAULT, right_rz, 0);
+        const right_ext = try chk.uextend(clif.Type.I64, right_byte);
+        const v_right_expected = try chk.iconst(clif.Type.I64, REDZONE_RIGHT_BYTE);
+        const right_ok = try chk.icmp(.eq, right_ext, v_right_expected);
+
+        const both_ok = try chk.band(left_ok, right_ok);
+
+        const block_ok = try builder.createBlock();
+        const block_corrupt = try builder.createBlock();
+        _ = try chk.brif(both_ok, block_ok, &.{}, block_corrupt, &.{});
+
+        // Corruption detected: print diagnostic and abort
+        builder.switchToBlock(block_corrupt);
+        try builder.ensureInsertedBlock();
+        {
+            const ci = builder.ins();
+            // Import write and _exit for error reporting
+            const write_idx = func_index_map.get("write") orelse 0;
+            var write_sig = clif.Signature.init(.system_v);
+            try write_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+            try write_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+            try write_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+            try write_sig.addReturn(allocator, clif.AbiParam.init(clif.Type.I64));
+            const write_sig_ref = try builder.importSignature(write_sig);
+            const write_func = try builder.importFunction(.{
+                .name = .{ .user = .{ .namespace = 0, .index = write_idx } },
+                .signature = write_sig_ref,
+                .colocated = false,
+            });
+
+            const exit_idx = func_index_map.get("_exit") orelse 0;
+            var exit_sig = clif.Signature.init(.system_v);
+            try exit_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+            const exit_sig_ref = try builder.importSignature(exit_sig);
+            const exit_func = try builder.importFunction(.{
+                .name = .{ .user = .{ .namespace = 0, .index = exit_idx } },
+                .signature = exit_sig_ref,
+                .colocated = false,
+            });
+
+            // Print backtrace
+            const bt_idx = func_index_map.get("__cot_print_backtrace") orelse 0;
+            const bt_sig = clif.Signature.init(.system_v);
+            const bt_sig_ref = try builder.importSignature(bt_sig);
+            const bt_func = try builder.importFunction(.{
+                .name = .{ .user = .{ .namespace = 0, .index = bt_idx } },
+                .signature = bt_sig_ref,
+                .colocated = true,
+            });
+
+            // Write error message to stderr
+            const msg_slot = try clif_func.createStackSlot(allocator, .{
+                .kind = .explicit_slot,
+                .size = 48,
+                .align_shift = 3,
+            });
+            const msg_addr = try ci.stackAddr(clif.Type.I64, msg_slot, 0);
+            const msg = "heap-buffer-overflow detected\n";
+            for (msg, 0..) |byte, offset| {
+                const ch = try ci.iconst(clif.Type.I8, @intCast(byte));
+                _ = try ci.store(clif.MemFlags.DEFAULT, ch, msg_addr, @intCast(offset));
+            }
+            const fd = try ci.iconst(clif.Type.I64, 2);
+            const msg_len = try ci.iconst(clif.Type.I64, @intCast(msg.len));
+            _ = try ci.call(write_func, &[_]clif.Value{ fd, msg_addr, msg_len });
+            _ = try ci.call(bt_func, &[_]clif.Value{});
+            const v_exit_code = try ci.iconst(clif.Type.I64, 77); // distinct exit code
+            _ = try ci.call(exit_func, &[_]clif.Value{v_exit_code});
+            _ = try ci.trap(.unreachable_code_reached);
+        }
+
+        // Redzones OK: free the raw allocation
+        builder.switchToBlock(block_ok);
+        try builder.ensureInsertedBlock();
+        {
+            const fi = builder.ins();
+            const free_idx = func_index_map.get("free") orelse func_index_map.get("_free") orelse 0;
+            var free_sig = clif.Signature.init(.system_v);
+            try free_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+            const free_sig_ref = try builder.importSignature(free_sig);
+            const free_func = try builder.importFunction(.{
+                .name = .{ .user = .{ .namespace = 0, .index = free_idx } },
+                .signature = free_sig_ref,
+                .colocated = false,
+            });
+            _ = try fi.call(free_func, &[_]clif.Value{raw_ptr});
+            _ = try fi.return_(&[_]clif.Value{});
+        }
+    }
 
     try builder.sealAllBlocks();
     builder.finalize();
