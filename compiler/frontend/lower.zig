@@ -2508,37 +2508,13 @@ pub const Lowerer = struct {
                 }
             } else {
                 {
-                    const value_node = try self.lowerExprNode(var_stmt.value);
-                    if (value_node == ir.null_node) return;
-                    _ = try fb.emitStoreLocal(local_idx, value_node, var_stmt.span);
-
-                    // Register cleanup for ARC values.
-                    // Reference: Swift's emitManagedRValueWithCleanup (SILGenExpr.cpp:375-390)
-                    // `weak var`: form side table reference, store side_table_ptr, register weak_release.
-                    // `unowned var`: increments unowned RC and registers unowned_release cleanup.
-                    // Reference: Swift's `weak` and `unowned` modifiers + WeakReference.h.
-                    if (!self.target.isWasm() and var_stmt.is_weak and self.type_reg.couldBeARC(type_idx)) {
-                        // weak: allocate/reuse side table, store side_table_ptr in local
-                        var wargs = [_]ir.NodeIndex{value_node};
-                        const side_table_ptr = try fb.emitCall("weak_form_reference", &wargs, false, TypeRegistry.I64, var_stmt.span);
-                        _ = try fb.emitStoreLocal(local_idx, side_table_ptr, var_stmt.span);
-                        const cleanup = arc.Cleanup.initForLocal(.weak_release, side_table_ptr, type_idx, local_idx);
-                        _ = try self.cleanup_stack.push(cleanup);
-                        try self.weak_locals.put(self.allocator, local_idx, {});
-                    } else if (!self.target.isWasm() and var_stmt.is_unowned and self.type_reg.couldBeARC(type_idx)) {
-                        // unowned: increment unowned RC, register unowned_release cleanup
-                        var uargs = [_]ir.NodeIndex{value_node};
-                        _ = try fb.emitCall("unowned_retain", &uargs, false, type_idx, var_stmt.span);
-                        const cleanup = arc.Cleanup.initForLocal(.unowned_release, value_node, type_idx, local_idx);
-                        _ = try self.cleanup_stack.push(cleanup);
-                    } else if (!self.target.isWasm() and !var_stmt.is_weak and !var_stmt.is_unowned and self.type_reg.couldBeARC(type_idx)) {
-                        // Swift ManagedValue pattern: use lowerExprManaged to get ownership info.
-                        // +1 values (new_expr, call) already have a cleanup registered by lowerExprManaged.
-                        // +0 values (borrowed) need retain to produce +1 before binding to a local.
-                        // Reference: Swift SILGenDecl.cpp:323-353 (InitAccessor, store [init])
+                    // Use lowerExprManaged as the SINGLE expression evaluation.
+                    // Previously lowerExprNode was called separately, then lowerExprManaged
+                    // was called again — causing double evaluation of function calls.
+                    if (!self.target.isWasm() and !var_stmt.is_weak and !var_stmt.is_unowned and self.type_reg.couldBeARC(type_idx)) {
+                        // ARC path: use lowerExprManaged for ownership tracking
                         const managed = try self.lowerExprManaged(var_stmt.value);
                         if (managed.hasCleanup()) {
-                            // +1 value: forward ownership to this local's cleanup
                             const fwd_value = blk: {
                                 var mv = managed;
                                 break :blk mv.forward(&self.cleanup_stack);
@@ -2547,13 +2523,8 @@ pub const Lowerer = struct {
                             const cleanup = arc.Cleanup.initForLocal(.release, fwd_value, type_idx, local_idx);
                             _ = try self.cleanup_stack.push(cleanup);
                         } else if (managed.getValue() != ir.null_node) {
-                            // +0 value: retain to produce +1, then register cleanup
-                            // Swift ensurePlusOne (ManagedValue.cpp:289)
                             const type_info = self.type_reg.get(type_idx);
                             if (type_info == .optional) {
-                                // ?*T: can't retain compound optional directly.
-                                // Store value and register cleanup — the cleanup unwrap
-                                // code handles conditional release via tag check.
                                 _ = try fb.emitStoreLocal(local_idx, managed.getValue(), var_stmt.span);
                                 const cleanup = arc.Cleanup.initForLocal(.release, managed.getValue(), type_idx, local_idx);
                                 _ = try self.cleanup_stack.push(cleanup);
@@ -2564,6 +2535,25 @@ pub const Lowerer = struct {
                                 const cleanup = arc.Cleanup.initForLocal(.release, retained, type_idx, local_idx);
                                 _ = try self.cleanup_stack.push(cleanup);
                             }
+                        }
+                    } else {
+                        // Non-ARC path (trivial types, weak, unowned)
+                        const value_node = try self.lowerExprNode(var_stmt.value);
+                        if (value_node == ir.null_node) return;
+                        _ = try fb.emitStoreLocal(local_idx, value_node, var_stmt.span);
+
+                        if (!self.target.isWasm() and var_stmt.is_weak and self.type_reg.couldBeARC(type_idx)) {
+                            var wargs = [_]ir.NodeIndex{value_node};
+                            const side_table_ptr = try fb.emitCall("weak_form_reference", &wargs, false, TypeRegistry.I64, var_stmt.span);
+                            _ = try fb.emitStoreLocal(local_idx, side_table_ptr, var_stmt.span);
+                            const cleanup = arc.Cleanup.initForLocal(.weak_release, side_table_ptr, type_idx, local_idx);
+                            _ = try self.cleanup_stack.push(cleanup);
+                            try self.weak_locals.put(self.allocator, local_idx, {});
+                        } else if (!self.target.isWasm() and var_stmt.is_unowned and self.type_reg.couldBeARC(type_idx)) {
+                            var uargs = [_]ir.NodeIndex{value_node};
+                            _ = try fb.emitCall("unowned_retain", &uargs, false, type_idx, var_stmt.span);
+                            const cleanup = arc.Cleanup.initForLocal(.unowned_release, value_node, type_idx, local_idx);
+                            _ = try self.cleanup_stack.push(cleanup);
                         }
                     }
                 }

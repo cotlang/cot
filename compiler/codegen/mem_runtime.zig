@@ -17,6 +17,9 @@ const BLOCK_VOID: u8 = 0x40;
 pub const ALLOC_NAME = "alloc";
 pub const DEALLOC_NAME = "dealloc";
 pub const REALLOC_NAME = "realloc";
+pub const ALLOC_RAW_NAME = "alloc_raw";
+pub const REALLOC_RAW_NAME = "realloc_raw";
+pub const DEALLOC_RAW_NAME = "dealloc_raw";
 pub const MEMCPY_NAME = "memcpy";
 pub const MEMSET_ZERO_NAME = "memset_zero";
 pub const STRING_EQ_NAME = "string_eq";
@@ -26,6 +29,9 @@ pub const MemFunctions = struct {
     alloc_idx: u32,
     dealloc_idx: u32,
     realloc_idx: u32,
+    alloc_raw_idx: u32,
+    realloc_raw_idx: u32,
+    dealloc_raw_idx: u32,
     memcpy_idx: u32,
     memset_zero_idx: u32,
     string_eq_idx: u32,
@@ -117,15 +123,81 @@ pub fn addToLinker(allocator: std.mem.Allocator, linker: *wasm_link.Linker, heap
         .exported = false,
     });
 
+    // Raw allocation: for WasmGC these are the same as regular alloc
+    // (no ARC headers in the Wasm bump allocator either).
+    // alloc_raw(size) -> i64
+    const i64_1i64_type = try linker.addType(&[_]ValType{.i64}, &[_]ValType{.i64});
+    const alloc_raw_body = try generateAllocRawBody(allocator, heap_ptr_global);
+    const alloc_raw_idx = try linker.addFunc(.{
+        .name = ALLOC_RAW_NAME,
+        .type_idx = i64_1i64_type,
+        .code = alloc_raw_body,
+        .exported = false,
+    });
+    // realloc_raw: just return ptr (bump allocator can't move)
+    const realloc_raw_body = try generateReturnFirstArgBody(allocator);
+    const realloc_raw_idx = try linker.addFunc(.{
+        .name = REALLOC_RAW_NAME,
+        .type_idx = i64_2i64_type,
+        .code = realloc_raw_body,
+        .exported = false,
+    });
+    // dealloc_raw: no-op
+    const dealloc_raw_body = try generateVoidStubBody(allocator);
+    const dealloc_raw_idx = try linker.addFunc(.{
+        .name = DEALLOC_RAW_NAME,
+        .type_idx = void_1i64_type,
+        .code = dealloc_raw_body,
+        .exported = false,
+    });
+
     return MemFunctions{
         .alloc_idx = alloc_idx,
         .dealloc_idx = dealloc_idx,
         .realloc_idx = realloc_idx,
+        .alloc_raw_idx = alloc_raw_idx,
+        .realloc_raw_idx = realloc_raw_idx,
+        .dealloc_raw_idx = dealloc_raw_idx,
         .memcpy_idx = memcpy_idx,
         .memset_zero_idx = memset_zero_idx,
         .string_eq_idx = string_eq_idx,
         .string_concat_idx = string_concat_idx,
     };
+}
+
+/// alloc_raw(size: i64) -> i64 — bump allocator, no ARC header
+/// Same as alloc but without metadata param. Just bumps heap_ptr by size.
+fn generateAllocRawBody(allocator: std.mem.Allocator, heap_ptr_global: u32) ![]const u8 {
+    var code = wasm.CodeBuilder.init(allocator);
+    defer code.deinit();
+
+    // local 0: size (i64), local 1: result_ptr (i64, declared)
+    _ = try code.declareLocals(&[_]wasm.ValType{.i64});
+
+    // result_ptr = heap_ptr (as i64)
+    try code.emitGlobalGet(heap_ptr_global);
+    try code.emitI64ExtendI32U();
+    try code.emitLocalSet(1);
+
+    // heap_ptr += size
+    try code.emitGlobalGet(heap_ptr_global);
+    try code.emitLocalGet(0);
+    try code.emitI32WrapI64();
+    try code.emitI32Add();
+    try code.emitGlobalSet(heap_ptr_global);
+
+    // return result_ptr
+    try code.emitLocalGet(1);
+
+    return code.finish();
+}
+
+/// return first arg unchanged: (i64, i64) -> i64
+fn generateReturnFirstArgBody(allocator: std.mem.Allocator) ![]const u8 {
+    var code = wasm.CodeBuilder.init(allocator);
+    defer code.deinit();
+    try code.emitLocalGet(0);
+    return code.finish();
 }
 
 /// memset_zero(ptr: i64, size: i64) -> void

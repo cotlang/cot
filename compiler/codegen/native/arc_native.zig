@@ -160,6 +160,21 @@ pub fn generate(
         .name = "dealloc",
         .compiled = try generateDealloc(allocator, isa, ctrl_plane, func_index_map),
     });
+    // Raw allocation functions (no ARC header) for List/Map backing buffers.
+    // Swift pattern: swift_slowAlloc vs swift_allocObject — only allocObject
+    // creates HeapObjects with refcount. Raw memory uses malloc directly.
+    try result.append(allocator, .{
+        .name = "alloc_raw",
+        .compiled = try generateAllocRaw(allocator, isa, ctrl_plane, func_index_map),
+    });
+    try result.append(allocator, .{
+        .name = "realloc_raw",
+        .compiled = try generateReallocRaw(allocator, isa, ctrl_plane, func_index_map),
+    });
+    try result.append(allocator, .{
+        .name = "dealloc_raw",
+        .compiled = try generateDeallocRaw(allocator, isa, ctrl_plane, func_index_map),
+    });
     try result.append(allocator, .{
         .name = "retain",
         .compiled = try generateRetain(allocator, isa, ctrl_plane, func_index_map),
@@ -373,6 +388,169 @@ fn generateDealloc(
     try builder.sealAllBlocks();
     builder.finalize();
 
+    return native_compile.compile(allocator, &clif_func, isa, ctrl_plane);
+}
+
+// ============================================================================
+// alloc_raw(size: i64) -> i64
+//
+// Raw memory allocation without ARC header. Uses malloc directly.
+// For List/Map backing buffers that should NOT be reference-counted.
+// Swift pattern: swift_slowAlloc (Heap.cpp) — plain malloc for non-objects.
+// ============================================================================
+
+fn generateAllocRaw(
+    allocator: Allocator,
+    isa: native_compile.TargetIsa,
+    ctrl_plane: *native_compile.ControlPlane,
+    func_index_map: *const std.StringHashMapUnmanaged(u32),
+) !native_compile.CompiledCode {
+    var clif_func = clif.Function.init(allocator);
+    defer clif_func.deinit();
+    var func_ctx = FunctionBuilderContext.init(allocator);
+    defer func_ctx.deinit();
+    var builder = FunctionBuilder.init(&clif_func, &func_ctx);
+
+    // Signature: (i64) -> i64
+    try clif_func.signature.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+    try clif_func.signature.addReturn(allocator, clif.AbiParam.init(clif.Type.I64));
+
+    const block_entry = try builder.createBlock();
+    builder.switchToBlock(block_entry);
+    try builder.appendBlockParamsForFunctionParams(block_entry);
+    try builder.ensureInsertedBlock();
+
+    const ins = builder.ins();
+    const size = builder.blockParams(block_entry)[0];
+
+    const malloc_idx = func_index_map.get("malloc") orelse func_index_map.get("_malloc") orelse 0;
+    var malloc_sig = clif.Signature.init(.system_v);
+    try malloc_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+    try malloc_sig.addReturn(allocator, clif.AbiParam.init(clif.Type.I64));
+    const malloc_sig_ref = try builder.importSignature(malloc_sig);
+    const malloc_func = try builder.importFunction(.{
+        .name = .{ .user = .{ .namespace = 0, .index = malloc_idx } },
+        .signature = malloc_sig_ref,
+        .colocated = false,
+    });
+
+    const result = try ins.call(malloc_func, &[_]clif.Value{size});
+    _ = try ins.return_(&[_]clif.Value{result.results[0]});
+
+    try builder.sealAllBlocks();
+    builder.finalize();
+    return native_compile.compile(allocator, &clif_func, isa, ctrl_plane);
+}
+
+// ============================================================================
+// realloc_raw(ptr: i64, size: i64) -> i64
+//
+// Raw realloc without ARC header management.
+// ============================================================================
+
+fn generateReallocRaw(
+    allocator: Allocator,
+    isa: native_compile.TargetIsa,
+    ctrl_plane: *native_compile.ControlPlane,
+    func_index_map: *const std.StringHashMapUnmanaged(u32),
+) !native_compile.CompiledCode {
+    var clif_func = clif.Function.init(allocator);
+    defer clif_func.deinit();
+    var func_ctx = FunctionBuilderContext.init(allocator);
+    defer func_ctx.deinit();
+    var builder = FunctionBuilder.init(&clif_func, &func_ctx);
+
+    // Signature: (i64, i64) -> i64
+    try clif_func.signature.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+    try clif_func.signature.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+    try clif_func.signature.addReturn(allocator, clif.AbiParam.init(clif.Type.I64));
+
+    const block_entry = try builder.createBlock();
+    builder.switchToBlock(block_entry);
+    try builder.appendBlockParamsForFunctionParams(block_entry);
+    try builder.ensureInsertedBlock();
+
+    const ins = builder.ins();
+    const params = builder.blockParams(block_entry);
+    const ptr = params[0];
+    const size = params[1];
+
+    const realloc_idx = func_index_map.get("realloc") orelse func_index_map.get("_realloc") orelse 0;
+    var realloc_sig = clif.Signature.init(.system_v);
+    try realloc_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+    try realloc_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+    try realloc_sig.addReturn(allocator, clif.AbiParam.init(clif.Type.I64));
+    const realloc_sig_ref = try builder.importSignature(realloc_sig);
+    const realloc_func = try builder.importFunction(.{
+        .name = .{ .user = .{ .namespace = 0, .index = realloc_idx } },
+        .signature = realloc_sig_ref,
+        .colocated = false,
+    });
+
+    const result = try ins.call(realloc_func, &[_]clif.Value{ ptr, size });
+    _ = try ins.return_(&[_]clif.Value{result.results[0]});
+
+    try builder.sealAllBlocks();
+    builder.finalize();
+    return native_compile.compile(allocator, &clif_func, isa, ctrl_plane);
+}
+
+// ============================================================================
+// dealloc_raw(ptr: i64) -> void
+//
+// Raw free without ARC header.
+// ============================================================================
+
+fn generateDeallocRaw(
+    allocator: Allocator,
+    isa: native_compile.TargetIsa,
+    ctrl_plane: *native_compile.ControlPlane,
+    func_index_map: *const std.StringHashMapUnmanaged(u32),
+) !native_compile.CompiledCode {
+
+    var clif_func = clif.Function.init(allocator);
+    defer clif_func.deinit();
+    var func_ctx = FunctionBuilderContext.init(allocator);
+    defer func_ctx.deinit();
+    var builder = FunctionBuilder.init(&clif_func, &func_ctx);
+
+    // Signature: (i64) -> void
+    try clif_func.signature.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+
+    const block_entry = try builder.createBlock();
+    const block_return = try builder.createBlock();
+    const block_free = try builder.createBlock();
+
+    builder.switchToBlock(block_entry);
+    try builder.appendBlockParamsForFunctionParams(block_entry);
+    try builder.ensureInsertedBlock();
+
+    const ins = builder.ins();
+    const ptr = builder.blockParams(block_entry)[0];
+    const v_zero = try ins.iconst(clif.Type.I64, 0);
+    const is_null = try ins.icmp(.eq, ptr, v_zero);
+    _ = try ins.brif(is_null, block_return, &.{}, block_free, &.{});
+
+    builder.switchToBlock(block_return);
+    try builder.ensureInsertedBlock();
+    _ = try builder.ins().return_(&[_]clif.Value{});
+
+    builder.switchToBlock(block_free);
+    try builder.ensureInsertedBlock();
+    const free_idx = func_index_map.get("free") orelse func_index_map.get("_free") orelse 0;
+    var free_sig = clif.Signature.init(.system_v);
+    try free_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+    const free_sig_ref = try builder.importSignature(free_sig);
+    const free_func = try builder.importFunction(.{
+        .name = .{ .user = .{ .namespace = 0, .index = free_idx } },
+        .signature = free_sig_ref,
+        .colocated = false,
+    });
+    _ = try builder.ins().call(free_func, &[_]clif.Value{ptr});
+    _ = try builder.ins().return_(&[_]clif.Value{});
+
+    try builder.sealAllBlocks();
+    builder.finalize();
     return native_compile.compile(allocator, &clif_func, isa, ctrl_plane);
 }
 

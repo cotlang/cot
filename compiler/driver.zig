@@ -1335,6 +1335,8 @@ pub const Driver = struct {
             "sched_spawn",   "sched_shutdown", "sched_get_num_workers",
             "sched_init",    "sched_worker_spawn", "sched_worker_loop",
             "sched_join_workers", "sched_select",
+            // Raw allocation (no ARC header) — for List/Map backing buffers
+            "alloc_raw",     "realloc_raw",   "dealloc_raw",
             // Signal handler runtime (signal_native.generate order)
             "__cot_signal_handler", "__cot_install_signals", "__cot_print_backtrace",
             // Test runtime (test_native.generate order)
@@ -5553,6 +5555,9 @@ pub const Driver = struct {
         try func_indices.put(self.allocator, mem_runtime.ALLOC_NAME, mem_funcs.alloc_idx);
         try func_indices.put(self.allocator, mem_runtime.DEALLOC_NAME, mem_funcs.dealloc_idx);
         try func_indices.put(self.allocator, mem_runtime.REALLOC_NAME, mem_funcs.realloc_idx);
+        try func_indices.put(self.allocator, mem_runtime.ALLOC_RAW_NAME, mem_funcs.alloc_raw_idx);
+        try func_indices.put(self.allocator, mem_runtime.REALLOC_RAW_NAME, mem_funcs.realloc_raw_idx);
+        try func_indices.put(self.allocator, mem_runtime.DEALLOC_RAW_NAME, mem_funcs.dealloc_raw_idx);
         try func_indices.put(self.allocator, mem_runtime.MEMCPY_NAME, mem_funcs.memcpy_idx);
         try func_indices.put(self.allocator, mem_runtime.MEMSET_ZERO_NAME, mem_funcs.memset_zero_idx);
         try func_indices.put(self.allocator, mem_runtime.STRING_EQ_NAME, mem_funcs.string_eq_idx);
