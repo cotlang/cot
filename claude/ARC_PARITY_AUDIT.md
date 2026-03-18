@@ -98,20 +98,13 @@ switch_enum %optional {
 - `emitCopy(value) → retained_value` — type-appropriate copy (retain/recursive)
 - `emitDestroy(value)` — type-appropriate destroy (release/recursive)
 
-### Gap 3: No Per-Field Cleanup Registration
+### Gap 3: ~~No Per-Field Cleanup Registration~~ — MATCHES SWIFT
 
-**Swift:** Each non-trivial variable gets a cleanup registered at declaration:
-```cpp
-// SILGenProlog.cpp — for each +1 parameter:
-if (!lowering.isTrivial())
-    enterDestroyCleanup(val);
-```
+**Swift audit result:** Swift registers **ONE cleanup per variable, NOT per field** (SILGenDecl.cpp:639). The cleanup emits `destroy_value %struct` which the type lowering dispatches to per-field destruction only if needed (TypeLowering.cpp:1424-1451).
 
-**Cot:** Registers ONE cleanup per struct (`scope_destroy` calling `deinit`). Does NOT register individual cleanups for each non-trivial field.
+**Cot's approach:** ONE `scope_destroy` cleanup per struct, with `emitFieldReleases` in auto-deinit handling per-field release including `?*T` unwrap-then-release.
 
-**Impact:** When a struct goes out of scope, its fields are not individually released. The struct's `deinit` (if any) runs, but fields without explicit release in deinit are leaked.
-
-**Fix:** At variable declaration, if the type is a struct with non-trivial fields, register a cleanup that recursively destroys each non-trivial field (matching `emitDestroyValue`).
+**Status:** ✅ ALREADY MATCHES SWIFT. The original audit was wrong — Swift does NOT do per-field cleanup. Cot's one-cleanup-per-struct is the correct pattern.
 
 ### Gap 4: Incomplete Ownership Forwarding on Return
 
@@ -155,10 +148,10 @@ Multiple other `lowerExprManaged(assign.value)` call sites remain (lines 3187, 3
 
 | Priority | Gap | Description | Effort | Unblocks |
 |----------|-----|-------------|--------|----------|
-| **P0** | Gap 1 | ?*T field retain in struct init (unwrap-then-retain) | Small | Selfcot scope bug |
-| **P1** | Gap 5 | Remaining double-eval sites in lowerAssign | Small | Correctness |
-| **P2** | Gap 4 | Return value ownership forwarding | Medium | Complex returns |
-| **P3** | Gap 3 | Per-field cleanup registration | Medium | Field-level cleanup |
+| **P0** | Gap 1 | ✅ DONE — ?*T field retain via emitOptionalFieldRetain | Small | Selfcot: 8/13 |
+| **P1** | Gap 5 | ✅ DONE — All double-eval sites use managedFromLowered | Small | Correctness |
+| **P2** | Gap 4 | ✅ DONE — ?*T return value unwrap-then-retain | Medium | Complex returns |
+| **P3** | Gap 3 | ✅ ALREADY CORRECT — matches Swift (one cleanup per var) | — | — |
 | **P4** | Gap 2 | TypeLowering hierarchy | Large | Systematic ARC |
 | **P5** | Gap 6 | Aggregate type expansion | Large | Full parity |
 
@@ -181,10 +174,10 @@ if (tag != 0) {
 
 **Reference:** Swift `LoadableEnumTypeLowering::emitCopyValue` (TypeLowering.cpp:1603+)
 
-Apply to:
-- `lowerNewExpr` field init (lower.zig:~6244)
-- `lowerStructInitExpr` field init (lower.zig:~5860)
-- `lowerStructInit` field init (lower.zig:~2752)
+Applied to ALL three struct init paths via shared `emitOptionalFieldRetain` helper:
+- ✅ `lowerNewExpr` field init
+- ✅ `lowerStructInitExpr` field init
+- ✅ `lowerStructInit` field init
 
 ---
 
