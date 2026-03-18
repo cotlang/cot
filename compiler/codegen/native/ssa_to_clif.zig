@@ -287,7 +287,24 @@ const SsaToClifTranslator = struct {
             // Translate all values in this block
             self.block_terminated = false;
             for (ssa_block_ptr.values.items) |v| {
+                // Track source offsets: record CLIF inst count before/after translation.
+                // SSA Value.pos.line stores the source file byte offset (set by ssa_builder.zig:396).
+                // Fill clif_func.source_offsets for all CLIF instructions created from this value.
+                const inst_count_before = self.clif_func.dfg.inst_count;
                 try self.translateValue(v, ssa_block_ptr);
+                const inst_count_after = self.clif_func.dfg.inst_count;
+                const src_offset = v.pos.line; // byte offset in source file
+                if (src_offset != 0) {
+                    // Ensure source_offsets array is large enough
+                    while (self.clif_func.source_offsets.items.len < inst_count_after) {
+                        try self.clif_func.source_offsets.append(self.allocator, 0);
+                    }
+                    // Fill all new instructions with this source offset
+                    var ci = inst_count_before;
+                    while (ci < inst_count_after) : (ci += 1) {
+                        self.clif_func.source_offsets.items[ci] = src_offset;
+                    }
+                }
                 if (self.block_terminated) break;
             }
 

@@ -868,8 +868,12 @@ pub fn Lower(comptime I: type) type {
         }
 
         /// Get the source location for a given instruction.
-        pub fn srcloc(_: *const Self, _: Inst) RelSourceLoc {
-            // TODO: Implement source location tracking in CLIF Function
+        /// Reads from CLIF Function.source_offsets populated by ssa_to_clif.zig.
+        pub fn srcloc(self: *const Self, inst: Inst) RelSourceLoc {
+            if (inst.index < self.f.source_offsets.items.len) {
+                const offset = self.f.source_offsets.items[inst.index];
+                if (offset != 0) return .{ .offset = offset };
+            }
             return RelSourceLoc.default();
         }
 

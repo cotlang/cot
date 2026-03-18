@@ -415,6 +415,12 @@ pub const Function = struct {
     /// Port of cranelift/codegen/src/ir/function.rs:174
     global_values: std.ArrayListUnmanaged(GlobalValueData),
 
+    /// Source file byte offsets indexed by instruction. Populated by ssa_to_clif.zig
+    /// from SSA Value.pos.line (which stores the source byte offset). Used by
+    /// machinst/lower.zig to emit source maps for crash diagnostics.
+    /// 0 = no source info for this instruction.
+    source_offsets: std.ArrayListUnmanaged(u32) = .{},
+
     const Self = @This();
 
     /// Create a new empty function.

@@ -1252,8 +1252,20 @@ pub fn VCode(comptime I: type) type {
                                 }
                             }
 
+                            // Source location tracking: bracket instruction emission
+                            // so MachBuffer records (code_offset → source_offset) pairs.
+                            // Populated by ssa_to_clif.zig from SSA Value.pos.line.
+                            // Source location tracking: bracket instruction emission
+                            const has_srcloc = inst.idx() < self.srclocs.items.len and
+                                self.srclocs.items[inst.idx()].offset != 0;
+                            if (has_srcloc) {
+                                buffer.startSrcloc(.{ .offset = self.srclocs.items[inst.idx()].offset });
+                            }
                             // Emit the instruction with physical registers
                             try vcode_inst.emitWithAllocs(&buffer, inst_allocs, emit_info, &emit_state);
+                            if (has_srcloc) {
+                                try buffer.endSrcloc();
+                            }
                         },
                         .edit => |edit| {
                             // Process regalloc edit (move insertion)
