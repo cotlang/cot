@@ -1,0 +1,15 @@
+// Minimal reproduction: selfcot crashes when checking a function with params.
+// fn main() { println(42) } works (no params)
+// fn add(a: i64, b: i64) i64 { return a + b } crashes (params not in scope)
+//
+// Test: /tmp/selfcot check test/selfcot/param_scope.cot
+// Expected: ok
+// Actual: error[E301]: undefined identifier 'a' + SIGSEGV
+
+fn add(a: i64, b: i64) i64 {
+    return a + b
+}
+
+fn main() {
+    println(add(1, 2))
+}
