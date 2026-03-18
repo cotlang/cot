@@ -6240,8 +6240,18 @@ pub const Lowerer = struct {
                     } else {
                         // Simple field: store value at offset
                         // ARC Phase 4: Retain +0 managed values stored in struct fields during init.
-                        // Swift: ManagedValue::hasCleanup() — only retain if source is managed.
-                        if (!self.target.isWasm() and self.type_reg.get(struct_field.type_idx) == .pointer and self.type_reg.get(struct_field.type_idx).pointer.managed) {
+                        // Swift TypeLowering: emitStoreOfCopy retains all non-trivial fields.
+                        // Must check BOTH pointer fields AND optional-pointer fields (?*T).
+                        const fld_type_info = self.type_reg.get(struct_field.type_idx);
+                        const fld_is_managed_ptr = fld_type_info == .pointer and fld_type_info.pointer.managed;
+                        // ?*T where T is managed: needs unwrap-then-retain
+                        // Swift LoadableEnumTypeLowering::emitCopyValue (TypeLowering.cpp:1603)
+                        const fld_is_opt_managed = fld_type_info == .optional and blk: {
+                            const elem_info = self.type_reg.get(fld_type_info.optional.elem);
+                            break :blk elem_info == .pointer and elem_info.pointer.managed;
+                        };
+                        if (!self.target.isWasm() and fld_is_managed_ptr) {
+                            // Direct managed pointer: retain if +0
                             const fi_node = self.tree.getNode(field_init.value);
                             const fi_expr = if (fi_node) |n| n.asExpr() else null;
                             const fi_owned = if (fi_expr) |e| (e == .new_expr or e == .call) else false;
@@ -6257,7 +6267,7 @@ pub const Lowerer = struct {
                                     if (e == .field_access) break :blk self.baseHasCleanup(e.field_access.base);
                                     if (e == .index) break :blk self.baseHasCleanup(e.index.base);
                                     if (e == .deref) break :blk self.baseHasCleanup(e.deref.operand);
-                                    break :blk true; // Swift ensurePlusOne: default retain for +0 non-trivial
+                                    break :blk true;
                                 } else false;
                                 if (needs_retain) {
                                     var retain_args = [_]ir.NodeIndex{value_node};
@@ -6268,6 +6278,60 @@ pub const Lowerer = struct {
                                 }
                             } else {
                                 _ = try fb.emitPtrStoreValue(field_addr, value_node, ne.span);
+                            }
+                        } else if (!self.target.isWasm() and fld_is_opt_managed) {
+                            // ?*T field: store the compound optional, then unwrap-then-retain.
+                            // Swift LoadableEnumTypeLowering::emitCopyValue (TypeLowering.cpp:1603):
+                            //   switch_enum %opt { case .some(%ptr): copy_value %ptr; case .none: }
+                            const field_ptr_type = try self.type_reg.makePointer(struct_field.type_idx);
+                            const field_addr = try fb.emitAddrOffset(ptr_node, field_offset, field_ptr_type, ne.span);
+
+                            // Check if this is a compound (16-byte) or pointer-like (8-byte) optional
+                            if (!self.isPtrLikeOptional(struct_field.type_idx)) {
+                                // Compound optional: store full 16 bytes first
+                                // value_node contains the compound optional value
+                                const opt_size = self.type_reg.sizeOf(struct_field.type_idx);
+                                const tmp_local = try fb.addLocalWithSize("__opt_field_tmp", struct_field.type_idx, false, opt_size);
+                                _ = try fb.emitStoreLocal(tmp_local, value_node, ne.span);
+
+                                // Store tag + pointer to field
+                                const i64_ptr = try self.type_reg.makePointer(TypeRegistry.I64);
+                                const tag_val = try fb.emitFieldLocal(tmp_local, 0, 0, TypeRegistry.I64, ne.span);
+                                const tag_addr = try fb.emitAddrOffset(ptr_node, field_offset, i64_ptr, ne.span);
+                                _ = try fb.emitPtrStoreValue(tag_addr, tag_val, ne.span);
+                                const ptr_val = try fb.emitFieldLocal(tmp_local, 1, 8, fld_type_info.optional.elem, ne.span);
+                                const ptr_addr = try fb.emitAddrOffset(ptr_node, field_offset + 8, i64_ptr, ne.span);
+                                _ = try fb.emitPtrStoreValue(ptr_addr, ptr_val, ne.span);
+
+                                // Conditionally retain inner pointer if non-null
+                                const zero = try fb.emitConstInt(0, TypeRegistry.I64, ne.span);
+                                const is_non_null = try fb.emitBinary(.ne, tag_val, zero, TypeRegistry.BOOL, ne.span);
+                                const retain_blk = try fb.newBlock("opt_field.retain");
+                                const skip_blk = try fb.newBlock("opt_field.skip");
+                                _ = try fb.emitBranch(is_non_null, retain_blk, skip_blk, ne.span);
+
+                                fb.setBlock(retain_blk);
+                                var retain_args = [_]ir.NodeIndex{ptr_val};
+                                _ = try fb.emitCall("retain", &retain_args, false, fld_type_info.optional.elem, ne.span);
+                                _ = try fb.emitJump(skip_blk, ne.span);
+
+                                fb.setBlock(skip_blk);
+                            } else {
+                                // Pointer-like optional (8 bytes, null=0): store directly
+                                _ = try fb.emitPtrStoreValue(field_addr, value_node, ne.span);
+                                // Conditionally retain if non-null
+                                const zero = try fb.emitConstInt(0, TypeRegistry.I64, ne.span);
+                                const is_non_null = try fb.emitBinary(.ne, value_node, zero, TypeRegistry.BOOL, ne.span);
+                                const retain_blk = try fb.newBlock("opt_field.retain");
+                                const skip_blk = try fb.newBlock("opt_field.skip");
+                                _ = try fb.emitBranch(is_non_null, retain_blk, skip_blk, ne.span);
+
+                                fb.setBlock(retain_blk);
+                                var retain_args = [_]ir.NodeIndex{value_node};
+                                _ = try fb.emitCall("retain", &retain_args, false, fld_type_info.optional.elem, ne.span);
+                                _ = try fb.emitJump(skip_blk, ne.span);
+
+                                fb.setBlock(skip_blk);
                             }
                         } else {
                             const field_ptr_type2 = try self.type_reg.makePointer(struct_field.type_idx);

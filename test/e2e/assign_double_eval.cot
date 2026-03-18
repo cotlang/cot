@@ -1,0 +1,36 @@
+// Test: assignment of side-effecting call to managed pointer local
+// should evaluate RHS exactly once.
+// Bug: lowerAssign evaluated assign.value twice for ARC managed locals.
+// Swift SILGen prevents this with move-only RValue (RValue.h:100-101).
+
+@safe
+
+var call_count: i64 = 0
+
+struct Box {
+    value: i64,
+}
+
+fn makeBox(v: i64) *Box {
+    call_count = call_count + 1
+    return new Box { value: v }
+}
+
+test "managed assignment evaluates RHS once" {
+    call_count = 0
+    var b = makeBox(1)
+    b = makeBox(2)
+    @assertEq(b.value, 2)
+    @assertEq(call_count, 2)
+}
+
+test "managed init + reassign" {
+    call_count = 0
+    var b = makeBox(10)
+    @assertEq(call_count, 1)
+    b = makeBox(20)
+    @assertEq(call_count, 2)
+    b = makeBox(30)
+    @assertEq(call_count, 3)
+    @assertEq(b.value, 30)
+}
