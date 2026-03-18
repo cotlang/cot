@@ -597,6 +597,7 @@ struct FuncBuilder {
         const idx = self.locals.count
         self.locals.append(Local.initParam(name, type_idx, idx, size))
         self.local_map.set(name, idx)
+        eprintln("[ir] addParam: ${name} map.cap=${self.local_map.capacity} map.states=${self.local_map.states}")
         return idx
     }
 
@@ -612,6 +613,7 @@ struct FuncBuilder {
     }
 
     fn lookupLocal(name: string) ?int {
+        if (self.local_map.capacity > 100000) { @trap() }
         return self.local_map.getOrNull(name)
     }
 
