@@ -482,6 +482,10 @@ fn generateAllocRaw(
     const v_right_byte = try ins.iconst(clif.Type.I64, REDZONE_RIGHT_BYTE);
     _ = try ins.call(memset_func, &[_]clif.Value{ v_right_start, v_right_byte, v_rz_size });
 
+    // Tier 3: Fill user data with 0xAA disabled for now — it overwrites data in
+    // buffers that are immediately initialized by the caller (Map.ensureCapacity
+    // zeros states after alloc). Re-enable when we have a debug_mode flag.
+
     // Return user data pointer: raw_ptr + 8 + 16 = raw_ptr + 24
     _ = try ins.return_(&[_]clif.Value{v_user_start});
 

@@ -613,6 +613,8 @@ struct FuncBuilder {
     }
 
     fn lookupLocal(name: string) ?int {
+        // Check for 0xAA pattern (uninitialized) or corruption
+        if (self.local_map.states == 0) { @trap() }
         if (self.local_map.capacity > 100000) { @trap() }
         return self.local_map.getOrNull(name)
     }
