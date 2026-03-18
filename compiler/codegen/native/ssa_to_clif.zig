@@ -334,10 +334,19 @@ const SsaToClifTranslator = struct {
             const ptype = self.type_reg.get(param.type_idx);
             const is_string_or_slice = param.type_idx == TypeRegistry.STRING or ptype == .slice;
             const type_size = self.type_reg.sizeOf(param.type_idx);
-            const is_compound_opt = ptype == .optional and self.type_reg.get(ptype.optional.elem) != .pointer;
+            const is_opt_ptr = ptype == .optional and blk: {
+                const ei = self.type_reg.get(ptype.optional.elem);
+                break :blk ei == .pointer and ei.pointer.managed;
+            };
+            const is_compound_opt = ptype == .optional and self.type_reg.get(ptype.optional.elem) != .pointer and !is_opt_ptr;
             const is_large_struct = (ptype == .struct_type or ptype == .union_type or ptype == .tuple or is_compound_opt) and type_size > 8;
 
-            if (is_string_or_slice) {
+            if (is_opt_ptr) {
+                // ?*T: decomposed to (tag, payload) — 2 x I64
+                try self.clif_func.signature.addParam(self.allocator, clif.AbiParam.init(clif.Type.I64));
+                try self.clif_func.signature.addParam(self.allocator, clif.AbiParam.init(clif.Type.I64));
+                total_clif_params += 2;
+            } else if (is_string_or_slice) {
                 // Decomposed to (ptr, len) — 2 x I64
                 try self.clif_func.signature.addParam(self.allocator, clif.AbiParam.init(clif.Type.I64));
                 try self.clif_func.signature.addParam(self.allocator, clif.AbiParam.init(clif.Type.I64));
@@ -359,10 +368,22 @@ const SsaToClifTranslator = struct {
             }
         }
         if (self.ir_return_type != TypeRegistry.VOID) {
-            try self.clif_func.signature.addReturn(
-                self.allocator,
-                clif.AbiParam.init(self.ssaTypeToClifType(self.ir_return_type)),
-            );
+            const ret_type = self.type_reg.get(self.ir_return_type);
+            const ret_is_string_or_slice = self.ir_return_type == TypeRegistry.STRING or ret_type == .slice;
+            const ret_is_opt_ptr = ret_type == .optional and blk: {
+                const ei = self.type_reg.get(ret_type.optional.elem);
+                break :blk ei == .pointer and ei.pointer.managed;
+            };
+            if (ret_is_string_or_slice or ret_is_opt_ptr) {
+                // Compound return: 2 x I64 (ptr+len or tag+payload)
+                try self.clif_func.signature.addReturn(self.allocator, clif.AbiParam.init(clif.Type.I64));
+                try self.clif_func.signature.addReturn(self.allocator, clif.AbiParam.init(clif.Type.I64));
+            } else {
+                try self.clif_func.signature.addReturn(
+                    self.allocator,
+                    clif.AbiParam.init(self.ssaTypeToClifType(self.ir_return_type)),
+                );
+            }
         }
 
         debug.log(.codegen, "ssa_to_clif: signature: {d} ir params -> {d} clif params, return={d}", .{
@@ -1254,6 +1275,42 @@ const SsaToClifTranslator = struct {
                     try self.compound_extra_map.put(self.allocator, v.id, len_val);
                 }
             },
+            .opt_make => {
+                // opt_make(tag, payload) — same compound pattern as string_make/slice_make
+                // Primary value = tag, secondary (in compound_extra_map) = payload
+                if (v.args.len >= 2) {
+                    const tag_val = self.getClif(v.args[0]);
+                    const data_val = self.getClif(v.args[1]);
+                    try self.putValue(v.id, tag_val);
+                    try self.compound_extra_map.put(self.allocator, v.id, data_val);
+                }
+            },
+            .opt_tag => {
+                // Extract tag component from optional pointer (primary value)
+                if (v.args.len > 0) {
+                    const src_id = v.args[0].id;
+                    if (self.value_map.get(src_id)) |primary| {
+                        try self.putValue(v.id, primary);
+                    } else {
+                        const arg = self.getClif(v.args[0]);
+                        const result = try ins.load(clif.Type.I64, clif.MemFlags.DEFAULT, arg, 0);
+                        try self.putValue(v.id, result);
+                    }
+                }
+            },
+            .opt_data => {
+                // Extract payload component from optional pointer (secondary value)
+                if (v.args.len > 0) {
+                    const src_id = v.args[0].id;
+                    if (self.compound_extra_map.get(src_id)) |secondary| {
+                        try self.putValue(v.id, secondary);
+                    } else {
+                        const arg = self.getClif(v.args[0]);
+                        const result = try ins.load(clif.Type.I64, clif.MemFlags.DEFAULT, arg, 8);
+                        try self.putValue(v.id, result);
+                    }
+                }
+            },
 
             // ============================================================
             // String ops — field access on string values
@@ -1359,7 +1416,7 @@ const SsaToClifTranslator = struct {
                 // Return: controls[0] is the return value (if any)
                 // Reference: cg_clif value_and_place.rs — ByValPair for compound returns
                 if (ssa_blk.controls[0]) |ctrl| {
-                    if ((ctrl.op == .string_make or ctrl.op == .slice_make) and ctrl.args.len >= 2) {
+                    if ((ctrl.op == .string_make or ctrl.op == .slice_make or ctrl.op == .opt_make) and ctrl.args.len >= 2) {
                         // Compound return: return both components (ptr, len)
                         // Reference: gen.zig:217-223 — Wasm path pushes both components
                         const ptr = self.getClif(ctrl); // Adjusted pointer (from value_map)
@@ -1632,10 +1689,14 @@ const SsaToClifTranslator = struct {
                 const ptype = self.type_reg.get(param.type_idx);
                 const is_string_or_slice = param.type_idx == TypeRegistry.STRING or ptype == .slice;
                 const type_size = self.type_reg.sizeOf(param.type_idx);
-                const is_compound_opt = ptype == .optional and self.type_reg.get(ptype.optional.elem) != .pointer;
+                const is_opt_ptr_p = ptype == .optional and blk: {
+                    const ei = self.type_reg.get(ptype.optional.elem);
+                    break :blk ei == .pointer and ei.pointer.managed;
+                };
+                const is_compound_opt = ptype == .optional and self.type_reg.get(ptype.optional.elem) != .pointer and !is_opt_ptr_p;
                 const is_large_struct = (ptype == .struct_type or ptype == .union_type or ptype == .tuple or is_compound_opt) and type_size > 8;
 
-                if (is_string_or_slice) {
+                if (is_opt_ptr_p or is_string_or_slice) {
                     try sig.addParam(self.allocator, clif.AbiParam.init(clif.Type.I64));
                     try sig.addParam(self.allocator, clif.AbiParam.init(clif.Type.I64));
                 } else if (is_large_struct) {
@@ -1650,8 +1711,12 @@ const SsaToClifTranslator = struct {
             if (ir_func.return_type != TypeRegistry.VOID) {
                 const ret_ptype = self.type_reg.get(ir_func.return_type);
                 const is_string_or_slice_ret = ir_func.return_type == TypeRegistry.STRING or ret_ptype == .slice;
-                if (is_string_or_slice_ret) {
-                    // Compound return: (ptr, len)
+                const is_opt_ptr_ret = ret_ptype == .optional and blk: {
+                    const ei = self.type_reg.get(ret_ptype.optional.elem);
+                    break :blk ei == .pointer and ei.pointer.managed;
+                };
+                if (is_string_or_slice_ret or is_opt_ptr_ret) {
+                    // Compound return: (ptr/tag, len/payload)
                     try sig.addReturn(self.allocator, clif.AbiParam.init(clif.Type.I64));
                     try sig.addReturn(self.allocator, clif.AbiParam.init(clif.Type.I64));
                 } else {

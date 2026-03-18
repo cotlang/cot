@@ -69,6 +69,7 @@ pub const Op = enum(u16) {
     phi, copy, fwd_ref, arg,
     select0, select1, make_tuple, select_n, cond_select,
     string_len, string_ptr, string_make, slice_len, slice_ptr, slice_cap, slice_make, string_concat,
+    opt_make, opt_tag, opt_data, // Optional pointer (?*T): tag+payload decomposition (Go IMake/ITab/IData pattern)
 
     // === Function Calls ===
     call, tail_call, static_call, closure_call, inter_call,
@@ -401,6 +402,9 @@ const op_info_table = blk: {
     table[@intFromEnum(Op.slice_cap)] = .{ .name = "SliceCap", .arg_len = 1 };
     table[@intFromEnum(Op.slice_make)] = .{ .name = "SliceMake", .arg_len = 3 };  // (ptr, len, cap) - matches Go's slice struct
     table[@intFromEnum(Op.string_concat)] = .{ .name = "StringConcat", .arg_len = 2, .has_side_effects = true, .call = true };
+    table[@intFromEnum(Op.opt_make)] = .{ .name = "OptMake", .arg_len = 2 }; // (tag, payload)
+    table[@intFromEnum(Op.opt_tag)] = .{ .name = "OptTag", .arg_len = 1 };
+    table[@intFromEnum(Op.opt_data)] = .{ .name = "OptData", .arg_len = 1 };
 
     // Calls
     for ([_]Op{ .call, .tail_call, .static_call, .closure_call, .inter_call }) |op| {

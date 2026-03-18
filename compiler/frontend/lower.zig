@@ -135,7 +135,10 @@ pub const Lowerer = struct {
         const info = self.type_reg.get(type_idx);
         if (info != .optional) return false;
         const elem_info = self.type_reg.get(info.optional.elem);
-        if (elem_info == .pointer) return true;
+        // Managed pointer optionals (?*T managed) use compound layout (opt_make/opt_tag/opt_data
+        // in SSA) because sizeOf always returns 16 bytes. They are NOT pointer-like.
+        // Only raw pointer optionals (?*T non-managed) and WasmGC refs are pointer-like.
+        if (elem_info == .pointer and !elem_info.pointer.managed) return true;
         // WasmGC: struct and union types are GC refs, so ?T is (ref null $T)
         if (self.target.isWasmGC() and (elem_info == .struct_type or elem_info == .union_type)) return true;
         return false;
@@ -2069,16 +2072,45 @@ pub const Lowerer = struct {
         if (type_info != .struct_type) return;
         const struct_type = type_info.struct_type;
 
-        // Destroy each non-trivial field using centralized emitDestroyValue.
-        // Swift LoadableStructTypeLowering: forEachNonTrivialChild → emitDestroyValue.
-        const self_local = fb.lookupLocal("self") orelse return;
-        const self_type_idx = fb.locals.items[self_local].type_idx;
-        for (struct_type.fields, 0..) |field, fi| {
-            if (!self.type_reg.isTrivial(field.type_idx)) {
+        // Release each ARC field directly from the struct.
+        // Can NOT use centralized emitDestroyValue here because the SSA builder
+        // treats ?*T as a single-word scalar (ssa_builder.zig:1411-1416 — only
+        // non-pointer optionals get compound treatment). Loading a ?*T field via
+        // emitFieldValue returns just the tag (8 bytes), not the full 16-byte
+        // compound value. So we must load tag and payload separately.
+        for (struct_type.fields, 0..) |field, i| {
+            const fld_type = self.type_reg.get(field.type_idx);
+            if (fld_type == .pointer and fld_type.pointer.managed) {
+                // Direct managed pointer: load and release
+                const self_local = fb.lookupLocal("self") orelse continue;
+                const self_type_idx = fb.locals.items[self_local].type_idx;
                 const self_ptr = try fb.emitLoadLocal(self_local, self_type_idx, span);
                 const field_offset: i64 = @intCast(field.offset);
-                const field_val = try fb.emitFieldValue(self_ptr, @intCast(fi), field_offset, field.type_idx, span);
-                try self.emitDestroyValue(fb, field_val, field.type_idx, span);
+                const field_val = try fb.emitFieldValue(self_ptr, @intCast(i), field_offset, field.type_idx, span);
+                var release_args = [_]ir.NodeIndex{field_val};
+                _ = try fb.emitCall("release", &release_args, false, TypeRegistry.VOID, span);
+            } else if (fld_type == .optional and self.type_reg.couldBeARC(field.type_idx)) {
+                // Optional managed pointer (?*T): unwrap then conditionally release.
+                // Load tag and payload SEPARATELY from struct (not as one value).
+                // Swift LoadableEnumTypeLowering::emitDestroyValue (TypeLowering.cpp:1603)
+                const self_local = fb.lookupLocal("self") orelse continue;
+                const self_type_idx = fb.locals.items[self_local].type_idx;
+                const self_ptr = try fb.emitLoadLocal(self_local, self_type_idx, span);
+                const field_offset: i64 = @intCast(field.offset);
+                // Load tag at field_offset + 0 (8 bytes)
+                const tag = try fb.emitFieldValue(self_ptr, @intCast(i), field_offset, TypeRegistry.I64, span);
+                const zero = try fb.emitConstInt(0, TypeRegistry.I64, span);
+                const is_some = try fb.emitBinary(.ne, tag, zero, TypeRegistry.BOOL, span);
+                const then_blk = try fb.newBlock("deinit.opt.then");
+                const end_blk = try fb.newBlock("deinit.opt.end");
+                _ = try fb.emitBranch(is_some, then_blk, end_blk, span);
+                fb.setBlock(then_blk);
+                // Load payload at field_offset + 8 (the actual pointer)
+                const inner = try fb.emitFieldValue(self_ptr, @intCast(i), field_offset + 8, fld_type.optional.elem, span);
+                var rel_args = [_]ir.NodeIndex{inner};
+                _ = try fb.emitCall("release", &rel_args, false, TypeRegistry.VOID, span);
+                _ = try fb.emitJump(end_blk, span);
+                fb.setBlock(end_blk);
             }
         }
     }
@@ -2106,14 +2138,33 @@ pub const Lowerer = struct {
                 fb.is_destructor = true;
                 _ = try fb.addParam("self", ptr_type, 8);
 
-                // Destroy each non-trivial field using centralized emitDestroyValue.
+                // Release each ARC field directly from the struct.
+                // Same pattern as emitFieldReleases: load tag/payload separately
+                // because SSA builder treats ?*T as single-word scalar.
                 const self_local: ir.LocalIdx = 0;
-                for (struct_type.fields, 0..) |field, fi| {
-                    if (!self.type_reg.isTrivial(field.type_idx)) {
+                for (struct_type.fields, 0..) |field, i| {
+                    const fld_type = self.type_reg.get(field.type_idx);
+                    if (fld_type == .pointer and fld_type.pointer.managed) {
                         const self_ptr = try fb.emitLoadLocal(self_local, ptr_type, Span.zero);
                         const field_offset: i64 = @intCast(field.offset);
-                        const field_val = try fb.emitFieldValue(self_ptr, @intCast(fi), field_offset, field.type_idx, Span.zero);
-                        try self.emitDestroyValue(fb, field_val, field.type_idx, Span.zero);
+                        const field_val = try fb.emitFieldValue(self_ptr, @intCast(i), field_offset, field.type_idx, Span.zero);
+                        var release_args = [_]ir.NodeIndex{field_val};
+                        _ = try fb.emitCall("release", &release_args, false, TypeRegistry.VOID, Span.zero);
+                    } else if (fld_type == .optional and self.type_reg.couldBeARC(field.type_idx)) {
+                        const self_ptr = try fb.emitLoadLocal(self_local, ptr_type, Span.zero);
+                        const field_offset: i64 = @intCast(field.offset);
+                        const tag = try fb.emitFieldValue(self_ptr, @intCast(i), field_offset, TypeRegistry.I64, Span.zero);
+                        const zero = try fb.emitConstInt(0, TypeRegistry.I64, Span.zero);
+                        const is_some = try fb.emitBinary(.ne, tag, zero, TypeRegistry.BOOL, Span.zero);
+                        const then_blk = try fb.newBlock("adeinit.opt.then");
+                        const end_blk = try fb.newBlock("adeinit.opt.end");
+                        _ = try fb.emitBranch(is_some, then_blk, end_blk, Span.zero);
+                        fb.setBlock(then_blk);
+                        const inner = try fb.emitFieldValue(self_ptr, @intCast(i), field_offset + 8, fld_type.optional.elem, Span.zero);
+                        var rel_args = [_]ir.NodeIndex{inner};
+                        _ = try fb.emitCall("release", &rel_args, false, TypeRegistry.VOID, Span.zero);
+                        _ = try fb.emitJump(end_blk, Span.zero);
+                        fb.setBlock(end_blk);
                     }
                 }
 
@@ -2731,12 +2782,16 @@ pub const Lowerer = struct {
                         // Swift store [init]: consumes +1 directly, copies +0 to produce +1.
                         // emitCopyValue handles all types: pointer, ?*T, struct with ARC fields.
                         _ = try fb.emitStoreLocalField(local_idx, field_idx, field_offset, actual_value, span);
-                        if (!self.target.isWasm() and !self.type_reg.isTrivial(struct_field.type_idx)) {
+                        if (!self.target.isWasm() and self.type_reg.get(struct_field.type_idx) == .pointer and self.type_reg.get(struct_field.type_idx).pointer.managed) {
+                            // Only retain direct managed pointers. ?*T and other compound
+                            // non-trivial types can't use emitCopyValue because the SSA builder
+                            // loads ?*T as single-word (tag only), losing the payload pointer.
                             const fi_node = self.tree.getNode(field_init.value);
                             const fi_expr = if (fi_node) |n| n.asExpr() else null;
                             const fi_owned = if (fi_expr) |e| (e == .new_expr or e == .call) else false;
                             if (!fi_owned) {
-                                _ = try self.emitCopyValue(fb, actual_value, struct_field.type_idx, span);
+                                var retain_args = [_]ir.NodeIndex{actual_value};
+                                _ = try fb.emitCall("retain", &retain_args, false, struct_field.type_idx, span);
                             }
                         }
                     }
@@ -3249,15 +3304,20 @@ pub const Lowerer = struct {
                 // Reference: Swift SILGenLValue.cpp — assign into lvalue releases old, consumes +1 / retains +0
                 if (!self.target.isWasm()) {
                     // Swift store [assign] through pointer: retain new, store, release old.
-                    // emitCopyValue/emitDestroyValue handle all type categories.
+                    // Only for managed pointers to managed pointee — single-word values.
+                    // Compound types (?*T, error unions) need specialized store paths.
                     const ptr_type_idx = self.inferExprType(d.operand);
                     const ptr_type_info = self.type_reg.get(ptr_type_idx);
-                    if (ptr_type_info == .pointer) {
+                    if (ptr_type_info == .pointer and ptr_type_info.pointer.managed) {
                         const pointee_type = ptr_type_info.pointer.elem;
-                        if (!self.type_reg.isTrivial(pointee_type)) {
+                        if (self.type_reg.couldBeARC(pointee_type)) {
                             const old_val = try fb.emitPtrLoadValue(ptr_node, pointee_type, assign.span);
-                            const managed_deref = try self.managedFromLowered(store_value, assign.value, pointee_type);
-                            if (!managed_deref.hasCleanup()) {
+                            var managed_deref = try self.managedFromLowered(store_value, assign.value, pointee_type);
+                            if (managed_deref.hasCleanup()) {
+                                // +1 value: forward ownership (cancel cleanup), store directly
+                                store_value = managed_deref.forward(&self.cleanup_stack);
+                            } else {
+                                // +0 value: retain before store
                                 _ = try self.emitCopyValue(fb, store_value, pointee_type, assign.span);
                             }
                             _ = try fb.emitPtrStoreValue(ptr_node, store_value, assign.span);
@@ -3328,9 +3388,12 @@ pub const Lowerer = struct {
                     // (parameters have no cleanup). Swift: field assignments always do retain/release.
                     // Swift SILGen pattern: copy_value %new; store %new; destroy_value %old
                     // Retain-before-release prevents use-after-free when old == new.
-                    if (!self.target.isWasm() and !self.type_reg.isTrivial(field.type_idx)) {
-                        // Swift store [assign]: load old → copy new → store → destroy old.
-                        // emitCopyValue/emitDestroyValue handle all type categories.
+                    if (self.type_reg.get(field.type_idx) == .pointer and self.type_reg.get(field.type_idx).pointer.managed and !self.target.isWasm()) {
+                        // Swift store [assign]: load old → retain new → store → release old.
+                        // Only for direct managed pointers (*T) — single-word IR operations.
+                        // ?*T and other compound types go through specialized store paths below
+                        // because emitFieldValue/emitStoreFieldValue are single-word and the SSA
+                        // builder treats ?*T as non-compound (ssa_builder.zig:1495-1498).
                         const old_val = try fb.emitFieldValue(ptr_val, field_idx, field_offset, field.type_idx, span);
                         _ = try self.emitCopyValue(fb, value_node, field.type_idx, span);
                         _ = try fb.emitStoreFieldValue(ptr_val, field_idx, field_offset, value_node, span);
@@ -3365,11 +3428,15 @@ pub const Lowerer = struct {
                         } else if (self.type_reg.get(field.type_idx) == .pointer and self.type_reg.get(field.type_idx).pointer.managed and !self.target.isWasm() and self.cleanup_stack.hasCleanupForLocal(local_idx)) {
                             // Swift store [assign]: copy +0 → store → destroy old. +1 forwarded.
                             const old_val = try fb.emitFieldLocal(local_idx, field_idx, field_offset, field.type_idx, span);
-                            const managed = try self.managedFromLowered(value_node, rhs_ast, field.type_idx);
-                            if (!managed.hasCleanup()) {
+                            var managed = try self.managedFromLowered(value_node, rhs_ast, field.type_idx);
+                            if (managed.hasCleanup()) {
+                                // +1 value: forward ownership (cancel cleanup)
+                                var mv = managed;
+                                _ = try fb.emitStoreLocalField(local_idx, field_idx, field_offset, mv.forward(&self.cleanup_stack), span);
+                            } else {
                                 _ = try self.emitCopyValue(fb, value_node, field.type_idx, span);
+                                _ = try fb.emitStoreLocalField(local_idx, field_idx, field_offset, value_node, span);
                             }
-                            _ = try fb.emitStoreLocalField(local_idx, field_idx, field_offset, value_node, span);
                             try self.emitDestroyValue(fb, old_val, field.type_idx, span);
                         } else {
                             _ = try fb.emitStoreLocalField(local_idx, field_idx, field_offset, value_node, span);
@@ -3380,14 +3447,18 @@ pub const Lowerer = struct {
                         const fld_info = self.type_reg.get(field.type_idx);
                         if (fld_info == .optional and !self.isPtrLikeOptional(field.type_idx)) {
                             try self.storeCompoundOptFieldPtr(fb, global_addr, field_idx, field_offset, value_node, rhs_ast, span);
-                        } else if (!self.target.isWasm() and !self.type_reg.isTrivial(field.type_idx)) {
-                            // Swift store [assign]: copy +0 → store → destroy old. +1 forwarded.
+                        } else if (self.type_reg.get(field.type_idx) == .pointer and self.type_reg.get(field.type_idx).pointer.managed and !self.target.isWasm()) {
+                            // Swift store [assign]: retain +0 → store → release old. +1 forwarded.
+                            // Only direct managed pointers — single-word IR operations.
                             const old_val = try fb.emitFieldValue(global_addr, field_idx, field_offset, field.type_idx, span);
-                            const managed = try self.managedFromLowered(value_node, rhs_ast, field.type_idx);
-                            if (!managed.hasCleanup()) {
+                            var managed = try self.managedFromLowered(value_node, rhs_ast, field.type_idx);
+                            if (managed.hasCleanup()) {
+                                var mv = managed;
+                                _ = try fb.emitStoreFieldValue(global_addr, field_idx, field_offset, mv.forward(&self.cleanup_stack), span);
+                            } else {
                                 _ = try self.emitCopyValue(fb, value_node, field.type_idx, span);
+                                _ = try fb.emitStoreFieldValue(global_addr, field_idx, field_offset, value_node, span);
                             }
-                            _ = try fb.emitStoreFieldValue(global_addr, field_idx, field_offset, value_node, span);
                             try self.emitDestroyValue(fb, old_val, field.type_idx, span);
                         } else if ((fld_info == .struct_type or fld_info == .tuple or fld_info == .union_type) and self.type_reg.sizeOf(field.type_idx) > 8) {
                             const fld_size = self.type_reg.sizeOf(field.type_idx);
@@ -3411,14 +3482,18 @@ pub const Lowerer = struct {
                         const fld_info = self.type_reg.get(field.type_idx);
                         if (fld_info == .optional and !self.isPtrLikeOptional(field.type_idx)) {
                             try self.storeCompoundOptFieldPtr(fb, base_addr, field_idx, field_offset, value_node, rhs_ast, span);
-                        } else if (!self.target.isWasm() and !self.type_reg.isTrivial(field.type_idx)) {
-                            // Swift store [assign]: copy +0 → store → destroy old. +1 forwarded.
+                        } else if (self.type_reg.get(field.type_idx) == .pointer and self.type_reg.get(field.type_idx).pointer.managed and !self.target.isWasm()) {
+                            // Swift store [assign]: retain +0 → store → release old. +1 forwarded.
+                            // Only direct managed pointers — single-word IR operations.
                             const old_val = try fb.emitFieldValue(base_addr, field_idx, field_offset, field.type_idx, span);
-                            const managed = try self.managedFromLowered(value_node, rhs_ast, field.type_idx);
-                            if (!managed.hasCleanup()) {
+                            var managed = try self.managedFromLowered(value_node, rhs_ast, field.type_idx);
+                            if (managed.hasCleanup()) {
+                                var mv = managed;
+                                _ = try fb.emitStoreFieldValue(base_addr, field_idx, field_offset, mv.forward(&self.cleanup_stack), span);
+                            } else {
                                 _ = try self.emitCopyValue(fb, value_node, field.type_idx, span);
+                                _ = try fb.emitStoreFieldValue(base_addr, field_idx, field_offset, value_node, span);
                             }
-                            _ = try fb.emitStoreFieldValue(base_addr, field_idx, field_offset, value_node, span);
                             try self.emitDestroyValue(fb, old_val, field.type_idx, span);
                         } else if ((fld_info == .struct_type or fld_info == .tuple or fld_info == .union_type) and self.type_reg.sizeOf(field.type_idx) > 8) {
                             const fld_size = self.type_reg.sizeOf(field.type_idx);
@@ -4570,41 +4645,30 @@ pub const Lowerer = struct {
             return;
         }
 
-        // Optional containing managed pointer: unwrap-then-release
+        // Optional containing managed pointer: unwrap-then-release.
+        // Swift LoadableEnumTypeLowering::emitDestroyValue — enums are NEVER
+        // expanded ("Enums, we never want to expand" — TypeLowering.cpp:1614).
+        // All optionals use compound layout (tag 8B + payload 8B = 16B) in
+        // struct fields and locals (sizeOf always returns 16). Extract tag,
+        // conditionally release payload.
         if (info == .optional) {
             const elem_info = self.type_reg.get(info.optional.elem);
             if (elem_info == .pointer and elem_info.pointer.managed) {
-                // Same pattern as emitFieldReleases ?*T path
-                if (!self.isPtrLikeOptional(type_idx)) {
-                    // Compound optional: extract tag, conditionally release
-                    const opt_size = self.type_reg.sizeOf(type_idx);
-                    const tmp = try fb.addLocalWithSize("__destroy_opt", type_idx, false, opt_size);
-                    _ = try fb.emitStoreLocal(tmp, value, span);
-                    const tag = try fb.emitFieldLocal(tmp, 0, 0, TypeRegistry.I64, span);
-                    const zero = try fb.emitConstInt(0, TypeRegistry.I64, span);
-                    const is_non_null = try fb.emitBinary(.ne, tag, zero, TypeRegistry.BOOL, span);
-                    const rel_blk = try fb.newBlock("destroy_opt.release");
-                    const skip_blk = try fb.newBlock("destroy_opt.skip");
-                    _ = try fb.emitBranch(is_non_null, rel_blk, skip_blk, span);
-                    fb.setBlock(rel_blk);
-                    const inner = try fb.emitFieldLocal(tmp, 1, 8, info.optional.elem, span);
-                    var args = [_]ir.NodeIndex{inner};
-                    _ = try fb.emitCall("release", &args, false, TypeRegistry.VOID, span);
-                    _ = try fb.emitJump(skip_blk, span);
-                    fb.setBlock(skip_blk);
-                } else {
-                    // Pointer-like optional: value IS the pointer, null=0
-                    const zero = try fb.emitConstInt(0, TypeRegistry.I64, span);
-                    const is_non_null = try fb.emitBinary(.ne, value, zero, TypeRegistry.BOOL, span);
-                    const rel_blk = try fb.newBlock("destroy_opt.release");
-                    const skip_blk = try fb.newBlock("destroy_opt.skip");
-                    _ = try fb.emitBranch(is_non_null, rel_blk, skip_blk, span);
-                    fb.setBlock(rel_blk);
-                    var args = [_]ir.NodeIndex{value};
-                    _ = try fb.emitCall("release", &args, false, TypeRegistry.VOID, span);
-                    _ = try fb.emitJump(skip_blk, span);
-                    fb.setBlock(skip_blk);
-                }
+                const opt_size = self.type_reg.sizeOf(type_idx);
+                const tmp = try fb.addLocalWithSize("__destroy_opt", type_idx, false, opt_size);
+                _ = try fb.emitStoreLocal(tmp, value, span);
+                const tag = try fb.emitFieldLocal(tmp, 0, 0, TypeRegistry.I64, span);
+                const zero = try fb.emitConstInt(0, TypeRegistry.I64, span);
+                const is_non_null = try fb.emitBinary(.ne, tag, zero, TypeRegistry.BOOL, span);
+                const rel_blk = try fb.newBlock("destroy_opt.release");
+                const skip_blk = try fb.newBlock("destroy_opt.skip");
+                _ = try fb.emitBranch(is_non_null, rel_blk, skip_blk, span);
+                fb.setBlock(rel_blk);
+                const inner = try fb.emitFieldLocal(tmp, 1, 8, info.optional.elem, span);
+                var args = [_]ir.NodeIndex{inner};
+                _ = try fb.emitCall("release", &args, false, TypeRegistry.VOID, span);
+                _ = try fb.emitJump(skip_blk, span);
+                fb.setBlock(skip_blk);
                 return;
             }
         }
@@ -4663,36 +4727,25 @@ pub const Lowerer = struct {
         const elem_info = self.type_reg.get(opt_info.optional.elem);
         if (elem_info != .pointer or !elem_info.pointer.managed) return;
 
-        if (!self.isPtrLikeOptional(opt_type_idx)) {
-            // Compound optional (16 bytes): store to temp, extract tag+ptr
-            const opt_size = self.type_reg.sizeOf(opt_type_idx);
-            const tmp = try fb.addLocalWithSize("__opt_retain_tmp", opt_type_idx, false, opt_size);
-            _ = try fb.emitStoreLocal(tmp, value_node, span);
-            const tag = try fb.emitFieldLocal(tmp, 0, 0, TypeRegistry.I64, span);
-            const ptr_val = try fb.emitFieldLocal(tmp, 1, 8, opt_info.optional.elem, span);
-            const zero = try fb.emitConstInt(0, TypeRegistry.I64, span);
-            const is_non_null = try fb.emitBinary(.ne, tag, zero, TypeRegistry.BOOL, span);
-            const retain_blk = try fb.newBlock("opt_ret.retain");
-            const skip_blk = try fb.newBlock("opt_ret.skip");
-            _ = try fb.emitBranch(is_non_null, retain_blk, skip_blk, span);
-            fb.setBlock(retain_blk);
-            var retain_args = [_]ir.NodeIndex{ptr_val};
-            _ = try fb.emitCall("retain", &retain_args, false, opt_info.optional.elem, span);
-            _ = try fb.emitJump(skip_blk, span);
-            fb.setBlock(skip_blk);
-        } else {
-            // Pointer-like optional (8 bytes, null=0): value IS the pointer
-            const zero = try fb.emitConstInt(0, TypeRegistry.I64, span);
-            const is_non_null = try fb.emitBinary(.ne, value_node, zero, TypeRegistry.BOOL, span);
-            const retain_blk = try fb.newBlock("opt_ret.retain");
-            const skip_blk = try fb.newBlock("opt_ret.skip");
-            _ = try fb.emitBranch(is_non_null, retain_blk, skip_blk, span);
-            fb.setBlock(retain_blk);
-            var retain_args = [_]ir.NodeIndex{value_node};
-            _ = try fb.emitCall("retain", &retain_args, false, opt_info.optional.elem, span);
-            _ = try fb.emitJump(skip_blk, span);
-            fb.setBlock(skip_blk);
-        }
+        // All optionals use compound layout (tag 8B + payload 8B = 16B) —
+        // sizeOf always returns 16 for optionals, so values from struct fields
+        // and locals are always compound. Extract tag, conditionally retain payload.
+        // Swift LoadableEnumTypeLowering::emitCopyValue — atomic, never expanded.
+        const opt_size = self.type_reg.sizeOf(opt_type_idx);
+        const tmp = try fb.addLocalWithSize("__opt_retain_tmp", opt_type_idx, false, opt_size);
+        _ = try fb.emitStoreLocal(tmp, value_node, span);
+        const tag = try fb.emitFieldLocal(tmp, 0, 0, TypeRegistry.I64, span);
+        const ptr_val = try fb.emitFieldLocal(tmp, 1, 8, opt_info.optional.elem, span);
+        const zero = try fb.emitConstInt(0, TypeRegistry.I64, span);
+        const is_non_null = try fb.emitBinary(.ne, tag, zero, TypeRegistry.BOOL, span);
+        const retain_blk = try fb.newBlock("opt_ret.retain");
+        const skip_blk = try fb.newBlock("opt_ret.skip");
+        _ = try fb.emitBranch(is_non_null, retain_blk, skip_blk, span);
+        fb.setBlock(retain_blk);
+        var retain_args = [_]ir.NodeIndex{ptr_val};
+        _ = try fb.emitCall("retain", &retain_args, false, opt_info.optional.elem, span);
+        _ = try fb.emitJump(skip_blk, span);
+        fb.setBlock(skip_blk);
     }
 
     /// Lower an expression and return a ManagedValue with correct ownership.
@@ -6023,12 +6076,13 @@ pub const Lowerer = struct {
                         // Store field, then copy (retain) non-trivial +0 values.
                         // Swift store [init]: emitCopyValue handles all type categories.
                         _ = try fb.emitStoreLocalField(temp_idx, field_idx, field_offset, actual_value, si.span);
-                        if (!self.target.isWasm() and !self.type_reg.isTrivial(struct_field.type_idx)) {
+                        if (!self.target.isWasm() and self.type_reg.get(struct_field.type_idx) == .pointer and self.type_reg.get(struct_field.type_idx).pointer.managed) {
                             const fi_node = self.tree.getNode(field_init.value);
                             const fi_expr = if (fi_node) |n| n.asExpr() else null;
                             const fi_owned = if (fi_expr) |e| (e == .new_expr or e == .call) else false;
                             if (!fi_owned) {
-                                _ = try self.emitCopyValue(fb, actual_value, struct_field.type_idx, si.span);
+                                var retain_args = [_]ir.NodeIndex{actual_value};
+                                _ = try fb.emitCall("retain", &retain_args, false, struct_field.type_idx, si.span);
                             }
                         }
                     }
@@ -6062,12 +6116,13 @@ pub const Lowerer = struct {
                 // Store default value, then copy (retain) non-trivial +0 values.
                 // Swift store [init]: emitCopyValue handles all type categories.
                 _ = try fb.emitStoreLocalField(temp_idx, field_idx, field_offset, value_node, si.span);
-                if (!self.target.isWasm() and !self.type_reg.isTrivial(struct_field.type_idx)) {
+                if (!self.target.isWasm() and self.type_reg.get(struct_field.type_idx) == .pointer and self.type_reg.get(struct_field.type_idx).pointer.managed) {
                     const def_node = self.tree.getNode(struct_field.default_value);
                     const def_expr = if (def_node) |n| n.asExpr() else null;
                     const def_owned = if (def_expr) |e| (e == .new_expr or e == .call) else false;
                     if (!def_owned) {
-                        _ = try self.emitCopyValue(fb, value_node, struct_field.type_idx, si.span);
+                        var retain_args = [_]ir.NodeIndex{value_node};
+                        _ = try fb.emitCall("retain", &retain_args, false, struct_field.type_idx, si.span);
                     }
                 }
             }
@@ -6347,22 +6402,71 @@ pub const Lowerer = struct {
                         const len_addr = try fb.emitAddrOffset(ptr_node, field_offset + 8, i64_ptr_type, ne.span);
                         _ = try fb.emitPtrStoreValue(len_addr, len_ir, ne.span);
                     } else {
-                        // Simple field: store value at offset, then copy (retain) if non-trivial.
-                        // Swift TypeLowering: store [init] consumes +1, copies +0 to produce +1.
-                        // emitCopyValue handles all type categories uniformly (pointer, ?*T, struct).
-                        {
+                        const fld_ti = self.type_reg.get(struct_field.type_idx);
+                        if (!self.target.isWasm() and fld_ti == .optional and self.type_reg.couldBeARC(struct_field.type_idx)) {
+                            // ?*T field in new_expr: SSA builder loads ?*T locals as
+                            // single-word (tag only, ssa_builder.zig:698-702). The loaded
+                            // value_node is the tag, not the pointer. Must read tag and
+                            // payload separately from the SOURCE local/expression, then
+                            // store word-by-word to the heap struct field.
+                            // Swift LoadableEnumTypeLowering::emitCopyValue (TypeLowering.cpp:1603)
+
+                            // Find the source local for the ?*T value
+                            const src_node = self.tree.getNode(field_init.value);
+                            const src_expr = if (src_node) |n| n.asExpr() else null;
+                            const src_local = if (src_expr) |e| blk: {
+                                if (e == .ident) break :blk fb.lookupLocal(e.ident.name);
+                                break :blk null;
+                            } else null;
+
+                            if (src_local) |local_idx| {
+                                // Read tag and payload from the source local's compound storage
+                                const tag_val = try fb.emitFieldLocal(local_idx, 0, 0, TypeRegistry.I64, ne.span);
+                                const ptr_val = try fb.emitFieldLocal(local_idx, 1, 8, fld_ti.optional.elem, ne.span);
+
+                                // Store tag and payload to struct field
+                                const i64_ptr = try self.type_reg.makePointer(TypeRegistry.I64);
+                                const tag_addr = try fb.emitAddrOffset(ptr_node, field_offset, i64_ptr, ne.span);
+                                _ = try fb.emitPtrStoreValue(tag_addr, tag_val, ne.span);
+                                const ptr_addr2 = try fb.emitAddrOffset(ptr_node, field_offset + 8, i64_ptr, ne.span);
+                                _ = try fb.emitPtrStoreValue(ptr_addr2, ptr_val, ne.span);
+
+                                // Conditionally retain if +0 and non-null
+                                const fi_node = self.tree.getNode(field_init.value);
+                                const fi_expr = if (fi_node) |n| n.asExpr() else null;
+                                const fi_owned = if (fi_expr) |e| (e == .new_expr or e == .call) else false;
+                                if (!fi_owned) {
+                                    const zero = try fb.emitConstInt(0, TypeRegistry.I64, ne.span);
+                                    const is_non_null = try fb.emitBinary(.ne, tag_val, zero, TypeRegistry.BOOL, ne.span);
+                                    const retain_blk = try fb.newBlock("opt_field.retain");
+                                    const skip_blk = try fb.newBlock("opt_field.skip");
+                                    _ = try fb.emitBranch(is_non_null, retain_blk, skip_blk, ne.span);
+                                    fb.setBlock(retain_blk);
+                                    var retain_args = [_]ir.NodeIndex{ptr_val};
+                                    _ = try fb.emitCall("retain", &retain_args, false, fld_ti.optional.elem, ne.span);
+                                    _ = try fb.emitJump(skip_blk, ne.span);
+                                    fb.setBlock(skip_blk);
+                                }
+                            } else {
+                                // Not a simple ident — fallback to generic store
+                                const field_ptr_type = try self.type_reg.makePointer(struct_field.type_idx);
+                                const field_addr = try fb.emitAddrOffset(ptr_node, field_offset, field_ptr_type, ne.span);
+                                _ = try fb.emitPtrStoreValue(field_addr, value_node, ne.span);
+                            }
+                        } else {
+                            // Simple field: store value at offset
                             const field_ptr_type = try self.type_reg.makePointer(struct_field.type_idx);
                             const field_addr = try fb.emitAddrOffset(ptr_node, field_offset, field_ptr_type, ne.span);
                             _ = try fb.emitPtrStoreValue(field_addr, value_node, ne.span);
-                        }
-                        // Retain +0 values to produce +1 for the field (Swift store [init] pattern).
-                        // +1 values (new/call) are already owned — skip retain.
-                        if (!self.target.isWasm() and !self.type_reg.isTrivial(struct_field.type_idx)) {
-                            const fi_node = self.tree.getNode(field_init.value);
-                            const fi_expr = if (fi_node) |n| n.asExpr() else null;
-                            const fi_owned = if (fi_expr) |e| (e == .new_expr or e == .call) else false;
-                            if (!fi_owned) {
-                                _ = try self.emitCopyValue(fb, value_node, struct_field.type_idx, ne.span);
+                            // Retain +0 managed pointers (Swift store [init] pattern)
+                            if (!self.target.isWasm() and fld_ti == .pointer and fld_ti.pointer.managed) {
+                                const fi_node = self.tree.getNode(field_init.value);
+                                const fi_expr = if (fi_node) |n| n.asExpr() else null;
+                                const fi_owned = if (fi_expr) |e| (e == .new_expr or e == .call) else false;
+                                if (!fi_owned) {
+                                    var retain_args = [_]ir.NodeIndex{value_node};
+                                    _ = try fb.emitCall("retain", &retain_args, false, struct_field.type_idx, ne.span);
+                                }
                             }
                         }
                     }
@@ -8264,15 +8368,42 @@ pub const Lowerer = struct {
                     // into per-slot values. The callee expects N i64 params.
                     // Same pattern as string/slice decomposition at other call sites.
                     var is_large_compound = false;
+                    var is_opt_ptr_arg = false;
                     if (cparam_types) |params| {
                         if (arg_i < params.len) {
                             const pt = self.type_reg.get(params[arg_i].type_idx);
                             const ps = self.type_reg.sizeOf(params[arg_i].type_idx);
-                            const is_compound_opt = pt == .optional and !self.isPtrLikeOptional(params[arg_i].type_idx);
+                            is_opt_ptr_arg = pt == .optional and blk: {
+                                const ei = self.type_reg.get(pt.optional.elem);
+                                break :blk ei == .pointer and ei.pointer.managed;
+                            };
+                            const is_compound_opt = pt == .optional and !self.isPtrLikeOptional(params[arg_i].type_idx) and !is_opt_ptr_arg;
                             is_large_compound = !self.target.isWasmGC() and (pt == .struct_type or pt == .union_type or pt == .tuple or is_compound_opt) and ps > 8;
                         }
                     }
-                    if (is_large_compound) {
+                    if (is_opt_ptr_arg) {
+                        // ?*T parameter: pass as (tag, payload).
+                        // The arg may be ?*T (already compound) or *T (needs wrapping).
+                        const arg_type_idx = fb.nodes.items[arg_node].type_idx;
+                        const arg_type_info = self.type_reg.get(arg_type_idx);
+                        if (arg_type_info == .pointer) {
+                            // *T → ?*T wrapping: tag=1, payload=pointer
+                            const tag = try fb.emitConstInt(1, TypeRegistry.I64, call.span);
+                            try gen_args.append(self.allocator, tag);
+                            try gen_args.append(self.allocator, arg_node);
+                        } else {
+                            // Already ?*T: store to temp, extract tag@0 and payload@8
+                            const arg_type = cparam_types.?[arg_i].type_idx;
+                            const opt_size = self.type_reg.sizeOf(arg_type);
+                            const tmp = try fb.addLocalWithSize("__opt_call_tmp", arg_type, false, opt_size);
+                            _ = try fb.emitStoreLocal(tmp, arg_node, call.span);
+                            const tag = try fb.emitFieldLocal(tmp, 0, 0, TypeRegistry.I64, call.span);
+                            const opt_info = self.type_reg.get(arg_type);
+                            const payload = try fb.emitFieldLocal(tmp, 1, 8, opt_info.optional.elem, call.span);
+                            try gen_args.append(self.allocator, tag);
+                            try gen_args.append(self.allocator, payload);
+                        }
+                    } else if (is_large_compound) {
                         const param_type_idx = cparam_types.?[arg_i].type_idx;
                         const param_size = self.type_reg.sizeOf(param_type_idx);
                         const num_slots: u32 = @intCast((param_size + 7) / 8);
@@ -8462,15 +8593,38 @@ pub const Lowerer = struct {
             } else {
                 // Decompose large compound args (struct/union/tuple > 8 bytes)
                 var is_large_compound = false;
+                var is_opt_ptr_arg2 = false;
                 if (param_types) |params| {
                     if (arg_i < params.len) {
                         const pt = self.type_reg.get(params[arg_i].type_idx);
                         const ps = self.type_reg.sizeOf(params[arg_i].type_idx);
-                        const is_compound_opt = pt == .optional and !self.isPtrLikeOptional(params[arg_i].type_idx);
+                        is_opt_ptr_arg2 = pt == .optional and blk: {
+                            const ei = self.type_reg.get(pt.optional.elem);
+                            break :blk ei == .pointer and ei.pointer.managed;
+                        };
+                        const is_compound_opt = pt == .optional and !self.isPtrLikeOptional(params[arg_i].type_idx) and !is_opt_ptr_arg2;
                         is_large_compound = !self.target.isWasmGC() and (pt == .struct_type or pt == .union_type or pt == .tuple or is_compound_opt) and ps > 8;
                     }
                 }
-                if (is_large_compound) {
+                if (is_opt_ptr_arg2) {
+                    const arg_type_idx = fb.nodes.items[arg_node].type_idx;
+                    const arg_type_info = self.type_reg.get(arg_type_idx);
+                    if (arg_type_info == .pointer) {
+                        const tag = try fb.emitConstInt(1, TypeRegistry.I64, call.span);
+                        try args.append(self.allocator, tag);
+                        try args.append(self.allocator, arg_node);
+                    } else {
+                        const arg_type = param_types.?[arg_i].type_idx;
+                        const opt_size = self.type_reg.sizeOf(arg_type);
+                        const tmp = try fb.addLocalWithSize("__opt_call_tmp", arg_type, false, opt_size);
+                        _ = try fb.emitStoreLocal(tmp, arg_node, call.span);
+                        const tag = try fb.emitFieldLocal(tmp, 0, 0, TypeRegistry.I64, call.span);
+                        const opt_info = self.type_reg.get(arg_type);
+                        const payload = try fb.emitFieldLocal(tmp, 1, 8, opt_info.optional.elem, call.span);
+                        try args.append(self.allocator, tag);
+                        try args.append(self.allocator, payload);
+                    }
+                } else if (is_large_compound) {
                     const param_type_idx = param_types.?[arg_i].type_idx;
                     const param_size = self.type_reg.sizeOf(param_type_idx);
                     const num_slots: u32 = @intCast((param_size + 7) / 8);
@@ -9387,16 +9541,40 @@ pub const Lowerer = struct {
             } else {
                 // Decompose large compound args (struct/union/tuple > 8 bytes)
                 var is_large_compound = false;
+                var is_opt_ptr_arg3 = false;
                 if (param_types) |params| {
                     const param_idx = arg_i + receiver_offset;
                     if (param_idx < params.len) {
                         const pt = self.type_reg.get(params[param_idx].type_idx);
                         const ps = self.type_reg.sizeOf(params[param_idx].type_idx);
-                        const is_compound_opt = pt == .optional and !self.isPtrLikeOptional(params[param_idx].type_idx);
+                        is_opt_ptr_arg3 = pt == .optional and blk: {
+                            const ei = self.type_reg.get(pt.optional.elem);
+                            break :blk ei == .pointer and ei.pointer.managed;
+                        };
+                        const is_compound_opt = pt == .optional and !self.isPtrLikeOptional(params[param_idx].type_idx) and !is_opt_ptr_arg3;
                         is_large_compound = !self.target.isWasmGC() and (pt == .struct_type or pt == .union_type or pt == .tuple or is_compound_opt) and ps > 8;
                     }
                 }
-                if (is_large_compound) {
+                if (is_opt_ptr_arg3) {
+                    const arg_type_idx = fb.nodes.items[arg_node].type_idx;
+                    const ati = self.type_reg.get(arg_type_idx);
+                    if (ati == .pointer) {
+                        const tag = try fb.emitConstInt(1, TypeRegistry.I64, call.span);
+                        try args.append(self.allocator, tag);
+                        try args.append(self.allocator, arg_node);
+                    } else {
+                        const pidx = arg_i + receiver_offset;
+                        const arg_type = param_types.?[pidx].type_idx;
+                        const opt_size = self.type_reg.sizeOf(arg_type);
+                        const tmp = try fb.addLocalWithSize("__opt_call_tmp", arg_type, false, opt_size);
+                        _ = try fb.emitStoreLocal(tmp, arg_node, call.span);
+                        const tag = try fb.emitFieldLocal(tmp, 0, 0, TypeRegistry.I64, call.span);
+                        const opt_info = self.type_reg.get(arg_type);
+                        const payload = try fb.emitFieldLocal(tmp, 1, 8, opt_info.optional.elem, call.span);
+                        try args.append(self.allocator, tag);
+                        try args.append(self.allocator, payload);
+                    }
+                } else if (is_large_compound) {
                     const param_idx = arg_i + receiver_offset;
                     const param_type_idx = param_types.?[param_idx].type_idx;
                     const param_size = self.type_reg.sizeOf(param_type_idx);

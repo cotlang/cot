@@ -161,12 +161,48 @@ pub const SSABuilder = struct {
             const local_type = type_registry.get(param.type_idx);
             const is_string_or_slice = param.type_idx == TypeRegistry.STRING or local_type == .slice;
             const type_size = type_registry.sizeOf(param.type_idx);
-            const is_compound_opt = local_type == .optional and type_registry.get(local_type.optional.elem) != .pointer;
+            const is_opt_ptr = local_type == .optional and blk: {
+                const ei = type_registry.get(local_type.optional.elem);
+                break :blk ei == .pointer and ei.pointer.managed;
+            };
+            const is_compound_opt = local_type == .optional and type_registry.get(local_type.optional.elem) != .pointer and !is_opt_ptr;
             // Compound optionals are always linear memory (not GC refs), so decompose on all targets.
             // Structs/unions/tuples skip decomposition on WasmGC (they use GC refs).
             const is_large_struct = (!is_wasm_gc and (local_type == .struct_type or local_type == .union_type or local_type == .tuple) and type_size > 8) or (is_compound_opt and type_size > 8);
 
-            if (is_string_or_slice) {
+            if (is_opt_ptr) {
+                // ?*T: two registers (tag, payload) — Go interface pattern (ITab, IData)
+                const tag_val = try func.newValue(.arg, TypeRegistry.I64, entry, .{});
+                tag_val.aux_int = phys_reg_idx;
+                try entry.addValue(allocator, tag_val);
+                phys_reg_idx += 1;
+
+                const data_val = try func.newValue(.arg, TypeRegistry.I64, entry, .{});
+                data_val.aux_int = phys_reg_idx;
+                try entry.addValue(allocator, data_val);
+                phys_reg_idx += 1;
+
+                const opt_val = try func.newValue(.opt_make, param.type_idx, entry, .{});
+                opt_val.addArg(tag_val);
+                opt_val.addArg(data_val);
+                try entry.addValue(allocator, opt_val);
+                try vars.put(@intCast(i), opt_val);
+
+                // Store to stack for address-taken variables
+                const addr = try func.newValue(.local_addr, TypeRegistry.VOID, entry, .{});
+                addr.aux_int = @intCast(slot_offsets[i]);
+                try entry.addValue(allocator, addr);
+                const tag_store = try func.newValue(.store, TypeRegistry.VOID, entry, .{});
+                tag_store.addArg2(addr, tag_val);
+                try entry.addValue(allocator, tag_store);
+                const data_addr = try func.newValue(.off_ptr, TypeRegistry.VOID, entry, .{});
+                data_addr.aux_int = 8;
+                data_addr.addArg(addr);
+                try entry.addValue(allocator, data_addr);
+                const data_store = try func.newValue(.store, TypeRegistry.VOID, entry, .{});
+                data_store.addArg2(data_addr, data_val);
+                try entry.addValue(allocator, data_store);
+            } else if (is_string_or_slice) {
                 // String/slice: two registers (ptr, len)
                 const ptr_val = try func.newValue(.arg, TypeRegistry.I64, entry, .{});
                 ptr_val.aux_int = phys_reg_idx;
@@ -689,13 +725,33 @@ pub const SSABuilder = struct {
             return slice_val;
         }
 
+        // ?*T optional pointer: decompose into tag + payload (Go interface pattern)
+        if (load_type == .optional) {
+            const elem_info = self.type_registry.get(load_type.optional.elem);
+            if (elem_info == .pointer and elem_info.pointer.managed) {
+                // Load tag@0
+                const tag_load = try self.func.newValue(.load, TypeRegistry.I64, cur, self.cur_pos);
+                tag_load.addArg(addr_val);
+                try cur.addValue(self.allocator, tag_load);
+                // Load payload@8
+                const data_addr = try self.func.newValue(.off_ptr, TypeRegistry.VOID, cur, self.cur_pos);
+                data_addr.aux_int = 8;
+                data_addr.addArg(addr_val);
+                try cur.addValue(self.allocator, data_addr);
+                const data_load = try self.func.newValue(.load, TypeRegistry.I64, cur, self.cur_pos);
+                data_load.addArg(data_addr);
+                try cur.addValue(self.allocator, data_load);
+                // Compose: opt_make(tag, payload)
+                const opt_val = try self.func.newValue(.opt_make, type_idx, cur, self.cur_pos);
+                opt_val.addArg(tag_load);
+                opt_val.addArg(data_load);
+                try cur.addValue(self.allocator, opt_val);
+                return opt_val;
+            }
+        }
+
         // For large structs (>8 bytes), return the local's address directly.
-        // convertFieldValue treats base as an address (off_ptr + load).
-        // A single .load would only get 8 bytes, and field access would
-        // use that loaded value as an address → SIGSEGV.
-        // convertStoreLocal handles this via OpMove (else branch extracts addr).
         // Non-pointer-like optionals (?i64, ?f64) are compound (tag+payload = 16 bytes).
-        // Pointer-like optionals (?*T) use null=0 sentinel — single i64, not compound.
         const type_size = self.type_registry.sizeOf(type_idx);
         const is_compound_optional = load_type == .optional and blk: {
             const elem_info = self.type_registry.get(load_type.optional.elem);
@@ -822,6 +878,46 @@ pub const SSABuilder = struct {
 
             self.assign(local_idx, value);
             return value;
+        }
+
+        // ?*T optional pointer store: decompose into tag@0, payload@8.
+        // Go interface pattern (ITab, IData) — same shape as string/slice.
+        if (value_type == .optional) {
+            const opt_elem_info = self.type_registry.get(value_type.optional.elem);
+            if (opt_elem_info == .pointer and opt_elem_info.pointer.managed) {
+                var tag_component: *Value = undefined;
+                var data_component: *Value = undefined;
+
+                if (value.op == .opt_make and value.args.len >= 2) {
+                    tag_component = value.args[0];
+                    data_component = value.args[1];
+                } else {
+                    tag_component = try self.func.newValue(.opt_tag, TypeRegistry.I64, cur, self.cur_pos);
+                    tag_component.addArg(value);
+                    try cur.addValue(self.allocator, tag_component);
+
+                    data_component = try self.func.newValue(.opt_data, TypeRegistry.I64, cur, self.cur_pos);
+                    data_component.addArg(value);
+                    try cur.addValue(self.allocator, data_component);
+                }
+
+                const addr_val = try self.emitLocalAddr(local_idx, TypeRegistry.VOID, cur);
+                const tag_store = try self.func.newValue(.store, TypeRegistry.VOID, cur, self.cur_pos);
+                tag_store.addArg2(addr_val, tag_component);
+                try cur.addValue(self.allocator, tag_store);
+
+                const data_addr = try self.func.newValue(.off_ptr, TypeRegistry.VOID, cur, self.cur_pos);
+                data_addr.aux_int = 8;
+                data_addr.addArg(addr_val);
+                try cur.addValue(self.allocator, data_addr);
+
+                const data_store = try self.func.newValue(.store, TypeRegistry.VOID, cur, self.cur_pos);
+                data_store.addArg2(data_addr, data_component);
+                try cur.addValue(self.allocator, data_store);
+
+                self.assign(local_idx, value);
+                return value;
+            }
         }
 
         const addr_val = try self.emitLocalAddr(local_idx, TypeRegistry.VOID, cur);
@@ -1264,6 +1360,31 @@ pub const SSABuilder = struct {
         const field_type = self.type_registry.get(type_idx);
         if (field_type == .struct_type or field_type == .array or field_type == .union_type) return off_val;
 
+        // ?*T optional pointer: decompose into tag@0, payload@8 (Go interface pattern)
+        if (field_type == .optional) {
+            const elem_info = self.type_registry.get(field_type.optional.elem);
+            if (elem_info == .pointer and elem_info.pointer.managed) {
+                const tag_load = try self.func.newValue(.load, TypeRegistry.I64, cur, self.cur_pos);
+                tag_load.addArg(off_val);
+                try cur.addValue(self.allocator, tag_load);
+
+                const data_addr = try self.func.newValue(.off_ptr, TypeRegistry.VOID, cur, self.cur_pos);
+                data_addr.aux_int = 8;
+                data_addr.addArg(off_val);
+                try cur.addValue(self.allocator, data_addr);
+
+                const data_load = try self.func.newValue(.load, TypeRegistry.I64, cur, self.cur_pos);
+                data_load.addArg(data_addr);
+                try cur.addValue(self.allocator, data_load);
+
+                const opt_val = try self.func.newValue(.opt_make, type_idx, cur, self.cur_pos);
+                opt_val.addArg(tag_load);
+                opt_val.addArg(data_load);
+                try cur.addValue(self.allocator, opt_val);
+                return opt_val;
+            }
+        }
+
         // Compound optional: return address (like struct), not loaded scalar
         if (field_type == .optional) {
             const elem_info = self.type_registry.get(field_type.optional.elem);
@@ -1346,6 +1467,42 @@ pub const SSABuilder = struct {
             return len_store;
         }
 
+        // ?*T optional pointer store: decompose into tag@0, payload@8
+        if (value_type == .optional) {
+            const opt_elem_info = self.type_registry.get(value_type.optional.elem);
+            if (opt_elem_info == .pointer and opt_elem_info.pointer.managed) {
+                var tag_component: *Value = undefined;
+                var data_component: *Value = undefined;
+
+                if (value.op == .opt_make and value.args.len >= 2) {
+                    tag_component = value.args[0];
+                    data_component = value.args[1];
+                } else {
+                    tag_component = try self.func.newValue(.opt_tag, TypeRegistry.I64, cur, self.cur_pos);
+                    tag_component.addArg(value);
+                    try cur.addValue(self.allocator, tag_component);
+
+                    data_component = try self.func.newValue(.opt_data, TypeRegistry.I64, cur, self.cur_pos);
+                    data_component.addArg(value);
+                    try cur.addValue(self.allocator, data_component);
+                }
+
+                const tag_store = try self.func.newValue(.store, TypeRegistry.VOID, cur, self.cur_pos);
+                tag_store.addArg2(off_val, tag_component);
+                try cur.addValue(self.allocator, tag_store);
+
+                const data_addr = try self.func.newValue(.off_ptr, TypeRegistry.VOID, cur, self.cur_pos);
+                data_addr.aux_int = 8;
+                data_addr.addArg(off_val);
+                try cur.addValue(self.allocator, data_addr);
+
+                const data_store = try self.func.newValue(.store, TypeRegistry.VOID, cur, self.cur_pos);
+                data_store.addArg2(data_addr, data_component);
+                try cur.addValue(self.allocator, data_store);
+                return data_store;
+            }
+        }
+
         // Large struct/tuple: use OpMove for bulk memory copy (same as convertStoreLocal).
         // Extract source address from load result, copy to dest field offset.
         const type_size = self.type_registry.sizeOf(value.type_idx);
@@ -1406,6 +1563,31 @@ pub const SSABuilder = struct {
             return load;
         }
         if (field_type == .struct_type or field_type == .array or field_type == .union_type) return off_val;
+
+        // ?*T optional pointer: decompose into tag@0, payload@8 (Go interface pattern)
+        if (field_type == .optional) {
+            const elem_info = self.type_registry.get(field_type.optional.elem);
+            if (elem_info == .pointer and elem_info.pointer.managed) {
+                const tag_load = try self.func.newValue(.load, TypeRegistry.I64, cur, self.cur_pos);
+                tag_load.addArg(off_val);
+                try cur.addValue(self.allocator, tag_load);
+
+                const data_addr = try self.func.newValue(.off_ptr, TypeRegistry.VOID, cur, self.cur_pos);
+                data_addr.aux_int = 8;
+                data_addr.addArg(off_val);
+                try cur.addValue(self.allocator, data_addr);
+
+                const data_load = try self.func.newValue(.load, TypeRegistry.I64, cur, self.cur_pos);
+                data_load.addArg(data_addr);
+                try cur.addValue(self.allocator, data_load);
+
+                const opt_val = try self.func.newValue(.opt_make, type_idx, cur, self.cur_pos);
+                opt_val.addArg(tag_load);
+                opt_val.addArg(data_load);
+                try cur.addValue(self.allocator, opt_val);
+                return opt_val;
+            }
+        }
 
         // Compound optional: return address (like struct), not loaded scalar
         if (field_type == .optional) {
@@ -1487,6 +1669,42 @@ pub const SSABuilder = struct {
             len_store.addArg2(len_addr, len_component);
             try cur.addValue(self.allocator, len_store);
             return len_store;
+        }
+
+        // ?*T optional pointer store: decompose into tag@0, payload@8
+        if (value_type == .optional) {
+            const opt_elem_info = self.type_registry.get(value_type.optional.elem);
+            if (opt_elem_info == .pointer and opt_elem_info.pointer.managed) {
+                var tag_component: *Value = undefined;
+                var data_component: *Value = undefined;
+
+                if (value.op == .opt_make and value.args.len >= 2) {
+                    tag_component = value.args[0];
+                    data_component = value.args[1];
+                } else {
+                    tag_component = try self.func.newValue(.opt_tag, TypeRegistry.I64, cur, self.cur_pos);
+                    tag_component.addArg(value);
+                    try cur.addValue(self.allocator, tag_component);
+
+                    data_component = try self.func.newValue(.opt_data, TypeRegistry.I64, cur, self.cur_pos);
+                    data_component.addArg(value);
+                    try cur.addValue(self.allocator, data_component);
+                }
+
+                const tag_store = try self.func.newValue(.store, TypeRegistry.VOID, cur, self.cur_pos);
+                tag_store.addArg2(off_val, tag_component);
+                try cur.addValue(self.allocator, tag_store);
+
+                const data_addr = try self.func.newValue(.off_ptr, TypeRegistry.VOID, cur, self.cur_pos);
+                data_addr.aux_int = 8;
+                data_addr.addArg(off_val);
+                try cur.addValue(self.allocator, data_addr);
+
+                const data_store = try self.func.newValue(.store, TypeRegistry.VOID, cur, self.cur_pos);
+                data_store.addArg2(data_addr, data_component);
+                try cur.addValue(self.allocator, data_store);
+                return data_store;
+            }
         }
 
         // Compound struct/tuple/union (> 8 bytes): use .move (memcpy)
@@ -1819,6 +2037,31 @@ pub const SSABuilder = struct {
             return make_val;
         }
 
+        // ?*T optional pointer: decompose into tag@0, payload@8 (Go interface pattern)
+        if (value_type == .optional) {
+            const opt_elem_info = self.type_registry.get(value_type.optional.elem);
+            if (opt_elem_info == .pointer and opt_elem_info.pointer.managed) {
+                const tag_load = try self.func.newValue(.load, TypeRegistry.I64, cur, self.cur_pos);
+                tag_load.addArg(ptr_val);
+                try cur.addValue(self.allocator, tag_load);
+
+                const data_addr = try self.func.newValue(.off_ptr, TypeRegistry.VOID, cur, self.cur_pos);
+                data_addr.aux_int = 8;
+                data_addr.addArg(ptr_val);
+                try cur.addValue(self.allocator, data_addr);
+
+                const data_load = try self.func.newValue(.load, TypeRegistry.I64, cur, self.cur_pos);
+                data_load.addArg(data_addr);
+                try cur.addValue(self.allocator, data_load);
+
+                const opt_val = try self.func.newValue(.opt_make, type_idx, cur, self.cur_pos);
+                opt_val.addArg(tag_load);
+                opt_val.addArg(data_load);
+                try cur.addValue(self.allocator, opt_val);
+                return opt_val;
+            }
+        }
+
         // Large compound types (structs, tuples, unions > 8 bytes, compound optionals):
         // the loaded pointer IS the struct's address in memory. We wrap it in a .copy
         // with the struct type so that consumers (convertStoreLocalField, getStructAddr)
@@ -1909,6 +2152,42 @@ pub const SSABuilder = struct {
             }
 
             return len_store;
+        }
+
+        // ?*T optional pointer store: decompose into tag@0, payload@8
+        if (value_type == .optional) {
+            const opt_elem_info = self.type_registry.get(value_type.optional.elem);
+            if (opt_elem_info == .pointer and opt_elem_info.pointer.managed) {
+                var tag_component: *Value = undefined;
+                var data_component: *Value = undefined;
+
+                if (value.op == .opt_make and value.args.len >= 2) {
+                    tag_component = value.args[0];
+                    data_component = value.args[1];
+                } else {
+                    tag_component = try self.func.newValue(.opt_tag, TypeRegistry.I64, cur, self.cur_pos);
+                    tag_component.addArg(value);
+                    try cur.addValue(self.allocator, tag_component);
+
+                    data_component = try self.func.newValue(.opt_data, TypeRegistry.I64, cur, self.cur_pos);
+                    data_component.addArg(value);
+                    try cur.addValue(self.allocator, data_component);
+                }
+
+                const tag_store = try self.func.newValue(.store, TypeRegistry.VOID, cur, self.cur_pos);
+                tag_store.addArg2(ptr_val, tag_component);
+                try cur.addValue(self.allocator, tag_store);
+
+                const data_addr = try self.func.newValue(.off_ptr, TypeRegistry.VOID, cur, self.cur_pos);
+                data_addr.aux_int = 8;
+                data_addr.addArg(ptr_val);
+                try cur.addValue(self.allocator, data_addr);
+
+                const data_store = try self.func.newValue(.store, TypeRegistry.VOID, cur, self.cur_pos);
+                data_store.addArg2(data_addr, data_component);
+                try cur.addValue(self.allocator, data_store);
+                return data_store;
+            }
         }
 
         const is_compound_opt_store = value_type == .optional and blk: {

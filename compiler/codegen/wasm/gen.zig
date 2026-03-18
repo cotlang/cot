@@ -228,7 +228,7 @@ pub const GenState = struct {
             .ret => {
                 // Get return value if any
                 if (b.controls[0]) |ret_val| {
-                    if (ret_val.op == .string_make or ret_val.op == .slice_make) {
+                    if (ret_val.op == .string_make or ret_val.op == .slice_make or ret_val.op == .opt_make) {
                         // Compound return: push both components (ptr, len)
                         // string_make/slice_make are conceptual — push args directly
                         if (ret_val.args.len >= 2) {
@@ -381,7 +381,7 @@ pub const GenState = struct {
 
             // Compound type ops - these are conceptual groupings, no code generated
             // The components are accessed via extraction ops which get decomposed
-            .string_make, .slice_make => {
+            .string_make, .slice_make, .opt_make => {
                 // No code - these values are decomposed when accessed
                 debug.log(.codegen, "wasm/gen: skip compound type op {s}", .{@tagName(v.op)});
             },
@@ -399,6 +399,20 @@ pub const GenState = struct {
                 } else {
                     // Fallback: try the main local (shouldn't happen for correctly compiled code)
                     debug.log(.codegen, "wasm/gen: string_len without compound local for v{d}", .{v.args[0].id});
+                    try self.getValue64(v.args[0]);
+                }
+            },
+            // Optional pointer extraction ops - same pattern as string/slice
+            .opt_tag => {
+                // Get tag component: stored in arg's main local (value_to_local)
+                try self.getValue64(v.args[0]);
+            },
+            .opt_data => {
+                // Get payload component: stored in arg's compound len local
+                if (self.compound_len_locals.get(v.args[0].id)) |data_local| {
+                    _ = try self.builder.appendFrom(.local_get, prog_mod.constAddr(data_local));
+                } else {
+                    debug.log(.codegen, "wasm/gen: opt_data without compound local for v{d}", .{v.args[0].id});
                     try self.getValue64(v.args[0]);
                 }
             },
@@ -1370,7 +1384,7 @@ pub const GenState = struct {
         // (slice_ptr, slice_len, etc.) have been decomposed by rewritedec.
         // Skip these entirely — they must never call setReg (empty stack).
         // Reference: Go's wasm/ssa.go has no case for OpSliceMake/OpStringMake.
-        if (v.op == .slice_make or v.op == .string_make) return;
+        if (v.op == .slice_make or v.op == .string_make or v.op == .opt_make) return;
 
         // Skip rematerializable values (generate on demand)
         if (isRematerializable(v)) return;
@@ -1469,7 +1483,7 @@ pub const GenState = struct {
                 // Go: SliceMake/StringMake are conceptual — no Wasm local needed
                 // wasm_lowered_move is inline bulk copy — no value produced
                 // wasm_return_call is a terminator (opcode 0x12) — no value on stack
-                if (v.op == .slice_make or v.op == .string_make or v.op == .wasm_lowered_move or v.op == .wasm_lowered_zero or v.op == .wasm_return_call) continue;
+                if (v.op == .slice_make or v.op == .string_make or v.op == .opt_make or v.op == .wasm_lowered_move or v.op == .wasm_lowered_zero or v.op == .wasm_return_call) continue;
                 // Store ops write to memory and produce no value — no local needed
                 // Go: ssaGenValue lines 280-284 — stores have no setReg call
                 if (v.op == .wasm_i64_store or v.op == .wasm_i64_store8 or

@@ -227,6 +227,7 @@ fn lowerValue(v: *Value) bool {
         // string_concat: decomposed by rewritedec to static_call + string_make
         .string_make, .string_concat,
         .slice_make,
+        .opt_make, // compound value construction, handled in codegen
         .addr, .local_addr, .global_addr, .metadata_addr, .off_ptr, .add_ptr, .sub_ptr,
         .var_def, .var_live, .var_kill,
         .is_non_nil, .is_nil, .bounds_check, .slice_bounds,
@@ -236,7 +237,9 @@ fn lowerValue(v: *Value) bool {
 
         // Decomposed ops - should have been handled by decomposeValue above
         // If they reach here, the pattern didn't match (e.g., slice loaded from memory)
-        .slice_ptr, .slice_len, .slice_cap, .string_ptr, .string_len => null,
+        .slice_ptr, .slice_len, .slice_cap, .string_ptr, .string_len,
+        .opt_tag, .opt_data, // decomposed by rewritedec
+        => null,
 
         // Already Wasm-specific - leave as-is
         .wasm_i64_const, .wasm_i32_const, .wasm_f64_const, .wasm_f32_const,

@@ -1469,7 +1469,7 @@ pub const Driver = struct {
 
             // Run SSA passes (native path — copyelim TODO after CLIF translation fix)
             try rewritegeneric.rewrite(func_alloc, ssa_func, &string_offsets);
-            try decompose_builtin.decompose(func_alloc, ssa_func);
+            try decompose_builtin.decompose(func_alloc, ssa_func, type_reg);
             try rewritedec.rewrite(func_alloc, ssa_func);
             try schedule.schedule(ssa_func);
             try layout.layout(ssa_func);
@@ -5864,7 +5864,7 @@ pub const Driver = struct {
             // Run Wasm-specific passes with optimization (Go pass order)
             try copyelim.copyelim(ssa_func);
             try rewritegeneric.rewrite(func_alloc, ssa_func, &string_offsets);
-            try decompose_builtin.decompose(func_alloc, ssa_func);
+            try decompose_builtin.decompose(func_alloc, ssa_func, type_reg);
             try rewritedec.rewrite(func_alloc, ssa_func);
             try copyelim.copyelim(ssa_func);
             try cse_pass.cse(ssa_func);
@@ -5896,7 +5896,11 @@ pub const Driver = struct {
                     const param_type = type_reg.get(param.type_idx);
                     const is_string_or_slice = param.type_idx == types_mod.TypeRegistry.STRING or param_type == .slice;
                     const type_size = type_reg.sizeOf(param.type_idx);
-                    const is_compound_opt = param_type == .optional and type_reg.get(param_type.optional.elem) != .pointer;
+                    const is_opt_ptr = param_type == .optional and blk: {
+                        const ei = type_reg.get(param_type.optional.elem);
+                        break :blk ei == .pointer and ei.pointer.managed;
+                    };
+                    const is_compound_opt = param_type == .optional and type_reg.get(param_type.optional.elem) != .pointer and !is_opt_ptr;
                     // Compound optionals are always linear memory (not GC refs), decompose on all targets.
                     // Structs/unions/tuples skip decomposition on WasmGC (they use GC refs).
                     const is_large_struct = (!is_wasm_gc and (param_type == .struct_type or param_type == .union_type or param_type == .tuple) and type_size > 8) or (is_compound_opt and type_size > 8);
@@ -5915,8 +5919,8 @@ pub const Driver = struct {
                         gc_params[wasm_param_idx] = wasm.WasmType.gcRefNull(gc_type_idx);
                         params[wasm_param_idx] = .i64; // placeholder for param_count
                         wasm_param_idx += 1;
-                    } else if (is_string_or_slice) {
-                        // String/slice: 2 i64 params (ptr+len)
+                    } else if (is_opt_ptr or is_string_or_slice) {
+                        // ?*T / String / Slice: 2 i64 params (tag+payload or ptr+len)
                         params[wasm_param_idx] = .i64;
                         gc_params[wasm_param_idx] = wasm.WasmType.fromVal(.i64);
                         wasm_param_idx += 1;
@@ -5947,7 +5951,11 @@ pub const Driver = struct {
             // to match the param decomposition pattern above.
             // WasmGC: no decomposition — compound returns are single ref values.
             const ret_type_info = type_reg.get(ir_func.return_type);
-            const ret_is_compound = ir_func.return_type == types_mod.TypeRegistry.STRING or ret_type_info == .slice;
+            const ret_is_opt_ptr = ret_type_info == .optional and blk: {
+                const ei = type_reg.get(ret_type_info.optional.elem);
+                break :blk ei == .pointer and ei.pointer.managed;
+            };
+            const ret_is_compound = ir_func.return_type == types_mod.TypeRegistry.STRING or ret_type_info == .slice or ret_is_opt_ptr;
             const results: []const wasm.ValType = if (!has_return)
                 &[_]wasm.ValType{}
             else if (ret_is_compound)

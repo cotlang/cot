@@ -30,7 +30,7 @@ const debug = @import("../../pipeline_debug.zig");
 
 /// Run the decomposition pass.
 /// Go reference: decompose.go decomposeBuiltin
-pub fn decompose(allocator: std.mem.Allocator, f: *Func) !void {
+pub fn decompose(allocator: std.mem.Allocator, f: *Func, type_reg: ?*TypeRegistry) !void {
     debug.log(.codegen, "decompose: processing '{s}'", .{f.name});
 
     var decomposed: usize = 0;
@@ -41,7 +41,7 @@ pub fn decompose(allocator: std.mem.Allocator, f: *Func) !void {
         for (block.values.items) |v| {
             if (v.op != .phi) continue;
 
-            if (try decomposeBuiltinPhi(allocator, f, block, v)) {
+            if (try decomposeBuiltinPhi(allocator, f, block, v, type_reg)) {
                 decomposed += 1;
             }
         }
@@ -52,7 +52,7 @@ pub fn decompose(allocator: std.mem.Allocator, f: *Func) !void {
 
 /// Decompose a phi node if it's a compound builtin type.
 /// Go reference: decompose.go decomposeBuiltinPhi (lines 124-141)
-fn decomposeBuiltinPhi(allocator: std.mem.Allocator, f: *Func, block: *Block, v: *Value) !bool {
+fn decomposeBuiltinPhi(allocator: std.mem.Allocator, f: *Func, block: *Block, v: *Value, type_reg: ?*TypeRegistry) !bool {
     // Check if phi type is a slice
     if (isSliceType(v.type_idx, f)) {
         return try decomposeSlicePhi(allocator, f, block, v);
@@ -61,6 +61,13 @@ fn decomposeBuiltinPhi(allocator: std.mem.Allocator, f: *Func, block: *Block, v:
     // Check if phi type is a string
     if (v.type_idx == TypeRegistry.STRING) {
         return try decomposeStringPhi(allocator, f, block, v);
+    }
+
+    // Check if phi type is ?*T (optional managed pointer)
+    if (type_reg) |tr| {
+        if (isOptPtrType(v.type_idx, tr)) {
+            return try decomposeOptPtrPhi(allocator, f, block, v);
+        }
     }
 
     return false;
@@ -175,6 +182,60 @@ fn decomposeStringPhi(allocator: std.mem.Allocator, f: *Func, block: *Block, v: 
     return true;
 }
 
+/// Decompose an optional pointer (?*T) phi node.
+/// Go reference: decompose.go decomposeInterfacePhi (ITab/IData pattern)
+///
+/// Before: phi<?*T>(o1, o2)
+/// After:  tag_phi = phi(opt_tag(o1), opt_tag(o2))
+///         data_phi = phi(opt_data(o1), opt_data(o2))
+///         result = opt_make(tag_phi, data_phi)
+fn decomposeOptPtrPhi(allocator: std.mem.Allocator, f: *Func, block: *Block, v: *Value) !bool {
+    if (v.args.len == 0) return false;
+
+    debug.log(.codegen, "  v{d}: decomposing opt_ptr phi with {d} args", .{ v.id, v.args.len });
+
+    // Create tag_phi = phi<i64>()
+    const tag_phi = try f.newValue(.phi, TypeRegistry.I64, block, v.pos);
+    try block.addValue(allocator, tag_phi);
+
+    // Create data_phi = phi<i64>()
+    const data_phi = try f.newValue(.phi, TypeRegistry.I64, block, v.pos);
+    try block.addValue(allocator, data_phi);
+
+    // For each arg of the original phi, extract tag and data
+    for (v.args) |a| {
+        const arg_block = a.block orelse block;
+
+        const tag_extract = try f.newValue(.opt_tag, TypeRegistry.I64, arg_block, v.pos);
+        tag_extract.addArg(a);
+        try arg_block.addValue(allocator, tag_extract);
+        try tag_phi.addArgAlloc(tag_extract, allocator);
+
+        const data_extract = try f.newValue(.opt_data, TypeRegistry.I64, arg_block, v.pos);
+        data_extract.addArg(a);
+        try arg_block.addValue(allocator, data_extract);
+        try data_phi.addArgAlloc(data_extract, allocator);
+    }
+
+    // Create result = opt_make(tag_phi, data_phi)
+    const result = try f.newValue(.opt_make, v.type_idx, block, v.pos);
+    result.addArg2(tag_phi, data_phi);
+    try block.addValue(allocator, result);
+
+    // Replace v with result
+    copyOf(v, result);
+
+    return true;
+}
+
+/// Check if a type is an optional managed pointer (?*T).
+fn isOptPtrType(type_idx: TypeIndex, type_reg: *TypeRegistry) bool {
+    const info = type_reg.get(type_idx);
+    if (info != .optional) return false;
+    const elem_info = type_reg.get(info.optional.elem);
+    return elem_info == .pointer and elem_info.pointer.managed;
+}
+
 /// Check if a type is a slice type.
 /// Go reference: Type.IsSlice()
 fn isSliceType(type_idx: TypeIndex, f: *Func) bool {
@@ -266,7 +327,7 @@ test "decomposeSlicePhi basic" {
     try merge.addValue(allocator, phi);
 
     // Run decompose - phi should be decomposed because SLICE_TYPE is not a basic type
-    try decompose(allocator, &f);
+    try decompose(allocator, &f, null);
 
     // Verify phi was decomposed (became a copy to the result)
     try testing.expectEqual(Op.copy, phi.op);

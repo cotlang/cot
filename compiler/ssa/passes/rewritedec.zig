@@ -83,6 +83,14 @@ fn rewriteValue(allocator: std.mem.Allocator, f: *Func, block: *Block, v: *Value
         // ====================================================================
         .string_concat => rewriteStringConcat(allocator, f, block, v),
 
+        // ====================================================================
+        // Optional pointer decomposition (Go: ITab/IData pattern)
+        // opt_tag(opt_make(tag, payload)) → tag
+        // opt_data(opt_make(tag, payload)) → payload
+        // ====================================================================
+        .opt_tag => rewriteOptTag(allocator, f, block, v),
+        .opt_data => rewriteOptData(allocator, f, block, v),
+
         else => false,
     };
 }
@@ -468,6 +476,106 @@ fn rewriteStringConcat(allocator: std.mem.Allocator, f: *Func, block: *Block, v:
     // Replace v with result
     copyOf(v, result);
     return true;
+}
+
+/// Rewrite OptTag extraction.
+/// Go reference: rewriteValuedec_OpITab pattern
+///
+/// Patterns:
+///   (OptTag (OptMake tag payload)) → tag
+///   (OptTag (Load<?*T> ptr mem)) → (Load<i64> ptr mem)
+///   (OptTag (ConstNil<?*T>)) → ConstInt(0)
+fn rewriteOptTag(allocator: std.mem.Allocator, f: *Func, block: *Block, v: *Value) !bool {
+    if (v.args.len < 1) return false;
+    const v_0 = followCopy(v.args[0]);
+
+    // Pattern 1: OptTag(OptMake tag payload) → tag
+    if (v_0.op == .opt_make and v_0.args.len >= 1) {
+        const tag = v_0.args[0];
+        debug.log(.codegen, "  v{d}: opt_tag(opt_make) -> copy v{d}", .{ v.id, tag.id });
+        copyOf(v, tag);
+        return true;
+    }
+
+    // Pattern 2: OptTag(Load<?*T> ptr mem) → Load<i64> ptr mem
+    if (v_0.op == .load) {
+        if (v_0.args.len >= 1) {
+            const ptr = v_0.args[0];
+            debug.log(.codegen, "  v{d}: opt_tag(load) -> load<i64>", .{v.id});
+            const load_val = try f.newValue(.load, TypeRegistry.I64, block, v.pos);
+            load_val.addArg(ptr);
+            if (v_0.args.len >= 2) {
+                load_val.addArg(v_0.args[1]);
+            }
+            try block.addValue(allocator, load_val);
+            copyOf(v, load_val);
+            return true;
+        }
+    }
+
+    // Pattern 3: OptTag(ConstNil) → ConstInt(0)
+    if (v_0.op == .const_nil) {
+        const zero = try f.newValue(.const_int, TypeRegistry.I64, block, v.pos);
+        zero.aux_int = 0;
+        try block.addValue(allocator, zero);
+        debug.log(.codegen, "  v{d}: opt_tag(const_nil) -> const_int(0)", .{v.id});
+        copyOf(v, zero);
+        return true;
+    }
+
+    return false;
+}
+
+/// Rewrite OptData extraction.
+/// Go reference: rewriteValuedec_OpIData pattern
+///
+/// Patterns:
+///   (OptData (OptMake tag payload)) → payload
+///   (OptData (Load<?*T> ptr mem)) → (Load<i64> (OffPtr ptr 8) mem)
+///   (OptData (ConstNil<?*T>)) → ConstInt(0)
+fn rewriteOptData(allocator: std.mem.Allocator, f: *Func, block: *Block, v: *Value) !bool {
+    if (v.args.len < 1) return false;
+    const v_0 = followCopy(v.args[0]);
+
+    // Pattern 1: OptData(OptMake tag payload) → payload
+    if (v_0.op == .opt_make and v_0.args.len >= 2) {
+        const data = v_0.args[1];
+        debug.log(.codegen, "  v{d}: opt_data(opt_make) -> copy v{d}", .{ v.id, data.id });
+        copyOf(v, data);
+        return true;
+    }
+
+    // Pattern 2: OptData(Load<?*T> ptr mem) → Load<i64> (OffPtr ptr 8) mem
+    if (v_0.op == .load) {
+        if (v_0.args.len >= 1) {
+            const ptr = v_0.args[0];
+            debug.log(.codegen, "  v{d}: opt_data(load) -> load<i64>(off_ptr 8)", .{v.id});
+            const off_ptr = try f.newValue(.off_ptr, TypeRegistry.I64, block, v.pos);
+            off_ptr.aux_int = 8;
+            off_ptr.addArg(ptr);
+            try block.addValue(allocator, off_ptr);
+            const load_val = try f.newValue(.load, TypeRegistry.I64, block, v.pos);
+            load_val.addArg(off_ptr);
+            if (v_0.args.len >= 2) {
+                load_val.addArg(v_0.args[1]);
+            }
+            try block.addValue(allocator, load_val);
+            copyOf(v, load_val);
+            return true;
+        }
+    }
+
+    // Pattern 3: OptData(ConstNil) → ConstInt(0)
+    if (v_0.op == .const_nil) {
+        const zero = try f.newValue(.const_int, TypeRegistry.I64, block, v.pos);
+        zero.aux_int = 0;
+        try block.addValue(allocator, zero);
+        debug.log(.codegen, "  v{d}: opt_data(const_nil) -> const_int(0)", .{v.id});
+        copyOf(v, zero);
+        return true;
+    }
+
+    return false;
 }
 
 /// Extract the pointer component from a string value.
