@@ -1,0 +1,3258 @@
+/// Recursive descent parser for the self-hosted Cot compiler.
+/// Ported from compiler/frontend/parser.zig
+///
+/// Produces a tagged union AST (see ast.cot) from a token stream.
+/// Uses precedence climbing for binary expressions.
+
+import "std/list"
+import "std/string"
+import "scanner"
+import "token"
+import "../check/errors"
+import "ast"
+
+const MAX_NEST: int = 10000
+
+// ============================================================================
+// Parser state
+// ============================================================================
+
+struct Parser {
+    scanner: *Scanner,
+    ast: *Ast,
+    errors: *ErrorReporter,
+    tok: int,          // current token tag (Token enum as int)
+    tok_text: string,  // current token text
+    tok_start: int,    // current token start offset
+    tok_end: int,      // current token end offset
+    peek_tok: int,     // lookahead token tag (0 = not populated)
+    peek_text: string,
+    peek_start: int,
+    peek_end: int,
+    has_peek: bool,
+    safe_mode: bool,
+    current_impl_type: string,
+    current_impl_is_generic: bool,
+    nest_level: int,
+    pending_doc: string,
+
+    /// Create a new parser. Primes the first token automatically.
+    static fn init(scanner: *Scanner, ast: *Ast, errors: *ErrorReporter) Parser {
+        var p = Parser {
+            scanner: scanner,
+            ast: ast,
+            errors: errors,
+            tok: 0,
+            tok_text: "",
+            tok_start: 0,
+            tok_end: 0,
+            peek_tok: 0,
+            peek_text: "",
+            peek_start: 0,
+            peek_end: 0,
+            has_peek: false,
+            safe_mode: false,
+            current_impl_type: "",
+            current_impl_is_generic: false,
+            nest_level: 0,
+            pending_doc: "",
+        }
+        // Prime the first token
+        p.advance()
+        return p
+    }
+
+
+    // ================================================================
+    // Core navigation helpers
+    // ================================================================
+
+    /// Advance to the next token.
+    fn advance() void {
+        if (self.has_peek) {
+            self.tok = self.peek_tok
+            self.tok_text = self.peek_text
+            self.tok_start = self.peek_start
+            self.tok_end = self.peek_end
+            self.has_peek = false
+        } else {
+            const info = self.scanner.scanNext()
+            self.tok = info.tok
+            self.tok_text = info.text
+            self.tok_start = info.start_offset
+            self.tok_end = info.end_offset
+        }
+    }
+
+    /// True if current token starts a statement (can't be a return value).
+    fn isStmtStart() bool {
+        return self.tok == Token.kw_const as int
+            or self.tok == Token.kw_var as int
+            or self.tok == Token.kw_if as int
+            or self.tok == Token.kw_for as int
+            or self.tok == Token.kw_while as int
+            or self.tok == Token.kw_return as int
+            or self.tok == Token.kw_defer as int
+            or self.tok == Token.kw_switch as int
+    }
+
+    /// True if current token ends a block (can't be a return value).
+    fn isBlockEnd() bool {
+        return self.tok == Token.eof as int
+            or self.tok == Token.rbrace as int
+            or self.tok == Token.rparen as int
+    }
+
+    /// Peek at the next token without consuming it.
+    fn peekToken() int {
+        if (!self.has_peek) {
+            const info = self.scanner.scanNext()
+            self.peek_tok = info.tok
+            self.peek_text = info.text
+            self.peek_start = info.start_offset
+            self.peek_end = info.end_offset
+            self.has_peek = true
+        }
+        return self.peek_tok
+    }
+
+    /// If current token matches, consume it and return true.
+    fn match(t: int) bool {
+        if (self.tok == t) {
+            self.advance()
+            return true
+        }
+        return false
+    }
+
+    /// Expect a specific token. Consume it and return true, or report error.
+    /// P10: include expected token string in error message (Zig parser.zig:119-127)
+    fn expect(t: int) bool {
+        if (self.tok == t) {
+            self.advance()
+            return true
+        }
+        const expected = (@enumFromInt(t) as Token).toString()
+        const got = (@enumFromInt(self.tok) as Token).toString()
+        self.errors.report(self.tok_start, ErrorCode.e200, "expected '${expected}', got '${got}'")
+        return false
+    }
+
+    /// Get a Span from start to end.
+    fn spanSE(start: int, end: int) Span {
+        return Span { start: start, end: end }
+    }
+
+    // ================================================================
+    // Doc comment accumulation
+    // ================================================================
+
+    fn collectDocComment() void {
+        if (self.tok != Token.doc_comment) {
+            self.pending_doc = ""
+            return
+        }
+        // Zig parser.zig:139-157: concatenate consecutive /// lines with newlines
+        var doc = self.tok_text
+        self.advance()
+        while (self.tok == Token.doc_comment) {
+            doc = doc ++ "\n" ++ self.tok_text
+            self.advance()
+        }
+        self.pending_doc = doc
+    }
+
+    fn consumeDocComment() string {
+        const doc = self.pending_doc
+        self.pending_doc = ""
+        return doc
+    }
+
+    // ================================================================
+    // Phase A: File + simplest declarations
+    // ================================================================
+
+    /// Parse an entire file. Populates ast.file_decls.
+    fn parseFile() void {
+        // Check for @safe annotation (Zig parser.zig:175-182)
+        if (self.tok == Token.at) {
+            const pk = self.peekToken()
+            if (pk == Token.ident and self.peek_text == "safe") {
+                self.advance()  // consume @
+                self.advance()  // consume safe
+                self.safe_mode = true
+            }
+        }
+        while (self.tok != Token.eof) {
+            self.collectDocComment()
+            if (self.tok == Token.eof) {
+                break
+            }
+            const decl = self.parseDecl()
+            if (decl != null_node) {
+                self.ast.addFileDecl(decl)
+            } else {
+                self.advance()
+            }
+        }
+    }
+
+    /// Parse a top-level declaration.
+    fn parseDecl() int {
+        // Handle 'export' modifier: consume it and parse the declaration
+        if (self.tok == Token.kw_export) {
+            self.advance()
+            if (self.tok == Token.kw_fn) {
+                return self.parseFnDecl(0, 0, 0, 1)
+            }
+            self.errors.report(self.tok_start, ErrorCode.e200, "expected 'fn' after 'export'")
+            return null_node
+        }
+        const tok = @enumFromInt(self.tok) as Token
+        return switch (tok) {
+            Token.kw_import => self.parseImportDecl(),
+            Token.kw_test => self.parseTestDecl(),
+            Token.kw_bench => self.parseBenchDecl(),
+            Token.kw_fn => self.parseFnDecl(0, 0, 0, 0),
+            Token.kw_static => {
+                self.advance()
+                if (self.tok != Token.kw_fn) {
+                    self.errors.report(self.tok_start, ErrorCode.e200, "expected 'fn' after 'static'")
+                    return null_node
+                }
+                self.parseFnDecl(0, 0, 1, 0)
+            },
+            Token.kw_const => self.parseVarDecl(1),
+            Token.kw_var => self.parseVarDecl(0),
+            Token.kw_let => self.parseVarDecl(0),
+            Token.kw_struct => self.parseStructDecl(0),
+            Token.kw_packed => self.parsePackedStructDecl(),
+            Token.kw_extern => self.parseExternDecl(),
+            Token.kw_enum => self.parseEnumDecl(),
+            Token.kw_union => self.parseUnionDecl(),
+            Token.kw_impl => self.parseImplBlock(),
+            Token.kw_trait => self.parseTraitDecl(),
+            Token.kw_type => self.parseTypeAlias(),
+            Token.kw_async => self.parseAsyncFn(),
+            else => {
+                self.errors.report(self.tok_start, ErrorCode.e200, "expected declaration")
+                null_node
+            },
+        }
+    }
+
+    /// import "path"
+    fn parseImportDecl() int {
+        const start = self.tok_start
+        self.advance()  // consume 'import'
+        if (self.tok != Token.string_lit) {
+            self.errors.report(self.tok_start, ErrorCode.e200, "expected string after import")
+            return null_node
+        }
+        const path = self.tok_text
+        self.advance()  // consume string
+        return self.ast.addDecl(Decl.import_decl(ImportDecl { .path = path, .span = self.spanSE(start, self.tok_end) }))
+    }
+
+    /// test "name" { body }
+    fn parseTestDecl() int {
+        const start = self.tok_start
+        self.advance()  // consume 'test'
+        if (self.tok != Token.string_lit) {
+            self.errors.report(self.tok_start, ErrorCode.e200, "expected test name string")
+            return null_node
+        }
+        const name = self.tok_text
+        self.advance()  // consume name
+        const body = self.parseBlock()
+        return self.ast.addDecl(Decl.test_decl(TestDecl { .name = name, .body = body, .span = self.spanSE(start, self.tok_end) }))
+    }
+
+    /// bench "name" { body }
+    fn parseBenchDecl() int {
+        const start = self.tok_start
+        self.advance()  // consume 'bench'
+        if (self.tok != Token.string_lit) {
+            self.errors.report(self.tok_start, ErrorCode.e200, "expected bench name string")
+            return null_node
+        }
+        const name = self.tok_text
+        self.advance()  // consume name
+        const body = self.parseBlock()
+        return self.ast.addDecl(Decl.bench_decl(BenchDecl { .name = name, .body = body, .span = self.spanSE(start, self.tok_end) }))
+    }
+
+    /// fn name(T)(params) return_type { body }
+    fn parseFnDecl(is_extern: int, is_async: int, is_static: int, is_export: int) int {
+        const start = self.tok_start
+        const doc = self.consumeDocComment()
+        self.advance()  // consume 'fn'
+        if (self.tok != Token.ident) {
+            self.errors.report(self.tok_start, ErrorCode.e203, "expected function name")
+            return null_node
+        }
+        const name = self.tok_text
+        self.advance()  // consume name
+
+        // Ported from parser.zig:250-270: fn max(T)(a: T, b: T) T
+        // First '(' is consumed, then we distinguish type params from regular params:
+        // bare idents (no ':') = type params; ident followed by ':' = regular params.
+        if (!self.expect(Token.lparen as int)) {
+            return null_node
+        }
+
+        var type_params: List(string) = .{}
+        if (self.tok == Token.ident and self.peekToken() != Token.colon) {
+            // Type parameters: (T) or (T, U)
+            while (self.tok != Token.rparen and self.tok != Token.eof) {
+                if (self.tok != Token.ident) {
+                    self.errors.report(self.tok_start, ErrorCode.e203, "expected type parameter name")
+                    return null_node
+                }
+                type_params.append(self.tok_text)
+                self.advance()
+                if (!self.match(Token.comma as int)) {
+                    break
+                }
+            }
+            if (!self.expect(Token.rparen as int)) {
+                return null_node
+            }
+            // Expect second ( for value parameters
+            if (!self.expect(Token.lparen as int)) {
+                return null_node
+            }
+        }
+
+        // Regular parameters (lparen already consumed above)
+        var params: List(int) = .{}
+        while (self.tok != Token.rparen and self.tok != Token.eof) {
+            const param_node = self.parseFieldDef()
+            if (param_node != null_node) {
+                params.append(param_node)
+            }
+            if (!self.match(Token.comma as int)) {
+                break
+            }
+        }
+        if (!self.expect(Token.rparen as int)) {
+            return null_node
+        }
+
+        // @safe implicit self: inject `self: TypeName` if in impl block
+        if (self.safe_mode and @lenOf(self.current_impl_type) > 0 and !self.current_impl_is_generic and is_static == 0) {
+            // Check if first param is already named "self"
+            var needs_self = true
+            if (params.count > 0) {
+                const first_name = nodeFieldDefName(self.ast, params.get(0))
+                if (first_name == "self") {
+                    needs_self = false
+                }
+            }
+            if (needs_self) {
+                // Create self param with type_expr(TYPE_NAMED) pointing to an ident for the impl type.
+                // Zig parser.zig:295 creates a type_expr with .named kind; checker's safeWrapType
+                // then wraps struct types to *Struct.
+                const name_ident = self.ast.addExpr(Expr.ident(Ident { .name = self.current_impl_type, .span = self.spanSE(start, start) }))
+                const self_type = self.ast.addExpr(Expr.type_expr(TypeExprNode { .kind = TYPE_NAMED, .data1 = name_ident, .data2 = null_node, .span = self.spanSE(start, start) }))
+                const self_param = self.ast.addExpr(Expr.field_def(FieldDef { .name = "self", .type_expr = self_type, .default_value = null_node, .doc_comment = "", .span = self.spanSE(start, start) }))
+                // Prepend self to params
+                var new_params: List(int) = .{}
+                new_params.append(self_param)
+                for pi in 0..params.count {
+                    new_params.append(params.get(pi))
+                }
+                params = new_params
+            }
+        }
+
+        // Return type — skip if at '{', eof, or 'where'
+        // Ported from parser.zig:294-295
+        var ret_type = null_node
+        if (self.tok != Token.lbrace and self.tok != Token.eof and self.tok != Token.kw_where) {
+            ret_type = self.parseType()
+        }
+
+        // Where clause: fn sort(T)(list: *List(T)) void where T: Ord
+        // Ported from parser.zig:299-321
+        var type_param_bounds: List(string) = .{}
+        if (self.tok == Token.kw_where and type_params.len() > 0) {
+            // Initialize bounds array with "" for each type param
+            for bi in 0..type_params.len() {
+                type_param_bounds.append("")
+            }
+            self.advance()  // consume 'where'
+            while (self.tok == Token.ident) {
+                const param_name = self.tok_text
+                self.advance()
+                if (!self.expect(Token.colon as int)) {
+                    break
+                }
+                if (self.tok != Token.ident) {
+                    self.errors.report(self.tok_start, ErrorCode.e203, "expected trait name after ':'")
+                    break
+                }
+                const trait_name = self.tok_text
+                self.advance()
+                // Find matching type param and set its bound
+                for wi in 0..type_params.len() {
+                    if (type_params.get(wi) == param_name) {
+                        type_param_bounds.set(wi, trait_name)
+                        break
+                    }
+                }
+                if (!self.match(Token.comma as int)) {
+                    break
+                }
+            }
+        }
+
+        // Body (optional for extern)
+        var body = null_node
+        if (self.tok == Token.lbrace) {
+            body = self.parseBlock()
+        }
+
+        return self.ast.addDecl(Decl.fn_decl(FnDecl {
+            .name = name,
+            .type_params = type_params,
+            .type_param_bounds = type_param_bounds,
+            .params = params,
+            .return_type = ret_type,
+            .body = body,
+            .is_extern = is_extern == 1,
+            .is_export = is_export == 1,
+            .is_async = is_async == 1,
+            .is_static = is_static == 1,
+            .doc_comment = doc,
+            .span = self.spanSE(start, self.tok_end),
+        }))
+    }
+
+    /// const/var name: Type = value
+    /// Also handles: const Name = enum { ... }, const Name = error { ... }
+    fn parseVarDecl(is_const: int) int {
+        const start = self.tok_start
+        const doc = self.consumeDocComment()
+        self.advance()  // consume const/var/let
+        if (self.tok != Token.ident) {
+            // P11: keyword-as-name error (Zig parser.zig:376-383)
+            if ((@enumFromInt(self.tok) as Token).isKeyword()) {
+                self.errors.report(self.tok_start, ErrorCode.e203, "keyword cannot be used as variable name")
+                return null_node
+            }
+            // Could be destructuring: const a, b = ...
+            return self.parseDestructureDecl(is_const, start, doc)
+        }
+        const name = self.tok_text
+        const name_start = self.tok_start
+        self.advance()  // consume name
+
+        // Optional type annotation
+        var type_expr = null_node
+        if (self.match(Token.colon as int)) {
+            type_expr = self.parseType()
+        }
+
+        // Destructuring: const a, b = expr
+        if (self.tok == Token.comma) {
+            return self.parseDestructureDeclFrom(name, type_expr, name_start, start, is_const, doc)
+        }
+
+        // Check for inline type declarations: const Name = enum { ... } or const Name = enum(u8) { ... }
+        // Ported from parser.zig:1678-1716 — full state save/restore backtracking
+        if (is_const == 1 and self.tok == Token.assign) {
+            // Save parser + scanner state for backtracking
+            const saved_tok = self.tok
+            const saved_tok_text = self.tok_text
+            const saved_tok_start = self.tok_start
+            const saved_tok_end = self.tok_end
+            const saved_has_peek = self.has_peek
+            const saved_peek_tok = self.peek_tok
+            const saved_peek_text = self.peek_text
+            const saved_peek_start = self.peek_start
+            const saved_peek_end = self.peek_end
+            const saved_scan_pos = self.scanner.pos
+            const saved_scan_ch = self.scanner.ch
+
+            self.advance()  // consume '='
+
+            if (self.tok == Token.kw_enum) {
+                self.advance()  // consume 'enum'
+                var backing = null_node
+                if (self.match(Token.lparen as int)) {
+                    backing = self.parseType()
+                    self.expect(Token.rparen as int)
+                }
+                if (!self.expect(Token.lbrace as int)) {
+                    return null_node
+                }
+                // Set current_impl_type so @safe implicit self injection works
+                const saved_impl = self.current_impl_type
+                const saved_impl_generic = self.current_impl_is_generic
+                self.current_impl_type = name
+                self.current_impl_is_generic = false
+                var variants: List(int) = .{}
+                var nested: List(int) = .{}
+                while (self.tok != Token.rbrace and self.tok != Token.eof) {
+                    self.collectDocComment()
+                    // Nested decls: fn, static fn, const (inferred impl)
+                    if (self.tok == Token.kw_fn or self.tok == Token.kw_static or self.tok == Token.kw_const) {
+                        const nested_idx = self.parseDecl()
+                        if (nested_idx != null_node) {
+                            nested.append(nested_idx)
+                        }
+                        continue
+                    }
+                    const vstart = self.tok_start
+                    if (self.tok == Token.at) {
+                        self.advance()
+                    }
+                    if (self.tok != Token.ident and self.tok != Token.string_lit) {
+                        self.errors.report(self.tok_start, ErrorCode.e203, "expected variant name")
+                        break
+                    }
+                    const vname = self.tok_text
+                    self.advance()
+                    var vval = null_node
+                    if (self.match(Token.assign as int)) {
+                        vval = self.parseExpr()
+                    }
+                    variants.append(self.ast.addExpr(Expr.enum_variant_node(EnumVariantNode { .name = vname, .value = vval, .span = self.spanSE(vstart, self.tok_end) })))
+                    self.match(Token.comma as int)
+                }
+                self.expect(Token.rbrace as int)
+                self.current_impl_type = saved_impl
+                self.current_impl_is_generic = saved_impl_generic
+                return self.ast.addDecl(Decl.enum_decl(EnumDecl { .name = name, .backing_type = backing, .variants = variants, .nested_decls = nested, .doc_comment = doc, .span = self.spanSE(start, self.tok_end) }))
+            }
+
+            if (self.tok == Token.kw_error) {
+                if (self.peekToken() == Token.lbrace) {
+                    self.advance()  // consume 'error'
+                    self.advance()  // consume '{'
+                    var variants: List(string) = .{}
+                    while (self.tok != Token.rbrace and self.tok != Token.eof) {
+                        if (self.tok != Token.ident) {
+                            break
+                        }
+                        variants.append(self.tok_text)
+                        self.advance()
+                        if (!self.match(Token.comma as int)) {
+                            break
+                        }
+                    }
+                    self.expect(Token.rbrace as int)
+                    return self.ast.addDecl(Decl.error_set_decl(ErrorSetDecl { .name = name, .variants = variants, .doc_comment = doc, .span = self.spanSE(start, self.tok_end) }))
+                }
+                // error.Name expression — not an error set, restore state
+            }
+
+            if (self.tok == Token.kw_union) {
+                self.advance()  // consume 'union'
+                if (!self.expect(Token.lbrace as int)) {
+                    return null_node
+                }
+                var variants: List(int) = .{}
+                while (self.tok != Token.rbrace and self.tok != Token.eof) {
+                    self.collectDocComment()
+                    const vstart = self.tok_start
+                    // Accept identifiers and keywords as variant names
+                    if (self.tok != Token.ident and !(self.tok > (Token.keyword_beg as int) and self.tok < (Token.keyword_end as int))) {
+                        self.errors.report(self.tok_start, ErrorCode.e203, "expected variant name")
+                        break
+                    }
+                    const vname = self.tok_text
+                    self.advance()
+                    var vtype = null_node
+                    if (self.match(Token.colon as int)) {
+                        vtype = self.parseType()
+                    }
+                    variants.append(self.ast.addExpr(Expr.union_variant_node(UnionVariantNode { .name = vname, .type_expr = vtype, .span = self.spanSE(vstart, self.tok_end) })))
+                    self.match(Token.comma as int)
+                }
+                self.expect(Token.rbrace as int)
+                return self.ast.addDecl(Decl.union_decl(UnionDecl { .name = name, .variants = variants, .doc_comment = doc, .span = self.spanSE(start, self.tok_end) }))
+            }
+
+            if (self.tok == Token.kw_struct) {
+                self.advance()  // consume 'struct'
+                var sfields: List(int) = .{}
+                var nested: List(int) = .{}
+                var type_params: List(string) = .{}
+                // Optional type parameters: struct Pair(T, U) { ... }
+                if (self.tok == Token.lparen) {
+                    self.advance()  // consume (
+                    while (self.tok != Token.rparen and self.tok != Token.eof) {
+                        if (self.tok != Token.ident) { break }
+                        type_params.append(self.tok_text)
+                        self.advance()
+                        if (!self.match(Token.comma as int)) { break }
+                    }
+                    self.expect(Token.rparen as int)
+                }
+                if (!self.expect(Token.lbrace as int)) {
+                    return null_node
+                }
+                // Set current_impl_type for @safe implicit self injection
+                const saved_impl = self.current_impl_type
+                const saved_impl_generic = self.current_impl_is_generic
+                self.current_impl_type = name
+                self.current_impl_is_generic = (type_params.count > 0)
+                // Parse fields first, then nested decls (methods, consts)
+                while (self.tok != Token.rbrace and self.tok != Token.eof) {
+                    self.collectDocComment()
+                    const ftok = @enumFromInt(self.tok) as Token
+                    if (ftok == Token.kw_fn or ftok == Token.kw_static or ftok == Token.kw_const or
+                        ftok == Token.kw_enum or ftok == Token.kw_type or ftok == Token.kw_struct) {
+                        break
+                    }
+                    const fd = self.parseFieldDef()
+                    if (fd != null_node) {
+                        sfields.append(fd)
+                    }
+                    self.match(Token.comma as int)
+                }
+                // Parse nested declarations (methods, static fn, const)
+                while (self.tok != Token.rbrace and self.tok != Token.eof) {
+                    self.collectDocComment()
+                    const dtok = @enumFromInt(self.tok) as Token
+                    if (dtok == Token.kw_fn or dtok == Token.kw_static or dtok == Token.kw_const or
+                        dtok == Token.kw_enum or dtok == Token.kw_type) {
+                        const nested_decl = self.parseDecl()
+                        if (nested_decl != null_node) {
+                            nested.append(nested_decl)
+                        }
+                    } else {
+                        break
+                    }
+                }
+                self.expect(Token.rbrace as int)
+                self.current_impl_type = saved_impl
+                self.current_impl_is_generic = saved_impl_generic
+                return self.ast.addDecl(Decl.struct_decl(StructDecl { .name = name, .type_params = type_params, .fields = sfields, .layout = 0, .nested_decls = nested, .doc_comment = doc, .span = self.spanSE(start, self.tok_end) }))
+            }
+
+            // Not a type declaration — restore parser + scanner state
+            self.tok = saved_tok
+            self.tok_text = saved_tok_text
+            self.tok_start = saved_tok_start
+            self.tok_end = saved_tok_end
+            self.has_peek = saved_has_peek
+            self.peek_tok = saved_peek_tok
+            self.peek_text = saved_peek_text
+            self.peek_start = saved_peek_start
+            self.peek_end = saved_peek_end
+            self.scanner.pos = saved_scan_pos
+            self.scanner.ch = saved_scan_ch
+        }
+
+        // Regular initializer
+        var value = null_node
+        if (self.match(Token.assign as int)) {
+            value = self.parseExpr()
+        }
+
+        return self.ast.addDecl(Decl.var_decl(VarDecl { .name = name, .type_expr = type_expr, .value = value, .is_const = is_const == 1, .doc_comment = doc, .span = self.spanSE(start, self.tok_end) }))
+    }
+
+    /// Destructure top-level: const a, b = expr (no ident found, multiple bindings)
+    fn parseDestructureDecl(is_const: int, start: int, doc: string) int {
+        // First token isn't ident — this shouldn't normally happen for destructuring
+        // Destructuring starts with ident: const a, b = ...
+        self.errors.report(self.tok_start, ErrorCode.e203, "expected variable name")
+        return null_node
+    }
+
+    /// Destructure from first binding: const a, b = expr
+    fn parseDestructureDeclFrom(first_name: string, first_type: int, first_start: int, start: int, is_const: int, doc: string) int {
+        var bindings: List(int) = .{}
+        bindings.append(self.ast.addExpr(Expr.destructure_bind(DestructureBindNode { .name = first_name, .type_expr = first_type, .span = self.spanSE(first_start, self.tok_end) })))
+        while (self.match(Token.comma as int)) {
+            if (self.tok != Token.ident) {
+                self.errors.report(self.tok_start, ErrorCode.e203, "expected variable name")
+                break
+            }
+            const bname = self.tok_text
+            const bstart = self.tok_start
+            self.advance()
+            var btype = null_node
+            if (self.match(Token.colon as int)) {
+                btype = self.parseType()
+            }
+            bindings.append(self.ast.addExpr(Expr.destructure_bind(DestructureBindNode { .name = bname, .type_expr = btype, .span = self.spanSE(bstart, self.tok_end) })))
+        }
+        if (!self.expect(Token.assign as int)) {
+            return null_node
+        }
+        const value = self.parseExpr()
+        return self.ast.addStmt(Stmt.destructure_stmt(DestructureStmt { .bindings = bindings, .value = value, .is_const = is_const == 1, .span = self.spanSE(start, self.tok_end) }))
+    }
+
+    /// struct Name { fields }
+    /// Ported from parser.zig:428-483 (parseStructDeclWithLayout)
+    fn parseStructDecl(layout: int) int {
+        const start = self.tok_start
+        const doc = self.consumeDocComment()
+        self.advance()  // consume 'struct'
+        if (self.tok != Token.ident) {
+            self.errors.report(self.tok_start, ErrorCode.e203, "expected struct name")
+            return null_node
+        }
+        const name = self.tok_text
+        self.advance()
+
+        // Parse optional type parameters: struct Pair(T, U) { ... }
+        // Ported from parser.zig:440-454
+        var type_params: List(string) = .{}
+        if (self.tok == Token.lparen) {
+            self.advance()  // consume (
+            while (self.tok != Token.rparen and self.tok != Token.eof) {
+                if (self.tok != Token.ident) {
+                    self.errors.report(self.tok_start, ErrorCode.e203, "expected type parameter name")
+                    return null_node
+                }
+                type_params.append(self.tok_text)
+                self.advance()
+                if (!self.match(Token.comma as int)) {
+                    break
+                }
+            }
+            self.expect(Token.rparen as int)
+        }
+
+        if (!self.expect(Token.lbrace as int)) {
+            return null_node
+        }
+
+        // Set current_impl_type so @safe implicit self injection works for methods inside struct bodies
+        const saved_impl = self.current_impl_type
+        const saved_impl_generic = self.current_impl_is_generic
+        self.current_impl_type = name
+        self.current_impl_is_generic = (type_params.count > 0)
+
+        // Parse nested declarations (const, enum, struct, type, fn, static fn) before fields
+        var nested: List(int) = .{}
+        while (self.tok != Token.rbrace and self.tok != Token.eof) {
+            self.collectDocComment()
+            const tok = @enumFromInt(self.tok) as Token
+            if (tok == Token.kw_const or tok == Token.kw_enum or tok == Token.kw_type or
+                tok == Token.kw_fn or tok == Token.kw_static) {
+                const nested_decl = self.parseDecl()
+                if (nested_decl != null_node) {
+                    nested.append(nested_decl)
+                }
+            } else {
+                break
+            }
+        }
+
+        // Fields
+        var fields: List(int) = .{}
+        while (self.tok != Token.rbrace and self.tok != Token.eof) {
+            self.collectDocComment()
+            // Break on nested-decl keywords (methods after fields)
+            const ftok = @enumFromInt(self.tok) as Token
+            if (ftok == Token.kw_fn or ftok == Token.kw_static or ftok == Token.kw_const or
+                ftok == Token.kw_enum or ftok == Token.kw_type or ftok == Token.kw_struct) {
+                break
+            }
+            const fd = self.parseFieldDef()
+            if (fd != null_node) {
+                fields.append(fd)
+            }
+            self.match(Token.comma as int)
+        }
+
+        // Parse nested declarations after fields (methods, static fn, etc.)
+        while (self.tok != Token.rbrace and self.tok != Token.eof) {
+            self.collectDocComment()
+            const tok = @enumFromInt(self.tok) as Token
+            if (tok == Token.kw_const or tok == Token.kw_enum or tok == Token.kw_type or
+                tok == Token.kw_fn or tok == Token.kw_static) {
+                const nested_decl = self.parseDecl()
+                if (nested_decl != null_node) {
+                    nested.append(nested_decl)
+                }
+            } else {
+                break
+            }
+        }
+
+        self.current_impl_type = saved_impl
+        self.current_impl_is_generic = saved_impl_generic
+
+        self.expect(Token.rbrace as int)
+
+        return self.ast.addDecl(Decl.struct_decl(StructDecl { .name = name, .type_params = type_params, .fields = fields, .layout = layout, .nested_decls = nested, .doc_comment = doc, .span = self.spanSE(start, self.tok_end) }))
+    }
+
+    fn parsePackedStructDecl() int {
+        self.advance()  // consume 'packed'
+        return self.parseStructDecl(1)  // packed layout
+    }
+
+    /// Parse extern fn or extern struct
+    fn parseExternDecl() int {
+        const start = self.tok_start
+        self.advance()  // consume 'extern'
+        if (self.tok == Token.kw_fn) {
+            return self.parseFnDecl(1, 0, 0, 0)
+        }
+        if (self.tok == Token.kw_struct) {
+            return self.parseStructDecl(2)  // extern layout
+        }
+        self.errors.report(start, ErrorCode.e200, "expected fn or struct after extern")
+        return null_node
+    }
+
+    /// const Name = enum { variants }
+    fn parseEnumDecl() int {
+        const start = self.tok_start
+        const doc = self.consumeDocComment()
+        self.advance()  // consume 'enum'
+        // Optional name: enum Color { ... }
+        var name = ""
+        if (self.tok == Token.ident) {
+            name = self.tok_text
+            self.advance()
+        }
+        // Optional backing type: enum(u8)
+        var backing = null_node
+        if (self.match(Token.lparen as int)) {
+            backing = self.parseType()
+            self.expect(Token.rparen as int)
+        }
+        if (!self.expect(Token.lbrace as int)) {
+            return null_node
+        }
+        // Set current_impl_type so @safe implicit self injection works for methods inside enum bodies
+        const saved_impl = self.current_impl_type
+        const saved_impl_generic = self.current_impl_is_generic
+        self.current_impl_type = name
+        self.current_impl_is_generic = false
+        var variants: List(int) = .{}
+        var nested: List(int) = .{}
+        while (self.tok != Token.rbrace and self.tok != Token.eof) {
+            self.collectDocComment()
+            // Nested decls: fn, static fn, const (inferred impl)
+            if (self.tok == Token.kw_fn or self.tok == Token.kw_static or self.tok == Token.kw_const) {
+                const nested_idx = self.parseDecl()
+                if (nested_idx != null_node) {
+                    nested.append(nested_idx)
+                }
+                continue
+            }
+            const vstart = self.tok_start
+            if (self.tok == Token.at) {
+                // Quoted identifier: @"packed"
+                self.advance()
+                if (self.tok != Token.string_lit) {
+                    self.errors.report(self.tok_start, ErrorCode.e200, "expected string after @")
+                    break
+                }
+            }
+            if (self.tok != Token.ident and self.tok != Token.string_lit) {
+                self.errors.report(self.tok_start, ErrorCode.e203, "expected variant name")
+                break
+            }
+            const vname = self.tok_text
+            self.advance()
+            var vval = null_node
+            if (self.match(Token.assign as int)) {
+                vval = self.parseExpr()
+            }
+            variants.append(self.ast.addExpr(Expr.enum_variant_node(EnumVariantNode { .name = vname, .value = vval, .span = self.spanSE(vstart, self.tok_end) })))
+            self.match(Token.comma as int)
+        }
+        self.expect(Token.rbrace as int)
+        self.current_impl_type = saved_impl
+        self.current_impl_is_generic = saved_impl_generic
+        return self.ast.addDecl(Decl.enum_decl(EnumDecl { .name = name, .backing_type = backing, .variants = variants, .nested_decls = nested, .doc_comment = doc, .span = self.spanSE(start, self.tok_end) }))
+    }
+
+    /// union { variants }
+    fn parseUnionDecl() int {
+        const start = self.tok_start
+        const doc = self.consumeDocComment()
+        self.advance()  // consume 'union'
+        // Parse optional name: union Name { ... }
+        var name = ""
+        if (self.tok == Token.ident) {
+            name = self.tok_text
+            self.advance()
+        }
+        if (!self.expect(Token.lbrace as int)) {
+            return null_node
+        }
+        var variants: List(int) = .{}
+        while (self.tok != Token.rbrace and self.tok != Token.eof) {
+            self.collectDocComment()
+            const vstart = self.tok_start
+            // Accept identifiers and keywords as variant names (e.g. `select: Select`)
+            if (self.tok != Token.ident and !(self.tok > (Token.keyword_beg as int) and self.tok < (Token.keyword_end as int))) {
+                self.errors.report(self.tok_start, ErrorCode.e203, "expected variant name")
+                break
+            }
+            const vname = self.tok_text
+            self.advance()
+            var vtype = null_node
+            if (self.match(Token.colon as int)) {
+                vtype = self.parseType()
+            }
+            variants.append(self.ast.addExpr(Expr.union_variant_node(UnionVariantNode { .name = vname, .type_expr = vtype, .span = self.spanSE(vstart, self.tok_end) })))
+            self.match(Token.comma as int)
+        }
+        self.expect(Token.rbrace as int)
+        return self.ast.addDecl(Decl.union_decl(UnionDecl { .name = name, .variants = variants, .doc_comment = doc, .span = self.spanSE(start, self.tok_end) }))
+    }
+
+    /// impl Type { methods }  or  impl Type(T) { methods }  or  impl Trait for Type { methods }
+    /// Ported from parser.zig:485-534
+    fn parseImplBlock() int {
+        const start = self.tok_start
+        const doc = self.consumeDocComment()
+        self.advance()  // consume 'impl'
+        if (self.tok != Token.ident) {
+            self.errors.report(self.tok_start, ErrorCode.e203, "expected type name after impl")
+            return null_node
+        }
+        const type_name = self.tok_text
+        self.advance()
+
+        // Parse optional type parameters: impl List(T) { ... }
+        // Ported from parser.zig:493-507
+        var type_params: List(string) = .{}
+        if (self.tok == Token.lparen) {
+            self.advance()
+            while (self.tok != Token.rparen and self.tok != Token.eof) {
+                if (self.tok != Token.ident) {
+                    self.errors.report(self.tok_start, ErrorCode.e203, "expected type parameter name")
+                    return null_node
+                }
+                type_params.append(self.tok_text)
+                self.advance()
+                if (!self.match(Token.comma as int)) {
+                    break
+                }
+            }
+            self.expect(Token.rparen as int)
+        }
+
+        // Check for trait impl: impl Trait for Type { ... }
+        // Ported from parser.zig:510
+        if (self.tok == Token.kw_for) {
+            return self.parseImplTraitBlock(type_name, type_params, doc, start)
+        }
+
+        if (!self.expect(Token.lbrace as int)) {
+            return null_node
+        }
+
+        // Save/restore impl context for implicit self injection (@safe mode)
+        // Ported from parser.zig:515-522
+        const saved_impl = self.current_impl_type
+        const saved_generic = self.current_impl_is_generic
+        self.current_impl_type = type_name
+        self.current_impl_is_generic = type_params.len() > 0
+
+        var methods: List(int) = .{}
+        var consts: List(int) = .{}
+
+        while (self.tok != Token.rbrace and self.tok != Token.eof) {
+            self.collectDocComment()
+            if (self.tok == Token.kw_static) {
+                self.advance()  // consume 'static'
+                if (self.tok != Token.kw_fn) {
+                    self.errors.report(self.tok_start, ErrorCode.e200, "expected 'fn' after 'static'")
+                    self.advance()
+                } else {
+                    const m = self.parseFnDecl(0, 0, 1, 0)
+                    if (m != null_node) {
+                        methods.append(m)
+                    }
+                }
+            } else if (self.tok == Token.kw_fn) {
+                const m = self.parseFnDecl(0, 0, 0, 0)
+                if (m != null_node) {
+                    methods.append(m)
+                }
+            } else if (self.tok == Token.kw_async) {
+                const m = self.parseAsyncFn()
+                if (m != null_node) {
+                    methods.append(m)
+                }
+            } else if (self.tok == Token.kw_const) {
+                const c = self.parseVarDecl(1)
+                if (c != null_node) {
+                    consts.append(c)
+                }
+            } else {
+                self.errors.report(self.tok_start, ErrorCode.e200, "expected 'fn', 'static fn', or 'const' in impl block")
+                self.advance()
+            }
+        }
+        self.expect(Token.rbrace as int)
+        self.current_impl_type = saved_impl
+        self.current_impl_is_generic = saved_generic
+
+        return self.ast.addDecl(Decl.impl_block(ImplBlock { .type_name = type_name, .type_params = type_params, .methods = methods, .consts = consts, .doc_comment = doc, .span = self.spanSE(start, self.tok_end) }))
+    }
+
+    /// impl Trait for Type { methods }
+    /// Ported from parser.zig:558-594
+    /// type_params already parsed by parseImplBlock, trait_name is actually the first ident
+    fn parseImplTraitBlock(trait_name: string, type_params: List(string), doc: string, start: int) int {
+        self.advance()  // consume 'for'
+        if (self.tok != Token.ident and !(@enumFromInt(self.tok) as Token).isTypeKeyword()) {
+            self.errors.report(self.tok_start, ErrorCode.e203, "expected type name after for")
+            return null_node
+        }
+        const target = self.tok_text
+        self.advance()
+
+        if (!self.expect(Token.lbrace as int)) {
+            return null_node
+        }
+
+        // Save/restore impl context — ported from parser.zig:575-582
+        const saved_impl = self.current_impl_type
+        const saved_generic = self.current_impl_is_generic
+        self.current_impl_type = target
+        self.current_impl_is_generic = type_params.len() > 0
+
+        var methods: List(int) = .{}
+
+        while (self.tok != Token.rbrace and self.tok != Token.eof) {
+            self.collectDocComment()
+            if (self.tok == Token.kw_static) {
+                self.advance()
+                if (self.tok != Token.kw_fn) {
+                    self.errors.report(self.tok_start, ErrorCode.e200, "expected 'fn' after 'static'")
+                    self.advance()
+                } else {
+                    const m = self.parseFnDecl(0, 0, 1, 0)
+                    if (m != null_node) {
+                        methods.append(m)
+                    }
+                }
+            } else if (self.tok == Token.kw_fn) {
+                const m = self.parseFnDecl(0, 0, 0, 0)
+                if (m != null_node) {
+                    methods.append(m)
+                }
+            } else {
+                self.errors.report(self.tok_start, ErrorCode.e200, "expected method")
+                self.advance()
+            }
+        }
+        self.expect(Token.rbrace as int)
+        self.current_impl_type = saved_impl
+        self.current_impl_is_generic = saved_generic
+
+        return self.ast.addDecl(Decl.impl_trait(ImplTraitBlock { .trait_name = trait_name, .target_type = target, .type_params = type_params, .methods = methods, .doc_comment = doc, .span = self.spanSE(start, self.tok_end) }))
+    }
+
+    /// trait Name { method signatures }
+    fn parseTraitDecl() int {
+        const start = self.tok_start
+        const doc = self.consumeDocComment()
+        self.advance()  // consume 'trait'
+        if (self.tok != Token.ident) {
+            self.errors.report(self.tok_start, ErrorCode.e203, "expected trait name")
+            return null_node
+        }
+        const name = self.tok_text
+        self.advance()
+        var methods: List(int) = .{}
+        if (!self.expect(Token.lbrace as int)) {
+            return null_node
+        }
+        while (self.tok != Token.rbrace and self.tok != Token.eof) {
+            self.collectDocComment()
+            if (self.tok == Token.kw_fn) {
+                const m = self.parseFnDecl(0, 0, 0, 0)
+                if (m != null_node) {
+                    methods.append(m)
+                }
+            } else {
+                self.errors.report(self.tok_start, ErrorCode.e200, "expected method signature in trait")
+                self.advance()
+            }
+        }
+        self.expect(Token.rbrace as int)
+        return self.ast.addDecl(Decl.trait_decl(TraitDecl { .name = name, .methods = methods, .doc_comment = doc, .span = self.spanSE(start, self.tok_end) }))
+    }
+
+    /// type Name = Type
+    fn parseTypeAlias() int {
+        const start = self.tok_start
+        const doc = self.consumeDocComment()
+        self.advance()  // consume 'type'
+        if (self.tok != Token.ident) {
+            self.errors.report(self.tok_start, ErrorCode.e203, "expected type name")
+            return null_node
+        }
+        const name = self.tok_text
+        self.advance()
+        if (!self.expect(Token.assign as int)) {
+            return null_node
+        }
+        const target = self.parseType()
+        return self.ast.addDecl(Decl.type_alias(TypeAlias { .name = name, .target = target, .doc_comment = doc, .span = self.spanSE(start, self.tok_end) }))
+    }
+
+    /// async fn name(...) { ... }
+    fn parseAsyncFn() int {
+        self.advance()  // consume 'async'
+        if (self.tok != Token.kw_fn) {
+            self.errors.report(self.tok_start, ErrorCode.e200, "expected fn after async")
+            return null_node
+        }
+        return self.parseFnDecl(0, 1, 0, 0)
+    }
+
+    /// Parse a field definition: name: Type or name: Type = default
+    fn parseFieldDef() int {
+        const start = self.tok_start
+        if (self.tok != Token.ident) {
+            self.errors.report(self.tok_start, ErrorCode.e203, "expected field name")
+            return null_node
+        }
+        const name = self.tok_text
+        self.advance()
+        var type_expr = null_node
+        if (self.match(Token.colon as int)) {
+            type_expr = self.parseType()
+        }
+        var default_val = null_node
+        if (self.match(Token.assign as int)) {
+            default_val = self.parseExpr()
+        }
+        const doc = self.consumeDocComment()
+        return self.ast.addExpr(Expr.field_def(FieldDef { .name = name, .type_expr = type_expr, .default_value = default_val, .doc_comment = doc, .span = self.spanSE(start, self.tok_end) }))
+    }
+
+    // ================================================================
+    // Phase B: Expressions
+    // ================================================================
+
+    /// Parse an expression (entry point).
+    fn parseExpr() int {
+        return self.parseBinaryExpr(0)
+    }
+
+    /// Precedence climbing for binary operators.
+    fn parseBinaryExpr(min_prec: int) int {
+        if (self.nest_level > MAX_NEST) {
+            self.errors.report(self.tok_start, ErrorCode.e200, "maximum nesting depth exceeded")
+            return null_node
+        }
+        self.nest_level += 1
+        var left = self.parseUnaryExpr()
+        if (left == null_node) {
+            self.nest_level -= 1
+            return null_node
+        }
+
+        while (true) {
+            const tok = @enumFromInt(self.tok) as Token
+            // Handle orelse specially (lowest precedence, right-associative)
+            if (tok == Token.kw_orelse) {
+                if (min_prec > 1) {
+                    break
+                }
+                const op_start = self.tok_start
+                self.advance()  // consume 'orelse'
+
+                // orelse return [expr]
+                if (self.tok == Token.kw_return as int) {
+                    self.advance()
+                    // Optional return value — only parse if next token can start an expr.
+                    // Port of Zig compiler fix 5c3bd49 (parser.zig:975-982)
+                    var ret_val = null_node
+                    if (!self.isStmtStart() and !self.isBlockEnd()) {
+                        ret_val = self.parseBinaryExpr(2)
+                    }
+                    const kind = if (ret_val != null_node) { ORELSE_RETURN_VAL } else { ORELSE_RETURN_VOID }
+                    left = self.ast.addExpr(Expr.orelse_expr(OrElseExpr { .operand = left, .fallback = ret_val, .fallback_kind = kind, .span = self.spanSE(op_start, self.tok_end) }))
+                    continue
+                }
+
+                // orelse break
+                if (self.tok == Token.kw_break as int) {
+                    self.advance()
+                    left = self.ast.addExpr(Expr.orelse_expr(OrElseExpr { .operand = left, .fallback = null_node, .fallback_kind = ORELSE_BREAK_VAL, .span = self.spanSE(op_start, self.tok_end) }))
+                    continue
+                }
+
+                // orelse continue
+                if (self.tok == Token.kw_continue as int) {
+                    self.advance()
+                    left = self.ast.addExpr(Expr.orelse_expr(OrElseExpr { .operand = left, .fallback = null_node, .fallback_kind = ORELSE_CONTINUE_VAL, .span = self.spanSE(op_start, self.tok_end) }))
+                    continue
+                }
+
+                // orelse expr (normal fallback)
+                const fallback = self.parseBinaryExpr(2)
+                if (fallback == null_node) {
+                    self.errors.report(self.tok_start, ErrorCode.e201, "expected expression after 'orelse'")
+                }
+                left = self.ast.addExpr(Expr.orelse_expr(OrElseExpr { .operand = left, .fallback = fallback, .fallback_kind = ORELSE_EXPR, .span = self.spanSE(op_start, self.tok_end) }))
+                continue
+            }
+
+            // Handle catch specially (low precedence, right-associative)
+            if (tok == Token.kw_catch) {
+                if (min_prec > 1) {
+                    break
+                }
+                const op_start = self.tok_start
+                self.advance()  // consume 'catch'
+                // Optional error capture: catch |err| { ... }
+                var capture = ""
+                if (self.tok == Token.@"or") {
+                    self.advance()  // consume |
+                    if (self.tok == Token.ident) {
+                        capture = self.tok_text
+                        self.advance()
+                    }
+                    self.expect(Token.@"or" as int)  // consume |
+                }
+                const right = self.parseBinaryExpr(2)
+                left = self.ast.addExpr(Expr.catch_expr(CatchExpr { .operand = left, .capture = capture, .fallback = right, .span = self.spanSE(op_start, self.tok_end) }))
+                continue
+            }
+
+            const prec = tok.precedence()
+            if (prec == 0 or (prec as int) < min_prec) {
+                break
+            }
+            const op = self.tok
+            self.advance()
+            const right = self.parseBinaryExpr(prec as int + 1)
+            left = self.ast.addExpr(Expr.binary(Binary { .op = op, .left = left, .right = right, .span = self.spanSE(self.tok_start, self.tok_end) }))
+        }
+        self.nest_level -= 1
+        return left
+    }
+
+    /// Parse a unary expression: -x, !x, try x, await x, &x
+    fn parseUnaryExpr() int {
+        const tok = @enumFromInt(self.tok) as Token
+        if (tok == Token.@"and") {
+            // Address-of: &expr
+            const start = self.tok_start
+            self.advance()
+            const operand = self.parseUnaryExpr()
+            return self.ast.addExpr(Expr.addr_of(AddrOf { .operand = operand, .span = self.spanSE(start, self.tok_end) }))
+        }
+        if (tok == Token.kw_try) {
+            const start = self.tok_start
+            self.advance()
+            const operand = self.parseUnaryExpr()
+            return self.ast.addExpr(Expr.try_expr(TryExpr { .operand = operand, .span = self.spanSE(start, self.tok_end) }))
+        }
+        if (tok == Token.kw_await) {
+            const start = self.tok_start
+            self.advance()
+            const operand = self.parseUnaryExpr()
+            return self.ast.addExpr(Expr.await_expr(AwaitExpr { .operand = operand, .span = self.spanSE(start, self.tok_end) }))
+        }
+        if (tok == Token.sub or tok == Token.lnot or tok == Token.@"not" or tok == Token.kw_not) {
+            const start = self.tok_start
+            const op = self.tok
+            self.advance()
+            const operand = self.parseUnaryExpr()
+            return self.ast.addExpr(Expr.unary(Unary { .op = op, .operand = operand, .span = self.spanSE(start, self.tok_end) }))
+        }
+        return self.parsePrimaryExpr()
+    }
+
+    /// Parse primary expression with postfix operations.
+    fn parsePrimaryExpr() int {
+        var node = self.parseOperand()
+        if (node == null_node) {
+            return null_node
+        }
+        // Postfix loop
+        while (true) {
+            const tok = @enumFromInt(self.tok) as Token
+            if (tok == Token.period_star) {
+                // .* dereference (single token)
+                self.advance()
+                node = self.ast.addExpr(Expr.deref(Deref { .operand = node, .span = self.spanSE(self.tok_start, self.tok_end) }))
+            } else if (tok == Token.period_question) {
+                // .? optional unwrap (single token)
+                self.advance()
+                node = self.ast.addExpr(Expr.unary(Unary { .op = Token.question as int, .operand = node, .span = self.spanSE(self.tok_start, self.tok_end) }))
+            } else if (tok == Token.period) {
+                self.advance()
+                if (self.tok == Token.mul) {
+                    // .*  dereference (two tokens)
+                    self.advance()
+                    node = self.ast.addExpr(Expr.deref(Deref { .operand = node, .span = self.spanSE(self.tok_start, self.tok_end) }))
+                } else if (self.tok == Token.question) {
+                    // .?  optional unwrap (two tokens)
+                    self.advance()
+                    node = self.ast.addExpr(Expr.unary(Unary { .op = Token.question as int, .operand = node, .span = self.spanSE(self.tok_start, self.tok_end) }))
+                } else if (self.tok == Token.ident or self.tok == Token.int_lit or (self.tok > (Token.keyword_beg as int) and self.tok < (Token.keyword_end as int))) {
+                    // .field or .0 (tuple index) or .keyword (e.g. .select)
+                    const field_name = self.tok_text
+                    self.advance()
+                    node = self.ast.addExpr(Expr.field_access(FieldAccessExpr { .base = node, .field = field_name, .span = self.spanSE(self.tok_start, self.tok_end) }))
+                } else {
+                    break
+                }
+            } else if (tok == Token.lbrack) {
+                self.advance()  // consume [
+                // Zig parser.zig:938-955: half-open slice syntax
+                if (self.tok == Token.colon) {
+                    // [:end] — start is null_node
+                    self.advance()
+                    var end_expr = null_node
+                    if (self.tok != Token.rbrack) {
+                        end_expr = self.parseExpr()
+                    }
+                    self.expect(Token.rbrack as int)
+                    node = self.ast.addExpr(Expr.slice_expr(SliceExpr { .base = node, .start = null_node, .end = end_expr, .span = self.spanSE(self.tok_start, self.tok_end) }))
+                } else {
+                    const idx = self.parseExpr()
+                    if (self.tok == Token.colon) {
+                        // [start:end] or [start:] — end may be null_node
+                        self.advance()
+                        var end_expr = null_node
+                        if (self.tok != Token.rbrack) {
+                            end_expr = self.parseExpr()
+                        }
+                        self.expect(Token.rbrack as int)
+                        node = self.ast.addExpr(Expr.slice_expr(SliceExpr { .base = node, .start = idx, .end = end_expr, .span = self.spanSE(self.tok_start, self.tok_end) }))
+                    } else {
+                        self.expect(Token.rbrack as int)
+                        node = self.ast.addExpr(Expr.index_expr(IndexExpr { .base = node, .idx = idx, .span = self.spanSE(self.tok_start, self.tok_end) }))
+                    }
+                }
+            } else if (tok == Token.lparen) {
+                // Function call
+                self.advance()  // consume (
+                var args: List(int) = .{}
+                while (self.tok != Token.rparen and self.tok != Token.eof) {
+                    const arg = self.parseExpr()
+                    if (arg != null_node) {
+                        args.append(arg)
+                    }
+                    if (!self.match(Token.comma as int)) {
+                        break
+                    }
+                }
+                self.expect(Token.rparen as int)
+                node = self.ast.addExpr(Expr.call(Call { .callee = node, .args = args, .span = self.spanSE(self.tok_start, self.tok_end) }))
+            } else if (tok == Token.kw_as) {
+                self.advance()
+                const type_node = self.parseType()
+                if (type_node == null_node) {
+                    self.errors.report(self.tok_start, ErrorCode.e200, "expected type after 'as'")
+                    return null_node
+                }
+                var args: List(int) = .{}
+                args.append(node)
+                node = self.ast.addExpr(Expr.builtin_call(BuiltinCallExpr { .kind = BuiltinKind.@"as" as int, .type_arg = type_node, .args = args, .span = self.spanSE(self.tok_start, self.tok_end) }))
+            } else if (self.peekNextIsPeriod() or self.peekNextIsIdentColon()) {
+                // Struct init: Type { .x = 1 } or Type { x: 1 }
+                node = self.parseStructInitFrom(node)
+            } else {
+                break
+            }
+        }
+        return node
+    }
+
+    /// Parse an atomic operand expression.
+    /// Split into parseOperandLiteral/parseOperandComplex to avoid
+    /// large stack frames that cause SIGBUS with many union temporaries.
+    fn parseOperand() int {
+        const tok = @enumFromInt(self.tok) as Token
+        const start = self.tok_start
+
+        // Contextual keyword: spawn { ... }
+        if (tok == Token.ident and self.tok_text == "spawn" and self.peekToken() == Token.lbrace as int) {
+            self.advance()  // consume "spawn"
+            const body = self.parseBlockExpr()
+            if (body == null_node) {
+                return null_node
+            }
+            return self.ast.addExpr(Expr.spawn_expr(SpawnExpr { .body = body, .span = self.spanSE(start, self.tok_end) }))
+        }
+
+        // Contextual keyword: select { ... }
+        if (tok == Token.ident and self.tok_text == "select" and self.peekToken() == Token.lbrace as int) {
+            return self.parseSelectExpr(start)
+        }
+
+        // Labeled block: label: { ... break :label value ... }
+        if (tok == Token.ident and self.peekToken() == Token.colon as int) {
+            const label = self.tok_text
+            self.advance()  // consume ident
+            self.advance()  // consume ':'
+            if (self.tok == Token.lbrace) {
+                return self.parseLabeledBlockExpr(label)
+            }
+            // Not a labeled block — rewind not possible, report error
+            self.errors.report(self.tok_start, ErrorCode.e201, "expected '{' after label")
+            return null_node
+        }
+
+        // Identifiers
+        if (tok == Token.ident) {
+            const name = self.tok_text
+            self.advance()
+            return self.ast.addExpr(Expr.ident(Ident { .name = name, .span = self.spanSE(start, self.tok_end) }))
+        }
+
+        // Delegate to split functions to avoid large stack frames
+        if (tok == Token.int_lit or tok == Token.float_lit or tok == Token.string_lit
+            or tok == Token.string_interp_start or tok == Token.char_lit
+            or tok == Token.kw_true or tok == Token.kw_false or tok == Token.kw_null
+            or tok == Token.kw_undefined or tok == Token.kw_unreachable) {
+            return self.parseOperandLiteral(tok, start)
+        }
+        return self.parseOperandComplex(tok, start)
+    }
+
+    fn parseOperandLiteral(tok: Token, start: int) int {
+
+        // Integer literal
+        if (tok == Token.int_lit) {
+            const text = self.tok_text
+            self.advance()
+            return self.ast.addExpr(Expr.literal(Literal { .kind = LiteralKind.@"int" as int, .value = text, .span = self.spanSE(start, self.tok_end) }))
+        }
+
+        // Float literal
+        if (tok == Token.float_lit) {
+            const text = self.tok_text
+            self.advance()
+            return self.ast.addExpr(Expr.literal(Literal { .kind = LiteralKind.@"float" as int, .value = text, .span = self.spanSE(start, self.tok_end) }))
+        }
+
+        // String literal
+        if (tok == Token.string_lit) {
+            const text = self.tok_text
+            self.advance()
+            return self.ast.addExpr(Expr.literal(Literal { .kind = LiteralKind.@"string" as int, .value = text, .span = self.spanSE(start, self.tok_end) }))
+        }
+
+        // String interpolation: "text${expr}..."
+        if (tok == Token.string_interp_start) {
+            return self.parseStringInterp()
+        }
+
+        // Char literal
+        if (tok == Token.char_lit) {
+            const text = self.tok_text
+            self.advance()
+            return self.ast.addExpr(Expr.literal(Literal { .kind = LiteralKind.char as int, .value = text, .span = self.spanSE(start, self.tok_end) }))
+        }
+
+        // Keywords as literals
+        if (tok == Token.kw_true) {
+            self.advance()
+            return self.ast.addExpr(Expr.literal(Literal { .kind = LiteralKind.true_lit as int, .value = "true", .span = self.spanSE(start, self.tok_end) }))
+        }
+        if (tok == Token.kw_false) {
+            self.advance()
+            return self.ast.addExpr(Expr.literal(Literal { .kind = LiteralKind.false_lit as int, .value = "false", .span = self.spanSE(start, self.tok_end) }))
+        }
+        if (tok == Token.kw_null) {
+            self.advance()
+            return self.ast.addExpr(Expr.literal(Literal { .kind = LiteralKind.null_lit as int, .value = "null", .span = self.spanSE(start, self.tok_end) }))
+        }
+        if (tok == Token.kw_undefined) {
+            self.advance()
+            return self.ast.addExpr(Expr.literal(Literal { .kind = LiteralKind.undefined_lit as int, .value = "undefined", .span = self.spanSE(start, self.tok_end) }))
+        }
+        if (tok == Token.kw_unreachable) {
+            self.advance()
+            return self.ast.addExpr(Expr.literal(Literal { .kind = LiteralKind.unreachable_lit as int, .value = "unreachable", .span = self.spanSE(start, self.tok_end) }))
+        }
+        return null_node
+    }
+
+    fn parseOperandComplex(tok: Token, start: int) int {
+        // Type keywords as identifiers
+        if (tok.isTypeKeyword()) {
+            const name = self.tok_text
+            self.advance()
+            return self.ast.addExpr(Expr.ident(Ident { .name = name, .span = self.spanSE(start, self.tok_end) }))
+        }
+
+        // Parenthesized expression or tuple
+        if (tok == Token.lparen) {
+            self.advance()  // consume (
+            const inner = self.parseExpr()
+            if (self.tok == Token.comma) {
+                // Tuple literal: (a, b, c)
+                var elems: List(int) = .{}
+                elems.append(inner)
+                while (self.match(Token.comma as int)) {
+                    if (self.tok == Token.rparen) {
+                        break
+                    }
+                    elems.append(self.parseExpr())
+                }
+                self.expect(Token.rparen as int)
+                return self.ast.addExpr(Expr.tuple_literal(TupleLiteral { .elements = elems, .span = self.spanSE(start, self.tok_end) }))
+            }
+            self.expect(Token.rparen as int)
+            return self.ast.addExpr(Expr.paren(Paren { .inner = inner, .span = self.spanSE(start, self.tok_end) }))
+        }
+
+        // Array literal: [1, 2, 3]
+        if (tok == Token.lbrack) {
+            self.advance()  // consume [
+            var elems: List(int) = .{}
+            while (self.tok != Token.rbrack and self.tok != Token.eof) {
+                elems.append(self.parseExpr())
+                if (!self.match(Token.comma as int)) {
+                    break
+                }
+            }
+            self.expect(Token.rbrack as int)
+            return self.ast.addExpr(Expr.array_literal(ArrayLiteral { .elements = elems, .span = self.spanSE(start, self.tok_end) }))
+        }
+
+        // Block expression: { stmts; result }
+        if (tok == Token.lbrace) {
+            return self.parseBlockExpr()
+        }
+
+        // If expression
+        if (tok == Token.kw_if) {
+            return self.parseIfExpr()
+        }
+
+        // Switch expression
+        if (tok == Token.kw_switch) {
+            return self.parseSwitchExpr()
+        }
+
+        // Anonymous function (closure): fn(params) rettype { body }
+        if (tok == Token.kw_fn) {
+            return self.parseClosureExpr()
+        }
+
+        // Builtin call: @name(args)
+        if (tok == Token.at) {
+            return self.parseBuiltinCall()
+        }
+
+        // new expression
+        if (tok == Token.kw_new) {
+            return self.parseNewExpr()
+        }
+
+        // error literal: error.Name
+        if (tok == Token.kw_error) {
+            self.advance()
+            if (self.match(Token.period as int)) {
+                if (self.tok == Token.ident) {
+                    const name = self.tok_text
+                    self.advance()
+                    return self.ast.addExpr(Expr.error_literal(ErrorLiteralExpr { .error_name = name, .span = self.spanSE(start, self.tok_end) }))
+                }
+            }
+            self.errors.report(start, ErrorCode.e200, "expected error variant name")
+            return null_node
+        }
+
+        // comptime block
+        if (tok == Token.kw_comptime) {
+            self.advance()
+            const body = self.parseBlock()
+            return self.ast.addExpr(Expr.comptime_block(ComptimeBlock { .body = body, .span = self.spanSE(start, self.tok_end) }))
+        }
+
+        // Period prefix: .variant, .{ .x = 1 } anonymous struct, or .{ } zero-init
+        if (tok == Token.period) {
+            self.advance()
+            if (self.tok == Token.lbrace) {
+                // .{ } — check if struct init or zero-init
+                if (self.peekToken() == Token.period or self.peekToken() == Token.ident) {
+                    // .{ .x = 1 } or .{ x: 1 } — anonymous struct init
+                    const anon = self.ast.addExpr(Expr.ident(Ident { .name = "", .span = self.spanSE(start, start) }))
+                    return self.parseStructInitFrom(anon)
+                }
+                if (self.peekToken() == Token.rbrace) {
+                    // .{ } — zero-init
+                    self.advance()  // consume {
+                    self.advance()  // consume }
+                    return self.ast.addExpr(Expr.zero_init(ZeroInit { .span = self.spanSE(start, self.tok_end) }))
+                }
+                // .{ expr, expr } — could be tuple or array init
+                return self.parseBlockExpr()
+            }
+            if (self.tok == Token.ident or (self.tok > (Token.keyword_beg as int) and self.tok < (Token.keyword_end as int))) {
+                const name = self.tok_text
+                self.advance()
+                return self.ast.addExpr(Expr.field_access(FieldAccessExpr { .base = null_node, .field = name, .span = self.spanSE(start, self.tok_end) }))
+            }
+            return self.ast.addExpr(Expr.zero_init(ZeroInit { .span = self.spanSE(start, self.tok_end) }))
+        }
+
+        self.errors.report(start, ErrorCode.e201, "expected expression")
+        return null_node
+    }
+
+    // ================================================================
+    // Phase E: Struct init disambiguation helpers
+    // ================================================================
+
+    /// Check if { . follows — indicates struct init with period syntax.
+    fn peekNextIsPeriod() bool {
+        if (self.tok != Token.lbrace) { return false }
+        return self.peekToken() == Token.period
+    }
+
+    /// Check if { ident : follows — indicates struct init with colon syntax (@safe).
+    /// Uses 2-token lookahead with scanner state save/restore.
+    fn peekNextIsIdentColon() bool {
+        if (self.tok != Token.lbrace) { return false }
+        // Save scanner state for restoration after lookahead
+        const saved_pos = self.scanner.pos
+        const saved_ch = self.scanner.ch
+        // Get token after { (use existing peek or scan new)
+        var after_brace: int = 0
+        if (self.has_peek) {
+            after_brace = self.peek_tok
+        } else {
+            after_brace = self.scanner.scanNext().tok
+        }
+        if (after_brace != Token.ident) {
+            self.scanner.pos = saved_pos
+            self.scanner.ch = saved_ch
+            return false
+        }
+        // Scan third token (after ident)
+        const third = self.scanner.scanNext()
+        const result = third.tok == Token.colon or
+                       third.tok == Token.comma or
+                       third.tok == Token.rbrace
+        // Restore scanner state
+        self.scanner.pos = saved_pos
+        self.scanner.ch = saved_ch
+        return result
+    }
+
+    // ================================================================
+    // Phase E: Complex expressions
+    // ================================================================
+
+    /// Parse string interpolation: "text${expr}more${expr}end"
+    /// Scanner produces string_interp_start, then exprs with
+    /// string_interp_mid between them, ending with string_interp_end.
+    fn parseStringInterp() int {
+        const start = self.tok_start
+        var segments: List(int) = .{}
+        // Start segment text (between " and ${)
+        const start_text = self.tok_text
+        if (@lenOf(start_text) > 0) {
+            segments.append(self.ast.addExpr(Expr.literal(Literal {
+                .kind = LiteralKind.@"string" as int, .value = start_text,
+                .span = self.spanSE(start, self.tok_end) })))
+        }
+        self.advance()  // consume string_interp_start
+        // Expression inside ${ }
+        segments.append(self.parseExpr())
+        // Mid and end segments
+        while (true) {
+            if (self.tok == Token.string_interp_mid) {
+                const mid_text = self.tok_text
+                if (@lenOf(mid_text) > 0) {
+                    segments.append(self.ast.addExpr(Expr.literal(Literal {
+                        .kind = LiteralKind.@"string" as int, .value = mid_text,
+                        .span = self.spanSE(self.tok_start, self.tok_end) })))
+                }
+                self.advance()  // consume mid
+                segments.append(self.parseExpr())
+            } else if (self.tok == Token.string_interp_end) {
+                const end_text = self.tok_text
+                if (@lenOf(end_text) > 0) {
+                    segments.append(self.ast.addExpr(Expr.literal(Literal {
+                        .kind = LiteralKind.@"string" as int, .value = end_text,
+                        .span = self.spanSE(self.tok_start, self.tok_end) })))
+                }
+                self.advance()  // consume end
+                break
+            } else {
+                self.errors.report(self.tok_start, ErrorCode.e200, "unterminated string interpolation")
+                break
+            }
+        }
+        return self.ast.addExpr(Expr.string_interp(StringInterpExpr { .segments = segments, .span = self.spanSE(start, self.tok_end) }))
+    }
+
+    /// Parse anonymous function (closure): fn(params) rettype { body }
+    fn parseClosureExpr() int {
+        const start = self.tok_start
+        self.advance()  // consume 'fn'
+        if (!self.expect(Token.lparen as int)) {
+            return null_node
+        }
+        var params: List(int) = .{}
+        while (self.tok != Token.rparen and self.tok != Token.eof) {
+            const param = self.parseFieldDef()
+            if (param != null_node) {
+                params.append(param)
+            }
+            if (!self.match(Token.comma as int)) {
+                break
+            }
+        }
+        if (!self.expect(Token.rparen as int)) {
+            return null_node
+        }
+        var ret_type = null_node
+        if (self.tok != Token.lbrace and self.tok != Token.eof) {
+            ret_type = self.parseType()
+        }
+        const body = self.parseBlock()
+        return self.ast.addExpr(Expr.closure_expr(ClosureExpr { .params = params, .return_type = ret_type, .body = body, .span = self.spanSE(start, self.tok_end) }))
+    }
+
+    /// Parse struct init fields after detecting { in postfix position.
+    /// `preceding` is the already-parsed type-name expression node.
+    fn parseStructInitFrom(preceding: int) int {
+        const start = self.tok_start
+        // Determine type name from preceding node
+        var type_name = ""
+        var type_args: List(int) = .{}
+        type_name = nodeIdentName(self.ast, preceding)
+        // Determine syntax: period vs colon
+        const use_colon = self.peekNextIsIdentColon()
+        self.advance()  // consume {
+        var fields: List(int) = .{}
+        if (use_colon) {
+            // Colon syntax (@safe): { name: val, name2: val2 }
+            while (self.tok != Token.rbrace and self.tok != Token.eof) {
+                const fi = self.parseFieldInit()
+                if (fi != null_node) {
+                    fields.append(fi)
+                }
+                if (!self.match(Token.comma as int)) {
+                    break
+                }
+            }
+        } else {
+            // Period syntax: { .name = val, .name2 = val2 }
+            while (self.tok != Token.rbrace and self.tok != Token.eof) {
+                if (!self.expect(Token.period as int)) {
+                    break
+                }
+                if (self.tok != Token.ident) {
+                    self.errors.report(self.tok_start, ErrorCode.e203, "expected field name")
+                    break
+                }
+                const fname = self.tok_text
+                const fstart = self.tok_start
+                self.advance()
+                self.expect(Token.assign as int)
+                const val = self.parseExpr()
+                fields.append(self.ast.addExpr(Expr.field_init_node(FieldInitNode { .name = fname, .value = val, .span = self.spanSE(fstart, self.tok_end) })))
+                if (!self.match(Token.comma as int)) {
+                    break
+                }
+            }
+        }
+        self.expect(Token.rbrace as int)
+        return self.ast.addExpr(Expr.struct_init(StructInitExpr { .type_name = type_name, .type_args = type_args, .fields = fields, .span = self.spanSE(start, self.tok_end) }))
+    }
+
+    /// if (cond) |capture| { then } else { else }
+    fn parseIfExpr() int {
+        const start = self.tok_start
+        self.advance()  // consume 'if'
+        if (!self.expect(Token.lparen as int)) {
+            return null_node
+        }
+        const cond = self.parseExpr()
+        if (!self.expect(Token.rparen as int)) {
+            return null_node
+        }
+        // Optional capture: |val| or |*val|
+        var capture = ""
+        var capture_is_ptr = false
+        if (self.tok == Token.@"or") {
+            self.advance()
+            if (self.tok == Token.mul) {
+                capture_is_ptr = true
+                self.advance()
+            }
+            if (self.tok == Token.ident) {
+                capture = self.tok_text
+                self.advance()
+            }
+            self.expect(Token.@"or" as int)
+        }
+        const then_br = self.parseExpr()
+        var else_br = null_node
+        if (self.match(Token.kw_else as int)) {
+            else_br = self.parseExpr()
+        }
+        return self.ast.addExpr(Expr.if_expr(IfExpr { .condition = cond, .then_branch = then_br, .else_branch = else_br, .capture = capture, .capture_is_ptr = capture_is_ptr, .span = self.spanSE(start, self.tok_end) }))
+    }
+
+    /// switch (subject) { cases } or switch subject { cases }
+    fn parseSwitchExpr() int {
+        const start = self.tok_start
+        self.advance()  // consume 'switch'
+        var subject = null_node
+        if (self.tok == Token.lparen) {
+            self.advance()
+            subject = self.parseExpr()
+            if (!self.expect(Token.rparen as int)) {
+                return null_node
+            }
+        } else {
+            subject = self.parseExpr()
+        }
+        if (!self.expect(Token.lbrace as int)) {
+            return null_node
+        }
+        var cases: List(int) = .{}
+        var else_body = null_node
+        while (self.tok != Token.rbrace and self.tok != Token.eof) {
+            // else => body
+            if (self.tok == Token.kw_else) {
+                self.advance()
+                self.expect(Token.fat_arrow as int)
+                else_body = self.parseExpr()
+                self.match(Token.comma as int)
+            } else if (self.tok == Token.ident and self.tok_text == "_") {
+                // Wildcard _ => treat as else (Rust/Zig convention)
+                // Ported from parser.zig:1502-1508
+                self.advance()
+                self.expect(Token.fat_arrow as int)
+                else_body = self.parseExpr()
+                self.match(Token.comma as int)
+            } else {
+                const case_node = self.parseSwitchCase()
+                if (case_node != null_node) {
+                    cases.append(case_node)
+                }
+            }
+        }
+        self.expect(Token.rbrace as int)
+        return self.ast.addExpr(Expr.switch_expr(SwitchExpr { .subject = subject, .cases = cases, .else_body = else_body, .span = self.spanSE(start, self.tok_end) }))
+    }
+
+    /// Ported from parser.zig:1510-1546
+    fn parseSwitchCase() int {
+        const start = self.tok_start
+        var patterns: List(int) = .{}
+        var is_range = 0
+
+        // First pattern
+        const first = self.parsePrimaryExpr()
+        patterns.append(first)
+
+        // Range pattern: 1..5 (ported from parser.zig:1517-1521)
+        if (self.tok == Token.period_period) {
+            self.advance()
+            const range_end = self.parsePrimaryExpr()
+            patterns.append(range_end)
+            is_range = 1
+        } else {
+            // Multiple comma-separated patterns
+            while (self.match(Token.comma as int)) {
+                if (self.tok == Token.fat_arrow or self.tok == Token.kw_else or self.tok == Token.rbrace) {
+                    break
+                }
+                patterns.append(self.parsePrimaryExpr())
+            }
+        }
+
+        // Optional capture: |val|
+        var capture = ""
+        if (self.tok == Token.@"or") {
+            self.advance()
+            if (self.tok == Token.ident) {
+                capture = self.tok_text
+                self.advance()
+            }
+            self.expect(Token.@"or" as int)
+        }
+
+        // Guard expression: pattern if expr => (ported from parser.zig:1537-1542)
+        var guard = null_node
+        if (self.tok == Token.kw_if) {
+            self.advance()
+            guard = self.parseExpr()
+        }
+
+        self.expect(Token.fat_arrow as int)
+        const body = self.parseExpr()
+        self.match(Token.comma as int)
+        return self.ast.addExpr(Expr.switch_case_node(SwitchCaseNode { .capture = capture, .guard = guard, .is_range = is_range == 1, .body = body, .patterns = patterns, .span = self.spanSE(start, self.tok_end) }))
+    }
+
+    /// Block expression: { stmts; result_expr }
+    fn parseBlockExpr() int {
+        const start = self.tok_start
+        self.advance()  // consume {
+        var stmts: List(int) = .{}
+        var result_expr = null_node
+        while (self.tok != Token.rbrace and self.tok != Token.eof) {
+            const prev_pos = self.tok_start
+            const s = self.parseStmt()
+            if (s != null_node) {
+                stmts.append(s)
+            } else if (self.tok_start == prev_pos) {
+                // No progress — skip token to prevent infinite loop
+                self.advance()
+            }
+        }
+        // If last stmt is expr_stmt, extract as result
+        if (stmts.count > 0) {
+            const last_inner = nodeExprStmtExpr(self.ast, stmts.get(stmts.count - 1))
+            if (last_inner != null_node) {
+                result_expr = last_inner
+                stmts.count -= 1
+            }
+        }
+        self.expect(Token.rbrace as int)
+        return self.ast.addExpr(Expr.block_expr(BlockExpr { .stmts = stmts, .result_expr = result_expr, .label = "", .span = self.spanSE(start, self.tok_end) }))
+    }
+
+    /// Labeled block expression: label: { stmts; break :label value }
+    fn parseLabeledBlockExpr(label: string) int {
+        const start = self.tok_start
+        self.advance()  // consume {
+        var stmts: List(int) = .{}
+        var result_expr = null_node
+        while (self.tok != Token.rbrace and self.tok != Token.eof) {
+            const prev_pos = self.tok_start
+            const s = self.parseStmt()
+            if (s != null_node) {
+                stmts.append(s)
+            } else if (self.tok_start == prev_pos) {
+                self.advance()
+            }
+        }
+        // If last stmt is expr_stmt, extract as result
+        if (stmts.count > 0) {
+            const last_inner = nodeExprStmtExpr(self.ast, stmts.get(stmts.count - 1))
+            if (last_inner != null_node) {
+                result_expr = last_inner
+                stmts.count -= 1
+            }
+        }
+        self.expect(Token.rbrace as int)
+        return self.ast.addExpr(Expr.block_expr(BlockExpr { .stmts = stmts, .result_expr = result_expr, .label = label, .span = self.spanSE(start, self.tok_end) }))
+    }
+
+    /// Parse select expression (Go-style channel select).
+    /// Copied from parser.zig:1819-1890
+    fn parseSelectExpr(start: int) int {
+        self.advance()  // consume "select"
+        if (!self.expect(Token.lbrace as int)) {
+            return null_node
+        }
+
+        var cases: List(int) = .{}
+        var default_body = null_node
+
+        while (self.tok != Token.rbrace and self.tok != Token.eof) {
+            const case_start = self.tok_start
+
+            // default => { body }
+            if (self.tok == Token.ident and self.tok_text == "default") {
+                self.advance()
+                if (!self.expect(Token.fat_arrow as int)) {
+                    return null_node
+                }
+                default_body = self.parseExpr()
+                if (default_body == null_node) {
+                    return null_node
+                }
+                if (self.match(Token.comma as int)) {}
+                continue
+            }
+
+            // Peek ahead: if second token is "from", it's a recv case
+            // recv: <capture> from <channel> => { body }
+            if (self.tok == Token.ident and self.peekToken() == Token.ident as int) {
+                if (self.peek_text == "from") {
+                    const capture = self.tok_text
+                    self.advance()  // consume capture name
+                    self.advance()  // consume "from"
+                    const channel = self.parsePrimaryExpr()
+                    if (channel == null_node) {
+                        return null_node
+                    }
+                    if (!self.expect(Token.fat_arrow as int)) {
+                        return null_node
+                    }
+                    const body = self.parseExpr()
+                    if (body == null_node) {
+                        return null_node
+                    }
+                    const case_node = self.ast.addSelectCase(SelectCase {
+                        .kind = SELECT_RECV,
+                        .channel = channel,
+                        .capture = capture,
+                        .send_value = null_node,
+                        .body = body,
+                        .span = self.spanSE(case_start, self.tok_end),
+                    })
+                    cases.append(case_node)
+                    if (self.match(Token.comma as int)) {}
+                    continue
+                }
+            }
+
+            // Send case: <channel>.send(<value>) => { body }
+            const channel_expr = self.parsePrimaryExpr()
+            if (channel_expr == null_node) {
+                return null_node
+            }
+            if (!self.expect(Token.fat_arrow as int)) {
+                return null_node
+            }
+            const body = self.parseExpr()
+            if (body == null_node) {
+                return null_node
+            }
+            const case_node = self.ast.addSelectCase(SelectCase {
+                .kind = SELECT_SEND,
+                .channel = channel_expr,
+                .capture = "",
+                .send_value = null_node,
+                .body = body,
+                .span = self.spanSE(case_start, self.tok_end),
+            })
+            cases.append(case_node)
+            if (self.match(Token.comma as int)) {}
+        }
+
+        if (!self.expect(Token.rbrace as int)) {
+            return null_node
+        }
+        return self.ast.addExpr(Expr.select_expr(SelectExpr { .cases = cases, .default_body = default_body, .span = self.spanSE(start, self.tok_end) }))
+    }
+
+    /// @builtin(args) — dispatches per-builtin to parse type vs expr args.
+    /// Ported from parser.zig:1348-1436
+    fn parseBuiltinCall() int {
+        const start = self.tok_start
+        self.advance()  // consume @
+        if (self.tok != Token.ident and self.tok != Token.kw_string and self.tok != Token.kw_as) {
+            self.errors.report(start, ErrorCode.e200, "expected builtin name after @")
+            return null_node
+        }
+        const name = if (self.tok == Token.kw_string) { "string" } else if (self.tok == Token.kw_as) { "as" } else { self.tok_text }
+        const kind = builtinFromString(name)
+        self.advance()
+        if (!self.expect(Token.lparen as int)) {
+            return null_node
+        }
+        var type_arg = null_node
+        var args: List(int) = .{}
+        const kind_val = kind orelse 0
+        const bk = @enumFromInt(kind_val) as BuiltinKind
+        switch (bk) {
+            // 0 args
+            .trap, .target, .target_os, .target_arch => {},
+            // 1 type arg only: @sizeOf(T), @alignOf(T), @enumLen(T), @typeName(T), @typeInfo(T), @enumName(T)
+            .size_of, .align_of, .enum_len, .type_name, .enum_name, .type_info => {
+                type_arg = self.parseType()
+            },
+            // 1 type + 1 value: @intCast(T, v), @ptrCast(T, v), @intToPtr(T, v), @as(T, v), etc.
+            .int_cast, .float_cast, .float_from_int, .ptr_cast, .int_to_ptr, .has_field,
+            .bit_cast, .truncate, .@"as", .offset_of, .align_cast => {
+                type_arg = self.parseType()
+                self.expect(Token.comma as int)
+                args.append(self.parseExpr())
+            },
+            // @enumFromInt: try 2-arg (Type, val) else 1-arg (val)
+            .enum_from_int => {
+                // Simple approach: try parsing as type, if comma follows it's 2-arg
+                const saved_pos = self.scanner.pos
+                const saved_ch = self.scanner.ch
+                const saved_tok = self.tok
+                const saved_text = self.tok_text
+                const saved_start = self.tok_start
+                const saved_end = self.tok_end
+                const saved_peek = self.has_peek
+                type_arg = self.parseType()
+                if (self.tok == Token.comma) {
+                    // 2-arg form confirmed
+                    self.advance()
+                    args.append(self.parseExpr())
+                } else {
+                    // 1-arg form — what we parsed as type_arg is actually the value
+                    // Re-parse as expression
+                    self.scanner.pos = saved_pos
+                    self.scanner.ch = saved_ch
+                    self.tok = saved_tok
+                    self.tok_text = saved_text
+                    self.tok_start = saved_start
+                    self.tok_end = saved_end
+                    self.has_peek = saved_peek
+                    type_arg = null_node
+                    args.append(self.parseExpr())
+                }
+            },
+            // 1 value arg
+            .ptr_to_int, .assert, .ptr_of, .len_of, .compile_error,
+            .abs, .ceil, .floor, .trunc, .round, .sqrt,
+            .embed_file, .type_of,
+            .int_from_enum, .tag_name, .error_name, .int_from_bool,
+            .const_cast, .int_from_float,
+            .arc_retain, .arc_release, .panic, .ctz, .clz, .pop_count,
+            .atomic_load => {
+                args.append(self.parseExpr())
+            },
+            // 2 value args
+            .@"string", .assert_eq, .fmin, .fmax, .field, .min, .max,
+            .atomic_store, .atomic_add, .atomic_exchange => {
+                args.append(self.parseExpr())
+                self.expect(Token.comma as int)
+                args.append(self.parseExpr())
+            },
+            // 3 value args
+            .atomic_cas => {
+                args.append(self.parseExpr())
+                self.expect(Token.comma as int)
+                args.append(self.parseExpr())
+                self.expect(Token.comma as int)
+                args.append(self.parseExpr())
+            },
+        }
+        self.expect(Token.rparen as int)
+        return self.ast.addExpr(Expr.builtin_call(BuiltinCallExpr { .kind = kind_val, .type_arg = type_arg, .args = args, .span = self.spanSE(start, self.tok_end) }))
+    }
+
+    /// new Type { fields } or new Type(args) { fields }
+    fn parseNewExpr() int {
+        const start = self.tok_start
+        self.advance()  // consume 'new'
+        if (self.tok != Token.ident) {
+            self.errors.report(start, ErrorCode.e200, "expected type name after new")
+            return null_node
+        }
+        const type_name = self.tok_text
+        self.advance()
+
+        var type_args: List(int) = .{}
+        var ctor_args: List(int) = .{}
+        var fields: List(int) = .{}
+
+        // P5: Type-arg vs constructor-arg disambiguation (Zig parser.zig:1114-1202)
+        // In safe_mode: peek at first token after (. If type-like → type args. Else → ctor args.
+        // Non-safe: ( = type args always.
+        var is_ctor = 0
+        if (self.tok == Token.lparen) {
+            if (self.safe_mode) {
+                // Peek to disambiguate: uppercase ident, *, ?, [, type keyword = type args
+                const pk = self.peekToken()
+                const is_type_like = (@enumFromInt(pk) as Token).isTypeKeyword() or
+                    pk == Token.mul or
+                    pk == Token.question or
+                    pk == Token.lbrack
+                if (is_type_like) {
+                    // Type args
+                    self.advance()  // consume (
+                    while (self.tok != Token.rparen and self.tok != Token.eof) {
+                        type_args.append(self.parseType())
+                        if (!self.match(Token.comma as int)) {
+                            break
+                        }
+                    }
+                    self.expect(Token.rparen as int)
+                } else {
+                    // Constructor args
+                    is_ctor = 1
+                    self.advance()
+                    while (self.tok != Token.rparen and self.tok != Token.eof) {
+                        ctor_args.append(self.parseExpr())
+                        if (!self.match(Token.comma as int)) {
+                            break
+                        }
+                    }
+                    self.expect(Token.rparen as int)
+                }
+            } else {
+                // Non-safe: ( is always type args
+                self.advance()
+                while (self.tok != Token.rparen and self.tok != Token.eof) {
+                    type_args.append(self.parseType())
+                    if (!self.match(Token.comma as int)) {
+                        break
+                    }
+                }
+                self.expect(Token.rparen as int)
+            }
+        }
+
+        // Field initializers
+        if (self.tok == Token.lbrace) {
+            self.advance()
+            while (self.tok != Token.rbrace and self.tok != Token.eof) {
+                const fi = self.parseFieldInit()
+                if (fi != null_node) {
+                    fields.append(fi)
+                }
+                self.match(Token.comma as int)
+            }
+            self.expect(Token.rbrace as int)
+        }
+
+        return self.ast.addExpr(Expr.new_expr(NewExpr { .type_name = type_name, .type_args = type_args, .fields = fields, .constructor_args = ctor_args, .is_constructor = is_ctor == 1, .span = self.spanSE(start, self.tok_end) }))
+    }
+
+    /// Parse field init: .name = expr or name: expr (@safe)
+    fn parseFieldInit() int {
+        const start = self.tok_start
+        if (self.tok == Token.period) {
+            // Standard: .name = expr
+            self.advance()
+            if (self.tok != Token.ident) {
+                return null_node
+            }
+            const name = self.tok_text
+            self.advance()
+            self.expect(Token.assign as int)
+            const value = self.parseExpr()
+            return self.ast.addExpr(Expr.field_init_node(FieldInitNode { .name = name, .value = value, .span = self.spanSE(start, self.tok_end) }))
+        }
+        if (self.tok == Token.ident) {
+            // @safe colon syntax: name: expr
+            const name = self.tok_text
+            self.advance()
+            if (self.match(Token.colon as int)) {
+                const value = self.parseExpr()
+                return self.ast.addExpr(Expr.field_init_node(FieldInitNode { .name = name, .value = value, .span = self.spanSE(start, self.tok_end) }))
+            }
+            // Field shorthand: just `name` means `name: name`
+            const name_node = self.ast.addExpr(Expr.ident(Ident { .name = name, .span = self.spanSE(start, self.tok_end) }))
+            return self.ast.addExpr(Expr.field_init_node(FieldInitNode { .name = name, .value = name_node, .span = self.spanSE(start, self.tok_end) }))
+        }
+        self.errors.report(start, ErrorCode.e200, "expected field initializer")
+        return null_node
+    }
+
+    // ================================================================
+    // Phase C: Statements
+    // ================================================================
+
+    /// Parse a statement.
+    fn parseStmt() int {
+        const tok = @enumFromInt(self.tok) as Token
+        // Label detection: `label: while` or `label: for`
+        if (tok == Token.ident) {
+            if (self.peekToken() == Token.colon) {
+                const label = self.tok_text
+                self.advance()  // consume ident
+                self.advance()  // consume :
+                if (self.tok == Token.kw_while) {
+                    return self.parseWhileStmt(label)
+                }
+                if (self.tok == Token.kw_for) {
+                    return self.parseForStmt(label, 0)
+                }
+                self.errors.report(self.tok_start, ErrorCode.e201, "expected 'while' or 'for' after label")
+                return null_node
+            }
+        }
+        // Block-scoped type declarations (struct/union/enum inside functions/tests)
+        if (tok == Token.kw_struct) {
+            const decl_idx = self.parseStructDecl(0)
+            return self.ast.addStmt(Stmt.expr_stmt(ExprStmt { .expr = decl_idx, .span = self.ast.nodeSpan(decl_idx) }))
+        }
+        if (tok == Token.kw_union) {
+            const decl_idx = self.parseUnionDecl()
+            return self.ast.addStmt(Stmt.expr_stmt(ExprStmt { .expr = decl_idx, .span = self.ast.nodeSpan(decl_idx) }))
+        }
+        if (tok == Token.kw_enum) {
+            const decl_idx = self.parseEnumDecl()
+            return self.ast.addStmt(Stmt.expr_stmt(ExprStmt { .expr = decl_idx, .span = self.ast.nodeSpan(decl_idx) }))
+        }
+        if (tok == Token.kw_packed) {
+            if ((@enumFromInt(self.peekToken()) as Token) == Token.kw_struct) {
+                const decl_idx = self.parseStructDecl(1)
+                return self.ast.addStmt(Stmt.expr_stmt(ExprStmt { .expr = decl_idx, .span = self.ast.nodeSpan(decl_idx) }))
+            }
+        }
+        return switch (tok) {
+            .kw_return => self.parseReturnStmt(),
+            .kw_var, .kw_let => self.parseVarStmt(0),
+            .kw_const => self.parseVarStmt(1),
+            .kw_weak => self.parseWeakVarStmt(),
+            .kw_unowned => self.parseUnownedVarStmt(),
+            .kw_if => self.parseIfStmt(),
+            .kw_while => self.parseWhileStmt(""),
+            .kw_for => self.parseForStmt("", 0),
+            .kw_inline => self.parseInlineFor(),
+            .kw_break => self.parseBreakStmt(),
+            .kw_continue => self.parseContinueStmt(),
+            .kw_defer => self.parseDeferStmt(0),
+            .kw_errdefer => self.parseDeferStmt(1),
+            else => self.parseExprOrAssign(),
+        }
+    }
+
+    fn parseReturnStmt() int {
+        const start = self.tok_start
+        self.advance()  // consume 'return'
+        var value = null_node
+        // Return has a value if the next token isn't a statement-ending token
+        if (self.tok != Token.rbrace and self.tok != Token.eof and self.tok != Token.semicolon) {
+            value = self.parseExpr()
+        }
+        self.match(Token.semicolon as int)
+        return self.ast.addStmt(Stmt.return_stmt(ReturnStmt { .value = value, .span = self.spanSE(start, self.tok_end) }))
+    }
+
+    fn parseVarStmt(is_const: int) int {
+        const start = self.tok_start
+        self.advance()  // consume const/var/let
+        if (self.tok != Token.ident) {
+            // P11: keyword-as-name error (Zig parser.zig:1711-1717)
+            if ((@enumFromInt(self.tok) as Token).isKeyword()) {
+                self.errors.report(self.tok_start, ErrorCode.e203, "keyword cannot be used as variable name")
+            } else {
+                self.errors.report(self.tok_start, ErrorCode.e203, "expected variable name")
+            }
+            return null_node
+        }
+        const name = self.tok_text
+        const name_start = self.tok_start
+        self.advance()
+        var type_expr = null_node
+        if (self.match(Token.colon as int)) {
+            type_expr = self.parseType()
+        }
+        // Destructuring: const a, b = expr
+        if (self.tok == Token.comma) {
+            return self.parseDestructureStmtFrom(name, type_expr, name_start, start, is_const)
+        }
+        var value = null_node
+        if (self.match(Token.assign as int)) {
+            value = self.parseExpr()
+        }
+        self.match(Token.semicolon as int)
+        return self.ast.addStmt(Stmt.var_stmt(VarStmt { .name = name, .type_expr = type_expr, .value = value, .is_const = is_const == 1, .is_weak = false, .is_unowned = false, .span = self.spanSE(start, self.tok_end) }))
+    }
+
+    fn parseWeakVarStmt() int {
+        self.advance()  // consume 'weak'
+        const start = self.tok_start
+        const is_const = if (self.tok == Token.kw_const) { 1 } else { 0 }
+        self.advance()  // consume var/const
+        if (self.tok != Token.ident) {
+            self.errors.report(self.tok_start, ErrorCode.e203, "expected variable name")
+            return null_node
+        }
+        const name = self.tok_text
+        self.advance()
+        var type_expr = null_node
+        if (self.match(Token.colon as int)) {
+            type_expr = self.parseType()
+        }
+        var value = null_node
+        if (self.match(Token.assign as int)) {
+            value = self.parseExpr()
+        }
+        self.match(Token.semicolon as int)
+        return self.ast.addStmt(Stmt.var_stmt(VarStmt { .name = name, .type_expr = type_expr, .value = value, .is_const = is_const == 1, .is_weak = true, .is_unowned = false, .span = self.spanSE(start, self.tok_end) }))
+    }
+
+    fn parseUnownedVarStmt() int {
+        self.advance()  // consume 'unowned'
+        const start = self.tok_start
+        const is_const = if (self.tok == Token.kw_const) { 1 } else { 0 }
+        self.advance()  // consume var/const
+        if (self.tok != Token.ident) {
+            self.errors.report(self.tok_start, ErrorCode.e203, "expected variable name")
+            return null_node
+        }
+        const name = self.tok_text
+        self.advance()
+        var type_expr = null_node
+        if (self.match(Token.colon as int)) {
+            type_expr = self.parseType()
+        }
+        var value = null_node
+        if (self.match(Token.assign as int)) {
+            value = self.parseExpr()
+        }
+        self.match(Token.semicolon as int)
+        return self.ast.addStmt(Stmt.var_stmt(VarStmt { .name = name, .type_expr = type_expr, .value = value, .is_const = is_const == 1, .is_weak = false, .is_unowned = true, .span = self.spanSE(start, self.tok_end) }))
+    }
+
+    /// if (cond) |cap| { then } else { else }
+    fn parseIfStmt() int {
+        const start = self.tok_start
+        self.advance()  // consume 'if'
+        if (!self.expect(Token.lparen as int)) {
+            return null_node
+        }
+        const cond = self.parseExpr()
+        if (!self.expect(Token.rparen as int)) {
+            return null_node
+        }
+        var capture = ""
+        var capture_is_ptr = false
+        if (self.tok == Token.@"or") {
+            self.advance()
+            if (self.tok == Token.mul) {
+                capture_is_ptr = true
+                self.advance()
+            }
+            if (self.tok == Token.ident) {
+                capture = self.tok_text
+                self.advance()
+            }
+            self.expect(Token.@"or" as int)
+        }
+        // P8: braceless then/else support (Zig parser.zig:1818-1826)
+        var then_br = null_node
+        if (self.tok == Token.lbrace) {
+            then_br = self.parseBlock()
+        } else {
+            then_br = self.parseStmt()
+        }
+        var else_br = null_node
+        if (self.match(Token.kw_else as int)) {
+            if (self.tok == Token.kw_if) {
+                else_br = self.parseIfStmt()
+            } else if (self.tok == Token.lbrace) {
+                else_br = self.parseBlock()
+            } else {
+                else_br = self.parseStmt()
+            }
+        }
+        return self.ast.addStmt(Stmt.if_stmt(IfStmt { .condition = cond, .then_branch = then_br, .else_branch = else_br, .capture = capture, .capture_is_ptr = capture_is_ptr, .span = self.spanSE(start, self.tok_end) }))
+    }
+
+    /// while (cond) |cap| : (continue_expr) { body }
+    fn parseWhileStmt(label: string) int {
+        const start = self.tok_start
+        self.advance()  // consume 'while'
+        if (!self.expect(Token.lparen as int)) {
+            return null_node
+        }
+        const cond = self.parseExpr()
+        if (!self.expect(Token.rparen as int)) {
+            return null_node
+        }
+        var capture = ""
+        var capture_is_ptr = false
+        if (self.tok == Token.@"or") {
+            self.advance()
+            if (self.tok == Token.mul) {
+                capture_is_ptr = true
+                self.advance()
+            }
+            if (self.tok == Token.ident) {
+                capture = self.tok_text
+                self.advance()
+            }
+            self.expect(Token.@"or" as int)
+        }
+        // P6: continue expression with assignment (Zig parser.zig:1841-1852)
+        var cont = null_node
+        if (self.match(Token.colon as int)) {
+            if (self.match(Token.lparen as int)) {
+                cont = self.parseExpr()
+                // Check for assignment in continue expr: : (x = x + 1)
+                if ((@enumFromInt(self.tok) as Token).isAssignment()) {
+                    const op = self.tok
+                    self.advance()
+                    const rhs = self.parseExpr()
+                    cont = self.ast.addStmt(Stmt.assign_stmt(AssignStmt { .target = cont, .op = op, .value = rhs, .span = self.spanSE(start, self.tok_end) }))
+                }
+                self.expect(Token.rparen as int)
+            }
+        }
+        const body = self.parseBlock()
+        return self.ast.addStmt(Stmt.while_stmt(WhileStmt { .condition = cond, .body = body, .capture = capture, .capture_is_ptr = capture_is_ptr, .continue_expr = cont, .label = label, .span = self.spanSE(start, self.tok_end) }))
+    }
+
+    /// for item in iterable { body } or for i in 0..10 { body }
+    fn parseForStmt(label: string, is_inline: int) int {
+        const start = self.tok_start
+        self.advance()  // consume 'for'
+        // Binding name
+        if (self.tok != Token.ident) {
+            self.errors.report(self.tok_start, ErrorCode.e203, "expected loop variable name")
+            return null_node
+        }
+        const first_binding = self.tok_text
+        self.advance()
+        // Check for indexed iteration: for i, item in collection
+        // Zig parser.zig:1864-1876: first=index, second=value
+        var binding = first_binding
+        var index_binding = ""
+        if (self.match(Token.comma as int)) {
+            if (self.tok == Token.ident) {
+                index_binding = first_binding
+                binding = self.tok_text
+                self.advance()
+            }
+        }
+        self.expect(Token.kw_in as int)
+        // Range (0..10) or iterable
+        const range_or_iter = self.parseExpr()
+        var range_start = null_node
+        var range_end = null_node
+        var iterable = null_node
+        if (self.tok == Token.period_period) {
+            // Range: start..end
+            self.advance()
+            range_start = range_or_iter
+            range_end = self.parseExpr()
+        } else {
+            iterable = range_or_iter
+        }
+        const body = self.parseBlock()
+        return self.ast.addStmt(Stmt.for_stmt(ForStmt { .binding = binding, .index_binding = index_binding, .iterable = iterable, .range_start = range_start, .range_end = range_end, .body = body, .is_inline = is_inline == 1, .label = label, .span = self.spanSE(start, self.tok_end) }))
+    }
+
+    fn parseInlineFor() int {
+        self.advance()  // consume 'inline'
+        if (self.tok != Token.kw_for) {
+            self.errors.report(self.tok_start, ErrorCode.e200, "expected for after inline")
+            return null_node
+        }
+        return self.parseForStmt("", 1)
+    }
+
+    /// P9: fix colon-label syntax (Zig parser.zig:1631-1636)
+    fn parseBreakStmt() int {
+        const start = self.tok_start
+        self.advance()  // consume 'break'
+        var label = ""
+        var value = null_node
+        if (self.tok == Token.colon) {
+            self.advance()  // consume ':'
+            if (self.tok == Token.ident) {
+                label = self.tok_text
+                self.advance()
+            }
+            // Labeled break with value: break :label expr
+            if (self.tok != Token.rbrace and self.tok != Token.semicolon as int and self.tok != Token.eof) {
+                value = self.parseExpr()
+            }
+        } else if (self.tok == Token.ident) {
+            label = self.tok_text
+            self.advance()
+        }
+        self.match(Token.semicolon as int)
+        return self.ast.addStmt(Stmt.break_stmt(BreakStmt { .label = label, .value = value, .span = self.spanSE(start, self.tok_end) }))
+    }
+
+    fn parseContinueStmt() int {
+        const start = self.tok_start
+        self.advance()  // consume 'continue'
+        var label = ""
+        if (self.tok == Token.ident) {
+            label = self.tok_text
+            self.advance()
+        }
+        self.match(Token.semicolon as int)
+        return self.ast.addStmt(Stmt.continue_stmt(ContinueStmt { .label = label, .span = self.spanSE(start, self.tok_end) }))
+    }
+
+    /// P1: defer with assignment support (Zig parser.zig:1645-1670)
+    fn parseDeferStmt(is_errdefer: int) int {
+        const start = self.tok_start
+        self.advance()  // consume 'defer'/'errdefer'
+        var expr = null_node
+        if (self.tok == Token.lbrace) {
+            expr = self.parseBlock()
+        } else {
+            expr = self.parseExpr()
+            // Check for assignment after expression (defer x = y)
+            if ((@enumFromInt(self.tok) as Token).isAssignment()) {
+                const op = self.tok
+                self.advance()
+                const rhs = self.parseExpr()
+                expr = self.ast.addStmt(Stmt.assign_stmt(AssignStmt { .target = expr, .op = op, .value = rhs, .span = self.spanSE(start, self.tok_end) }))
+            }
+        }
+        self.match(Token.semicolon as int)
+        return self.ast.addStmt(Stmt.defer_stmt(DeferStmt { .expr = expr, .is_errdefer = is_errdefer == 1, .span = self.spanSE(start, self.tok_end) }))
+    }
+
+    /// Destructure statement: const a, b = expr (called after first binding parsed)
+    fn parseDestructureStmtFrom(first_name: string, first_type: int, first_start: int, start: int, is_const: int) int {
+        var bindings: List(int) = .{}
+        bindings.append(self.ast.addExpr(Expr.destructure_bind(DestructureBindNode { .name = first_name, .type_expr = first_type, .span = self.spanSE(first_start, self.tok_end) })))
+        while (self.match(Token.comma as int)) {
+            if (self.tok != Token.ident) {
+                self.errors.report(self.tok_start, ErrorCode.e203, "expected variable name")
+                break
+            }
+            const bname = self.tok_text
+            const bstart = self.tok_start
+            self.advance()
+            var btype = null_node
+            if (self.match(Token.colon as int)) {
+                btype = self.parseType()
+            }
+            bindings.append(self.ast.addExpr(Expr.destructure_bind(DestructureBindNode { .name = bname, .type_expr = btype, .span = self.spanSE(bstart, self.tok_end) })))
+        }
+        if (!self.expect(Token.assign as int)) {
+            return null_node
+        }
+        const value = self.parseExpr()
+        self.match(Token.semicolon as int)
+        return self.ast.addStmt(Stmt.destructure_stmt(DestructureStmt { .bindings = bindings, .value = value, .is_const = is_const == 1, .span = self.spanSE(start, self.tok_end) }))
+    }
+
+    /// Expression statement or assignment: expr = value
+    fn parseExprOrAssign() int {
+        const start = self.tok_start
+        const expr = self.parseExpr()
+        if (expr == null_node) {
+            return null_node
+        }
+        const tok = @enumFromInt(self.tok) as Token
+        if (tok.isAssignment()) {
+            const op = self.tok
+            self.advance()
+            const value = self.parseExpr()
+            self.match(Token.semicolon as int)
+            return self.ast.addStmt(Stmt.assign_stmt(AssignStmt { .target = expr, .op = op, .value = value, .span = self.spanSE(start, self.tok_end) }))
+        }
+        self.match(Token.semicolon as int)
+        return self.ast.addStmt(Stmt.expr_stmt(ExprStmt { .expr = expr, .span = self.spanSE(start, self.tok_end) }))
+    }
+
+    // ================================================================
+    // Phase D: Block + Type parsing
+    // ================================================================
+
+    /// Parse a { ... } block.
+    fn parseBlock() int {
+        const start = self.tok_start
+        if (!self.expect(Token.lbrace as int)) {
+            return null_node
+        }
+        var stmts: List(int) = .{}
+        while (self.tok != Token.rbrace and self.tok != Token.eof) {
+            const prev_pos = self.tok_start
+            const s = self.parseStmt()
+            if (s != null_node) {
+                stmts.append(s)
+            } else if (self.tok_start == prev_pos) {
+                // No progress — skip token to prevent infinite loop
+                self.advance()
+            }
+        }
+        self.expect(Token.rbrace as int)
+        return self.ast.addStmt(Stmt.block_stmt(BlockStmt { .stmts = stmts, .span = self.spanSE(start, self.tok_end) }))
+    }
+
+    /// Parse a type expression.
+    fn parseType() int {
+        const start = self.tok_start
+        // P3: @TypeOf(expr) in type position (Zig parser.zig:757-759)
+        if (self.tok == Token.at) {
+            return self.parseBuiltinCall()
+        }
+        // Optional prefix: ?, *, !
+        if (self.tok == Token.question) {
+            self.advance()
+            const inner = self.parseType()
+            return self.ast.addExpr(Expr.type_expr(TypeExprNode { .kind = TYPE_OPTIONAL, .data1 = inner, .data2 = null_node, .span = self.spanSE(start, self.tok_end) }))
+        }
+        if (self.tok == Token.mul) {
+            self.advance()
+            const inner = self.parseType()
+            return self.ast.addExpr(Expr.type_expr(TypeExprNode { .kind = TYPE_POINTER, .data1 = inner, .data2 = null_node, .span = self.spanSE(start, self.tok_end) }))
+        }
+        if (self.tok == Token.lnot) {
+            self.advance()
+            const inner = self.parseType()
+            return self.ast.addExpr(Expr.type_expr(TypeExprNode { .kind = TYPE_ERROR_UNION, .data1 = inner, .data2 = null_node, .span = self.spanSE(start, self.tok_end) }))
+        }
+        // Slice: []T
+        if (self.tok == Token.lbrack) {
+            self.advance()
+            if (self.tok == Token.rbrack) {
+                self.advance()
+                const elem = self.parseType()
+                return self.ast.addExpr(Expr.type_expr(TypeExprNode { .kind = TYPE_SLICE, .data1 = elem, .data2 = null_node, .span = self.spanSE(start, self.tok_end) }))
+            }
+            // Array: [N]T
+            const size_expr = self.parseExpr()
+            self.expect(Token.rbrack as int)
+            const elem = self.parseType()
+            return self.ast.addExpr(Expr.type_expr(TypeExprNode { .kind = TYPE_ARRAY, .data1 = elem, .data2 = size_expr, .span = self.spanSE(start, self.tok_end) }))
+        }
+        // Tuple type: (T1, T2, ...)
+        if (self.tok == Token.lparen) {
+            self.advance()  // consume (
+            const first = self.parseType()
+            if (self.match(Token.comma as int)) {
+                // It's a tuple type
+                var elems: List(int) = .{}
+                elems.append(first)
+                while (self.tok != Token.rparen and self.tok != Token.eof) {
+                    elems.append(self.parseType())
+                    if (!self.match(Token.comma as int)) {
+                        break
+                    }
+                }
+                self.expect(Token.rparen as int)
+                return self.ast.addExpr(Expr.tuple_type(TupleTypeNode { .elements = elems, .span = self.spanSE(start, self.tok_end) }))
+            }
+            // Single type in parens — just grouping
+            self.expect(Token.rparen as int)
+            return first
+        }
+        // Named type or keyword type
+        if (self.tok == Token.ident or (@enumFromInt(self.tok) as Token).isTypeKeyword()) {
+            var name = self.tok_text
+            self.advance()
+            // P2: Nested type namespace: Outer.Inner (Zig parser.zig:765-771)
+            if (self.tok == Token.period and self.peekToken() == Token.ident) {
+                const outer = name
+                self.advance()  // consume '.'
+                const inner = self.tok_text
+                self.advance()  // consume inner ident
+                name = "${outer}_${inner}"
+            }
+            // Check for generic: Type(Args)
+            if (self.tok == Token.lparen) {
+                const name_node = self.ast.addExpr(Expr.ident(Ident { .name = name, .span = self.spanSE(start, self.tok_end) }))
+                self.advance()  // consume (
+                var type_args: List(int) = .{}
+                while (self.tok != Token.rparen and self.tok != Token.eof) {
+                    type_args.append(self.parseType())
+                    if (!self.match(Token.comma as int)) {
+                        break
+                    }
+                }
+                self.expect(Token.rparen as int)
+                // Check for GenericType!T (named error union with generic error set)
+                if (self.tok == Token.lnot) {
+                    const error_set = self.ast.addExpr(Expr.generic_instance(GenericInstanceExpr { .name = name, .type_args = type_args, .span = self.spanSE(start, self.tok_end) }))
+                    self.advance()
+                    const inner = self.parseType()
+                    return self.ast.addExpr(Expr.type_expr(TypeExprNode { .kind = TYPE_ERROR_UNION, .data1 = inner, .data2 = error_set, .span = self.spanSE(start, self.tok_end) }))
+                }
+                return self.ast.addExpr(Expr.generic_instance(GenericInstanceExpr { .name = name, .type_args = type_args, .span = self.spanSE(start, self.tok_end) }))
+            }
+            // Check for E!T (named error union)
+            if (self.tok == Token.lnot) {
+                const error_set = self.ast.addExpr(Expr.ident(Ident { .name = name, .span = self.spanSE(start, self.tok_end) }))
+                self.advance()
+                const inner = self.parseType()
+                return self.ast.addExpr(Expr.type_expr(TypeExprNode { .kind = TYPE_ERROR_UNION, .data1 = inner, .data2 = error_set, .span = self.spanSE(start, self.tok_end) }))
+            }
+            const name_idx = self.ast.addExpr(Expr.ident(Ident { .name = name, .span = self.spanSE(start, self.tok_end) }))
+            return self.ast.addExpr(Expr.type_expr(TypeExprNode { .kind = TYPE_NAMED, .data1 = name_idx, .data2 = null_node, .span = self.spanSE(start, self.tok_end) }))
+        }
+        // fn type
+        if (self.tok == Token.kw_fn) {
+            return self.parseFnType(start)
+        }
+        self.errors.report(start, ErrorCode.e202, "expected type")
+        return null_node
+    }
+
+    /// P4: parseFnType stores param type nodes (Zig parser.zig:831-844)
+    /// Params encoded as: data2 = param_count, param type nodes added as consecutive
+    /// exprs before the fn type node, recoverable by offset from the fn type node index.
+    fn parseFnType(start: int) int {
+        // Ported from parser.zig:800-812: fn(Type, Type) -> RetType
+        self.advance()  // consume 'fn'
+        self.expect(Token.lparen as int)
+        // Parse function type parameter types and store them as nodes
+        var param_types: List(int) = .{}
+        while (self.tok != Token.rparen and self.tok != Token.eof) {
+            const pt = self.parseType()
+            param_types.append(pt)
+            if (!self.match(Token.comma as int)) {
+                break
+            }
+        }
+        self.expect(Token.rparen as int)
+        // Return type after '->'
+        var ret = null_node
+        if (self.match(Token.arrow as int)) {
+            ret = self.parseType()
+        }
+        return self.ast.addExpr(Expr.type_expr(TypeExprNode { .kind = TYPE_FUNCTION, .data1 = ret, .data2 = param_types.count, .span = self.spanSE(start, self.tok_end) }))
+    }
+
+    // ================================================================
+    // Phase G: Error recovery
+    // ================================================================
+
+    /// Skip tokens until we find a declaration-starting keyword.
+    /// Used for error recovery after parse errors.
+    fn synchronize() void {
+        while (self.tok != Token.eof) {
+            const tok = @enumFromInt(self.tok) as Token
+            if (tok == Token.kw_fn or tok == Token.kw_const or tok == Token.kw_var or
+                tok == Token.kw_struct or tok == Token.kw_enum or tok == Token.kw_union or
+                tok == Token.kw_impl or tok == Token.kw_trait or tok == Token.kw_import or
+                tok == Token.kw_test or tok == Token.kw_bench or tok == Token.kw_type or
+                tok == Token.kw_extern) {
+                return
+            }
+            self.advance()
+        }
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+test "parser init" {
+    const src = "const x = 42"
+    var s = Scanner.init(src)
+    var ast = Ast.init("test.cot")
+    var errors = ErrorReporter.init()
+    var p = Parser.init(s, ast, errors)
+    @assertEq(errors.hasErrors(), false)
+    // Verify first token was loaded
+    @assertEq(p.tok, Token.kw_const as int)
+}
+
+test "parse import" {
+    const src = "import \"std/list\""
+    var s = Scanner.init(src)
+    var ast = Ast.init("test.cot")
+    var errors = ErrorReporter.init()
+    var p = Parser.init(s, ast, errors)
+    p.parseFile()
+    @assertEq(errors.errorCount(), 0)
+    @assertEq(ast.file_decls.count, 1)
+    @assertEq(nodeDeclTag(ast, ast.file_decls.get(0)), "import_decl")
+}
+
+test "parse const decl" {
+    const src = "const x = 42"
+    var s = Scanner.init(src)
+    var ast = Ast.init("test.cot")
+    var errors = ErrorReporter.init()
+    var p = Parser.init(s, ast, errors)
+    p.parseFile()
+    @assertEq(errors.errorCount(), 0)
+    @assertEq(ast.file_decls.count, 1)
+    @assertEq(nodeDeclTag(ast, ast.file_decls.get(0)), "var_decl")
+}
+
+test "parse fn decl" {
+    const src = "fn main() void { return }"
+    var s = Scanner.init(src)
+    var ast = Ast.init("test.cot")
+    var errors = ErrorReporter.init()
+    var p = Parser.init(s, ast, errors)
+    p.parseFile()
+    @assertEq(errors.errorCount(), 0)
+    @assertEq(ast.file_decls.count, 1)
+    @assertEq(nodeDeclTag(ast, ast.file_decls.get(0)), "fn_decl")
+}
+
+test "parse test decl" {
+    const src = "test \"basic\" { @assertEq(1, 1) }"
+    var s = Scanner.init(src)
+    var ast = Ast.init("test.cot")
+    var errors = ErrorReporter.init()
+    var p = Parser.init(s, ast, errors)
+    p.parseFile()
+    @assertEq(errors.hasErrors(), false)
+    @assertEq(ast.file_decls.count, 1)
+    @assertEq(nodeDeclTag(ast, ast.file_decls.get(0)), "test_decl")
+}
+
+test "parse struct decl" {
+    const src = "struct Point { x: int, y: int }"
+    var s = Scanner.init(src)
+    var ast = Ast.init("test.cot")
+    var errors = ErrorReporter.init()
+    var p = Parser.init(s, ast, errors)
+    p.parseFile()
+    @assertEq(errors.hasErrors(), false)
+    @assertEq(ast.file_decls.count, 1)
+    @assertEq(nodeDeclTag(ast, ast.file_decls.get(0)), "struct_decl")
+}
+
+test "parse multiple decls" {
+    const src = "import \"std/list\"\nconst x = 1\nfn foo() void { }"
+    var s = Scanner.init(src)
+    var ast = Ast.init("test.cot")
+    var errors = ErrorReporter.init()
+    var p = Parser.init(s, ast, errors)
+    p.parseFile()
+    @assertEq(errors.hasErrors(), false)
+    @assertEq(ast.file_decls.count, 3)
+}
+
+test "parse binary expr" {
+    const src = "const x = 1 + 2 * 3"
+    var s = Scanner.init(src)
+    var ast = Ast.init("test.cot")
+    var errors = ErrorReporter.init()
+    var p = Parser.init(s, ast, errors)
+    p.parseFile()
+    @assertEq(errors.hasErrors(), false)
+    @assertEq(ast.file_decls.count, 1)
+}
+
+test "parse if stmt" {
+    const src = "fn f() void { if (x > 0) { return x } }"
+    var s = Scanner.init(src)
+    var ast = Ast.init("test.cot")
+    var errors = ErrorReporter.init()
+    var p = Parser.init(s, ast, errors)
+    p.parseFile()
+    @assertEq(errors.hasErrors(), false)
+}
+
+test "parse while stmt" {
+    const src = "fn f() void { while (true) { break } }"
+    var s = Scanner.init(src)
+    var ast = Ast.init("test.cot")
+    var errors = ErrorReporter.init()
+    var p = Parser.init(s, ast, errors)
+    p.parseFile()
+    @assertEq(errors.hasErrors(), false)
+}
+
+test "parse for stmt" {
+    const src = "fn f() void { for i in 0..10 { } }"
+    var s = Scanner.init(src)
+    var ast = Ast.init("test.cot")
+    var errors = ErrorReporter.init()
+    var p = Parser.init(s, ast, errors)
+    p.parseFile()
+    @assertEq(errors.hasErrors(), false)
+}
+
+// ============================================================================
+// Phase E: Complex expressions
+// ============================================================================
+
+test "parse builtin call" {
+    const src = "fn f() void { @assertEq(1, 2) }"
+    var s = Scanner.init(src)
+    var ast = Ast.init("test.cot")
+    var errors = ErrorReporter.init()
+    var p = Parser.init(s, ast, errors)
+    p.parseFile()
+    @assertEq(errors.hasErrors(), false)
+}
+
+test "parse closure expr" {
+    const src = "const f = fn(x: int) int { return x * 2 }"
+    var s = Scanner.init(src)
+    var ast = Ast.init("test.cot")
+    var errors = ErrorReporter.init()
+    var p = Parser.init(s, ast, errors)
+    p.parseFile()
+    @assertEq(errors.hasErrors(), false)
+    @assertEq(ast.file_decls.count, 1)
+}
+
+test "parse struct init" {
+    const src = "fn f() void { const p = Point { .x = 1, .y = 2 } }"
+    var s = Scanner.init(src)
+    var ast = Ast.init("test.cot")
+    var errors = ErrorReporter.init()
+    var p = Parser.init(s, ast, errors)
+    p.parseFile()
+    @assertEq(errors.hasErrors(), false)
+}
+
+test "parse anon struct literal" {
+    const src = "fn f() void { const p = .{ .x = 1, .y = 2 } }"
+    var s = Scanner.init(src)
+    var ast = Ast.init("test.cot")
+    var errors = ErrorReporter.init()
+    var p = Parser.init(s, ast, errors)
+    p.parseFile()
+    @assertEq(errors.hasErrors(), false)
+}
+
+// ============================================================================
+// Phase F: Labels, destructuring, inline types, backtracking
+// ============================================================================
+
+test "parse enum decl" {
+    const src = "const Color = enum { red, green, blue }"
+    var s = Scanner.init(src)
+    var ast = Ast.init("test.cot")
+    var errors = ErrorReporter.init()
+    var p = Parser.init(s, ast, errors)
+    p.parseFile()
+    @assertEq(errors.hasErrors(), false)
+    @assertEq(ast.file_decls.count, 1)
+    @assertEq(nodeDeclTag(ast, ast.file_decls.get(0)), "enum_decl")
+}
+
+test "parse enum with backing type" {
+    const src = "const Flags = enum(u8) { a = 1, b = 2, c = 4 }"
+    var s = Scanner.init(src)
+    var ast = Ast.init("test.cot")
+    var errors = ErrorReporter.init()
+    var p = Parser.init(s, ast, errors)
+    p.parseFile()
+    @assertEq(errors.hasErrors(), false)
+    @assertEq(ast.file_decls.count, 1)
+    @assertEq(nodeDeclTag(ast, ast.file_decls.get(0)), "enum_decl")
+}
+
+test "parse error set decl" {
+    const src = "const FileError = error { NotFound, PermissionDenied, IoError }"
+    var s = Scanner.init(src)
+    var ast = Ast.init("test.cot")
+    var errors = ErrorReporter.init()
+    var p = Parser.init(s, ast, errors)
+    p.parseFile()
+    @assertEq(errors.hasErrors(), false)
+    @assertEq(ast.file_decls.count, 1)
+    @assertEq(nodeDeclTag(ast, ast.file_decls.get(0)), "error_set_decl")
+}
+
+test "parse union decl" {
+    const src = "const Value = union { int_val: int, str_val: string }"
+    var s = Scanner.init(src)
+    var ast = Ast.init("test.cot")
+    var errors = ErrorReporter.init()
+    var p = Parser.init(s, ast, errors)
+    p.parseFile()
+    @assertEq(errors.hasErrors(), false)
+    @assertEq(ast.file_decls.count, 1)
+    @assertEq(nodeDeclTag(ast, ast.file_decls.get(0)), "union_decl")
+}
+
+test "parse inline struct decl" {
+    const src = "const Pair = struct { a: int, b: int }"
+    var s = Scanner.init(src)
+    var ast = Ast.init("test.cot")
+    var errors = ErrorReporter.init()
+    var p = Parser.init(s, ast, errors)
+    p.parseFile()
+    @assertEq(errors.hasErrors(), false)
+    @assertEq(ast.file_decls.count, 1)
+    @assertEq(nodeDeclTag(ast, ast.file_decls.get(0)), "struct_decl")
+}
+
+test "parse const non-type backtrack" {
+    // const x = regular_expr must backtrack when '=' is not followed by a type keyword
+    const src = "const x = 42\nconst y = x + 1"
+    var s = Scanner.init(src)
+    var ast = Ast.init("test.cot")
+    var errors = ErrorReporter.init()
+    var p = Parser.init(s, ast, errors)
+    p.parseFile()
+    @assertEq(errors.hasErrors(), false)
+    @assertEq(ast.file_decls.count, 2)
+    @assertEq(nodeDeclTag(ast, ast.file_decls.get(0)), "var_decl")
+    @assertEq(nodeDeclTag(ast, ast.file_decls.get(1)), "var_decl")
+}
+
+test "parse labeled while" {
+    const src = "fn f() void { outer: while (true) { break } }"
+    var s = Scanner.init(src)
+    var ast = Ast.init("test.cot")
+    var errors = ErrorReporter.init()
+    var p = Parser.init(s, ast, errors)
+    p.parseFile()
+    @assertEq(errors.hasErrors(), false)
+}
+
+test "parse labeled for" {
+    const src = "fn f() void { outer: for i in 0..10 { break } }"
+    var s = Scanner.init(src)
+    var ast = Ast.init("test.cot")
+    var errors = ErrorReporter.init()
+    var p = Parser.init(s, ast, errors)
+    p.parseFile()
+    @assertEq(errors.hasErrors(), false)
+}
+
+test "parse fn type simple" {
+    const src = "const f: fn(int) -> int = null"
+    var s = Scanner.init(src)
+    var ast = Ast.init("test.cot")
+    var errors = ErrorReporter.init()
+    var p = Parser.init(s, ast, errors)
+    p.parseFile()
+    @assertEq(errors.errorCount(), 0)
+    @assertEq(ast.file_decls.count, 1)
+}
+
+test "parse fn type as param" {
+    const src = "fn apply(f: fn(int) -> int, x: int) int { return f(x) }"
+    var s = Scanner.init(src)
+    var ast = Ast.init("test.cot")
+    var errors = ErrorReporter.init()
+    var p = Parser.init(s, ast, errors)
+    p.parseFile()
+    @assertEq(errors.errorCount(), 0)
+    @assertEq(ast.file_decls.count, 1)
+}
+
+test "parse mixed inline types" {
+    const src = "const Color = enum { red }\nconst E = error { Fail }\nconst x = 42"
+    var s = Scanner.init(src)
+    var ast = Ast.init("test.cot")
+    var errors = ErrorReporter.init()
+    var p = Parser.init(s, ast, errors)
+    p.parseFile()
+    @assertEq(errors.hasErrors(), false)
+    @assertEq(ast.file_decls.count, 3)
+    @assertEq(nodeDeclTag(ast, ast.file_decls.get(0)), "enum_decl")
+    @assertEq(nodeDeclTag(ast, ast.file_decls.get(1)), "error_set_decl")
+    @assertEq(nodeDeclTag(ast, ast.file_decls.get(2)), "var_decl")
+}
+
+test "parse impl block with param" {
+    const src = "impl Foo { fn bar(x: int) int { return 0 } }"
+    var s = Scanner.init(src)
+    var ast = Ast.init("test.cot")
+    var errors = ErrorReporter.init()
+    var p = Parser.init(s, ast, errors)
+    p.parseFile()
+    @assertEq(errors.errorCount(), 0)
+    @assertEq(ast.file_decls.count, 1)
+    @assertEq(nodeDeclTag(ast, ast.file_decls.get(0)), "impl_block")
+}
+
+test "parse generic fn" {
+    const src = "fn max(T)(a: T, b: T) T { return a }"
+    var s = Scanner.init(src)
+    var ast = Ast.init("test.cot")
+    var errors = ErrorReporter.init()
+    var p = Parser.init(s, ast, errors)
+    p.parseFile()
+    @assertEq(errors.errorCount(), 0)
+    @assertEq(ast.file_decls.count, 1)
+    @assertEq(nodeDeclTag(ast, ast.file_decls.get(0)), "fn_decl")
+}
+
+test "parse generic impl block" {
+    const src = "impl List(T) { fn push(val: T) void { return } }"
+    var s = Scanner.init(src)
+    var ast = Ast.init("test.cot")
+    var errors = ErrorReporter.init()
+    var p = Parser.init(s, ast, errors)
+    p.parseFile()
+    @assertEq(errors.errorCount(), 0)
+    @assertEq(ast.file_decls.count, 1)
+    @assertEq(nodeDeclTag(ast, ast.file_decls.get(0)), "impl_block")
+}
+
+test "parse orelse expr" {
+    const src = "fn f(x: ?int) int { return x orelse 0 }"
+    var s = Scanner.init(src)
+    var ast = Ast.init("test.cot")
+    var errors = ErrorReporter.init()
+    var p = Parser.init(s, ast, errors)
+    p.parseFile()
+    @assertEq(errors.errorCount(), 0)
+    @assertEq(ast.file_decls.count, 1)
+    @assertEq(nodeDeclTag(ast, ast.file_decls.get(0)), "fn_decl")
+}
+
+test "parse orelse return" {
+    const src = "fn f(x: ?int) int { const v = x orelse return }"
+    var s = Scanner.init(src)
+    var ast = Ast.init("test.cot")
+    var errors = ErrorReporter.init()
+    var p = Parser.init(s, ast, errors)
+    p.parseFile()
+    @assertEq(errors.errorCount(), 0)
+    @assertEq(ast.file_decls.count, 1)
+    @assertEq(nodeDeclTag(ast, ast.file_decls.get(0)), "fn_decl")
+}
+
+test "parse impl trait for type" {
+    const src = "impl Display for Point { fn toString(s: *Point) string { return \"\" } }"
+    var s = Scanner.init(src)
+    var ast = Ast.init("test.cot")
+    var errors = ErrorReporter.init()
+    var p = Parser.init(s, ast, errors)
+    p.parseFile()
+    @assertEq(errors.errorCount(), 0)
+    @assertEq(ast.file_decls.count, 1)
+    @assertEq(nodeDeclTag(ast, ast.file_decls.get(0)), "impl_trait")
+}
+
+test "parse where clause" {
+    const src = "fn sort(T)(list: *T) void where T: Ord { return }"
+    var s = Scanner.init(src)
+    var ast = Ast.init("test.cot")
+    var errors = ErrorReporter.init()
+    var p = Parser.init(s, ast, errors)
+    p.parseFile()
+    @assertEq(errors.errorCount(), 0)
+    @assertEq(ast.file_decls.count, 1)
+    @assertEq(nodeDeclTag(ast, ast.file_decls.get(0)), "fn_decl")
+}
+
+test "parse where clause multi" {
+    const src = "fn combine(T, U)(a: T, b: U) int where T: Display, U: Clone { return 0 }"
+    var s = Scanner.init(src)
+    var ast = Ast.init("test.cot")
+    var errors = ErrorReporter.init()
+    var p = Parser.init(s, ast, errors)
+    p.parseFile()
+    @assertEq(errors.errorCount(), 0)
+    @assertEq(ast.file_decls.count, 1)
+    @assertEq(nodeDeclTag(ast, ast.file_decls.get(0)), "fn_decl")
+}
+
+test "parse switch range pattern" {
+    const src = "fn f(x: int) int { return switch (x) { 1..5 => 1, else => 0 } }"
+    var s = Scanner.init(src)
+    var ast = Ast.init("test.cot")
+    var errors = ErrorReporter.init()
+    var p = Parser.init(s, ast, errors)
+    p.parseFile()
+    @assertEq(errors.errorCount(), 0)
+    @assertEq(ast.file_decls.count, 1)
+}
+
+test "parse switch guard" {
+    const src = "fn f(x: int) int { return switch (x) { 1 if x > 0 => 1, else => 0 } }"
+    var s = Scanner.init(src)
+    var ast = Ast.init("test.cot")
+    var errors = ErrorReporter.init()
+    var p = Parser.init(s, ast, errors)
+    p.parseFile()
+    @assertEq(errors.errorCount(), 0)
+    @assertEq(ast.file_decls.count, 1)
+}
+
+test "parse switch wildcard" {
+    const src = "fn f(x: int) int { return switch (x) { 1 => 10, _ => 0 } }"
+    var s = Scanner.init(src)
+    var ast = Ast.init("test.cot")
+    var errors = ErrorReporter.init()
+    var p = Parser.init(s, ast, errors)
+    p.parseFile()
+    @assertEq(errors.errorCount(), 0)
+    @assertEq(ast.file_decls.count, 1)
+}
+
+test "parse generic impl trait" {
+    const src = "impl Iterable(T) for List { fn next(s: *List) int { return 0 } }"
+    var s = Scanner.init(src)
+    var ast = Ast.init("test.cot")
+    var errors = ErrorReporter.init()
+    var p = Parser.init(s, ast, errors)
+    p.parseFile()
+    @assertEq(errors.errorCount(), 0)
+    @assertEq(ast.file_decls.count, 1)
+    @assertEq(nodeDeclTag(ast, ast.file_decls.get(0)), "impl_trait")
+}

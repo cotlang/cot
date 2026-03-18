@@ -6,30 +6,32 @@
 
 ---
 
-## Current Status: 5 of 13 Frontend Files Produce Valid Wasm
+## Current Status: 5 of 13 Files Produce Valid Wasm
 
 **Audited 2026-03-18** — verified with clean selfcot build + test of each file.
 
-| File | Lines | Build | Blocker |
-|------|------:|-------|---------|
-| token.cot | 448 | **OK** | — |
-| source.cot | 315 | **OK** | — |
-| errors.cot | 545 | **OK** | — |
-| ast.cot | 1,532 | **OK** | — |
-| arc_insertion.cot | 443 | **OK** | — |
-| scanner.cot | 774 | SIGILL (132) | Crash during check phase (pre-existing) |
-| types.cot | 1,572 | SIGSEGV (139) | Crash during lowerChecked |
-| ir.cot | 1,467 | SIGILL (132) | Crash during check phase |
-| parser.cot | 3,258 | SIGILL (132) | Crash during check phase |
-| ssa.cot | 625 | SIGSEGV (139) | Crash during lowerChecked |
-| ssa_builder.cot | 2,364 | SIGSEGV (11) | Map.getOrNull crash in checker.Scope_lookup |
-| checker.cot | 5,909 | SIGILL (132) | Crash during check phase |
-| lower.cot | 9,201 | SIGILL (132) | Crash during check phase |
+**Structure:** `self/` reorganized as `parse/ → check/ → build/ → optimize/ → emit/`
+
+| File | Location | Lines | Build | Blocker |
+|------|----------|------:|-------|---------|
+| token.cot | parse/ | 448 | **OK** | — |
+| source.cot | parse/ | 315 | **OK** | — |
+| errors.cot | check/ | 545 | **OK** | — |
+| ast.cot | parse/ | 1,532 | **OK** | — |
+| arc.cot | build/ | 443 | **OK** | — |
+| scanner.cot | parse/ | 774 | SIGSEGV | Crash during check — Map/Scope corruption |
+| types.cot | check/ | 1,572 | SIGSEGV | Crash during lowerChecked |
+| ir.cot | build/ | 1,467 | SIGILL | Crash during check phase |
+| parser.cot | parse/ | 3,258 | SIGILL | Crash during check phase |
+| ssa.cot | build/ | 625 | SIGSEGV | Crash during lowerChecked |
+| builder.cot | build/ | 2,364 | SIGSEGV | Map.getOrNull crash in checker.Scope_lookup |
+| checker.cot | check/ | 5,909 | SIGILL | Crash during check phase |
+| lower.cot | build/ | 9,201 | SIGILL | Crash during check phase |
 
 **Key facts:**
-- 5 files produce valid wasm: token, source, errors, ast, arc_insertion
-- 5 files crash with SIGILL (132) during check — likely illegal instruction from miscompiled code
-- 3 files crash with SIGSEGV during lowering or checking — Map/Scope corruption
+- 5 files produce valid wasm: token, source, errors, ast, arc
+- 4 files crash with SIGILL during check — miscompiled code in selfcot binary
+- 4 files crash with SIGSEGV during lowering or checking — Map/Scope corruption
 - selfcot check passes for all 38+ files (`/tmp/selfcot check self/main.cot` exits 0)
 - Previous "9 of 13" status was inaccurate — many files had regressed
 
@@ -182,9 +184,9 @@ All ported from Swift SILGen reference (`references/swift/lib/SILGen/`, `referen
 | File | Purpose |
 |------|---------|
 | `self/main.cot` | Selfcot entry point + multi-file pipeline |
-| `self/frontend/checker.cot` | Type checker (5,947 lines) — scope rewrite with `?*Scope` |
-| `self/frontend/lower.cot` | IR lowering (9,177 lines, most complex) |
-| `self/frontend/parser.cot` | Parser (3,235 lines) — orelse return fix applied |
+| `self/check/checker.cot` | Type checker (~5,900 lines) — scope rewrite with `?*Scope` |
+| `self/build/lower.cot` | IR lowering (~9,200 lines, most complex) |
+| `self/parse/parser.cot` | Parser (~3,250 lines) — orelse return fix applied |
 | `compiler/frontend/lower.zig` | Zig compiler's lowerer (ARC fixes go here) |
 | `compiler/codegen/native/arc_native.zig` | ARC runtime (range check, diagnostics, poison) |
 | `compiler/codegen/native/signal_native.zig` | Signal handler + backtrace |

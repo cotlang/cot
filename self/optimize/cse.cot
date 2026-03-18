@@ -1,0 +1,300 @@
+/// Common Subexpression Elimination — Replace duplicate computations.
+///
+/// Go reference: cmd/compile/internal/ssa/cse.go
+///
+/// Simplified approach: hash-based value numbering within each block.
+/// Two values are equivalent if they have the same op, type, aux_int, and args.
+/// When a duplicate is found, replace all uses of the duplicate with the original.
+
+import "std/list"
+import "std/map"
+import "../build/ssa"
+
+/// Run CSE on a function.
+fn cse(func: *SsaFunc) void {
+    const total = func.next_value_id
+
+    // Build a hash for each value and look for duplicates within the same block.
+    // rewrite[v] = w means "replace v with w"
+    var rewrite: Map(int, int) = .{}
+
+    var bi = 0
+    while (bi < func.blocks.count) {
+        const blk = func.getBlock(bi)
+
+        // Hash table: hash → first value index with that hash
+        var seen: Map(int, int) = .{}
+
+        var vi = 0
+        while (vi < blk.values.count) {
+            const val_idx = blk.values.get(vi)
+            const val = func.getValue(val_idx)
+
+            // Skip non-CSE-able ops (side effects, phis, memory ops)
+            if (!canCSE(val.op)) { vi += 1; continue }
+
+            const h = hashValue(val)
+            if (seen.contains(h)) {
+                const existing_idx = seen.get(h)
+                const existing = func.getValue(existing_idx)
+                if (valuesEqual(val, existing, val_idx, existing_idx)) {
+                    // Duplicate found — rewrite val_idx → existing_idx
+                    rewrite.set(val_idx, existing_idx)
+                }
+                // Hash collision but not equal — keep both (simple approach)
+            } else {
+                seen.set(h, val_idx)
+            }
+            vi += 1
+        }
+
+        seen.free()
+        bi += 1
+    }
+
+    if (rewrite.count == 0) {
+        rewrite.free()
+        return
+    }
+
+    // Apply rewrites: for each value, replace args that have rewrites
+    var vi = 0
+    while (vi < total) {
+        var val = func.getValue(vi)
+        var changed = false
+        var ai = 0
+        while (ai < val.args_len) {
+            const arg = val.getArg(ai)
+            if (rewrite.contains(arg)) {
+                val.setArg(ai, rewrite.get(arg))
+                changed = true
+            }
+            ai += 1
+        }
+        if (changed) {
+            func.setValue(vi, val)
+        }
+        vi += 1
+    }
+
+    // Also rewrite block controls
+    bi = 0
+    while (bi < func.blocks.count) {
+        var blk = func.getBlock(bi)
+        var ctrl_changed = false
+        var ci = 0
+        while (ci < blk.controls.count) {
+            const ctrl = blk.controls.get(ci)
+            if (rewrite.contains(ctrl)) {
+                blk.controls.set(ci, rewrite.get(ctrl))
+                ctrl_changed = true
+            }
+            ci += 1
+        }
+        if (ctrl_changed) {
+            func.setBlock(bi, blk)
+        }
+        bi += 1
+    }
+
+    rewrite.free()
+}
+
+/// Check if an op can be CSE'd (pure, no side effects).
+fn canCSE(op: SsaOp) bool {
+    return switch (op) {
+        // Pure arithmetic
+        .add, .sub, .mul, .div, .udiv, .mod, .umod, .neg => true,
+        .add8, .sub8, .mul8, .add16, .sub16, .mul16 => true,
+        .add32, .sub32, .mul32, .add64, .sub64, .mul64 => true,
+
+        // Bitwise
+        .and_, .or_, .xor, .shl, .shr, .sar, .@"not", .bool_not => true,
+
+        // Comparisons
+        .eq, .ne, .lt, .le, .gt, .ge, .ult, .ule, .ugt, .uge => true,
+
+        // Type conversions
+        .sign_ext8to16, .sign_ext8to32, .sign_ext8to64 => true,
+        .sign_ext16to32, .sign_ext16to64, .sign_ext32to64 => true,
+        .zero_ext8to16, .zero_ext8to32, .zero_ext8to64 => true,
+        .zero_ext16to32, .zero_ext16to64, .zero_ext32to64 => true,
+        .trunc16to8, .trunc32to8, .trunc32to16 => true,
+        .trunc64to8, .trunc64to16, .trunc64to32 => true,
+        .convert => true,
+
+        // Float operations
+        .add32f, .sub32f, .mul32f, .div32f, .neg32f, .sqrt32f => true,
+        .add64f, .sub64f, .mul64f, .div64f, .neg64f, .sqrt64f => true,
+        .eq64f, .ne64f, .lt64f, .le64f, .gt64f, .ge64f => true,
+
+        // Constants (perfect CSE targets)
+        .const_bool, .const_int, .const_float, .const_nil => true,
+        .const_8, .const_16, .const_32, .const_64 => true,
+
+        // Pointer arithmetic
+        .off_ptr, .add_ptr, .sub_ptr => true,
+
+        // Wasm pure ops
+        .wasm_i64_add, .wasm_i64_sub, .wasm_i64_mul => true,
+        .wasm_i32_add, .wasm_i32_sub, .wasm_i32_mul => true,
+        .wasm_i64_and, .wasm_i64_or, .wasm_i64_xor => true,
+        .wasm_i64_shl, .wasm_i64_shr_s, .wasm_i64_shr_u => true,
+        .wasm_i64_eq, .wasm_i64_ne, .wasm_i64_lt_s, .wasm_i64_gt_s => true,
+        .wasm_i64_le_s, .wasm_i64_ge_s => true,
+        .wasm_i64_const, .wasm_i32_const => true,
+        .wasm_f64_const, .wasm_f32_const => true,
+        .wasm_f64_add, .wasm_f64_sub, .wasm_f64_mul, .wasm_f64_div => true,
+        .wasm_i64_extend_i32_s, .wasm_i64_extend_i32_u => true,
+        .wasm_i32_wrap_i64 => true,
+
+        // Select operations
+        .select0, .select1, .select_n => true,
+
+        // String/slice extraction (pure reads)
+        .string_len, .string_ptr, .slice_len, .slice_ptr, .slice_cap => true,
+
+        else => false,
+    }
+}
+
+/// Compute a hash for a value (op + type + aux_int + args).
+fn hashValue(val: SsaValue) int {
+    var h: int = @intCast(int, val.op) * 31
+    h = h ^ (val.type_idx * 17)
+    h = h ^ (val.aux_int * 13)
+    var ai = 0
+    while (ai < val.args_len) {
+        h = h ^ (val.getArg(ai) * (7 + ai))
+        ai += 1
+    }
+    // Make hash positive
+    if (h < 0) { h = -h }
+    return h
+}
+
+/// Check if two values are structurally equal (same op, type, aux, args).
+fn valuesEqual(a: SsaValue, b: SsaValue, a_idx: int, b_idx: int) bool {
+    if (a.op != b.op) { return false }
+    if (a.type_idx != b.type_idx) { return false }
+    if (a.aux_int != b.aux_int) { return false }
+    if (a.args_len != b.args_len) { return false }
+    var ai = 0
+    while (ai < a.args_len) {
+        if (a.getArg(ai) != b.getArg(ai)) { return false }
+        ai += 1
+    }
+    return true
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+test "cse eliminates duplicate constants" {
+    var func = SsaFunc.init("test_cse")
+    const b0 = func.newBlock(SsaBlockKind.plain)
+
+    // v0 = const_int 42
+    const v0 = func.newValue(SsaOp.const_int, I64, b0, 0, 0)
+    var val0 = func.getValue(v0)
+    val0.aux_int = 42
+    func.setValue(v0, val0)
+    func.addValueToBlock(v0, b0)
+
+    // v1 = const_int 42 (duplicate of v0)
+    const v1 = func.newValue(SsaOp.const_int, I64, b0, 0, 0)
+    var val1 = func.getValue(v1)
+    val1.aux_int = 42
+    func.setValue(v1, val1)
+    func.addValueToBlock(v1, b0)
+
+    // v2 = add(v0, v1) — v1 should be rewritten to v0
+    const v2 = func.newValue(SsaOp.add, I64, b0, 0, 0)
+    var val2 = func.getValue(v2)
+    val2.addArg(v0)
+    val2.addArg(v1)
+    func.setValue(v2, val2)
+    func.addValueToBlock(v2, b0)
+
+    cse(&func)
+
+    // After CSE, v2's second arg should point to v0 (v1 rewritten to v0)
+    const result = func.getValue(v2)
+    @assertEq(result.getArg(0), v0)
+    @assertEq(result.getArg(1), v0)
+}
+
+test "cse keeps different constants" {
+    var func = SsaFunc.init("test_different")
+    const b0 = func.newBlock(SsaBlockKind.plain)
+
+    // v0 = const_int 42
+    const v0 = func.newValue(SsaOp.const_int, I64, b0, 0, 0)
+    var val0 = func.getValue(v0)
+    val0.aux_int = 42
+    func.setValue(v0, val0)
+    func.addValueToBlock(v0, b0)
+
+    // v1 = const_int 99 (different value — NOT duplicate)
+    const v1 = func.newValue(SsaOp.const_int, I64, b0, 0, 0)
+    var val1 = func.getValue(v1)
+    val1.aux_int = 99
+    func.setValue(v1, val1)
+    func.addValueToBlock(v1, b0)
+
+    // v2 = add(v0, v1)
+    const v2 = func.newValue(SsaOp.add, I64, b0, 0, 0)
+    var val2 = func.getValue(v2)
+    val2.addArg(v0)
+    val2.addArg(v1)
+    func.setValue(v2, val2)
+    func.addValueToBlock(v2, b0)
+
+    cse(&func)
+
+    // No rewrites — args unchanged
+    const result = func.getValue(v2)
+    @assertEq(result.getArg(0), v0)
+    @assertEq(result.getArg(1), v1)
+}
+
+test "cse eliminates duplicate arithmetic" {
+    var func = SsaFunc.init("test_arith")
+    const b0 = func.newBlock(SsaBlockKind.plain)
+
+    const v0 = func.newValue(SsaOp.const_int, I64, b0, 0, 0)
+    func.addValueToBlock(v0, b0)
+    const v1 = func.newValue(SsaOp.const_int, I64, b0, 0, 0)
+    func.addValueToBlock(v1, b0)
+
+    // v2 = add(v0, v1)
+    const v2 = func.newValue(SsaOp.add, I64, b0, 0, 0)
+    var val2 = func.getValue(v2)
+    val2.addArg(v0)
+    val2.addArg(v1)
+    func.setValue(v2, val2)
+    func.addValueToBlock(v2, b0)
+
+    // v3 = add(v0, v1) — same as v2, should be eliminated
+    const v3 = func.newValue(SsaOp.add, I64, b0, 0, 0)
+    var val3 = func.getValue(v3)
+    val3.addArg(v0)
+    val3.addArg(v1)
+    func.setValue(v3, val3)
+    func.addValueToBlock(v3, b0)
+
+    // v4 = mul(v2, v3) — v3 should be rewritten to v2
+    const v4 = func.newValue(SsaOp.mul, I64, b0, 0, 0)
+    var val4 = func.getValue(v4)
+    val4.addArg(v2)
+    val4.addArg(v3)
+    func.setValue(v4, val4)
+    func.addValueToBlock(v4, b0)
+
+    cse(&func)
+
+    const result = func.getValue(v4)
+    @assertEq(result.getArg(0), v2)
+    @assertEq(result.getArg(1), v2)  // v3 rewritten to v2
+}

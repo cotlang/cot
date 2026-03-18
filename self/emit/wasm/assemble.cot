@@ -1,0 +1,914 @@
+/// Assemble — Convert Prog chain to Wasm bytes.
+///
+/// Zig reference: compiler/codegen/wasm/assemble.zig
+/// Go reference: cmd/internal/obj/wasm/wasmobj.go assemble()
+///
+/// Converts the preprocessed Prog list into actual Wasm binary bytes.
+/// Key responsibilities:
+/// - Local variable declarations (i32 PC_B, i64 values, f64 floats, GC refs)
+/// - Register to local index mapping
+/// - Opcode encoding
+/// - Operand encoding (LEB128 for integers, raw bytes for floats)
+
+import "std/list"
+import "prog"
+import "types"
+
+// ============================================================================
+// LEB128 encoding
+// Go: wasmobj.go lines 1423-1451
+// ============================================================================
+
+const LEB128_LOW_BITS_MASK: int = 0x7F
+const LEB128_CONTINUATION_BIT: int = 0x80
+const LEB128_SIGN_BIT: int = 0x40
+
+/// Unsigned LEB128 encoding
+fn writeULEB128(w: *List(int), value: int) void {
+    var v = value
+    while (true) {
+        const b = v & LEB128_LOW_BITS_MASK
+        v = v >> 7
+        if (v == 0) {
+            w.append(b)
+            return
+        }
+        w.append(b | LEB128_CONTINUATION_BIT)
+    }
+}
+
+/// Signed LEB128 encoding
+fn writeSLEB128(w: *List(int), value: int) void {
+    var v = value
+    while (true) {
+        const b = v & LEB128_LOW_BITS_MASK
+        const s = v & LEB128_SIGN_BIT
+        v = v >> 7
+        const done = (v == 0 and s == 0) or (v == -1 and s != 0)
+        if (done) {
+            w.append(b)
+            return
+        }
+        w.append(b | LEB128_CONTINUATION_BIT)
+    }
+}
+
+// ============================================================================
+// Register variable info (like Go's regVar)
+// ============================================================================
+
+struct RegVar {
+    global: bool,
+    index: int,
+}
+
+// ============================================================================
+// Assemble a function's Prog list into Wasm bytes
+// Go reference: wasmobj.go lines 1039-1352
+// ============================================================================
+
+/// Assemble a Symbol's text (List(Prog)) into a List(int) of Wasm bytes.
+fn assemble(sym: *Symbol) List(int) {
+    var w: List(int) = .{}
+
+    // ========================================================================
+    // Scan for highest local index and check for dispatch loop
+    // ========================================================================
+
+    var max_local_idx = 0
+    var has_dispatch_loop = false
+    var scan_i = 0
+    while (scan_i < sym.text.count) {
+        const p = sym.text.get(scan_i)
+        switch (p.instr) {
+            As.local_get => {
+                if (p.from.addr_type == AddrType.const_int) {
+                    const idx = p.from.offset
+                    if (idx >= max_local_idx) {
+                        max_local_idx = idx + 1
+                    }
+                }
+            },
+            As.local_set => {
+                if (p.to.addr_type == AddrType.const_int) {
+                    const idx = p.to.offset
+                    if (idx >= max_local_idx) {
+                        max_local_idx = idx + 1
+                    }
+                }
+            },
+            As.br_table => {
+                has_dispatch_loop = true
+            },
+            else => {},
+        }
+        scan_i += 1
+    }
+
+    // ========================================================================
+    // Write local declarations
+    // Go reference: wasmobj.go lines 1146-1150
+    // ========================================================================
+
+    const param_count = sym.param_count
+    const float_count = sym.float_local_count
+    const gc_ref_count = sym.gc_ref_locals.count
+
+    // Calculate value locals (after PC_B, minus floats and GC refs)
+    var total_value_locals = 0
+    if (max_local_idx > param_count + 1) {
+        total_value_locals = max_local_idx - param_count - 1
+    }
+
+    var i64_value_locals = total_value_locals
+    if (total_value_locals >= float_count + gc_ref_count) {
+        i64_value_locals = total_value_locals - float_count - gc_ref_count
+    } else if (total_value_locals >= float_count) {
+        i64_value_locals = total_value_locals - float_count
+    }
+
+    // Count local groups
+    var num_groups = 0
+    if (has_dispatch_loop) { num_groups += 1 }  // PC_B (i32)
+    if (i64_value_locals > 0) { num_groups += 1 }  // i64 locals
+    if (float_count > 0) { num_groups += 1 }  // f64 locals
+    num_groups += gc_ref_count  // each GC ref is its own group
+
+    if (num_groups == 0 and !has_dispatch_loop and max_local_idx <= param_count) {
+        writeULEB128(&w, 0)
+    } else {
+        writeULEB128(&w, num_groups)
+        if (has_dispatch_loop) {
+            writeULEB128(&w, 1)  // 1 i32 local (PC_B)
+            w.append(0x7F)  // ValType.i32
+        }
+        if (i64_value_locals > 0) {
+            writeULEB128(&w, i64_value_locals)
+            w.append(0x7E)  // ValType.i64
+        }
+        if (float_count > 0) {
+            writeULEB128(&w, float_count)
+            w.append(0x7C)  // ValType.f64
+        }
+        // GC ref locals: each declared as (ref null $typeidx)
+        var gc_i = 0
+        while (gc_i < gc_ref_count) {
+            const gc_type_idx = sym.gc_ref_locals.get(gc_i)
+            writeULEB128(&w, 1)  // 1 local of this ref type
+            w.append(0x63)  // GC_REF_TYPE_NULL
+            writeULEB128(&w, gc_type_idx)
+            gc_i += 1
+        }
+    }
+
+    // Initialize GC ref locals at function entry using struct.new_default
+    if (gc_ref_count > 0) {
+        var ref_local_start = param_count + i64_value_locals + float_count
+        if (has_dispatch_loop) {
+            ref_local_start = param_count + 1 + i64_value_locals + float_count
+        }
+        var init_i = 0
+        while (init_i < gc_ref_count) {
+            const gc_type_idx = sym.gc_ref_locals.get(init_i)
+            const ref_local_idx = ref_local_start + init_i
+            w.append(0xFB)  // GC_PREFIX
+            w.append(0x01)  // GC_STRUCT_NEW_DEFAULT
+            writeULEB128(&w, gc_type_idx)
+            w.append(0x21)  // local.set
+            writeULEB128(&w, ref_local_idx)
+            init_i += 1
+        }
+    }
+
+    // ========================================================================
+    // Encode instructions
+    // Go: wasmobj.go lines 1157-1347
+    // ========================================================================
+
+    var prog_i = 0
+    while (prog_i < sym.text.count) {
+        const p = sym.text.get(prog_i)
+        encodeInstruction(&w, p, sym.param_count)
+        prog_i += 1
+    }
+
+    // End opcode
+    w.append(0x0B)
+
+    return w
+}
+
+// ============================================================================
+// Encode a single instruction
+// ============================================================================
+
+fn encodeInstruction(w: *List(int), p: Prog, param_count: int) void {
+    switch (p.instr) {
+        // ====================================================================
+        // Pseudo-instructions that map to real ops
+        // ====================================================================
+
+        As.get => {
+            // Go: wasmobj.go lines 1159-1179
+            if (p.from.addr_type == AddrType.reg) {
+                encodeGetSet(w, p.from.reg, param_count, true)
+            }
+        },
+
+        As.set => {
+            // Go: wasmobj.go lines 1181-1205
+            if (p.to.addr_type == AddrType.reg) {
+                encodeGetSet(w, p.to.reg, param_count, false)
+            }
+        },
+
+        As.tee => {
+            // Go: wasmobj.go lines 1207-1218
+            if (p.to.addr_type == AddrType.reg) {
+                // tee only for PC_B (local)
+                w.append(0x22)  // local.tee
+                writeULEB128(w, param_count)  // PC_B is at param_count
+            }
+        },
+
+        As.@"not" => {
+            // Alias for i32.eqz
+            w.append(0x45)
+        },
+
+        // ====================================================================
+        // Block instructions with block type
+        // ====================================================================
+
+        As.block, As.loop, As.@"if" => {
+            // Go: wasmobj.go lines 1236-1242
+            writeOpcode(w, p.instr)
+            if (p.from.offset != 0) {
+                // Block type stored as negative offset
+                w.append(0x80 - p.from.offset)
+            } else {
+                w.append(0x40)  // BLOCK_VOID
+            }
+        },
+
+        // ====================================================================
+        // Branch instructions
+        // ====================================================================
+
+        As.br, As.br_if => {
+            // Go: wasmobj.go lines 1244-1248
+            writeOpcode(w, p.instr)
+            writeULEB128(w, p.to.offset)
+        },
+
+        As.br_table => {
+            // Go: wasmobj.go lines 1250-1255
+            w.append(0x0E)  // br_table opcode
+            switch (p.to.val) {
+                AddrVal.br_table |idxs| => {
+                    writeULEB128(w, idxs.count - 1)
+                    var bt_i = 0
+                    while (bt_i < idxs.count) {
+                        writeULEB128(w, idxs.get(bt_i))
+                        bt_i += 1
+                    }
+                },
+                else => {},
+            }
+        },
+
+        // ====================================================================
+        // Call instructions
+        // ====================================================================
+
+        As.call, As.return_call => {
+            // Go: wasmobj.go lines 1257-1284
+            writeOpcode(w, p.instr)
+            writeULEB128(w, p.to.offset)
+        },
+
+        As.call_indirect => {
+            // Go: wasmobj.go lines 1286-1292
+            w.append(0x11)  // call_indirect opcode
+            writeULEB128(w, p.to.offset)
+            w.append(0x00)  // table index 0
+        },
+
+        // ====================================================================
+        // Constant instructions
+        // ====================================================================
+
+        As.i32_const, As.i64_const => {
+            // Go: wasmobj.go lines 1294-1305
+            writeOpcode(w, p.instr)
+            writeSLEB128(w, p.from.offset)
+        },
+
+        As.f32_const => {
+            // Go: wasmobj.go lines 1307-1310
+            writeOpcode(w, p.instr)
+            switch (p.from.val) {
+                AddrVal.float_val |v| => {
+                    writeF32Bytes(w, v)
+                },
+                else => {},
+            }
+        },
+
+        As.f64_const => {
+            // Go: wasmobj.go lines 1312-1315
+            writeOpcode(w, p.instr)
+            switch (p.from.val) {
+                AddrVal.float_val |v| => {
+                    writeF64Bytes(w, v)
+                },
+                else => {},
+            }
+        },
+
+        // ====================================================================
+        // Load instructions
+        // Go: wasmobj.go lines 1317-1328
+        // ====================================================================
+
+        As.i32_load, As.i64_load, As.f32_load, As.f64_load,
+        As.i32_load8_s, As.i32_load8_u, As.i32_load16_s, As.i32_load16_u,
+        As.i64_load8_s, As.i64_load8_u, As.i64_load16_s, As.i64_load16_u,
+        As.i64_load32_s, As.i64_load32_u => {
+            writeOpcode(w, p.instr)
+            writeULEB128(w, alignment(p.instr))
+            writeULEB128(w, p.from.offset)
+        },
+
+        // ====================================================================
+        // Store instructions
+        // Go: wasmobj.go lines 1330-1338
+        // ====================================================================
+
+        As.i32_store, As.i64_store, As.f32_store, As.f64_store,
+        As.i32_store8, As.i32_store16,
+        As.i64_store8, As.i64_store16, As.i64_store32 => {
+            writeOpcode(w, p.instr)
+            writeULEB128(w, alignment(p.instr))
+            writeULEB128(w, p.to.offset)
+        },
+
+        // ====================================================================
+        // Memory instructions
+        // ====================================================================
+
+        As.memory_size, As.memory_grow, As.memory_fill => {
+            writeOpcode(w, p.instr)
+            w.append(0x00)  // memory index 0
+        },
+
+        As.memory_copy => {
+            writeOpcode(w, p.instr)
+            w.append(0x00)  // dest memory
+            w.append(0x00)  // src memory
+        },
+
+        // ====================================================================
+        // Skip pseudo-instructions
+        // ====================================================================
+
+        As.nop, As.text, As.func_data, As.pc_data => {},
+
+        As.undef => {
+            w.append(0x00)  // unreachable
+        },
+
+        // ====================================================================
+        // Direct local/global access (emitted by wasm_gen with const_int index)
+        // ====================================================================
+
+        As.local_get => {
+            w.append(0x20)  // local.get
+            if (p.from.addr_type == AddrType.const_int) {
+                writeULEB128(w, p.from.offset)
+            }
+        },
+
+        As.local_set => {
+            w.append(0x21)  // local.set
+            if (p.to.addr_type == AddrType.const_int) {
+                writeULEB128(w, p.to.offset)
+            }
+        },
+
+        As.local_tee => {
+            w.append(0x22)  // local.tee
+            if (p.to.addr_type == AddrType.const_int) {
+                writeULEB128(w, p.to.offset)
+            }
+        },
+
+        As.global_get => {
+            w.append(0x23)  // global.get
+            if (p.from.addr_type == AddrType.const_int) {
+                writeULEB128(w, p.from.offset)
+            }
+        },
+
+        As.global_set => {
+            w.append(0x24)  // global.set
+            if (p.to.addr_type == AddrType.const_int) {
+                writeULEB128(w, p.to.offset)
+            }
+        },
+
+        // ====================================================================
+        // WasmGC struct operations (0xFB prefix)
+        // ====================================================================
+
+        As.gc_struct_new => {
+            // 0xFB 0x00 <type_idx>
+            w.append(0xFB)
+            w.append(0x00)
+            writeULEB128(w, p.from.offset)
+        },
+
+        As.gc_struct_get => {
+            // 0xFB 0x02 <type_idx> <field_idx>
+            w.append(0xFB)
+            w.append(0x02)
+            writeULEB128(w, p.from.offset)
+            writeULEB128(w, p.to.offset)
+        },
+
+        As.gc_struct_set => {
+            // 0xFB 0x05 <type_idx> <field_idx>
+            w.append(0xFB)
+            w.append(0x05)
+            writeULEB128(w, p.from.offset)
+            writeULEB128(w, p.to.offset)
+        },
+
+        // ====================================================================
+        // WasmGC array operations (0xFB prefix)
+        // ====================================================================
+
+        As.gc_array_new => {
+            w.append(0xFB)
+            w.append(0x06)
+            writeULEB128(w, p.from.offset)
+        },
+
+        As.gc_array_new_default => {
+            w.append(0xFB)
+            w.append(0x07)
+            writeULEB128(w, p.from.offset)
+        },
+
+        As.gc_array_new_fixed => {
+            w.append(0xFB)
+            w.append(0x08)
+            writeULEB128(w, p.from.offset)
+            writeULEB128(w, p.to.offset)
+        },
+
+        As.gc_array_new_data => {
+            w.append(0xFB)
+            w.append(0x09)
+            writeULEB128(w, p.from.offset)
+            writeULEB128(w, p.to.offset)
+        },
+
+        As.gc_array_get => {
+            w.append(0xFB)
+            w.append(0x0B)
+            writeULEB128(w, p.from.offset)
+        },
+
+        As.gc_array_set => {
+            w.append(0xFB)
+            w.append(0x0E)
+            writeULEB128(w, p.from.offset)
+        },
+
+        As.gc_array_len => {
+            w.append(0xFB)
+            w.append(0x0F)
+        },
+
+        As.gc_array_copy => {
+            w.append(0xFB)
+            w.append(0x11)
+            writeULEB128(w, p.from.offset)
+            writeULEB128(w, p.to.offset)
+        },
+
+        // ====================================================================
+        // WasmGC reference operations
+        // ====================================================================
+
+        As.ref_test => {
+            w.append(0xFB)
+            w.append(0x14)
+            writeULEB128(w, p.from.offset)
+        },
+
+        As.ref_cast => {
+            w.append(0xFB)
+            w.append(0x16)
+            writeULEB128(w, p.from.offset)
+        },
+
+        As.ref_null => {
+            w.append(0xD0)
+            writeULEB128(w, p.from.offset)
+        },
+
+        As.ref_func => {
+            w.append(0xD2)
+            writeULEB128(w, p.from.offset)
+        },
+
+        As.ref_eq => {
+            w.append(0xD3)
+        },
+
+        As.ref_as_not_null => {
+            w.append(0xD4)
+        },
+
+        As.br_on_null => {
+            w.append(0xD5)
+            writeULEB128(w, p.from.offset)
+        },
+
+        As.br_on_non_null => {
+            w.append(0xD6)
+            writeULEB128(w, p.from.offset)
+        },
+
+        As.call_ref => {
+            w.append(0x14)
+            writeULEB128(w, p.from.offset)
+        },
+
+        As.return_call_ref => {
+            w.append(0x15)
+            writeULEB128(w, p.from.offset)
+        },
+
+        // ====================================================================
+        // All other instructions — direct opcode
+        // ====================================================================
+
+        else => {
+            writeOpcode(w, p.instr)
+        },
+    }
+}
+
+// ============================================================================
+// Helper: encode get/set for register (global or PC_B local)
+// ============================================================================
+
+fn encodeGetSet(w: *List(int), reg: Reg, param_count: int, is_get: bool) void {
+    switch (reg) {
+        // Global registers
+        Reg.sp => {
+            w.append(if (is_get) { 0x23 } else { 0x24 })  // global.get/set
+            writeULEB128(w, 0)  // SP = global 0
+        },
+        Reg.ctxt => {
+            w.append(if (is_get) { 0x23 } else { 0x24 })
+            writeULEB128(w, 1)  // CTXT = global 1
+        },
+        Reg.g => {
+            w.append(if (is_get) { 0x23 } else { 0x24 })
+            writeULEB128(w, 2)  // g = global 2
+        },
+        Reg.ret0 => {
+            w.append(if (is_get) { 0x23 } else { 0x24 })
+            writeULEB128(w, 3)
+        },
+        Reg.ret1 => {
+            w.append(if (is_get) { 0x23 } else { 0x24 })
+            writeULEB128(w, 4)
+        },
+        Reg.ret2 => {
+            w.append(if (is_get) { 0x23 } else { 0x24 })
+            writeULEB128(w, 5)
+        },
+        Reg.ret3 => {
+            w.append(if (is_get) { 0x23 } else { 0x24 })
+            writeULEB128(w, 6)
+        },
+        Reg.pause => {
+            w.append(if (is_get) { 0x23 } else { 0x24 })
+            writeULEB128(w, 7)
+        },
+        // PC_B is a local (first declared local = param_count)
+        Reg.pc_b => {
+            w.append(if (is_get) { 0x20 } else { 0x21 })  // local.get/set
+            writeULEB128(w, param_count)
+        },
+        else => {},
+    }
+}
+
+// ============================================================================
+// Helper: write opcode byte(s)
+// ============================================================================
+
+fn writeOpcode(w: *List(int), instr: As) void {
+    if (instr.isFcPrefixed()) {
+        w.append(0xFC)
+        if (instr.fcOpcode()) |fc_op| {
+            w.append(fc_op)
+        }
+    } else if (instr.opcode()) |op| {
+        w.append(op)
+    }
+}
+
+// ============================================================================
+// Helper: alignment for load/store instructions
+// Go: wasmobj.go lines 1408-1421
+// ============================================================================
+
+fn alignment(instr: As) int {
+    return switch (instr) {
+        As.i32_load8_s, As.i32_load8_u, As.i64_load8_s, As.i64_load8_u,
+        As.i32_store8, As.i64_store8 => 0,
+        As.i32_load16_s, As.i32_load16_u, As.i64_load16_s, As.i64_load16_u,
+        As.i32_store16, As.i64_store16 => 1,
+        As.i32_load, As.f32_load, As.i64_load32_s, As.i64_load32_u,
+        As.i32_store, As.f32_store, As.i64_store32 => 2,
+        As.i64_load, As.f64_load, As.i64_store, As.f64_store => 3,
+        else => 0,
+    }
+}
+
+// ============================================================================
+// Helper: write float bytes (little-endian)
+// ============================================================================
+
+fn writeF64Bytes(w: *List(int), value: f64) void {
+    const bits = @bitCast(int, value)
+    w.append(bits & 0xFF)
+    w.append((bits >> 8) & 0xFF)
+    w.append((bits >> 16) & 0xFF)
+    w.append((bits >> 24) & 0xFF)
+    w.append((bits >> 32) & 0xFF)
+    w.append((bits >> 40) & 0xFF)
+    w.append((bits >> 48) & 0xFF)
+    w.append((bits >> 56) & 0xFF)
+}
+
+fn writeF32Bytes(w: *List(int), value: f64) void {
+    // Convert f64 bits to f32 bits via IEEE 754 field extraction.
+    // Cot has no native i32 bitcast, so we do it manually.
+    const f64_bits = @bitCast(int, value)
+    const f32_bits = f64BitsToF32Bits(f64_bits)
+    w.append(f32_bits & 0xFF)
+    w.append((f32_bits >> 8) & 0xFF)
+    w.append((f32_bits >> 16) & 0xFF)
+    w.append((f32_bits >> 24) & 0xFF)
+}
+
+/// Convert IEEE 754 f64 bits to f32 bits (truncating mantissa, rebasing exponent).
+fn f64BitsToF32Bits(f64_bits: int) int {
+    const sign = (f64_bits >> 63) & 1
+    const exp64 = (f64_bits >> 52) & 0x7FF
+    const mant64 = f64_bits & 0xFFFFFFFFFFFFF  // 52 bits
+
+    // Special cases
+    if (exp64 == 0x7FF) {
+        // Inf or NaN
+        if (mant64 == 0) {
+            return (sign << 31) | 0x7F800000  // Inf
+        }
+        return (sign << 31) | 0x7FC00000  // NaN
+    }
+    if (exp64 == 0) {
+        // Zero or subnormal → f32 zero (subnormals too small for f32)
+        return sign << 31
+    }
+
+    // Rebias exponent: f64 bias=1023, f32 bias=127
+    const exp32 = exp64 - 1023 + 127
+    if (exp32 <= 0) {
+        return sign << 31  // Underflow → zero
+    }
+    if (exp32 >= 0xFF) {
+        return (sign << 31) | 0x7F800000  // Overflow → Inf
+    }
+
+    // Truncate mantissa: 52 bits → 23 bits (drop lower 29)
+    const mant32 = (mant64 >> 29) & 0x7FFFFF
+    return (sign << 31) | (exp32 << 23) | mant32
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+test "ULEB128 encoding" {
+    var w: List(int) = .{}
+    writeULEB128(&w, 0)
+    @assertEq(w.count, 1)
+    @assertEq(w.get(0), 0x00)
+
+    w.clear()
+    writeULEB128(&w, 127)
+    @assertEq(w.count, 1)
+    @assertEq(w.get(0), 0x7F)
+
+    w.clear()
+    writeULEB128(&w, 128)
+    @assertEq(w.count, 2)
+    @assertEq(w.get(0), 0x80)
+    @assertEq(w.get(1), 0x01)
+
+    w.clear()
+    writeULEB128(&w, 624485)
+    @assertEq(w.count, 3)
+    @assertEq(w.get(0), 0xE5)
+    @assertEq(w.get(1), 0x8E)
+    @assertEq(w.get(2), 0x26)
+}
+
+test "SLEB128 encoding" {
+    var w: List(int) = .{}
+    writeSLEB128(&w, 0)
+    @assertEq(w.count, 1)
+    @assertEq(w.get(0), 0x00)
+
+    w.clear()
+    writeSLEB128(&w, -1)
+    @assertEq(w.count, 1)
+    @assertEq(w.get(0), 0x7F)
+
+    w.clear()
+    writeSLEB128(&w, 42)
+    @assertEq(w.count, 1)
+    @assertEq(w.get(0), 42)
+
+    w.clear()
+    writeSLEB128(&w, -128)
+    @assertEq(w.count, 2)
+    @assertEq(w.get(0), 0x80)
+    @assertEq(w.get(1), 0x7F)
+}
+
+test "alignment values" {
+    @assertEq(alignment(As.i64_load8_s), 0)
+    @assertEq(alignment(As.i64_load16_s), 1)
+    @assertEq(alignment(As.i32_load), 2)
+    @assertEq(alignment(As.i64_load), 3)
+    @assertEq(alignment(As.f64_store), 3)
+    @assertEq(alignment(As.i64_store8), 0)
+}
+
+test "assemble empty function" {
+    var sym = Symbol.init("test_empty")
+    sym.param_count = 0
+    sym.float_local_count = 0
+
+    const bytes = assemble(&sym)
+    // Should have at least local declarations (0 groups) + end opcode
+    @assert(bytes.count >= 2)
+    @assertEq(bytes.get(0), 0x00)  // 0 local groups
+    @assertEq(bytes.get(bytes.count - 1), 0x0B)  // end
+}
+
+test "assemble i64 const" {
+    var sym = Symbol.init("test_const")
+    sym.param_count = 0
+    sym.float_local_count = 0
+
+    // Add: i64.const 42
+    sym.text.append(Prog.initFrom(As.i64_const, Addr.initConst(42)))
+
+    const bytes = assemble(&sym)
+    // 0x00 (0 locals) + 0x42 (i64.const) + 0x2A (42 SLEB128) + 0x0B (end)
+    @assertEq(bytes.get(0), 0x00)
+    @assertEq(bytes.get(1), 0x42)  // i64.const opcode
+    @assertEq(bytes.get(2), 42)
+    @assertEq(bytes.get(bytes.count - 1), 0x0B)
+}
+
+test "assemble local get/set" {
+    var sym = Symbol.init("test_locals")
+    sym.param_count = 1
+    sym.float_local_count = 0
+
+    // local.get 0, local.set 1
+    var get_prog = Prog.init(As.local_get)
+    get_prog.from = Addr.initConst(0)
+    sym.text.append(get_prog)
+
+    var set_prog = Prog.init(As.local_set)
+    set_prog.to = Addr.initConst(2)
+    sym.text.append(set_prog)
+
+    const bytes = assemble(&sym)
+    // Should contain local.get (0x20) and local.set (0x21)
+    var found_get = false
+    var found_set = false
+    var bi = 0
+    while (bi < bytes.count) {
+        if (bytes.get(bi) == 0x20) { found_get = true }
+        if (bytes.get(bi) == 0x21) { found_set = true }
+        bi += 1
+    }
+    @assert(found_get)
+    @assert(found_set)
+}
+
+test "assemble register get/set (SP)" {
+    var sym = Symbol.init("test_sp")
+    sym.param_count = 0
+    sym.float_local_count = 0
+
+    // get SP (global), set SP (global)
+    sym.text.append(Prog.initFrom(As.get, Addr.initReg(Reg.sp)))
+    sym.text.append(Prog.initTo(As.set, Addr.initReg(Reg.sp)))
+
+    const bytes = assemble(&sym)
+    // Should contain global.get (0x23) and global.set (0x24)
+    var found_gget = false
+    var found_gset = false
+    var bi = 0
+    while (bi < bytes.count) {
+        if (bytes.get(bi) == 0x23) { found_gget = true }
+        if (bytes.get(bi) == 0x24) { found_gset = true }
+        bi += 1
+    }
+    @assert(found_gget)
+    @assert(found_gset)
+}
+
+test "assemble block/br structure" {
+    var sym = Symbol.init("test_block")
+    sym.param_count = 0
+    sym.float_local_count = 0
+
+    sym.text.append(Prog.init(As.block))
+    var br_prog = Prog.init(As.br)
+    br_prog.to = Addr.initConst(0)
+    sym.text.append(br_prog)
+    sym.text.append(Prog.init(As.end))
+
+    const bytes = assemble(&sym)
+    // Should contain block (0x02), br (0x0C), end (0x0B)
+    var found_block = false
+    var found_br = false
+    var bi = 0
+    while (bi < bytes.count) {
+        if (bytes.get(bi) == 0x02) { found_block = true }
+        if (bytes.get(bi) == 0x0C) { found_br = true }
+        bi += 1
+    }
+    @assert(found_block)
+    @assert(found_br)
+}
+
+test "assemble call instruction" {
+    var sym = Symbol.init("test_call")
+    sym.param_count = 0
+    sym.float_local_count = 0
+
+    var call_prog = Prog.init(As.call)
+    call_prog.to = Addr.initConst(5)
+    sym.text.append(call_prog)
+
+    const bytes = assemble(&sym)
+    // Should contain call (0x10) + funcidx 5
+    var found_call = false
+    var bi = 0
+    while (bi < bytes.count - 1) {
+        if (bytes.get(bi) == 0x10 and bytes.get(bi + 1) == 5) {
+            found_call = true
+        }
+        bi += 1
+    }
+    @assert(found_call)
+}
+
+test "assemble load/store with alignment" {
+    var sym = Symbol.init("test_load")
+    sym.param_count = 0
+    sym.float_local_count = 0
+
+    // i64.load with offset 8
+    var load_prog = Prog.init(As.i64_load)
+    load_prog.from = Addr.initConst(8)
+    sym.text.append(load_prog)
+
+    const bytes = assemble(&sym)
+    // Should contain i64.load (0x29) + align(3) + offset(8)
+    var found_load = false
+    var bi = 0
+    while (bi < bytes.count - 2) {
+        if (bytes.get(bi) == 0x29 and bytes.get(bi + 1) == 3 and bytes.get(bi + 2) == 8) {
+            found_load = true
+        }
+        bi += 1
+    }
+    @assert(found_load)
+}

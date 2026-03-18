@@ -108,21 +108,21 @@ cot build self/main.cot -o /tmp/selfcot
 **How to test selfcot:**
 ```bash
 # Use selfcot to compile a file and measure memory
-/usr/bin/time -l /tmp/selfcot build self/frontend/scanner.cot -o /tmp/out.wasm
+/usr/bin/time -l /tmp/selfcot build self/parse/scanner.cot -o /tmp/out.wasm
 
 # Compare with Zig compiler for the same file (baseline)
-/usr/bin/time -l cot build self/frontend/scanner.cot --target=wasm32 -o /tmp/out_zig.wasm
+/usr/bin/time -l cot build self/parse/scanner.cot --target=wasm32 -o /tmp/out_zig.wasm
 ```
 
 **Key facts:**
 - `self/cot.json` sets `"safe": true` project-wide — all `self/` files use `@safe` mode
 - selfcot only emits Wasm (no native target yet) — entry point is `self/main.cot`
 - selfcot is compiled to a native binary by the Zig `cot` compiler
-- The pipeline: `self/main.cot` → `self/frontend/` (scanner, parser, checker, lowerer, ssa) → `self/codegen/wasm/` (driver, wasm_gen, preprocess, assemble, linker)
+- The pipeline: `self/main.cot` → `self/parse/` → `self/check/` → `self/build/` → `self/optimize/` → `self/emit/wasm/`
 - `self/test_tiny.cot` is a minimal test file for smoke-testing selfcot
-- 44,716 lines across 42 files — frontend, codegen, SSA passes, runtime all complete
+- ~44,700 lines across 41 files — parse, check, build, optimize, emit all complete
 
-**Current status (as of 2026-03-17):** selfcot compiles **9 of 13 frontend files** to valid Wasm: token, scanner, source, errors, types, ast, ir (17MB/0.5s), parser, ssa. Four remaining: checker (5947 lines), lower (9177 lines), ssa_builder (2337 lines), arc_insertion (414 lines) — all crash from stack overflow during deep generic re-checking chains. **Blocker:** Native codegen generates stack frames ~2x larger than the Zig compiler's own (e.g., `checkFnDeclBody`: 2,528 bytes vs Zig's 1,648 bytes). Deep call chains during complex file lowering overflow the 8MB stack. See `claude/STACK_FRAME_ANALYSIS.md` and `claude/COT_IMPROVEMENT_PLAN.md`.
+**Current status (as of 2026-03-18):** selfcot compiles **5 of 13 parse/check/build files** to valid Wasm: token, source, errors, ast, arc. Eight remaining crash during check or lowering phases. See `claude/SELF_HOSTING.md` for detailed status.
 
 **Stdlib** is a separate repo (`cotlang/std`) included as a git submodule at `stdlib/`. After cloning: `git submodule update --init stdlib`. When modifying stdlib files, changes must be committed in the submodule first (`cd stdlib && git add . && git commit && git push`), then the updated submodule ref committed in the parent repo.
 

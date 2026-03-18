@@ -1,0 +1,140 @@
+/// Copy Elimination + Phi Elimination — Remove redundant copies and phis.
+///
+/// Go reference: cmd/compile/internal/ssa/copyelim.go
+/// Zig reference: compiler/ssa/passes/copyelim.zig
+///
+/// Algorithm:
+/// 1. phielim: Convert redundant phis (all non-self args equal) to copies
+/// 2. copyelim: Replace all copy args with their sources (follow chains)
+
+import "std/list"
+import "../build/ssa"
+
+/// Combined copy + phi elimination pass.
+fn copyelim(func: *SsaFunc) void {
+    phielim(func)
+}
+
+/// Phi elimination: convert redundant phis to copies.
+/// A phi is redundant if all non-self args are the same value.
+/// Repeats to fixed point for transitive cases.
+fn phielim(func: *SsaFunc) void {
+    var changed = true
+    while (changed) {
+        changed = false
+        var bi = 0
+        while (bi < func.blocks.count) {
+            const blk = func.getBlock(bi)
+            var vi = 0
+            while (vi < blk.values.count) {
+                const val_idx = blk.values.get(vi)
+                if (phielimValue(func, val_idx)) {
+                    changed = true
+                }
+                vi += 1
+            }
+            bi += 1
+        }
+    }
+}
+
+/// Try to convert a phi to a copy.
+/// Returns true if the phi was converted.
+fn phielimValue(func: *SsaFunc, val_idx: int) bool {
+    var val = func.getValue(val_idx)
+    if (val.op != SsaOp.phi) { return false }
+
+    // Find the single non-self argument
+    var w: int = -1
+    var ai = 0
+    while (ai < val.args_len) {
+        const arg = val.getArg(ai)
+        if (arg == val_idx) { ai += 1; continue }  // skip self-references
+        if (arg == w) { ai += 1; continue }          // skip duplicates of w
+        if (w != -1) { return false }                 // two distinct args — not redundant
+        w = arg
+        ai += 1
+    }
+
+    if (w == -1) { return false }  // all self-refs — dead cycle
+
+    // Convert phi to copy(w)
+    val.op = SsaOp.copy
+    val.args_len = 0
+    val.addArg(w)
+    func.setValue(val_idx, val)
+    return true
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+test "phielim redundant phi" {
+    var func = SsaFunc.init("test_phi")
+    const b0 = func.newBlock(SsaBlockKind.plain)
+
+    // v0 = const_int 42
+    const v0 = func.newValue(SsaOp.const_int, I64, b0, 0, 0)
+    func.addValueToBlock(v0, b0)
+
+    // v1 = phi(v0, v0) — redundant, should become copy(v0)
+    const v1 = func.newValue(SsaOp.phi, I64, b0, 0, 0)
+    var val1 = func.getValue(v1)
+    val1.addArg(v0)
+    val1.addArg(v0)
+    func.setValue(v1, val1)
+    func.addValueToBlock(v1, b0)
+
+    copyelim(&func)
+
+    const result = func.getValue(v1)
+    @assertEq(result.op == SsaOp.copy, true)
+    @assertEq(result.args_len, 1)
+    @assertEq(result.getArg(0), v0)
+}
+
+test "phielim non-redundant phi" {
+    var func = SsaFunc.init("test_nonredundant")
+    const b0 = func.newBlock(SsaBlockKind.plain)
+
+    const v0 = func.newValue(SsaOp.const_int, I64, b0, 0, 0)
+    func.addValueToBlock(v0, b0)
+    const v1 = func.newValue(SsaOp.const_int, I64, b0, 0, 0)
+    func.addValueToBlock(v1, b0)
+
+    // v2 = phi(v0, v1) — NOT redundant (two distinct args)
+    const v2 = func.newValue(SsaOp.phi, I64, b0, 0, 0)
+    var val2 = func.getValue(v2)
+    val2.addArg(v0)
+    val2.addArg(v1)
+    func.setValue(v2, val2)
+    func.addValueToBlock(v2, b0)
+
+    copyelim(&func)
+
+    const result = func.getValue(v2)
+    @assertEq(result.op == SsaOp.phi, true)  // should remain a phi
+}
+
+test "phielim self-referencing phi" {
+    var func = SsaFunc.init("test_selfref")
+    const b0 = func.newBlock(SsaBlockKind.plain)
+
+    const v0 = func.newValue(SsaOp.const_int, I64, b0, 0, 0)
+    func.addValueToBlock(v0, b0)
+
+    // v1 = phi(v0, v1) — redundant: only non-self arg is v0
+    const v1 = func.newValue(SsaOp.phi, I64, b0, 0, 0)
+    var val1 = func.getValue(v1)
+    val1.addArg(v0)
+    val1.addArg(v1)  // self-reference
+    func.setValue(v1, val1)
+    func.addValueToBlock(v1, b0)
+
+    copyelim(&func)
+
+    const result = func.getValue(v1)
+    @assertEq(result.op == SsaOp.copy, true)
+    @assertEq(result.getArg(0), v0)
+}

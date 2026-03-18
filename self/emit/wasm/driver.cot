@@ -1,0 +1,584 @@
+/// Wasm Driver — orchestrates the full Wasm compilation pipeline.
+///
+/// Zig reference: compiler/driver.zig generateWasmCode()
+///
+/// Pipeline: IR funcs/globals + TypeRegistry → Linker setup → runtime registration
+///           → func_indices → SSA build → 6 passes → codegen → .wasm binary
+///
+/// Split into multiple functions to avoid stack overflow (Cot compiler limitation
+/// with many locals in a single function).
+
+import "std/list"
+import "std/map"
+import "std/string"
+import "../../build/ir"
+import "../../check/types"
+import "../../build/ssa"
+import "../../build/builder"
+import "../../optimize/decompose"
+import "../../optimize/schedule"
+import "../../optimize/layout"
+import "lower"
+import "passes"
+import "passes_dec"
+import "link"
+import "gen"
+import "preprocess"
+import "assemble"
+import "mem"
+import "slice"
+import "print"
+import "wasi"
+import "test"
+import "bench"
+
+// ============================================================================
+// Memory layout constants
+// ============================================================================
+
+const HEAP_START: int = 0x800000      // 8MB — after stack
+const MEMORY_PAGES: int = 256         // 256 * 64KB = 16MB
+
+// ============================================================================
+// RuntimeIndices — holds all runtime function indices after registration
+// ============================================================================
+
+struct RuntimeIndices {
+    mem: MemFunctions,
+    slice_fns: SliceFunctions,
+    print: PrintFunctions,
+    wasi: WasiFunctions,
+    test_fns: TestFunctions,
+    bench_fns: BenchFunctions,
+    heap_ptr_global: int,
+    runtime_func_count: int,
+}
+
+// ============================================================================
+// CompileOptions — configuration for Wasm compilation
+// ============================================================================
+
+struct CompileOptions {
+    is_wasi: bool,
+    test_mode: bool,
+    bench_mode: bool,
+    bench_n: int,
+}
+
+// ============================================================================
+// Top-level entry point
+// ============================================================================
+
+/// Generate a complete Wasm binary from IR functions, globals, and type registry.
+/// Returns the binary as List(int) (byte values).
+fn generateWasmCode(ir: IR, types: *TypeRegistry, opts: CompileOptions) List(int) {
+    var linker = Linker.init()
+
+    // Configure memory: 256 pages = 16MB
+    linker.setMemory(MEMORY_PAGES, null)
+
+    // Global 1: CTXT (closure context pointer)
+    // Layout: SP(0), CTXT(1), heap_ptr(2)
+    linker.addGlobal(WasmGlobal { val_type: VT_I64, mutable: true, init_val: 0 })
+
+    // Global 2: heap_ptr (bump allocator, starts at 8MB)
+    const heap_ptr_dynamic_idx = linker.addGlobal(WasmGlobal { val_type: VT_I32, mutable: true, init_val: HEAP_START })
+    const heap_ptr_global = heap_ptr_dynamic_idx + 1 // Offset by SP (global 0)
+
+    // Register all runtime functions
+    const rt = addAllRuntimeFunctions(&linker, heap_ptr_global, opts)
+
+    // Build function index map
+    var func_indices: Map(string, int) = .{}
+    populateRuntimeIndices(&func_indices, &rt)
+    populateUserFuncIndicesFromIR(&func_indices, ir, rt.runtime_func_count)
+
+    // Set minimum table size for call_indirect
+    linker.setTableSize(1)
+
+    // Build function table: all user functions get table entries
+    var func_table_indices: Map(string, int) = .{}
+    addUserTableEntries(&linker, ir, rt.runtime_func_count, &func_table_indices)
+
+    // Collect string literals from all functions
+    var string_offsets: Map(string, int) = .{}
+    collectAllStringLiterals(&linker, &string_offsets, ir)
+
+    // Null sentinel for metadata at offset 0
+    var null_data: List(int) = .{}
+    var j = 0
+    while (j < 8) {
+        null_data.append(0)
+        j += 1
+    }
+    linker.addDataSegment(null_data)
+
+    // Generate code for each function
+    generateAllFunctions(&linker, ir, types, &func_indices, &string_offsets, &func_table_indices, rt.runtime_func_count)
+
+    return linker.emit()
+}
+
+// ============================================================================
+// Runtime registration (split to avoid stack overflow)
+// ============================================================================
+
+/// Register all runtime modules with the linker.
+fn addAllRuntimeFunctions(linker: *Linker, heap_ptr_global: int, opts: CompileOptions) RuntimeIndices {
+    // WASI host imports MUST be registered FIRST — Wasm requires imports at
+    // indices 0..N-1, module functions at N onwards. addFunc() returns
+    // imports.count + funcs.count, so imports must exist before any addFunc call.
+    const ws = addWasiRuntime(linker, opts.is_wasi)
+    const mem = addMemRuntime(linker, heap_ptr_global)
+    const sl = addSliceRuntime(linker, heap_ptr_global)
+    const pr = addPrintRuntime(linker)
+    const tf = addTestRuntime(linker, pr.write_idx, pr.eprint_int_idx, ws.time_idx)
+    const bf = addBenchRuntime(linker, pr.write_idx, pr.eprint_int_idx, ws.time_idx, opts.bench_n)
+
+    const runtime_func_count = linker.funcCount()
+
+    return RuntimeIndices {
+        mem: mem,
+        slice_fns: sl,
+        print: pr,
+        wasi: ws,
+        test_fns: tf,
+        bench_fns: bf,
+        heap_ptr_global: heap_ptr_global,
+        runtime_func_count: runtime_func_count,
+    }
+}
+
+// ============================================================================
+// Function index map population (split into multiple functions)
+// ============================================================================
+
+/// Populate func_indices with all runtime function names → indices.
+fn populateRuntimeIndices(func_indices: *Map(string, int), rt: *RuntimeIndices) void {
+    populateMemIndices(func_indices, &rt.mem)
+    populateSliceIndices(func_indices, &rt.slice_fns)
+    populatePrintIndices(func_indices, &rt.print)
+    populateWasiIndices(func_indices, &rt.wasi)
+    populateTestIndices(func_indices, &rt.test_fns)
+    populateBenchIndices(func_indices, &rt.bench_fns)
+}
+
+fn populateMemIndices(m: *Map(string, int), f: *MemFunctions) void {
+    m.set(ALLOC_NAME, f.alloc_idx)
+    m.set(DEALLOC_NAME, f.dealloc_idx)
+    m.set(REALLOC_NAME, f.realloc_idx)
+    m.set(MEMCPY_NAME, f.memcpy_idx)
+    m.set(MEMSET_ZERO_NAME, f.memset_zero_idx)
+    m.set(STRING_EQ_NAME, f.string_eq_idx)
+    m.set(STRING_CONCAT_NAME, f.string_concat_idx)
+}
+
+fn populateSliceIndices(m: *Map(string, int), f: *SliceFunctions) void {
+    m.set(GROWSLICE_NAME, f.growslice_idx)
+    m.set(NEXTSLICECAP_NAME, f.nextslicecap_idx)
+}
+
+fn populatePrintIndices(m: *Map(string, int), f: *PrintFunctions) void {
+    m.set(WRITE_NAME, f.write_idx)
+    m.set(PRINT_INT_NAME, f.print_int_idx)
+    m.set(EPRINT_INT_NAME, f.eprint_int_idx)
+    m.set(INT_TO_STRING_NAME, f.int_to_string_idx)
+    m.set(PRINT_FLOAT_NAME, f.print_float_idx)
+    m.set(EPRINT_FLOAT_NAME, f.eprint_float_idx)
+    m.set(FLOAT_TO_STRING_NAME, f.float_to_string_idx)
+}
+
+fn populateWasiIndicesCore(m: *Map(string, int), f: *WasiFunctions) void {
+    m.set(FD_WRITE_NAME, f.fd_write_idx)
+    m.set(FD_WRITE_SIMPLE_NAME, f.fd_write_simple_idx)
+    m.set(FD_READ_SIMPLE_NAME, f.fd_read_simple_idx)
+    m.set(FD_CLOSE_NAME, f.fd_close_idx)
+    m.set(FD_SEEK_NAME, f.fd_seek_idx)
+    m.set(FD_OPEN_NAME, f.fd_open_idx)
+    m.set(TIME_NAME, f.time_idx)
+    m.set(RANDOM_NAME, f.random_idx)
+    m.set(EXIT_NAME, f.exit_idx)
+    m.set(ARGS_COUNT_NAME, f.args_count_idx)
+    m.set(ARG_LEN_NAME, f.arg_len_idx)
+    m.set(ARG_PTR_NAME, f.arg_ptr_idx)
+    m.set(ENVIRON_COUNT_NAME, f.environ_count_idx)
+    m.set(ENVIRON_LEN_NAME, f.environ_len_idx)
+    m.set(ENVIRON_PTR_NAME, f.environ_ptr_idx)
+}
+
+fn populateWasiIndicesNet(m: *Map(string, int), f: *WasiFunctions) void {
+    m.set(NET_SOCKET_NAME, f.net_socket_idx)
+    m.set(NET_BIND_NAME, f.net_bind_idx)
+    m.set(NET_LISTEN_NAME, f.net_listen_idx)
+    m.set(NET_ACCEPT_NAME, f.net_accept_idx)
+    m.set(NET_CONNECT_NAME, f.net_connect_idx)
+    m.set(NET_SET_REUSE_ADDR_NAME, f.net_set_reuse_addr_idx)
+}
+
+fn populateWasiIndicesEventLoop(m: *Map(string, int), f: *WasiFunctions) void {
+    m.set(KQUEUE_CREATE_NAME, f.kqueue_create_idx)
+    m.set(KEVENT_ADD_NAME, f.kevent_add_idx)
+    m.set(KEVENT_DEL_NAME, f.kevent_del_idx)
+    m.set(KEVENT_WAIT_NAME, f.kevent_wait_idx)
+    m.set(EPOLL_CREATE_NAME, f.epoll_create_idx)
+    m.set(EPOLL_ADD_NAME, f.epoll_add_idx)
+    m.set(EPOLL_DEL_NAME, f.epoll_del_idx)
+    m.set(EPOLL_WAIT_NAME, f.epoll_wait_idx)
+    m.set(SET_NONBLOCK_NAME, f.set_nonblocking_idx)
+}
+
+fn populateWasiIndicesProcess(m: *Map(string, int), f: *WasiFunctions) void {
+    m.set(FORK_NAME, f.fork_idx)
+    m.set(EXECVE_NAME, f.execve_idx)
+    m.set(WAITPID_NAME, f.waitpid_idx)
+    m.set(PIPE_NAME, f.pipe_idx)
+    m.set(DUP2_NAME, f.dup2_idx)
+    m.set(ISATTY_NAME, f.isatty_idx)
+}
+
+fn populateWasiIndicesDir(m: *Map(string, int), f: *WasiFunctions) void {
+    m.set(MKDIR_NAME, f.mkdir_idx)
+    m.set(DIR_OPEN_NAME, f.dir_open_idx)
+    m.set(DIR_NEXT_NAME, f.dir_next_idx)
+    m.set(DIR_CLOSE_NAME, f.dir_close_idx)
+    m.set(STAT_TYPE_NAME, f.stat_type_idx)
+    m.set(UNLINK_NAME, f.unlink_idx)
+}
+
+fn populateWasiIndices(m: *Map(string, int), f: *WasiFunctions) void {
+    populateWasiIndicesCore(m, f)
+    populateWasiIndicesNet(m, f)
+    populateWasiIndicesEventLoop(m, f)
+    populateWasiIndicesProcess(m, f)
+    populateWasiIndicesDir(m, f)
+}
+
+fn populateTestIndices(m: *Map(string, int), f: *TestFunctions) void {
+    m.set(TEST_BEGIN_NAME, f.test_begin_idx)
+    m.set(TEST_PRINT_NAME_NAME, f.test_print_name_idx)
+    m.set(TEST_PASS_NAME, f.test_pass_idx)
+    m.set(TEST_FAIL_NAME, f.test_fail_idx)
+    m.set(TEST_SUMMARY_NAME, f.test_summary_idx)
+    m.set(TEST_STORE_FAIL_VALUES_NAME, f.test_store_fail_values_idx)
+}
+
+fn populateBenchIndices(m: *Map(string, int), f: *BenchFunctions) void {
+    m.set(BENCH_PRINT_NAME_NAME, f.bench_print_name_idx)
+    m.set(BENCH_CALIBRATE_START_NAME, f.bench_calibrate_start_idx)
+    m.set(BENCH_CALIBRATE_END_NAME, f.bench_calibrate_end_idx)
+    m.set(BENCH_MEASURE_START_NAME, f.bench_measure_start_idx)
+    m.set(BENCH_MEASURE_END_NAME, f.bench_measure_end_idx)
+    m.set(BENCH_GET_N_NAME, f.bench_get_n_idx)
+    m.set(BENCH_SUMMARY_NAME, f.bench_summary_idx)
+}
+
+/// Add user function names to func_indices (offset by runtime count).
+fn populateUserFuncIndicesFromIR(func_indices: *Map(string, int), ir: IR, runtime_func_count: int) void {
+    var i = 0
+    while (i < ir.funcs.count) {
+        const f = ir.funcs.get(i)
+        func_indices.set(f.name, i + runtime_func_count)
+        i += 1
+    }
+}
+
+// ============================================================================
+// Function table entries
+// ============================================================================
+
+/// Add all user functions to the indirect call table, building table index map.
+fn addUserTableEntries(linker: *Linker, ir: IR, runtime_func_count: int, func_table_indices: *Map(string, int)) void {
+    var i = 0
+    while (i < ir.funcs.count) {
+        const func_idx = i + runtime_func_count
+        const table_idx = linker.addTableFunc(func_idx)
+        func_table_indices.set(ir.funcs.get(i).name, table_idx)
+        i += 1
+    }
+}
+
+// ============================================================================
+// String literal collection
+// ============================================================================
+
+/// Collect all string literals from IR functions, dedup, add to linker data segments.
+fn collectAllStringLiterals(linker: *Linker, string_offsets: *Map(string, int), ir: IR) void {
+    var i = 0
+    while (i < ir.funcs.count) {
+        const f = ir.funcs.get(i)
+        var j = 0
+        while (j < f.string_literals.count) {
+            const s = f.string_literals.get(j)
+            if (!string_offsets.contains(s)) {
+                const data = stringToData(s)
+                const offset = linker.addDataSegment(data)
+                string_offsets.set(s, offset)
+            }
+            j += 1
+        }
+        i += 1
+    }
+}
+
+/// Convert a string to List(int) byte data for a data segment.
+fn stringToData(s: string) List(int) {
+    var data: List(int) = .{}
+    const ptr = @ptrOf(s)
+    const len = @lenOf(s)
+    var i = 0
+    while (i < len) {
+        const b = @intCast(int, @intToPtr(*u8, ptr + i).*)
+        data.append(b)
+        i += 1
+    }
+    return data
+}
+
+// ============================================================================
+// Per-function code generation
+// ============================================================================
+
+/// Generate code for all IR functions and add them to the linker.
+fn generateAllFunctions(linker: *Linker, ir: IR, types: *TypeRegistry, func_indices: *Map(string, int), string_offsets: *Map(string, int), func_table_indices: *Map(string, int), runtime_func_count: int) void {
+    var i = 0
+    while (i < ir.funcs.count) {
+        const ir_func = ir.funcs.get(i)
+        generateAndAddFunc(linker, ir_func, ir, types, func_indices, string_offsets, func_table_indices)
+        i += 1
+    }
+}
+
+/// Build SSA, run passes, generate Wasm bytecode, and add function to linker.
+fn generateAndAddFunc(linker: *Linker, ir_func: Func, ir: IR, types: *TypeRegistry, func_indices: *Map(string, int), string_offsets: *Map(string, int), func_table_indices: *Map(string, int)) void {
+    // Build SSA from IR
+    var builder = SSABuilder.init(ir_func, ir.globals, types)
+    const ssa_func = builder.build()
+
+    // Run Wasm-specific SSA passes (Go pass order)
+    passRewriteGeneric(ssa_func, string_offsets)
+    decompose(ssa_func)
+    passRewriteDec(ssa_func)
+    schedule(ssa_func)
+    layout(ssa_func)
+    lower(ssa_func)
+
+    // Determine function type
+    const type_idx = registerFuncType(linker, ir_func, types)
+
+    // Generate Prog chain → preprocess (dispatch loop) → assemble (bytecode)
+    var sym = generateFunc(ssa_func, func_indices, string_offsets, func_table_indices)
+    preprocess(&sym)
+    const body = assemble(&sym)
+
+    // Free all per-function SSA data — mirrors Zig compiler's arena.deinit() pattern
+    ssa_func.free()
+    builder.free()
+
+    // Add to linker
+    linker.addFunc(WasmFunc.init(ir_func.name, type_idx, body, true))
+}
+
+/// Register a function's type signature with the linker.
+/// Decomposes compound params (string/slice → 2xi64, large struct → Nxi64).
+fn registerFuncType(linker: *Linker, ir_func: Func, types: *TypeRegistry) int {
+    var params: List(int) = .{}
+    buildFuncParams(&params, ir_func, types)
+
+    var results: List(int) = .{}
+    buildFuncResults(&results, ir_func, types)
+
+    const idx = linker.addType(params, results)
+    params.free()
+    results.free()
+    return idx
+}
+
+/// Build Wasm param types from IR function parameters.
+/// Decompose compound types: string/slice → 2xi64, large struct → Nxi64.
+fn buildFuncParams(params: *List(int), ir_func: Func, types: *TypeRegistry) void {
+    var i = 0
+    while (i < ir_func.params.count) {
+        const param = ir_func.params.get(i)
+        addParamType(params, param, types)
+        i += 1
+    }
+}
+
+/// Add Wasm param type(s) for a single IR parameter.
+fn addParamType(params: *List(int), param: Local, types: *TypeRegistry) void {
+    const param_type = types.get(param.type_idx)
+    const is_string_or_slice = param.type_idx == STRING or param_type.tag == TAG_SLICE
+    const type_size = types.sizeOf(param.type_idx)
+    const is_compound_opt = param_type.tag == TAG_OPTIONAL and types.get(switch (param_type) { Type.optional |o| => o.elem, else => 0 }).tag != TAG_POINTER
+    const is_large_struct = (param_type.tag == TAG_STRUCT or param_type.tag == TAG_UNION or param_type.tag == TAG_TUPLE or is_compound_opt) and type_size > 8
+
+    if (is_string_or_slice) {
+        params.append(VT_I64)
+        params.append(VT_I64)
+    } else if (is_large_struct) {
+        const num_slots = (type_size + 7) / 8
+        var k = 0
+        while (k < num_slots) {
+            params.append(VT_I64)
+            k += 1
+        }
+    } else {
+        const is_float = param.type_idx == F64 or param.type_idx == F32
+        if (is_float) {
+            params.append(VT_F64)
+        } else {
+            params.append(VT_I64)
+        }
+    }
+}
+
+/// Build Wasm result types from IR function return type.
+fn buildFuncResults(results: *List(int), ir_func: Func, types: *TypeRegistry) void {
+    if (ir_func.return_type == VOID) { return }
+
+    const ret_type_info = types.get(ir_func.return_type)
+    const ret_is_compound = ir_func.return_type == STRING or ret_type_info.tag == TAG_SLICE
+
+    if (ret_is_compound) {
+        results.append(VT_I64)
+        results.append(VT_I64)
+    } else {
+        const ret_is_float = ir_func.return_type == F64 or ir_func.return_type == F32
+        if (ret_is_float) {
+            results.append(VT_F64)
+        } else {
+            results.append(VT_I64)
+        }
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+test "stringToData converts string bytes" {
+    const data = stringToData("ABC")
+    @assertEq(data.count, 3)
+    @assertEq(data.get(0), 65)
+    @assertEq(data.get(1), 66)
+    @assertEq(data.get(2), 67)
+}
+
+test "stringToData empty string" {
+    const data = stringToData("")
+    @assertEq(data.count, 0)
+}
+
+test "buildFuncResults void returns nothing" {
+    var types = TypeRegistry.init()
+    var results: List(int) = .{}
+    const f = makeDriverTestFunc("void_fn", VOID)
+    buildFuncResults(&results, f, &types)
+    @assertEq(results.count, 0)
+}
+
+test "buildFuncResults int returns i64" {
+    var types = TypeRegistry.init()
+    var results: List(int) = .{}
+    const f = makeDriverTestFunc("int_fn", INT)
+    buildFuncResults(&results, f, &types)
+    @assertEq(results.count, 1)
+    @assertEq(results.get(0), VT_I64)
+}
+
+test "buildFuncResults float returns f64" {
+    var types = TypeRegistry.init()
+    var results: List(int) = .{}
+    const f = makeDriverTestFunc("float_fn", F64)
+    buildFuncResults(&results, f, &types)
+    @assertEq(results.count, 1)
+    @assertEq(results.get(0), VT_F64)
+}
+
+test "buildFuncParams empty params" {
+    var types = TypeRegistry.init()
+    var params: List(int) = .{}
+    const f = makeDriverTestFunc("empty_fn", VOID)
+    buildFuncParams(&params, f, &types)
+    @assertEq(params.count, 0)
+}
+
+test "buildFuncParams int param produces i64" {
+    var types = TypeRegistry.init()
+    var params: List(int) = .{}
+    var f = makeDriverTestFunc("int_fn", VOID)
+    f.params.append(Local.initParam("x", INT, 0, 8))
+    buildFuncParams(&params, f, &types)
+    @assertEq(params.count, 1)
+    @assertEq(params.get(0), VT_I64)
+}
+
+test "buildFuncParams string param produces 2xi64" {
+    var types = TypeRegistry.init()
+    var params: List(int) = .{}
+    var f = makeDriverTestFunc("str_fn", VOID)
+    f.params.append(Local.initParam("s", STRING, 0, 16))
+    buildFuncParams(&params, f, &types)
+    @assertEq(params.count, 2)
+    @assertEq(params.get(0), VT_I64)
+    @assertEq(params.get(1), VT_I64)
+}
+
+test "CompileOptions default" {
+    const opts = CompileOptions {
+        is_wasi: true,
+        test_mode: false,
+        bench_mode: false,
+        bench_n: -1,
+    }
+    @assertEq(opts.is_wasi, true)
+    @assertEq(opts.bench_n, -1)
+}
+
+test "populateMemIndices sets function names" {
+    var m: Map(string, int) = .{}
+    var f = MemFunctions {
+        alloc_idx: 0,
+        dealloc_idx: 1,
+        realloc_idx: 2,
+        memcpy_idx: 3,
+        memset_zero_idx: 4,
+        string_eq_idx: 5,
+        string_concat_idx: 6,
+    }
+    populateMemIndices(&m, &f)
+    @assert(m.contains("alloc"))
+    @assert(m.contains("dealloc"))
+    @assert(m.contains("realloc"))
+    @assert(m.contains("memcpy"))
+    @assert(m.contains("memset_zero"))
+    @assert(m.contains("string_eq"))
+    @assert(m.contains("string_concat"))
+    @assertEq(m.get("alloc"), 0)
+    @assertEq(m.get("string_concat"), 6)
+}
+
+/// Helper: create a minimal Func for testing.
+fn makeDriverTestFunc(name: string, return_type: int) Func {
+    var fp: List(Local) = .{}
+    var fl: List(Local) = .{}
+    var fblocks: List(Block) = .{}
+    var fn_nodes: List(Node) = .{}
+    var fs: List(string) = .{}
+    const sp = Span { start: 0, end: 0 }
+    return Func {
+        name: name,
+        type_idx: 0,
+        return_type: return_type,
+        params: fp,
+        locals: fl,
+        blocks: fblocks,
+        entry: 0,
+        nodes: fn_nodes,
+        span: sp,
+        frame_size: 0,
+        string_literals: fs,
+        is_destructor: false,
+        is_export: false,
+    }
+}

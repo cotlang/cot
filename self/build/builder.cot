@@ -1,0 +1,2364 @@
+/// IR to SSA Conversion — Go's FwdRef pattern for deferred phi insertion.
+/// Ported from compiler/frontend/ssa_builder.zig (2,213 lines).
+///
+/// Converts IR (flat instructions in basic blocks) into SSA form using
+/// Braun et al.'s (2013) deferred phi insertion algorithm.
+
+import "std/list"
+import "std/map"
+import "std/string"
+import "ir"
+import "ssa"
+import "../check/types"
+import "../parse/source"
+
+// ============================================================================
+// Parameter initialization helpers (extracted to keep stack frames small)
+// ============================================================================
+
+/// Emit SSA for a string/slice parameter: two registers (ptr, len) → slice_make → stack store.
+fn initStringSliceParam(func: *SsaFunc, vars: *Map(int, int), slot_offsets: *List(int), entry: int, i: int, param: Local, phys_reg_idx: int) int {
+    var reg = phys_reg_idx
+
+    const ptr_val = func.newValue(SsaOp.arg, I64, entry, 0, 0)
+    var ptr_v = func.getValue(ptr_val)
+    ptr_v.aux_int = reg
+    func.setValue(ptr_val, ptr_v)
+    func.addValueToBlock(ptr_val, entry)
+    reg += 1
+
+    const len_val = func.newValue(SsaOp.arg, I64, entry, 0, 0)
+    var len_v = func.getValue(len_val)
+    len_v.aux_int = reg
+    func.setValue(len_val, len_v)
+    func.addValueToBlock(len_val, entry)
+    reg += 1
+
+    // SliceMake always has 3 args (ptr, len, cap). For params, cap = len.
+    const slice_val = func.newValue(SsaOp.slice_make, param.type_idx, entry, 0, 0)
+    var slice_v = func.getValue(slice_val)
+    slice_v.addArg(ptr_val)
+    slice_v.addArg(len_val)
+    slice_v.addArg(len_val)
+    func.setValue(slice_val, slice_v)
+    func.addValueToBlock(slice_val, entry)
+    vars.set(i, slice_val)
+
+    // Store to stack for address-taken variables
+    const addr_v = func.newValue(SsaOp.local_addr, VOID, entry, 0, 0)
+    var av = func.getValue(addr_v)
+    av.aux_int = slot_offsets.get(i)
+    func.setValue(addr_v, av)
+    func.addValueToBlock(addr_v, entry)
+
+    const ptr_store = func.newValue(SsaOp.store, VOID, entry, 0, 0)
+    var ps = func.getValue(ptr_store)
+    ps.addArg2(addr_v, ptr_val)
+    func.setValue(ptr_store, ps)
+    func.addValueToBlock(ptr_store, entry)
+
+    const len_addr = func.newValue(SsaOp.off_ptr, VOID, entry, 0, 0)
+    var la = func.getValue(len_addr)
+    la.aux_int = 8
+    la.addArg(addr_v)
+    func.setValue(len_addr, la)
+    func.addValueToBlock(len_addr, entry)
+
+    const len_store = func.newValue(SsaOp.store, VOID, entry, 0, 0)
+    var ls = func.getValue(len_store)
+    ls.addArg2(len_addr, len_val)
+    func.setValue(len_store, ls)
+    func.addValueToBlock(len_store, entry)
+
+    return reg
+}
+
+/// Emit SSA for a large struct parameter: N i64 arg registers stored chunk-by-chunk.
+fn initLargeStructParam(func: *SsaFunc, entry: int, slot_offsets: *List(int), i: int, type_size: int, phys_reg_idx: int) int {
+    var reg = phys_reg_idx
+    const num_slots = (type_size + 7) / 8
+    const base_addr = func.newValue(SsaOp.local_addr, VOID, entry, 0, 0)
+    var ba = func.getValue(base_addr)
+    ba.aux_int = slot_offsets.get(i)
+    func.setValue(base_addr, ba)
+    func.addValueToBlock(base_addr, entry)
+
+    for slot in 0..num_slots {
+        const chunk_val = func.newValue(SsaOp.arg, I64, entry, 0, 0)
+        var cv = func.getValue(chunk_val)
+        cv.aux_int = reg
+        func.setValue(chunk_val, cv)
+        func.addValueToBlock(chunk_val, entry)
+        reg += 1
+
+        if (slot == 0) {
+            const store_v = func.newValue(SsaOp.store, VOID, entry, 0, 0)
+            var sv = func.getValue(store_v)
+            sv.addArg2(base_addr, chunk_val)
+            func.setValue(store_v, sv)
+            func.addValueToBlock(store_v, entry)
+        } else {
+            const off_addr = func.newValue(SsaOp.off_ptr, VOID, entry, 0, 0)
+            var oa = func.getValue(off_addr)
+            oa.aux_int = slot * 8
+            oa.addArg(base_addr)
+            func.setValue(off_addr, oa)
+            func.addValueToBlock(off_addr, entry)
+
+            const store_v = func.newValue(SsaOp.store, VOID, entry, 0, 0)
+            var sv = func.getValue(store_v)
+            sv.addArg2(off_addr, chunk_val)
+            func.setValue(store_v, sv)
+            func.addValueToBlock(store_v, entry)
+        }
+    }
+
+    return reg
+}
+
+/// Emit SSA for a regular (scalar) parameter: single arg register → stack store.
+fn initRegularParam(func: *SsaFunc, vars: *Map(int, int), slot_offsets: *List(int), entry: int, i: int, param: Local, phys_reg_idx: int) int {
+    var reg = phys_reg_idx
+
+    const arg_val = func.newValue(SsaOp.arg, param.type_idx, entry, 0, 0)
+    var arg_v = func.getValue(arg_val)
+    arg_v.aux_int = reg
+    func.setValue(arg_val, arg_v)
+    func.addValueToBlock(arg_val, entry)
+    reg += 1
+    vars.set(i, arg_val)
+
+    // Store to stack
+    const addr_v = func.newValue(SsaOp.local_addr, VOID, entry, 0, 0)
+    var av = func.getValue(addr_v)
+    av.aux_int = slot_offsets.get(i)
+    func.setValue(addr_v, av)
+    func.addValueToBlock(addr_v, entry)
+
+    const store_v = func.newValue(SsaOp.store, VOID, entry, 0, 0)
+    var sv = func.getValue(store_v)
+    sv.addArg2(addr_v, arg_val)
+    func.setValue(store_v, sv)
+    func.addValueToBlock(store_v, entry)
+
+    return reg
+}
+
+// ============================================================================
+// DefvarEntry — flat replacement for Zig's nested Map(u32, Map(LocalIdx, *Value))
+// ============================================================================
+
+struct DefvarEntry {
+    block_id: int,
+    local_idx: int,
+    value_idx: int,
+}
+
+// ============================================================================
+// LoopContext — loop break/continue targets
+// ============================================================================
+
+struct LoopContext {
+    continue_block: int,
+    break_block: int,
+}
+
+// ============================================================================
+// SSABuilder
+// ============================================================================
+
+struct SSABuilder {
+    func: SsaFunc,
+    ir_func: Func,
+    ir_globals: List(Global),
+    type_reg: *TypeRegistry,
+    vars: Map(int, int),           // local_idx → value_idx (current block)
+    fwd_vars: Map(int, int),       // local_idx → fwd_ref value_idx
+    defvars: List(DefvarEntry),    // flat list of block→local→value entries
+    cur_block: int,                // current SSA block index (null_block if none)
+    block_map: Map(int, int),      // IR block index → SSA block index
+    node_values: Map(int, int),    // IR node index → SSA value index (cache)
+    loop_stack: List(LoopContext),
+    cur_pos_line: int,
+    cur_pos_col: int,
+    local_slot_offsets: List(int),
+    shape_aliases: ?*Map(string, string),
+    dict_arg_names: ?*Map(string, string),  // concrete_name → comma-separated helper names
+    logical_operands: Map(int, int),
+
+    static fn init(ir_func: Func, ir_globals: List(Global), type_reg: *TypeRegistry) SSABuilder {
+        var func = SsaFunc.init(ir_func.name)
+        func.is_export = ir_func.is_export
+
+        // Create entry block
+        const entry = func.newBlock(SsaBlockKind.plain)
+        func.entry = entry
+
+        // Compute local slot offsets: each IR local gets a frame slot
+        // Multi-word locals (structs, tuples) occupy multiple 8-byte slots
+        var slot_offsets: List(int) = .{}
+        var next_slot: int = 0
+        for i in 0..ir_func.locals.count {
+            slot_offsets.append(next_slot)
+            const local = ir_func.locals.get(i)
+            const num_slots = @max(1, (local.size + 7) / 8)
+            next_slot += num_slots
+        }
+
+        var vars: Map(int, int) = .{}
+
+        // Initialize parameters — each param kind in its own function to keep stack small
+        var phys_reg_idx: int = 0
+        for i in 0..ir_func.params.count {
+            const param = ir_func.params.get(i)
+            const local_type = type_reg.get(param.type_idx)
+            const is_string_or_slice = param.type_idx == STRING or local_type.tag == TAG_SLICE
+            const type_size = type_reg.sizeOf(param.type_idx)
+            const is_compound_opt = local_type.tag == TAG_OPTIONAL and type_reg.get(switch (local_type) { Type.optional |o| => o.elem, else => 0 }).tag != TAG_POINTER
+            const is_large_struct = (local_type.tag == TAG_STRUCT or local_type.tag == TAG_UNION or local_type.tag == TAG_TUPLE or is_compound_opt) and type_size > 8
+
+            if (is_string_or_slice) {
+                phys_reg_idx = initStringSliceParam(&func, &vars, &slot_offsets, entry, i, param, phys_reg_idx)
+            } else if (is_large_struct) {
+                phys_reg_idx = initLargeStructParam(&func, entry, &slot_offsets, i, type_size, phys_reg_idx)
+            } else {
+                phys_reg_idx = initRegularParam(&func, &vars, &slot_offsets, entry, i, param, phys_reg_idx)
+            }
+        }
+
+        var fwd_vars: Map(int, int) = .{}
+        var defvars: List(DefvarEntry) = .{}
+        var block_map: Map(int, int) = .{}
+        block_map.set(0, entry)
+        var node_values: Map(int, int) = .{}
+        var loop_stack: List(LoopContext) = .{}
+        var logical_operands: Map(int, int) = .{}
+
+        return SSABuilder {
+            func: func,
+            ir_func: ir_func,
+            ir_globals: ir_globals,
+            type_reg: type_reg,
+            vars: vars,
+            fwd_vars: fwd_vars,
+            defvars: defvars,
+            cur_block: entry,
+            block_map: block_map,
+            node_values: node_values,
+            loop_stack: loop_stack,
+            cur_pos_line: 0,
+            cur_pos_col: 0,
+            local_slot_offsets: slot_offsets,
+            shape_aliases: null,
+            dict_arg_names: null,
+            logical_operands: logical_operands,
+        }
+    }
+
+    fn takeFunc() SsaFunc {
+        return self.func
+    }
+
+    /// Free all builder-owned memory (does NOT free the SsaFunc — caller owns that after build()).
+    fn free() void {
+        self.vars.free()
+        self.fwd_vars.free()
+        self.defvars.free()
+        self.block_map.free()
+        self.node_values.free()
+        self.loop_stack.free()
+        self.local_slot_offsets.free()
+        self.logical_operands.free()
+    }
+
+    // === Block management ===
+
+    fn startBlock(block: int) void {
+        self.saveDefvars()
+        self.cur_block = block
+        self.vars.clear()
+        self.fwd_vars.clear()
+    }
+
+    fn endBlock() int {
+        self.saveDefvars()
+        const b = self.cur_block
+        self.cur_block = null_block
+        return b
+    }
+
+    fn saveDefvars() void {
+        if (self.cur_block == null_block) { return }
+        const block_id = self.func.getBlock(self.cur_block).id
+        // Save current vars snapshot into defvars flat list
+        var keys = self.vars.keys()
+        for i in 0..keys.count {
+            const local_idx = keys.get(i)
+            const val_idx = self.vars.get(local_idx)
+            self.setDefvar(block_id, local_idx, val_idx)
+        }
+    }
+
+    fn assign(local_idx: int, value: int) void {
+        self.vars.set(local_idx, value)
+    }
+
+    fn variable(local_idx: int, type_idx: int) int {
+        if (self.vars.contains(local_idx)) { return self.vars.get(local_idx) }
+        if (self.fwd_vars.contains(local_idx)) { return self.fwd_vars.get(local_idx) }
+        if (self.cur_block == null_block) { return null_value }
+        const fwd = self.func.newValue(SsaOp.fwd_ref, type_idx, self.cur_block, self.cur_pos_line, self.cur_pos_col)
+        var fwd_v = self.func.getValue(fwd)
+        fwd_v.aux_int = local_idx
+        self.func.setValue(fwd, fwd_v)
+        self.func.addValueToBlock(fwd, self.cur_block)
+        self.fwd_vars.set(local_idx, fwd)
+        return fwd
+    }
+
+    fn getOrCreateBlock(ir_block_idx: int) int {
+        if (self.block_map.contains(ir_block_idx)) {
+            return self.block_map.get(ir_block_idx)
+        }
+        const blk = self.func.newBlock(SsaBlockKind.plain)
+        self.block_map.set(ir_block_idx, blk)
+        return blk
+    }
+
+    // === Main build loop ===
+
+    fn build() SsaFunc {
+        // Copy local sizes for stack allocation
+        if (self.ir_func.locals.count > 0) {
+            for i in 0..self.ir_func.locals.count {
+                self.func.local_sizes.append(self.ir_func.locals.get(i).size)
+            }
+        }
+        if (self.ir_func.string_literals.count > 0) {
+            self.func.string_literals = self.ir_func.string_literals
+        }
+
+        // Pre-scan for logical operands
+        for i in 0..self.ir_func.blocks.count {
+            const ir_block = self.ir_func.blocks.get(i)
+            if (ir_block.nodes.count < 0 or ir_block.nodes.count > 100000) {
+                @panic("CORRUPT block[${i}] in ${self.ir_func.name}: nodes.count=${ir_block.nodes.count}")
+            }
+            for j in 0..ir_block.nodes.count {
+                const node_idx = ir_block.nodes.get(j)
+                if (node_idx < 0 or node_idx >= self.ir_func.nodes.count) {
+                    @panic("BAD node_idx ${node_idx} in block[${i}] of ${self.ir_func.name} (nodes.count=${self.ir_func.nodes.count})")
+                }
+                const node = self.ir_func.getNode(node_idx)
+                switch (node.data) {
+                    Data.binary |b| => {
+                        if (b.op.isLogical()) {
+                            self.markLogicalOperands(b.left)
+                            self.markLogicalOperands(b.right)
+                        }
+                    },
+                    else => {},
+                }
+            }
+        }
+
+        // Walk all IR blocks
+        for i in 0..self.ir_func.blocks.count {
+            const ssa_block = self.getOrCreateBlock(i)
+            if (i != 0) { self.startBlock(ssa_block) }
+            const ir_block = self.ir_func.blocks.get(i)
+            for j in 0..ir_block.nodes.count {
+                const node_idx = ir_block.nodes.get(j)
+                if (self.logical_operands.contains(node_idx)) { continue }
+                self.convertNode(node_idx)
+            }
+        }
+
+        self.insertPhis()
+        self.verify()
+        return self.takeFunc()
+    }
+
+    // === Dispatch ===
+
+    fn convertNode(node_idx: int) int {
+        // null_node is -1 but may appear as 0xFFFFFFFF due to 32-bit field truncation.
+        // Treat any out-of-range index as null to handle both representations.
+        if (node_idx < 0 or node_idx >= self.ir_func.nodes.count) { return null_value }
+        if (self.node_values.contains(node_idx)) { return self.node_values.get(node_idx) }
+        const node = self.ir_func.getNode(node_idx)
+        const cur = self.cur_block
+        if (cur == null_block) {
+            // Block terminated (e.g. after return/jump). Skip remaining nodes.
+            return null_value
+        }
+        self.cur_pos_line = node.span.start
+        self.cur_pos_col = 0
+
+        const result = switch (node.data) {
+            Data.const_int |c| => self.emitConst(SsaOp.const_int, node.type_idx, c.value),
+            Data.const_float |c| => self.emitConst(SsaOp.const_float, node.type_idx, @bitCast(int, c.value)),
+            Data.const_bool |c| => self.emitConst(SsaOp.const_bool, node.type_idx, if (c.value) { 1 } else { 0 }),
+            Data.const_null => self.emitConst(SsaOp.const_nil, node.type_idx, 0),
+            Data.const_slice |c| => self.emitConst(SsaOp.const_string, node.type_idx, c.string_index),
+            Data.load_local |l| => self.convertLoadLocal(l.local_idx, node.type_idx),
+            Data.store_local |s| => self.convertStoreLocal(s.local_idx, s.value),
+            Data.local_ref |l| => self.emitLocalAddr(l.local_idx, node.type_idx),
+            Data.addr_local |l| => self.emitLocalAddr(l.local_idx, node.type_idx),
+            Data.global_ref |g| => self.convertGlobalRef(g.name, node.type_idx),
+            Data.global_store |g| => self.convertGlobalStore(g.name, g.global_idx, g.value),
+            Data.addr_global |g| => self.convertAddrGlobal(g.name, node.type_idx),
+            Data.type_metadata |m| => self.convertTypeMetadata(m.type_name, node.type_idx),
+            Data.wasm_global_read |g| => self.convertWasmGlobalRead(g.global_idx, node.type_idx),
+            Data.binary |b| => self.convertBinary(b, node.type_idx),
+            Data.unary |u| => self.convertUnary(u, node.type_idx),
+            Data.call |c| => self.convertCall(c.func_name, c.args, node.type_idx),
+            Data.call_indirect |c| => self.convertCallIndirect(c.callee, c.args, node.type_idx),
+            Data.closure_call |c| => self.convertClosureCall(c.callee, c.context, c.args, node.type_idx),
+            Data.ret |r| => self.convertRet(r),
+            Data.jump |j| => self.convertJump(j),
+            Data.branch |br| => self.convertBranch(br),
+            Data.select |s| => self.convertSelect(s, node.type_idx),
+            Data.convert |c| => self.convertConvert(c, node.type_idx),
+            Data.phi => null_value,
+            Data.nop => null_value,
+            Data.trap => self.convertTrap(node.type_idx),
+            Data.field_local |f| => self.convertFieldLocal(f, node.type_idx),
+            Data.store_local_field |f| => self.convertStoreLocalField(f),
+            Data.field_value |f| => self.convertFieldValue(f, node.type_idx),
+            Data.store_field |f| => self.convertStoreField(f),
+            Data.index_local |idx| => self.convertIndexLocal(idx, node.type_idx),
+            Data.index_value |idx| => self.convertIndexValue(idx, node.type_idx),
+            Data.store_index_local |s| => self.convertStoreIndexLocal(s),
+            Data.store_index_value |s| => self.convertStoreIndexValue(s),
+            Data.slice_local |s| => self.convertSliceLocal(s, node.type_idx),
+            Data.slice_value |s| => self.convertSliceValue(s, node.type_idx),
+            Data.slice_ptr |s| => self.convertSliceOp(SsaOp.slice_ptr, s.slice, node.type_idx),
+            Data.slice_len |s| => self.convertSliceOp(SsaOp.slice_len, s.slice, node.type_idx),
+            Data.slice_cap |s| => self.convertSliceOp(SsaOp.slice_cap, s.slice, node.type_idx),
+            Data.ptr_load |p| => self.convertPtrLoad(p.ptr_local, node.type_idx),
+            Data.ptr_store |p| => self.convertPtrStore(p),
+            Data.ptr_load_value |p| => self.convertPtrLoadValue(p.ptr, node.type_idx),
+            Data.ptr_store_value |p| => self.convertPtrStoreValue(p),
+            Data.ptr_field |p| => self.convertPtrField(p, node.type_idx),
+            Data.ptr_field_store |p| => self.convertPtrFieldStore(p),
+            Data.func_addr |f| => self.convertFuncAddr(f.name, node.type_idx),
+            Data.addr_offset |ao| => self.convertAddrOffset(ao, node.type_idx),
+            Data.addr_index |ai| => self.convertAddrIndex(ai, node.type_idx),
+            Data.atomic_cas |ac| => self.convertAtomicCas(ac, node.type_idx),
+            Data.str_concat |s| => self.convertStrConcat(s, node.type_idx),
+            Data.string_header |s| => self.convertStringHeader(s, node.type_idx),
+            Data.slice_header |s| => self.convertSliceHeader(s, node.type_idx),
+            Data.union_init |u| => self.convertUnionInit(u, node.type_idx),
+            Data.union_tag |u| => self.convertUnionTag(u, node.type_idx),
+            Data.union_payload |u| => self.convertUnionPayload(u, node.type_idx),
+            Data.list_new, Data.list_push, Data.list_get, Data.list_set, Data.list_len, Data.list_free,
+            Data.map_new, Data.map_set, Data.map_get, Data.map_has, Data.map_free => null_value,
+            Data.ptr_cast |p| => self.convertCast(p.operand, node.type_idx),
+            Data.int_to_ptr |p| => self.convertCast(p.operand, node.type_idx),
+            Data.ptr_to_int |p| => self.convertCast(p.operand, node.type_idx),
+            Data.gc_struct_new |gc| => self.convertGcStructNew(gc, node.type_idx),
+            Data.gc_struct_get |gc| => self.convertGcStructGet(gc, node.type_idx),
+            Data.gc_struct_set |gc| => self.convertGcStructSet(gc),
+            // WasmGC array operations
+            Data.gc_array_new |gc| => self.convertGcArrayNew(gc, node.type_idx),
+            Data.gc_array_new_default |gc| => self.convertGcArrayNewDefault(gc, node.type_idx),
+            Data.gc_array_new_fixed |gc| => self.convertGcArrayNewFixed(gc, node.type_idx),
+            Data.gc_array_new_data |gc| => self.convertGcArrayNewData(gc, node.type_idx),
+            Data.gc_array_get |gc| => self.convertGcArrayGet(gc, node.type_idx),
+            Data.gc_array_set |gc| => self.convertGcArraySet(gc),
+            Data.gc_array_len |gc| => self.convertGcArrayLen(gc),
+            Data.gc_array_copy => null_value,
+            // WasmGC reference operations
+            Data.gc_ref_null |gc| => self.convertGcRefNull(gc, node.type_idx),
+            Data.gc_ref_is_null |gc| => self.convertGcRefIsNull(gc),
+            Data.gc_ref_eq |gc| => self.convertGcRefEq(gc),
+            Data.gc_ref_cast |gc| => self.convertGcRefCast(gc, node.type_idx),
+            Data.gc_ref_test |gc| => self.convertGcRefTest(gc),
+        }
+
+        if (result != null_value) { self.node_values.set(node_idx, result) }
+        return result
+    }
+
+    // --- Extracted inline block handlers ---
+
+    fn convertAddrGlobal(name: string, type_idx: int) int {
+        const cur = self.cur_block
+        const val = self.func.newValue(SsaOp.global_addr, type_idx, cur, self.cur_pos_line, self.cur_pos_col)
+        var v = self.func.getValue(val)
+        v.aux = SsaAux.str(name)
+        self.func.setValue(val, v)
+        self.func.addValueToBlock(val, cur)
+        return val
+    }
+
+    fn convertTypeMetadata(type_name: string, type_idx: int) int {
+        const cur = self.cur_block
+        const val = self.func.newValue(SsaOp.metadata_addr, type_idx, cur, self.cur_pos_line, self.cur_pos_col)
+        var v = self.func.getValue(val)
+        v.aux = SsaAux.str(type_name)
+        self.func.setValue(val, v)
+        self.func.addValueToBlock(val, cur)
+        return val
+    }
+
+    fn convertWasmGlobalRead(global_idx: int, type_idx: int) int {
+        const cur = self.cur_block
+        const val = self.func.newValue(SsaOp.wasm_global_get, type_idx, cur, self.cur_pos_line, self.cur_pos_col)
+        var v = self.func.getValue(val)
+        v.aux_int = global_idx
+        self.func.setValue(val, v)
+        self.func.addValueToBlock(val, cur)
+        return val
+    }
+
+    fn convertFuncAddr(name: string, type_idx: int) int {
+        const cur = self.cur_block
+        const val = self.func.newValue(SsaOp.addr, type_idx, cur, self.cur_pos_line, self.cur_pos_col)
+        var v = self.func.getValue(val)
+        v.aux = SsaAux.str(name)
+        self.func.setValue(val, v)
+        self.func.addValueToBlock(val, cur)
+        return val
+    }
+
+    fn convertRet(r: Return) int {
+        const cur = self.cur_block
+        // Convert return value BEFORE reading the block — convertNode may
+        // add values to the current block (e.g. constants, loads).
+        // Reading the block first then overwriting it erases those values.
+        var ret_val = null_value
+        if (r.value != null_node) {
+            ret_val = self.convertNode(r.value)
+        }
+        // Now read the block (captures any values convertNode added)
+        var blk = self.func.getBlock(cur)
+        blk.kind = SsaBlockKind.ret
+        if (ret_val != null_value) {
+            blk.setControl(ret_val)
+        }
+        self.func.setBlock(cur, blk)
+        self.endBlock()
+        return null_value
+    }
+
+    fn convertJump(j: Jump) int {
+        const cur = self.cur_block
+        const target = self.getOrCreateBlock(j.target)
+        var blk = self.func.getBlock(cur)
+        blk.addEdgeTo(target, &self.func.blocks)
+        self.func.setBlock(cur, blk)
+        self.endBlock()
+        return null_value
+    }
+
+    fn convertBranch(br: Branch) int {
+        const cur = self.cur_block
+        const cond = self.convertNode(br.condition)
+        const then_block = self.getOrCreateBlock(br.then_block)
+        const else_block = self.getOrCreateBlock(br.else_block)
+        var blk = self.func.getBlock(cur)
+        blk.kind = SsaBlockKind.if_
+        blk.setControl(cond)
+        blk.addEdgeTo(then_block, &self.func.blocks)
+        blk.addEdgeTo(else_block, &self.func.blocks)
+        self.func.setBlock(cur, blk)
+        self.endBlock()
+        return null_value
+    }
+
+    fn convertTrap(type_idx: int) int {
+        const cur = self.cur_block
+        const val = self.func.newValue(SsaOp.wasm_unreachable, type_idx, cur, self.cur_pos_line, self.cur_pos_col)
+        self.func.addValueToBlock(val, cur)
+        return null_value
+    }
+
+    fn convertAddrOffset(ao: AddrOffset, type_idx: int) int {
+        const cur = self.cur_block
+        const base_val = self.convertNode(ao.base)
+        const val = self.func.newValue(SsaOp.off_ptr, type_idx, cur, self.cur_pos_line, self.cur_pos_col)
+        var v = self.func.getValue(val)
+        v.addArg(base_val)
+        v.aux_int = ao.offset
+        self.func.setValue(val, v)
+        self.func.addValueToBlock(val, cur)
+        return val
+    }
+
+    fn convertAddrIndex(ai: AddrIndex, type_idx: int) int {
+        const cur = self.cur_block
+        const base = self.convertNode(ai.base)
+        const idx = self.convertNode(ai.index)
+        const elem_size = self.func.newValue(SsaOp.const_int, I64, cur, self.cur_pos_line, self.cur_pos_col)
+        var es = self.func.getValue(elem_size)
+        es.aux_int = ai.elem_size
+        self.func.setValue(elem_size, es)
+        self.func.addValueToBlock(elem_size, cur)
+        const scaled_idx = self.func.newValue(SsaOp.mul, I64, cur, self.cur_pos_line, self.cur_pos_col)
+        var si = self.func.getValue(scaled_idx)
+        si.addArg2(idx, elem_size)
+        self.func.setValue(scaled_idx, si)
+        self.func.addValueToBlock(scaled_idx, cur)
+        const val = self.func.newValue(SsaOp.add_ptr, type_idx, cur, self.cur_pos_line, self.cur_pos_col)
+        var v = self.func.getValue(val)
+        v.addArg2(base, scaled_idx)
+        self.func.setValue(val, v)
+        self.func.addValueToBlock(val, cur)
+        return val
+    }
+
+    fn convertAtomicCas(ac: AtomicCas, type_idx: int) int {
+        const cur = self.cur_block
+        const ptr = self.convertNode(ac.ptr)
+        const expected = self.convertNode(ac.expected)
+        const new_val = self.convertNode(ac.new_val)
+        const val = self.func.newValue(SsaOp.atomic_cas64, type_idx, cur, self.cur_pos_line, self.cur_pos_col)
+        var v = self.func.getValue(val)
+        v.addArg(ptr)
+        v.addArg(expected)
+        v.addArg(new_val)
+        self.func.setValue(val, v)
+        self.func.addValueToBlock(val, cur)
+        return val
+    }
+
+    // === Helper emit functions ===
+
+    fn emitConst(op: SsaOp, type_idx: int, value: int) int {
+        const cur = self.cur_block
+        const val = self.func.newValue(op, type_idx, cur, self.cur_pos_line, self.cur_pos_col)
+        var v = self.func.getValue(val)
+        v.aux_int = value
+        self.func.setValue(val, v)
+        self.func.addValueToBlock(val, cur)
+        return val
+    }
+
+    fn emitLocalAddr(local_idx: int, type_idx: int) int {
+        const cur = self.cur_block
+        const val = self.func.newValue(SsaOp.local_addr, type_idx, cur, self.cur_pos_line, self.cur_pos_col)
+        var v = self.func.getValue(val)
+        v.aux_int = self.getSlotOffset(local_idx)
+        self.func.setValue(val, v)
+        self.func.addValueToBlock(val, cur)
+        return val
+    }
+
+    fn getSlotOffset(local_idx: int) int {
+        if (local_idx < self.local_slot_offsets.count) {
+            return self.local_slot_offsets.get(local_idx)
+        }
+        // Dynamically-added locals: compute offset by summing sizes of all preceding locals
+        var next_slot: int = 0
+        for i in 0..self.ir_func.locals.count {
+            if (i == local_idx) { return next_slot }
+            const num_slots = @max(1, (self.ir_func.locals.get(i).size + 7) / 8)
+            next_slot += num_slots
+        }
+        return next_slot
+    }
+
+    fn getLoadOp(type_idx: int) SsaOp {
+        const type_info = self.type_reg.get(type_idx)
+        if (type_info.tag == TAG_BASIC) {
+            const bk = switch (type_info) { Type.basic |bk| => bk, else => BasicKind.invalid }
+            return switch (bk) {
+                BasicKind.bool_type => SsaOp.load8,
+                BasicKind.i8_type => SsaOp.load8s,
+                BasicKind.u8_type => SsaOp.load8,
+                BasicKind.i16_type => SsaOp.load16s,
+                BasicKind.u16_type => SsaOp.load16,
+                BasicKind.i32_type => SsaOp.load32s,
+                BasicKind.u32_type => SsaOp.load32,
+                BasicKind.f32_type => SsaOp.load32,
+                BasicKind.f64_type => SsaOp.load,
+                else => SsaOp.load,
+            }
+        }
+        // enum_type: delegate to backing type (Zig ssa_builder.zig:1441-1443)
+        if (type_info.tag == TAG_ENUM) {
+            const backing = switch (type_info) { Type.enum_type |e| => e.backing_type, else => I64 }
+            return self.getLoadOp(backing)
+        }
+        return SsaOp.load
+    }
+
+    fn getStoreOp(type_idx: int) SsaOp {
+        const type_info = self.type_reg.get(type_idx)
+        if (type_info.tag == TAG_BASIC) {
+            const bk = switch (type_info) { Type.basic |bk| => bk, else => BasicKind.invalid }
+            return switch (bk) {
+                BasicKind.bool_type, BasicKind.i8_type, BasicKind.u8_type => SsaOp.store8,
+                BasicKind.i16_type, BasicKind.u16_type => SsaOp.store16,
+                BasicKind.i32_type, BasicKind.u32_type, BasicKind.f32_type => SsaOp.store32,
+                else => SsaOp.store,
+            }
+        }
+        // enum_type: delegate to backing type (Zig ssa_builder.zig:1465-1467)
+        if (type_info.tag == TAG_ENUM) {
+            const backing = switch (type_info) { Type.enum_type |e| => e.backing_type, else => I64 }
+            return self.getStoreOp(backing)
+        }
+        return SsaOp.store
+    }
+
+    // === isCompoundOptional helper ===
+
+    fn isCompoundOptional(type_idx: int) bool {
+        const t = self.type_reg.get(type_idx)
+        if (t.tag != TAG_OPTIONAL) { return false }
+        const elem = switch (t) { Type.optional |o| => o.elem, else => 0 }
+        return self.type_reg.get(elem).tag != TAG_POINTER
+    }
+
+    fn isStringOrSlice(type_idx: int) bool {
+        if (type_idx == STRING) { return true }
+        return self.type_reg.get(type_idx).tag == TAG_SLICE
+    }
+
+    fn isLargeCompound(type_idx: int) bool {
+        const t = self.type_reg.get(type_idx)
+        const size = self.type_reg.sizeOf(type_idx)
+        if ((t.tag == TAG_STRUCT or t.tag == TAG_UNION or t.tag == TAG_TUPLE) and size > 8) { return true }
+        return self.isCompoundOptional(type_idx)
+    }
+
+    // === Load/Store local ===
+
+    fn convertLoadLocal(local_idx: int, type_idx: int) int {
+        const cur = self.cur_block
+        const load_type = self.type_reg.get(type_idx)
+        const addr_val = self.emitLocalAddr(local_idx, VOID)
+
+        if (load_type.tag == TAG_SLICE) {
+            // Slice: load ptr, len, cap separately, combine with slice_make
+            const ptr_load = self.emitNewValueWithArg(SsaOp.load, I64, addr_val)
+            const len_addr = self.emitOffPtr(addr_val, 8)
+            const len_load = self.emitNewValueWithArg(SsaOp.load, I64, len_addr)
+            const cap_addr = self.emitOffPtr(addr_val, 16)
+            const cap_load = self.emitNewValueWithArg(SsaOp.load, I64, cap_addr)
+
+            const slice_val = self.func.newValue(SsaOp.slice_make, type_idx, cur, self.cur_pos_line, self.cur_pos_col)
+            var sv = self.func.getValue(slice_val)
+            sv.addArg(ptr_load)
+            sv.addArg(len_load)
+            sv.addArg(cap_load)
+            self.func.setValue(slice_val, sv)
+            self.func.addValueToBlock(slice_val, cur)
+            return slice_val
+        }
+
+        // Large structs/compound optionals: return the local's address directly
+        const type_size = self.type_reg.sizeOf(type_idx)
+        if (((load_type.tag == TAG_STRUCT or load_type.tag == TAG_TUPLE or load_type.tag == TAG_UNION) and type_size > 8) or self.isCompoundOptional(type_idx)) {
+            // Retype the addr to carry the struct type
+            var av = self.func.getValue(addr_val)
+            av.type_idx = type_idx
+            self.func.setValue(addr_val, av)
+            return addr_val
+        }
+
+        // Use type-aware load op for narrow integers
+        const type_info = self.type_reg.get(type_idx)
+        const is_narrow_int = type_info.tag == TAG_BASIC and (switch (type_info) { Type.basic |bk| => bk.isInteger() and bk.size() < 8, else => false })
+        const load_op = if (is_narrow_int) { self.getLoadOp(type_idx) } else { SsaOp.load }
+        return self.emitNewValueWithArg(load_op, type_idx, addr_val)
+    }
+
+    fn convertStoreLocal(local_idx: int, value_idx: int) int {
+        const cur = self.cur_block
+        const value = self.convertNode(value_idx)
+        if (value == null_value) { return null_value }
+        const value_type_idx = self.func.getValue(value).type_idx
+        const value_type = self.type_reg.get(value_type_idx)
+
+        // String/slice compound store: decompose into ptr@0, len@8
+        if (self.isStringOrSlice(value_type_idx)) {
+            const val_v = self.func.getValue(value)
+            var ptr_component: int = null_value
+            var len_component: int = null_value
+            var cap_component: int = null_value
+
+            const is_decomposed = (val_v.op == SsaOp.slice_make or val_v.op == SsaOp.string_make) and val_v.argsLen() >= 2
+            if (is_decomposed) {
+                ptr_component = val_v.args.get(0)
+                len_component = val_v.args.get(1)
+                if (val_v.op == SsaOp.slice_make and val_v.argsLen() >= 3) { cap_component = val_v.args.get(2) }
+            } else {
+                ptr_component = self.emitNewValueWithArg(SsaOp.slice_ptr, I64, value)
+                len_component = self.emitNewValueWithArg(SsaOp.slice_len, I64, value)
+            }
+
+            const addr_val = self.emitLocalAddr(local_idx, VOID)
+            self.emitStore(addr_val, ptr_component)
+            const len_addr = self.emitOffPtr(addr_val, 8)
+            self.emitStore(len_addr, len_component)
+
+            // Store cap at offset 16 for slices with cap
+            if (cap_component != null_value) {
+                const cap_addr = self.emitOffPtr(addr_val, 16)
+                self.emitStore(cap_addr, cap_component)
+            } else if (val_v.op == SsaOp.slice_make) {
+                // cap defaults to len
+                const cap_addr = self.emitOffPtr(addr_val, 16)
+                self.emitStore(cap_addr, len_component)
+            }
+
+            self.assign(local_idx, value)
+            return value
+        }
+
+        const addr_val = self.emitLocalAddr(local_idx, VOID)
+        const type_size = self.type_reg.sizeOf(value_type_idx)
+        var is_large = self.isLargeCompound(value_type_idx)
+
+        // VOID-typed address check (from convertFieldValue/convertFieldLocal)
+        if (!is_large) {
+            const val_v = self.func.getValue(value)
+            if (val_v.op == SsaOp.off_ptr and val_v.type_idx == VOID) {
+                const local_type_idx = self.ir_func.locals.get(local_idx).type_idx
+                const local_type = self.type_reg.get(local_type_idx)
+                if (local_type.tag == TAG_STRUCT or local_type.tag == TAG_TUPLE or local_type.tag == TAG_UNION or self.isCompoundOptional(local_type_idx)) {
+                    is_large = true
+                }
+            }
+        }
+
+        if (is_large) {
+            // Use OpMove for bulk memory copy
+            const move_val = self.func.newValue(SsaOp.move, VOID, cur, self.cur_pos_line, self.cur_pos_col)
+            var mv = self.func.getValue(move_val)
+            mv.addArg2(addr_val, value)
+            const move_size = if (type_size > 0) { type_size } else { self.ir_func.locals.get(local_idx).size }
+            mv.aux_int = move_size
+            self.func.setValue(move_val, mv)
+            self.func.addValueToBlock(move_val, cur)
+            self.assign(local_idx, value)
+            return value
+        }
+
+        self.emitStore(addr_val, value)
+        self.assign(local_idx, value)
+        return value
+    }
+
+    // === Global ref/store ===
+
+    fn convertGlobalRef(name: string, type_idx: int) int {
+        const cur = self.cur_block
+        const addr_val = self.func.newValue(SsaOp.global_addr, VOID, cur, self.cur_pos_line, self.cur_pos_col)
+        var av = self.func.getValue(addr_val)
+        av.aux = SsaAux.str(name)
+        self.func.setValue(addr_val, av)
+        self.func.addValueToBlock(addr_val, cur)
+
+        const load_type = self.type_reg.get(type_idx)
+        if (load_type.tag == TAG_SLICE) {
+            const ptr_load = self.emitNewValueWithArg(SsaOp.load, I64, addr_val)
+            const len_addr = self.emitOffPtr(addr_val, 8)
+            const len_load = self.emitNewValueWithArg(SsaOp.load, I64, len_addr)
+            const cap_addr = self.emitOffPtr(addr_val, 16)
+            const cap_load = self.emitNewValueWithArg(SsaOp.load, I64, cap_addr)
+
+            const slice_val = self.func.newValue(SsaOp.slice_make, type_idx, cur, self.cur_pos_line, self.cur_pos_col)
+            var sv = self.func.getValue(slice_val)
+            sv.addArg(ptr_load)
+            sv.addArg(len_load)
+            sv.addArg(cap_load)
+            self.func.setValue(slice_val, sv)
+            self.func.addValueToBlock(slice_val, cur)
+            return slice_val
+        }
+
+        // Use type-aware load op for narrow integers
+        const gtype_info = self.type_reg.get(type_idx)
+        const g_is_narrow_int = gtype_info.tag == TAG_BASIC and (switch (gtype_info) { Type.basic |bk| => bk.isInteger() and bk.size() < 8, else => false })
+        const gload_op = if (g_is_narrow_int) { self.getLoadOp(type_idx) } else { SsaOp.load }
+        return self.emitNewValueWithArg(gload_op, type_idx, addr_val)
+    }
+
+    fn convertGlobalStore(name: string, global_idx: int, value_idx: int) int {
+        const cur = self.cur_block
+        const value = self.convertNode(value_idx)
+        if (value == null_value) { return null_value }
+
+        const gaddr = self.func.newValue(SsaOp.global_addr, VOID, cur, self.cur_pos_line, self.cur_pos_col)
+        var ga = self.func.getValue(gaddr)
+        ga.aux = SsaAux.str(name)
+        self.func.setValue(gaddr, ga)
+        self.func.addValueToBlock(gaddr, cur)
+
+        const value_type_idx = self.func.getValue(value).type_idx
+        const value_type = self.type_reg.get(value_type_idx)
+        const type_size = self.type_reg.sizeOf(value_type_idx)
+
+        // String/slice field-by-field decomposition
+        if (self.isStringOrSlice(value_type_idx)) {
+            const val_v = self.func.getValue(value)
+            var ptr_component: int = null_value
+            var len_component: int = null_value
+
+            if ((val_v.op == SsaOp.string_make or val_v.op == SsaOp.slice_make) and val_v.argsLen() >= 2) {
+                ptr_component = val_v.args.get(0)
+                len_component = val_v.args.get(1)
+            } else {
+                ptr_component = self.emitNewValueWithArg(SsaOp.slice_ptr, I64, value)
+                len_component = self.emitNewValueWithArg(SsaOp.slice_len, I64, value)
+            }
+
+            self.emitStore(gaddr, ptr_component)
+            const len_addr = self.emitOffPtr(gaddr, 8)
+            self.emitStore(len_addr, len_component)
+
+            if (val_v.op == SsaOp.slice_make and val_v.argsLen() >= 3) {
+                const cap_addr = self.emitOffPtr(gaddr, 16)
+                self.emitStore(cap_addr, val_v.args.get(2))
+            }
+            return value
+        }
+
+        // Compound optional / large struct: bulk move
+        var is_large = self.isLargeCompound(value_type_idx)
+
+        if (!is_large) {
+            const val_v = self.func.getValue(value)
+            if (val_v.op == SsaOp.off_ptr and val_v.type_idx == VOID) {
+                if (global_idx < self.ir_globals.count) {
+                    const global_type_idx = self.ir_globals.get(global_idx).type_idx
+                    const global_type = self.type_reg.get(global_type_idx)
+                    if (global_type.tag == TAG_STRUCT or global_type.tag == TAG_TUPLE or global_type.tag == TAG_UNION or self.isCompoundOptional(global_type_idx)) {
+                        is_large = true
+                    }
+                }
+            }
+        }
+
+        if (is_large) {
+            const move_val = self.func.newValue(SsaOp.move, VOID, cur, self.cur_pos_line, self.cur_pos_col)
+            var mv = self.func.getValue(move_val)
+            mv.addArg2(gaddr, value)
+            var move_size = 8
+            if (type_size > 0) { move_size = type_size } else if (global_idx < self.ir_globals.count) { move_size = self.ir_globals.get(global_idx).size }
+            mv.aux_int = move_size
+            self.func.setValue(move_val, mv)
+            self.func.addValueToBlock(move_val, cur)
+            return value
+        }
+
+        self.emitStore(gaddr, value)
+        return value
+    }
+
+    // === Binary/Unary ===
+
+    fn convertBinary(b: Binary, type_idx: int) int {
+        if (b.op.isLogical()) { return self.convertLogicalOp(b, type_idx) }
+
+        const left = self.convertNode(b.left)
+        const right = self.convertNode(b.right)
+        if (left == null_value or right == null_value) { return null_value }
+
+        const operand_type = self.func.getValue(left).type_idx
+        const is_float = operand_type == F64 or operand_type == F32 or operand_type == UNTYPED_FLOAT
+
+        const op_kind = if (is_float) {
+            switch (b.op) {
+                BinaryOp.add => SsaOp.add64f, BinaryOp.sub => SsaOp.sub64f,
+                BinaryOp.mul => SsaOp.mul64f, BinaryOp.div => SsaOp.div64f,
+                BinaryOp.eq => SsaOp.eq64f, BinaryOp.ne => SsaOp.ne64f,
+                BinaryOp.lt => SsaOp.lt64f, BinaryOp.le => SsaOp.le64f,
+                BinaryOp.gt => SsaOp.gt64f, BinaryOp.ge => SsaOp.ge64f,
+                BinaryOp.fmin => SsaOp.wasm_f64_min, BinaryOp.fmax => SsaOp.wasm_f64_max,
+                else => SsaOp.invalid,
+            }
+        } else {
+            switch (b.op) {
+                BinaryOp.add => SsaOp.add, BinaryOp.sub => SsaOp.sub,
+                BinaryOp.mul => SsaOp.mul, BinaryOp.div => SsaOp.div,
+                BinaryOp.mod => SsaOp.mod,
+                BinaryOp.eq => SsaOp.eq, BinaryOp.ne => SsaOp.ne,
+                BinaryOp.lt => SsaOp.lt, BinaryOp.le => SsaOp.le,
+                BinaryOp.gt => SsaOp.gt, BinaryOp.ge => SsaOp.ge,
+                BinaryOp.lt_u => SsaOp.ult, BinaryOp.le_u => SsaOp.ule,
+                BinaryOp.gt_u => SsaOp.ugt, BinaryOp.ge_u => SsaOp.uge,
+                BinaryOp.bit_and => SsaOp.and_, BinaryOp.bit_or => SsaOp.or_,
+                BinaryOp.bit_xor => SsaOp.xor, BinaryOp.shl => SsaOp.shl, BinaryOp.shr => SsaOp.shr,
+                BinaryOp.fmin => SsaOp.wasm_f64_min, BinaryOp.fmax => SsaOp.wasm_f64_max,
+                BinaryOp.atomic_store => SsaOp.atomic_store64,
+                BinaryOp.atomic_add => SsaOp.atomic_add64,
+                BinaryOp.atomic_exchange => SsaOp.atomic_exchange64,
+                else => SsaOp.invalid,
+            }
+        }
+
+        return self.emitBinOp(op_kind, type_idx, left, right)
+    }
+
+    fn convertUnary(u: Unary, type_idx: int) int {
+        const operand = self.convertNode(u.operand)
+        if (operand == null_value) { return null_value }
+        const is_float = type_idx == F64 or type_idx == F32 or type_idx == UNTYPED_FLOAT
+        const op_kind = switch (u.op) {
+            UnaryOp.neg => if (is_float) { SsaOp.neg64f } else { SsaOp.neg },
+            UnaryOp.@"not" => SsaOp.bool_not,
+            UnaryOp.bit_not => SsaOp.@"not",
+            UnaryOp.optional_unwrap => SsaOp.copy,
+            UnaryOp.abs => SsaOp.wasm_f64_abs,
+            UnaryOp.ceil => SsaOp.wasm_f64_ceil,
+            UnaryOp.floor => SsaOp.wasm_f64_floor,
+            UnaryOp.trunc_float => SsaOp.wasm_f64_trunc,
+            UnaryOp.nearest => SsaOp.wasm_f64_nearest,
+            UnaryOp.sqrt => SsaOp.wasm_f64_sqrt,
+            UnaryOp.f64_reinterpret_i64 => SsaOp.wasm_f64_reinterpret_i64,
+            UnaryOp.i64_reinterpret_f64 => SsaOp.wasm_i64_reinterpret_f64,
+            UnaryOp.ctz => SsaOp.ctz64,
+            UnaryOp.clz => SsaOp.clz64,
+            UnaryOp.popcnt => SsaOp.popcnt64,
+            UnaryOp.atomic_load => SsaOp.atomic_load64,
+            else => SsaOp.invalid,
+        }
+        return self.emitNewValueWithArg(op_kind, type_idx, operand)
+    }
+
+    // === Calls ===
+
+    fn convertCall(func_name: string, args: List(int), type_idx: int) int {
+        const cur = self.cur_block
+        // Shape stenciling: resolve aliased function names
+        var resolved_name = func_name
+        if (self.shape_aliases) |aliases| {
+            if (aliases.contains(func_name)) {
+                resolved_name = aliases.get(func_name)
+            }
+        }
+
+        const call_val = self.func.newValue(SsaOp.static_call, type_idx, cur, self.cur_pos_line, self.cur_pos_col)
+        var cv = self.func.getValue(call_val)
+        cv.aux = SsaAux.str(resolved_name)
+
+        // Dict dispatch: inject fn-ptr args for dict-stenciled functions
+        if (self.dict_arg_names) |dan| {
+            if (dan.contains(func_name)) {
+                // Helper names are comma-separated: "name1,name2,..."
+                const helpers_csv = dan.get(func_name)
+                var start = 0
+                for ci in 0..helpers_csv.len {
+                    if (helpers_csv[ci] == 44) {  // ','
+                        const helper_name = substring(helpers_csv, start, ci)
+                        const addr_val = self.func.newValue(SsaOp.addr, I64, cur, self.cur_pos_line, self.cur_pos_col)
+                        var adv = self.func.getValue(addr_val)
+                        adv.aux = SsaAux.str(helper_name)
+                        self.func.setValue(addr_val, adv)
+                        self.func.addValueToBlock(addr_val, cur)
+                        cv.addArg(addr_val)
+                        start = ci + 1
+                    }
+                }
+                // Last (or only) helper name
+                if (start < helpers_csv.len) {
+                    const helper_name = substring(helpers_csv, start, helpers_csv.len)
+                    const addr_val = self.func.newValue(SsaOp.addr, I64, cur, self.cur_pos_line, self.cur_pos_col)
+                    var adv = self.func.getValue(addr_val)
+                    adv.aux = SsaAux.str(helper_name)
+                    self.func.setValue(addr_val, adv)
+                    self.func.addValueToBlock(addr_val, cur)
+                    cv.addArg(addr_val)
+                }
+            }
+        }
+
+        self.func.setValue(call_val, cv)
+
+        for k in 0..args.count {
+            const arg_idx = args.get(k)
+            const arg_val = self.convertNode(arg_idx)
+            if (arg_val == null_value) { continue }
+            self.addCallArg(call_val, arg_val)
+        }
+
+        self.func.addValueToBlock(call_val, cur)
+        return call_val
+    }
+
+    fn addCallArg(call_val: int, arg_val: int) void {
+        const cur = self.cur_block
+        const arg_v = self.func.getValue(arg_val)
+        const arg_type = self.type_reg.get(arg_v.type_idx)
+        const type_size = self.type_reg.sizeOf(arg_v.type_idx)
+
+        // String/slice decomposition
+        if (self.isStringOrSlice(arg_v.type_idx)) {
+            const ptr_val = self.emitNewValueWithArg(SsaOp.slice_ptr, I64, arg_val)
+            var cv = self.func.getValue(call_val)
+            cv.addArg(ptr_val)
+            self.func.setValue(call_val, cv)
+
+            const len_val = self.emitNewValueWithArg(SsaOp.slice_len, I64, arg_val)
+            cv = self.func.getValue(call_val)
+            cv.addArg(len_val)
+            self.func.setValue(call_val, cv)
+            return
+        }
+
+        // Large struct decomposition
+        const is_compound_opt_arg = self.isCompoundOptional(arg_v.type_idx)
+        const is_large = (arg_type.tag == TAG_STRUCT or arg_type.tag == TAG_UNION or arg_type.tag == TAG_TUPLE or is_compound_opt_arg) and type_size > 8
+        if (is_large) {
+            const addr = self.getStructAddr(arg_val)
+            if (addr == null_value) { return }
+            const num_slots = (type_size + 7) / 8
+
+            for slot in 0..num_slots {
+                var load_from: int = addr
+                if (slot > 0) {
+                    load_from = self.emitOffPtr(addr, slot * 8)
+                }
+                const chunk_val = self.emitNewValueWithArg(SsaOp.load, I64, load_from)
+                var cv = self.func.getValue(call_val)
+                cv.addArg(chunk_val)
+                self.func.setValue(call_val, cv)
+            }
+            return
+        }
+
+        // Regular arg: single value
+        var cv = self.func.getValue(call_val)
+        cv.addArg(arg_val)
+        self.func.setValue(call_val, cv)
+    }
+
+    fn getStructAddr(val: int) int {
+        const v = self.func.getValue(val)
+        if (v.op == SsaOp.local_addr or v.op == SsaOp.off_ptr or v.op == SsaOp.global_addr or v.op == SsaOp.copy) {
+            return val
+        }
+        if (v.op == SsaOp.load and v.argsLen() > 0) {
+            return v.args.get(0)
+        }
+        // Search backwards for a store that stored this value
+        const cur = self.cur_block
+        const blk = self.func.getBlock(cur)
+        for i in 0..blk.values.count {
+            const vid = blk.values.get(i)
+            const sv = self.func.getValue(vid)
+            if (sv.op == SsaOp.store and sv.argsLen() >= 2 and sv.args.get(1) == val) {
+                return sv.args.get(0)
+            }
+        }
+        return null_value
+    }
+
+    fn convertCallIndirect(callee_idx: int, args: List(int), type_idx: int) int {
+        const cur = self.cur_block
+        const callee = self.convertNode(callee_idx)
+        if (callee == null_value) { return null_value }
+        const call_val = self.func.newValue(SsaOp.inter_call, type_idx, cur, self.cur_pos_line, self.cur_pos_col)
+        var cv = self.func.getValue(call_val)
+        cv.addArg(callee)
+        self.func.setValue(call_val, cv)
+        for k in 0..args.count {
+            const arg_val = self.convertNode(args.get(k))
+            if (arg_val == null_value) { continue }
+            self.addCallArg(call_val, arg_val)
+        }
+        self.func.addValueToBlock(call_val, cur)
+        return call_val
+    }
+
+    fn convertClosureCall(callee_idx: int, context_idx: int, args: List(int), type_idx: int) int {
+        const cur = self.cur_block
+        const callee = self.convertNode(callee_idx)
+        const context = self.convertNode(context_idx)
+        if (callee == null_value or context == null_value) { return null_value }
+        const call_val = self.func.newValue(SsaOp.closure_call, type_idx, cur, self.cur_pos_line, self.cur_pos_col)
+        var cv = self.func.getValue(call_val)
+        cv.addArg(callee)
+        cv.addArg(context)
+        self.func.setValue(call_val, cv)
+        for k in 0..args.count {
+            const arg_val = self.convertNode(args.get(k))
+            if (arg_val == null_value) { continue }
+            self.addCallArg(call_val, arg_val)
+        }
+        self.func.addValueToBlock(call_val, cur)
+        return call_val
+    }
+
+    // === Field access ===
+
+    fn convertFieldLocal(f: FieldLocal, type_idx: int) int {
+        const addr_val = self.emitLocalAddr(f.local_idx, VOID)
+        const off_val = self.emitOffPtr(addr_val, f.offset)
+
+        const field_type = self.type_reg.get(type_idx)
+        if (field_type.tag == TAG_STRUCT or field_type.tag == TAG_ARRAY or field_type.tag == TAG_UNION) { return off_val }
+
+        // Compound optional: return address
+        if (self.isCompoundOptional(type_idx)) {
+            var ov = self.func.getValue(off_val)
+            ov.type_idx = type_idx
+            self.func.setValue(off_val, ov)
+            return off_val
+        }
+
+        // String/slice compound load
+        if (self.isStringOrSlice(type_idx)) {
+            return self.emitStringSliceLoad(off_val, type_idx)
+        }
+
+        return self.emitNewValueWithArg(self.getLoadOp(type_idx), type_idx, off_val)
+    }
+
+    fn convertStoreLocalField(f: StoreLocalField) int {
+        const cur = self.cur_block
+
+        const value = self.convertNode(f.value)
+
+        if (value == null_value) { return null_value }
+        const addr_val = self.emitLocalAddr(f.local_idx, VOID)
+        const off_val = self.emitOffPtr(addr_val, f.offset)
+
+        const value_type_idx = self.func.getValue(value).type_idx
+
+        // String/slice compound store
+        if (self.isStringOrSlice(value_type_idx)) {
+            return self.emitStringSliceStore(off_val, value)
+        }
+
+        // Large struct/tuple: use OpMove
+        const type_size = self.type_reg.sizeOf(value_type_idx)
+        const value_type = self.type_reg.get(value_type_idx)
+        var is_large = (value_type.tag == TAG_STRUCT or value_type.tag == TAG_TUPLE or value_type.tag == TAG_UNION) and type_size > 8
+
+        // VOID-typed address check
+        if (!is_large) {
+            const val_v = self.func.getValue(value)
+            if (val_v.op == SsaOp.off_ptr and val_v.type_idx == VOID) {
+                const ir_node = self.ir_func.getNode(f.value)
+                const ir_type = self.type_reg.get(ir_node.type_idx)
+                const ir_size = self.type_reg.sizeOf(ir_node.type_idx)
+                if (((ir_type.tag == TAG_STRUCT or ir_type.tag == TAG_TUPLE or ir_type.tag == TAG_UNION) and ir_size > 8) or self.isCompoundOptional(ir_node.type_idx)) {
+                    is_large = true
+                }
+            }
+        }
+
+        if (is_large) {
+            return self.emitMove(off_val, value, type_size, f.value)
+        }
+
+        return self.emitStoreOp(off_val, value)
+    }
+
+    fn convertFieldValue(f: FieldValue, type_idx: int) int {
+        const base = self.convertNode(f.base)
+        if (base == null_value) { return null_value }
+        const off_val = self.emitOffPtr(base, f.offset)
+
+        const field_type = self.type_reg.get(type_idx)
+        if (field_type.tag == TAG_STRUCT or field_type.tag == TAG_ARRAY or field_type.tag == TAG_UNION) { return off_val }
+
+        if (self.isCompoundOptional(type_idx)) {
+            var ov = self.func.getValue(off_val)
+            ov.type_idx = type_idx
+            self.func.setValue(off_val, ov)
+            return off_val
+        }
+
+        if (self.isStringOrSlice(type_idx)) {
+            return self.emitStringSliceLoad(off_val, type_idx)
+        }
+
+        return self.emitNewValueWithArg(self.getLoadOp(type_idx), type_idx, off_val)
+    }
+
+    fn convertStoreField(f: StoreField) int {
+        const base = self.convertNode(f.base)
+        const value = self.convertNode(f.value)
+        if (base == null_value or value == null_value) { return null_value }
+        const off_val = self.emitOffPtr(base, f.offset)
+
+        const value_type_idx = self.func.getValue(value).type_idx
+
+        if (self.isStringOrSlice(value_type_idx)) {
+            return self.emitStringSliceStore(off_val, value)
+        }
+
+        const type_size = self.type_reg.sizeOf(value_type_idx)
+        const value_type = self.type_reg.get(value_type_idx)
+        var is_large = ((value_type.tag == TAG_STRUCT or value_type.tag == TAG_TUPLE or value_type.tag == TAG_UNION) and type_size > 8) or self.isCompoundOptional(value_type_idx)
+
+        if (!is_large) {
+            const val_v = self.func.getValue(value)
+            if (val_v.op == SsaOp.off_ptr and val_v.type_idx == VOID) {
+                const ir_node = self.ir_func.getNode(f.value)
+                const ir_type = self.type_reg.get(ir_node.type_idx)
+                if (ir_type.tag == TAG_STRUCT or ir_type.tag == TAG_TUPLE or ir_type.tag == TAG_UNION or self.isCompoundOptional(ir_node.type_idx)) {
+                    is_large = true
+                }
+            }
+        }
+
+        if (is_large) {
+            return self.emitMove(off_val, value, type_size, f.value)
+        }
+
+        return self.emitStoreOp(off_val, value)
+    }
+
+    // === Index operations ===
+
+    fn convertIndexLocal(idx: IndexLocal, type_idx: int) int {
+        const addr = self.emitLocalAddr(idx.local_idx, VOID)
+        const index = self.convertNode(idx.index)
+        if (index == null_value) { return null_value }
+        return self.emitIndexedLoad(addr, index, idx.elem_size, type_idx)
+    }
+
+    fn convertIndexValue(idx: IndexValue, type_idx: int) int {
+        const base = self.convertNode(idx.base)
+        const index = self.convertNode(idx.index)
+        if (base == null_value or index == null_value) { return null_value }
+        return self.emitIndexedLoad(base, index, idx.elem_size, type_idx)
+    }
+
+    fn emitIndexedLoad(base: int, index: int, elem_size: int, type_idx: int) int {
+        const cur = self.cur_block
+        const size_val = self.emitConst(SsaOp.const_int, I64, elem_size)
+        const offset = self.emitBinOp(SsaOp.mul, I64, index, size_val)
+        const ptr = self.emitBinOp(SsaOp.add_ptr, VOID, base, offset)
+
+        if (self.isStringOrSlice(type_idx)) {
+            return self.emitStringSliceLoad(ptr, type_idx)
+        }
+
+        return self.emitNewValueWithArg(self.getLoadOp(type_idx), type_idx, ptr)
+    }
+
+    fn convertStoreIndexLocal(s: StoreIndexLocal) int {
+        const addr = self.emitLocalAddr(s.local_idx, VOID)
+        const index = self.convertNode(s.index)
+        const value = self.convertNode(s.value)
+        if (index == null_value or value == null_value) { return null_value }
+        return self.emitIndexedStore(addr, index, value, s.elem_size)
+    }
+
+    fn convertStoreIndexValue(s: StoreIndexValue) int {
+        const base = self.convertNode(s.base)
+        const index = self.convertNode(s.index)
+        const value = self.convertNode(s.value)
+        if (base == null_value or index == null_value or value == null_value) { return null_value }
+        return self.emitIndexedStore(base, index, value, s.elem_size)
+    }
+
+    fn emitIndexedStore(base: int, index: int, value: int, elem_size: int) int {
+        const size_val = self.emitConst(SsaOp.const_int, I64, elem_size)
+        const offset = self.emitBinOp(SsaOp.mul, I64, index, size_val)
+        const ptr = self.emitBinOp(SsaOp.add_ptr, VOID, base, offset)
+
+        const value_type_idx = self.func.getValue(value).type_idx
+        if (self.isStringOrSlice(value_type_idx)) {
+            return self.emitStringSliceStore(ptr, value)
+        }
+
+        return self.emitStoreOp(ptr, value)
+    }
+
+    // === Slice operations ===
+
+    fn convertSliceLocal(s: SliceLocal, type_idx: int) int {
+        const addr = self.emitLocalAddr(s.local_idx, VOID)
+        const start = if (s.start != null_node) { self.convertNode(s.start) } else { null_value }
+        const end = if (s.end != null_node) { self.convertNode(s.end) } else { null_value }
+        return self.emitSlice(addr, start, end, s.elem_size, type_idx)
+    }
+
+    fn convertSliceValue(s: SliceValue, type_idx: int) int {
+        const base = self.convertNode(s.base)
+        if (base == null_value) { return null_value }
+        const start = if (s.start != null_node) { self.convertNode(s.start) } else { null_value }
+        const end = if (s.end != null_node) { self.convertNode(s.end) } else { null_value }
+        return self.emitSlice(base, start, end, s.elem_size, type_idx)
+    }
+
+    fn emitSlice(base: int, start: int, end: int, elem_size: int, type_idx: int) int {
+        const cur = self.cur_block
+        var new_ptr = base
+        if (start != null_value) {
+            const size_val = self.emitConst(SsaOp.const_int, I64, elem_size)
+            const offset = self.emitBinOp(SsaOp.mul, I64, start, size_val)
+            new_ptr = self.emitBinOp(SsaOp.add_ptr, VOID, base, offset)
+        }
+
+        var new_len = end
+        if (start != null_value and end != null_value) {
+            new_len = self.emitBinOp(SsaOp.sub, I64, end, start)
+        }
+
+        if (new_len != null_value) {
+            const slice_val = self.func.newValue(SsaOp.slice_make, type_idx, cur, self.cur_pos_line, self.cur_pos_col)
+            var sv = self.func.getValue(slice_val)
+            sv.addArg(new_ptr)
+            sv.addArg(new_len)
+            sv.addArg(new_len)  // cap = len
+            self.func.setValue(slice_val, sv)
+            self.func.addValueToBlock(slice_val, cur)
+            return slice_val
+        }
+
+        return new_ptr
+    }
+
+    fn convertSliceOp(op: SsaOp, slice_idx: int, type_idx: int) int {
+        const slice = self.convertNode(slice_idx)
+        if (slice == null_value) { return null_value }
+        return self.emitNewValueWithArg(op, type_idx, slice)
+    }
+
+    // === Pointer operations ===
+
+    fn convertPtrLoad(ptr_local: int, type_idx: int) int {
+        const ptr_val = self.variable(ptr_local, type_idx)
+        if (ptr_val == null_value) { return null_value }
+        return self.emitNewValueWithArg(self.getLoadOp(type_idx), type_idx, ptr_val)
+    }
+
+    fn convertPtrStore(p: PtrStore) int {
+        const ptr_val = self.variable(p.ptr_local, VOID)
+        const value = self.convertNode(p.value)
+        if (ptr_val == null_value or value == null_value) { return null_value }
+        const value_type_idx = self.func.getValue(value).type_idx
+        return self.emitStoreOp(ptr_val, value)
+    }
+
+    fn convertPtrLoadValue(ptr_idx: int, type_idx: int) int {
+        if (ptr_idx < 0 or ptr_idx == null_node) { return null_value }
+        const cur = self.cur_block
+        const ptr_val = self.convertNode(ptr_idx)
+        if (ptr_val == null_value) { return null_value }
+
+        // String/slice compound load
+        if (self.isStringOrSlice(type_idx)) {
+            return self.emitStringSliceLoad(ptr_val, type_idx)
+        }
+
+        // Large compound: wrap in .copy
+        const type_size = self.type_reg.sizeOf(type_idx)
+        const value_type = self.type_reg.get(type_idx)
+        if (((value_type.tag == TAG_STRUCT or value_type.tag == TAG_TUPLE or value_type.tag == TAG_UNION) and type_size > 8) or self.isCompoundOptional(type_idx)) {
+            const pv = self.func.getValue(ptr_val)
+            if (pv.op == SsaOp.load) {
+                const copy_val = self.func.newValue(SsaOp.copy, type_idx, cur, self.cur_pos_line, self.cur_pos_col)
+                var cv = self.func.getValue(copy_val)
+                cv.addArg(ptr_val)
+                self.func.setValue(copy_val, cv)
+                self.func.addValueToBlock(copy_val, cur)
+                return copy_val
+            }
+            var pvm = self.func.getValue(ptr_val)
+            pvm.type_idx = type_idx
+            self.func.setValue(ptr_val, pvm)
+            return ptr_val
+        }
+
+        return self.emitNewValueWithArg(self.getLoadOp(type_idx), type_idx, ptr_val)
+    }
+
+    fn convertPtrStoreValue(p: PtrStoreValue) int {
+        const cur = self.cur_block
+        const ptr_val = self.convertNode(p.ptr)
+        const value = self.convertNode(p.value)
+        if (ptr_val == null_value or value == null_value) { return null_value }
+
+        const value_type_idx = self.func.getValue(value).type_idx
+        const type_size = self.type_reg.sizeOf(value_type_idx)
+
+        // String/slice compound store
+        if (self.isStringOrSlice(value_type_idx)) {
+            return self.emitStringSliceStore(ptr_val, value)
+        }
+
+        // Large compound: bulk move
+        if (self.isLargeCompound(value_type_idx)) {
+            const move_val = self.func.newValue(SsaOp.move, VOID, cur, self.cur_pos_line, self.cur_pos_col)
+            var mv = self.func.getValue(move_val)
+            mv.addArg2(ptr_val, value)
+            mv.aux_int = type_size
+            self.func.setValue(move_val, mv)
+            self.func.addValueToBlock(move_val, cur)
+            return move_val
+        }
+
+        // Use pointee type for store width
+        const ptr_type = self.type_reg.get(self.func.getValue(ptr_val).type_idx)
+        const store_type = if (ptr_type.tag == TAG_POINTER) { switch (ptr_type) { Type.pointer |p| => p.elem, else => value_type_idx } } else { value_type_idx }
+        const store_op = self.getStoreOp(store_type)
+        return self.emitStoreWithOp(store_op, ptr_val, value)
+    }
+
+    fn convertPtrField(p: PtrField, type_idx: int) int {
+        const ptr_val = self.variable(p.ptr_local, VOID)
+        if (ptr_val == null_value) { return null_value }
+        const off_val = self.emitOffPtr(ptr_val, p.offset)
+
+        const field_type = self.type_reg.get(type_idx)
+        if (field_type.tag == TAG_STRUCT or field_type.tag == TAG_ARRAY) { return off_val }
+
+        return self.emitNewValueWithArg(self.getLoadOp(type_idx), type_idx, off_val)
+    }
+
+    fn convertPtrFieldStore(p: PtrFieldStore) int {
+        const ptr_val = self.variable(p.ptr_local, VOID)
+        const value = self.convertNode(p.value)
+        if (ptr_val == null_value or value == null_value) { return null_value }
+        const off_val = self.emitOffPtr(ptr_val, p.offset)
+        return self.emitStoreOp(off_val, value)
+    }
+
+    // === Select, Convert, Cast ===
+
+    fn convertSelect(s: Select, type_idx: int) int {
+        const cur = self.cur_block
+        const cond = self.convertNode(s.condition)
+        const then_val = self.convertNode(s.then_value)
+        const else_val = self.convertNode(s.else_value)
+        if (cond == null_value or then_val == null_value or else_val == null_value) { return null_value }
+
+        // String/slice decomposition: separate selects for ptr and len
+        if (self.isStringOrSlice(type_idx)) {
+            const make_op = if (type_idx == STRING) { SsaOp.string_make } else { SsaOp.slice_make }
+
+            const then_ptr = self.emitNewValueWithArg(SsaOp.slice_ptr, I64, then_val)
+            const else_ptr = self.emitNewValueWithArg(SsaOp.slice_ptr, I64, else_val)
+            const sel_ptr = self.emitSelect3(SsaOp.cond_select, I64, cond, then_ptr, else_ptr)
+
+            const then_len = self.emitNewValueWithArg(SsaOp.slice_len, I64, then_val)
+            const else_len = self.emitNewValueWithArg(SsaOp.slice_len, I64, else_val)
+            const sel_len = self.emitSelect3(SsaOp.cond_select, I64, cond, then_len, else_len)
+
+            const result = self.func.newValue(make_op, type_idx, cur, self.cur_pos_line, self.cur_pos_col)
+            var rv = self.func.getValue(result)
+            rv.addArg2(sel_ptr, sel_len)
+            self.func.setValue(result, rv)
+            self.func.addValueToBlock(result, cur)
+            return result
+        }
+
+        return self.emitSelect3(SsaOp.cond_select, type_idx, cond, then_val, else_val)
+    }
+
+    fn convertConvert(c: Convert, type_idx: int) int {
+        const cur = self.cur_block
+        const operand = self.convertNode(c.operand)
+        if (operand == null_value) { return null_value }
+        const val = self.func.newValue(SsaOp.convert, type_idx, cur, self.cur_pos_line, self.cur_pos_col)
+        var v = self.func.getValue(val)
+        v.addArg(operand)
+        v.aux = SsaAux.type_ref(c.from_type)
+        self.func.setValue(val, v)
+        self.func.addValueToBlock(val, cur)
+        return val
+    }
+
+    fn convertCast(operand_idx: int, type_idx: int) int {
+        const operand = self.convertNode(operand_idx)
+        if (operand == null_value) { return null_value }
+        const val = self.func.newValue(SsaOp.copy, type_idx, self.cur_block, self.cur_pos_line, self.cur_pos_col)
+        var v = self.func.getValue(val)
+        v.addArg(operand)
+        self.func.setValue(val, v)
+        self.func.addValueToBlock(val, self.cur_block)
+        return val
+    }
+
+    // === String/Slice headers ===
+
+    fn convertStrConcat(s: StrConcat, type_idx: int) int {
+        const left = self.convertNode(s.left)
+        const right = self.convertNode(s.right)
+        if (left == null_value or right == null_value) { return null_value }
+        return self.emitBinOp(SsaOp.string_concat, type_idx, left, right)
+    }
+
+    fn convertStringHeader(s: StringHeader, type_idx: int) int {
+        const ptr = self.convertNode(s.ptr)
+        const len = self.convertNode(s.len)
+        if (ptr == null_value or len == null_value) { return null_value }
+        return self.emitBinOp(SsaOp.string_make, type_idx, ptr, len)
+    }
+
+    fn convertSliceHeader(s: SliceHeader, type_idx: int) int {
+        const cur = self.cur_block
+        const ptr = self.convertNode(s.ptr)
+        const len = self.convertNode(s.len)
+        const cap = self.convertNode(s.cap)
+        if (ptr == null_value or len == null_value or cap == null_value) { return null_value }
+        const val = self.func.newValue(SsaOp.slice_make, type_idx, cur, self.cur_pos_line, self.cur_pos_col)
+        var v = self.func.getValue(val)
+        v.addArg(ptr)
+        v.addArg(len)
+        v.addArg(cap)
+        self.func.setValue(val, v)
+        self.func.addValueToBlock(val, cur)
+        return val
+    }
+
+    // === Union operations ===
+
+    fn convertUnionInit(u: UnionInit, type_idx: int) int {
+        return self.emitConst(SsaOp.const_int, type_idx, u.variant_idx)
+    }
+
+    fn convertUnionTag(u: UnionTag, type_idx: int) int {
+        const union_val = self.convertNode(u.value)
+        if (union_val == null_value) { return null_value }
+        return self.emitNewValueWithArg(SsaOp.load, type_idx, union_val)
+    }
+
+    fn convertUnionPayload(u: UnionPayload, type_idx: int) int {
+        const union_val = self.convertNode(u.value)
+        if (union_val == null_value) { return null_value }
+        const off_val = self.emitOffPtr(union_val, 8)
+        return self.emitNewValueWithArg(SsaOp.load, type_idx, off_val)
+    }
+
+    // === Logical operations ===
+
+    fn convertLogicalOp(b: Binary, result_type: int) int {
+        const is_and = b.op == BinaryOp.@"and"
+        const left = self.convertNode(b.left)
+        if (left == null_value) { return null_value }
+        const cur = self.cur_block
+        if (cur == null_block) { return null_value }
+
+        const eval_right_block = self.func.newBlock(SsaBlockKind.plain)
+        const short_circuit_block = self.func.newBlock(SsaBlockKind.plain)
+        const merge_block = self.func.newBlock(SsaBlockKind.plain)
+
+        var cur_blk = self.func.getBlock(cur)
+        cur_blk.kind = SsaBlockKind.if_
+        cur_blk.setControl(left)
+        if (is_and) {
+            cur_blk.addEdgeTo(eval_right_block, &self.func.blocks)
+            cur_blk.addEdgeTo(short_circuit_block, &self.func.blocks)
+        } else {
+            cur_blk.addEdgeTo(short_circuit_block, &self.func.blocks)
+            cur_blk.addEdgeTo(eval_right_block, &self.func.blocks)
+        }
+        self.func.setBlock(cur, cur_blk)
+        self.endBlock()
+
+        // Short circuit block
+        self.startBlock(short_circuit_block)
+        const short_val = self.emitConst(SsaOp.const_bool, result_type, if (is_and) { 0 } else { 1 })
+        var sc_blk = self.func.getBlock(short_circuit_block)
+        sc_blk.addEdgeTo(merge_block, &self.func.blocks)
+        self.func.setBlock(short_circuit_block, sc_blk)
+        self.endBlock()
+
+        // Eval right block
+        self.startBlock(eval_right_block)
+        const right = self.convertNode(b.right)
+        const right_block = self.cur_block
+        var rb = self.func.getBlock(right_block)
+        rb.addEdgeTo(merge_block, &self.func.blocks)
+        self.func.setBlock(right_block, rb)
+        self.endBlock()
+
+        // Merge block with phi
+        self.startBlock(merge_block)
+        const phi = self.func.newValue(SsaOp.phi, result_type, merge_block, self.cur_pos_line, self.cur_pos_col)
+        var pv = self.func.getValue(phi)
+        pv.addArg2(short_val, right)
+        self.func.setValue(phi, pv)
+        self.func.addValueToBlock(phi, merge_block)
+
+        return phi
+    }
+
+    fn markLogicalOperands(node_idx: int) void {
+        self.logical_operands.set(node_idx, 1)
+        const node = self.ir_func.getNode(node_idx)
+        switch (node.data) {
+            Data.binary |b| => {
+                self.markLogicalOperands(b.left)
+                self.markLogicalOperands(b.right)
+            },
+            Data.unary |u| => { self.markLogicalOperands(u.operand) },
+            else => {},
+        }
+    }
+
+    // === WasmGC (placeholder — native only) ===
+
+    fn convertGcStructNew(gc: GcStructNew, type_idx: int) int {
+        const cur = self.cur_block
+        const val = self.func.newValue(SsaOp.wasm_gc_struct_new, type_idx, cur, self.cur_pos_line, self.cur_pos_col)
+        var v = self.func.getValue(val)
+        v.aux = SsaAux.str(gc.type_name)
+        for k in 0..gc.field_values.count {
+            const arg = self.convertNode(gc.field_values.get(k))
+            if (arg != null_value) { v.addArg(arg) }
+        }
+        self.func.setValue(val, v)
+        self.func.addValueToBlock(val, cur)
+        return val
+    }
+
+    fn convertGcStructGet(gc: GcStructGet, type_idx: int) int {
+        const cur = self.cur_block
+        const val = self.func.newValue(SsaOp.wasm_gc_struct_get, type_idx, cur, self.cur_pos_line, self.cur_pos_col)
+        var v = self.func.getValue(val)
+        v.aux = SsaAux.str(gc.type_name)
+        v.aux_int = gc.field_idx
+        const base_val = self.convertNode(gc.base)
+        if (base_val != null_value) { v.addArg(base_val) }
+        self.func.setValue(val, v)
+        self.func.addValueToBlock(val, cur)
+        return val
+    }
+
+    fn convertGcStructSet(gc: GcStructSet) int {
+        const cur = self.cur_block
+        const val = self.func.newValue(SsaOp.wasm_gc_struct_set, VOID, cur, self.cur_pos_line, self.cur_pos_col)
+        var v = self.func.getValue(val)
+        v.aux = SsaAux.str(gc.type_name)
+        v.aux_int = gc.field_idx
+        const base_val = self.convertNode(gc.base)
+        const value_val = self.convertNode(gc.value)
+        if (base_val != null_value and value_val != null_value) {
+            v.addArg2(base_val, value_val)
+        }
+        self.func.setValue(val, v)
+        self.func.addValueToBlock(val, cur)
+        return val
+    }
+
+    // === WasmGC array conversion helpers ===
+
+    fn convertGcArrayNew(gc: GcArrayNew, type_idx: int) int {
+        const cur = self.cur_block
+        const val = self.func.newValue(SsaOp.wasm_gc_array_new, type_idx, cur, self.cur_pos_line, self.cur_pos_col)
+        var v = self.func.getValue(val)
+        v.aux = SsaAux.str(gc.type_name)
+        const init_val = self.convertNode(gc.init_val)
+        const length = self.convertNode(gc.length)
+        if (init_val != null_value and length != null_value) { v.addArg2(init_val, length) }
+        self.func.setValue(val, v)
+        self.func.addValueToBlock(val, cur)
+        return val
+    }
+
+    fn convertGcArrayNewDefault(gc: GcArrayNewDefault, type_idx: int) int {
+        const cur = self.cur_block
+        const val = self.func.newValue(SsaOp.wasm_gc_array_new_default, type_idx, cur, self.cur_pos_line, self.cur_pos_col)
+        var v = self.func.getValue(val)
+        v.aux = SsaAux.str(gc.type_name)
+        const length = self.convertNode(gc.length)
+        if (length != null_value) { v.addArg(length) }
+        self.func.setValue(val, v)
+        self.func.addValueToBlock(val, cur)
+        return val
+    }
+
+    fn convertGcArrayNewFixed(gc: GcArrayNewFixed, type_idx: int) int {
+        const cur = self.cur_block
+        const val = self.func.newValue(SsaOp.wasm_gc_array_new_fixed, type_idx, cur, self.cur_pos_line, self.cur_pos_col)
+        var v = self.func.getValue(val)
+        v.aux = SsaAux.str(gc.type_name)
+        v.aux_int = gc.values.count
+        for k in 0..gc.values.count {
+            const arg = self.convertNode(gc.values.get(k))
+            if (arg != null_value) { v.addArg(arg) }
+        }
+        self.func.setValue(val, v)
+        self.func.addValueToBlock(val, cur)
+        return val
+    }
+
+    fn convertGcArrayNewData(gc: GcArrayNewData, type_idx: int) int {
+        const cur = self.cur_block
+        const val = self.func.newValue(SsaOp.wasm_gc_array_new_data, type_idx, cur, self.cur_pos_line, self.cur_pos_col)
+        var v = self.func.getValue(val)
+        v.aux = SsaAux.str(gc.type_name)
+        v.aux_int = gc.data_idx
+        const offset = self.convertNode(gc.offset)
+        const length = self.convertNode(gc.length)
+        if (offset != null_value and length != null_value) { v.addArg2(offset, length) }
+        self.func.setValue(val, v)
+        self.func.addValueToBlock(val, cur)
+        return val
+    }
+
+    fn convertGcArrayGet(gc: GcArrayGet, type_idx: int) int {
+        const cur = self.cur_block
+        const val = self.func.newValue(SsaOp.wasm_gc_array_get, type_idx, cur, self.cur_pos_line, self.cur_pos_col)
+        var v = self.func.getValue(val)
+        v.aux = SsaAux.str(gc.type_name)
+        const array_val = self.convertNode(gc.array)
+        const index_val = self.convertNode(gc.index)
+        if (array_val != null_value and index_val != null_value) { v.addArg2(array_val, index_val) }
+        self.func.setValue(val, v)
+        self.func.addValueToBlock(val, cur)
+        return val
+    }
+
+    fn convertGcArraySet(gc: GcArraySet) int {
+        const cur = self.cur_block
+        const val = self.func.newValue(SsaOp.wasm_gc_array_set, VOID, cur, self.cur_pos_line, self.cur_pos_col)
+        var v = self.func.getValue(val)
+        v.aux = SsaAux.str(gc.type_name)
+        const array_val = self.convertNode(gc.array)
+        const index_val = self.convertNode(gc.index)
+        const value_val = self.convertNode(gc.value)
+        if (array_val != null_value) { v.addArg(array_val) }
+        if (index_val != null_value) { v.addArg(index_val) }
+        if (value_val != null_value) { v.addArg(value_val) }
+        self.func.setValue(val, v)
+        self.func.addValueToBlock(val, cur)
+        return val
+    }
+
+    fn convertGcArrayLen(gc: GcArrayLen) int {
+        const cur = self.cur_block
+        const val = self.func.newValue(SsaOp.wasm_gc_array_len, I32, cur, self.cur_pos_line, self.cur_pos_col)
+        var v = self.func.getValue(val)
+        const array_val = self.convertNode(gc.array)
+        if (array_val != null_value) { v.addArg(array_val) }
+        self.func.setValue(val, v)
+        self.func.addValueToBlock(val, cur)
+        return val
+    }
+
+    // === WasmGC reference conversion helpers ===
+
+    fn convertGcRefNull(gc: GcRefNull, type_idx: int) int {
+        const cur = self.cur_block
+        const val = self.func.newValue(SsaOp.wasm_gc_ref_null, type_idx, cur, self.cur_pos_line, self.cur_pos_col)
+        var v = self.func.getValue(val)
+        v.aux = SsaAux.str(gc.type_name)
+        self.func.setValue(val, v)
+        self.func.addValueToBlock(val, cur)
+        return val
+    }
+
+    fn convertGcRefIsNull(gc: GcRefIsNull) int {
+        const cur = self.cur_block
+        const val = self.func.newValue(SsaOp.wasm_gc_ref_is_null, BOOL, cur, self.cur_pos_line, self.cur_pos_col)
+        var v = self.func.getValue(val)
+        const ref_val = self.convertNode(gc.value)
+        if (ref_val != null_value) { v.addArg(ref_val) }
+        self.func.setValue(val, v)
+        self.func.addValueToBlock(val, cur)
+        return val
+    }
+
+    fn convertGcRefEq(gc: GcRefEq) int {
+        const cur = self.cur_block
+        const val = self.func.newValue(SsaOp.wasm_gc_ref_eq, BOOL, cur, self.cur_pos_line, self.cur_pos_col)
+        var v = self.func.getValue(val)
+        const left = self.convertNode(gc.left)
+        const right = self.convertNode(gc.right)
+        if (left != null_value and right != null_value) { v.addArg2(left, right) }
+        self.func.setValue(val, v)
+        self.func.addValueToBlock(val, cur)
+        return val
+    }
+
+    fn convertGcRefCast(gc: GcRefCast, type_idx: int) int {
+        const cur = self.cur_block
+        const val = self.func.newValue(SsaOp.wasm_gc_ref_cast, type_idx, cur, self.cur_pos_line, self.cur_pos_col)
+        var v = self.func.getValue(val)
+        v.aux = SsaAux.str(gc.type_name)
+        const ref_val = self.convertNode(gc.value)
+        if (ref_val != null_value) { v.addArg(ref_val) }
+        self.func.setValue(val, v)
+        self.func.addValueToBlock(val, cur)
+        return val
+    }
+
+    fn convertGcRefTest(gc: GcRefTest) int {
+        const cur = self.cur_block
+        const val = self.func.newValue(SsaOp.wasm_gc_ref_test, BOOL, cur, self.cur_pos_line, self.cur_pos_col)
+        var v = self.func.getValue(val)
+        v.aux = SsaAux.str(gc.type_name)
+        const ref_val = self.convertNode(gc.value)
+        if (ref_val != null_value) { v.addArg(ref_val) }
+        self.func.setValue(val, v)
+        self.func.addValueToBlock(val, cur)
+        return val
+    }
+
+    // === Phi insertion (Braun et al. 2013) ===
+
+    fn insertPhis() void {
+        var fwd_refs: List(int) = .{}
+        for i in 0..self.func.blocks.count {
+            const blk = self.func.getBlock(i)
+            for j in 0..blk.values.count {
+                const vid = blk.values.get(j)
+                const v = self.func.getValue(vid)
+                if (v.op == SsaOp.fwd_ref) {
+                    fwd_refs.append(vid)
+                    self.ensureDefvar(blk.id, v.aux_int, vid)
+                }
+            }
+        }
+
+        var phi_args: List(int) = .{}
+
+        while (fwd_refs.count > 0) {
+            const fwd = fwd_refs.pop()
+            const fwd_v = self.func.getValue(fwd)
+            const block_idx = fwd_v.block
+            if (block_idx == null_block) { continue }
+            const block = self.func.getBlock(block_idx)
+            if (block_idx == self.func.entry or block.preds.count == 0) { continue }
+
+            const local_idx = fwd_v.aux_int
+            phi_args.clear()
+
+            for k in 0..block.preds.count {
+                const pred_edge = block.preds.get(k)
+                const val = self.lookupVarOutgoing(pred_edge.block, local_idx, fwd_v.type_idx, &fwd_refs)
+                phi_args.append(val)
+            }
+
+            var witness: int = null_value
+            var need_phi = false
+            for k in 0..phi_args.count {
+                const a = phi_args.get(k)
+                if (a == fwd) { continue }
+                if (witness == null_value) {
+                    witness = a
+                } else if (a != witness) {
+                    need_phi = true
+                }
+            }
+
+            if (need_phi) {
+                var fv = self.func.getValue(fwd)
+                fv.op = SsaOp.phi
+                for k in 0..phi_args.count {
+                    fv.addArg(phi_args.get(k))
+                }
+                self.func.setValue(fwd, fv)
+            } else if (witness != null_value) {
+                var fv = self.func.getValue(fwd)
+                fv.op = SsaOp.copy
+                fv.addArg(witness)
+                self.func.setValue(fwd, fv)
+            }
+        }
+
+        self.reorderPhis()
+    }
+
+    fn reorderPhis() void {
+        for i in 0..self.func.blocks.count {
+            var blk = self.func.getBlock(i)
+            var phis: List(int) = .{}
+            var non_phis: List(int) = .{}
+
+            for j in 0..blk.values.count {
+                const vid = blk.values.get(j)
+                const v = self.func.getValue(vid)
+                if (v.op == SsaOp.phi) {
+                    phis.append(vid)
+                } else {
+                    non_phis.append(vid)
+                }
+            }
+
+            blk.values.clear()
+            for j in 0..phis.count { blk.values.append(phis.get(j)) }
+            for j in 0..non_phis.count { blk.values.append(non_phis.get(j)) }
+            self.func.setBlock(i, blk)
+        }
+    }
+
+    fn verify() void {
+        for i in 0..self.func.blocks.count {
+            const blk = self.func.getBlock(i)
+            // Skip unreachable blocks (no predecessors, not entry) — they may have
+            // unresolved fwd_refs that can never be resolved.
+            if (blk.preds.count == 0 and i != self.func.entry) { continue }
+            var seen_non_phi = false
+            for j in 0..blk.values.count {
+                const v = self.func.getValue(blk.values.get(j))
+                if (v.op == SsaOp.phi) {
+                    // phi must be at block start
+                    if (seen_non_phi) {
+                        @panic("verify: phi after non-phi in block ${i} of ${self.ir_func.name}")
+                    }
+                    // phi arg count must match pred count
+                    if (v.argsLen() != blk.preds.count) {
+                        @panic("verify: phi args=${v.argsLen()} != preds=${blk.preds.count} in block ${i} of ${self.ir_func.name}")
+                    }
+                } else {
+                    seen_non_phi = true
+                }
+                // Skip unresolved fwd_refs — can occur when Phase 3 re-checking
+                // is depth-limited and some expr_types aren't populated.
+                // The function will still be emitted; the fwd_ref becomes a zero.
+                if (v.op == SsaOp.fwd_ref) {
+                    // Silently accept — the codegen treats fwd_ref as zero
+                }
+            }
+            if (blk.kind == SsaBlockKind.ret) {
+                if (blk.succs.count != 0) {
+                    @panic("verify: ret block ${i} has ${blk.succs.count} succs in ${self.ir_func.name}")
+                }
+            }
+            if (blk.kind == SsaBlockKind.if_) {
+                if (blk.succs.count != 2) {
+                    @panic("verify: if block ${i} has ${blk.succs.count} succs (want 2) in ${self.ir_func.name}")
+                }
+                if (blk.controls.count == 0) {
+                    @panic("verify: if block ${i} has no controls in ${self.ir_func.name}")
+                }
+            }
+        }
+    }
+
+    // === Defvar helpers (flat list) ===
+
+    fn lookupDefvar(block_id: int, local_idx: int) int {
+        // Search backwards for most recent entry matching block_id and local_idx
+        var i = self.defvars.count
+        while (i > 0) {
+            i -= 1
+            const entry = self.defvars.get(i)
+            if (entry.block_id == block_id and entry.local_idx == local_idx) {
+                return entry.value_idx
+            }
+        }
+        return null_value
+    }
+
+    fn setDefvar(block_id: int, local_idx: int, value_idx: int) void {
+        // Update existing or append new entry
+        var i = self.defvars.count
+        while (i > 0) {
+            i -= 1
+            var entry = self.defvars.get(i)
+            if (entry.block_id == block_id and entry.local_idx == local_idx) {
+                entry.value_idx = value_idx
+                self.defvars.set(i, entry)
+                return
+            }
+        }
+        self.defvars.append(DefvarEntry { block_id: block_id, local_idx: local_idx, value_idx: value_idx })
+    }
+
+    fn ensureDefvar(block_id: int, local_idx: int, value_idx: int) void {
+        if (self.lookupDefvar(block_id, local_idx) == null_value) {
+            self.setDefvar(block_id, local_idx, value_idx)
+        }
+    }
+
+    fn lookupVarOutgoing(block_idx: int, local_idx: int, type_idx: int, fwd_refs: *List(int)) int {
+        var cur = block_idx
+        while (true) {
+            const blk = self.func.getBlock(cur)
+            const result = self.lookupDefvar(blk.id, local_idx)
+            if (result != null_value) {
+                return result
+            }
+            if (blk.preds.count == 1) {
+                cur = blk.preds.get(0).block
+                continue
+            }
+            break
+        }
+
+        const cur_blk = self.func.getBlock(cur)
+        const new_fwd = self.func.newValue(SsaOp.fwd_ref, type_idx, cur, self.cur_pos_line, self.cur_pos_col)
+        var nf = self.func.getValue(new_fwd)
+        nf.aux_int = local_idx
+        self.func.setValue(new_fwd, nf)
+        self.func.addValueToBlock(new_fwd, cur)
+
+        self.setDefvar(cur_blk.id, local_idx, new_fwd)
+        fwd_refs.append(new_fwd)
+
+        return new_fwd
+    }
+
+    // === Shared emit helpers (reduce repetition) ===
+
+    fn emitNewValueWithArg(op: SsaOp, type_idx: int, arg: int) int {
+        const cur = self.cur_block
+        const val = self.func.newValue(op, type_idx, cur, self.cur_pos_line, self.cur_pos_col)
+        var v = self.func.getValue(val)
+        v.addArg(arg)
+        self.func.setValue(val, v)
+        self.func.addValueToBlock(val, cur)
+        return val
+    }
+
+    fn emitBinOp(op: SsaOp, type_idx: int, left: int, right: int) int {
+        const cur = self.cur_block
+        const val = self.func.newValue(op, type_idx, cur, self.cur_pos_line, self.cur_pos_col)
+        var v = self.func.getValue(val)
+        v.addArg2(left, right)
+        self.func.setValue(val, v)
+        self.func.addValueToBlock(val, cur)
+        return val
+    }
+
+    fn emitSelect3(op: SsaOp, type_idx: int, a: int, b: int, c: int) int {
+        const cur = self.cur_block
+        const val = self.func.newValue(op, type_idx, cur, self.cur_pos_line, self.cur_pos_col)
+        var v = self.func.getValue(val)
+        v.addArg3(a, b, c)
+        self.func.setValue(val, v)
+        self.func.addValueToBlock(val, cur)
+        return val
+    }
+
+    fn emitOffPtr(base: int, offset: int) int {
+        const cur = self.cur_block
+        const val = self.func.newValue(SsaOp.off_ptr, VOID, cur, self.cur_pos_line, self.cur_pos_col)
+        var v = self.func.getValue(val)
+        v.aux_int = offset
+        v.addArg(base)
+        self.func.setValue(val, v)
+        self.func.addValueToBlock(val, cur)
+        return val
+    }
+
+    fn emitStore(addr: int, value: int) int {
+        const cur = self.cur_block
+        const val = self.func.newValue(SsaOp.store, VOID, cur, self.cur_pos_line, self.cur_pos_col)
+        var v = self.func.getValue(val)
+        v.addArg2(addr, value)
+        self.func.setValue(val, v)
+        self.func.addValueToBlock(val, cur)
+        return val
+    }
+
+    fn emitStoreOp(addr: int, value: int) int {
+        const value_type_idx = self.func.getValue(value).type_idx
+        const store_op = self.getStoreOp(value_type_idx)
+        return self.emitStoreWithOp(store_op, addr, value)
+    }
+
+    fn emitStoreWithOp(op: SsaOp, addr: int, value: int) int {
+        const cur = self.cur_block
+        const val = self.func.newValue(op, VOID, cur, self.cur_pos_line, self.cur_pos_col)
+        var v = self.func.getValue(val)
+        v.addArg2(addr, value)
+        self.func.setValue(val, v)
+        self.func.addValueToBlock(val, cur)
+        return val
+    }
+
+    fn emitMove(dst_addr: int, src: int, type_size: int, ir_node_idx: int) int {
+        const cur = self.cur_block
+        // Zig reference: use src directly as source address.
+        // Do NOT unwrap load ops — that was an invention not in the reference.
+        const src_addr = src
+        const move_val = self.func.newValue(SsaOp.move, VOID, cur, self.cur_pos_line, self.cur_pos_col)
+        var mv = self.func.getValue(move_val)
+        mv.addArg2(dst_addr, src_addr)
+        var move_size = type_size
+        if (move_size == 0) {
+            move_size = self.type_reg.sizeOf(self.ir_func.getNode(ir_node_idx).type_idx)
+        }
+        mv.aux_int = move_size
+        self.func.setValue(move_val, mv)
+        self.func.addValueToBlock(move_val, cur)
+        return move_val
+    }
+
+    fn emitStringSliceLoad(base_addr: int, type_idx: int) int {
+        const cur = self.cur_block
+        const ptr_load = self.emitNewValueWithArg(SsaOp.load, I64, base_addr)
+        const len_addr = self.emitOffPtr(base_addr, 8)
+        const len_load = self.emitNewValueWithArg(SsaOp.load, I64, len_addr)
+
+        const make_op = if (type_idx == STRING) { SsaOp.string_make } else { SsaOp.slice_make }
+        const make_val = self.func.newValue(make_op, type_idx, cur, self.cur_pos_line, self.cur_pos_col)
+        var mv = self.func.getValue(make_val)
+        mv.addArg2(ptr_load, len_load)
+        self.func.setValue(make_val, mv)
+        self.func.addValueToBlock(make_val, cur)
+        return make_val
+    }
+
+    fn emitStringSliceStore(dest_addr: int, value: int) int {
+        const val_v = self.func.getValue(value)
+        var ptr_component: int = null_value
+        var len_component: int = null_value
+
+        if ((val_v.op == SsaOp.string_make or val_v.op == SsaOp.slice_make) and val_v.argsLen() >= 2) {
+            ptr_component = val_v.args.get(0)
+            len_component = val_v.args.get(1)
+        } else {
+            ptr_component = self.emitNewValueWithArg(SsaOp.slice_ptr, I64, value)
+            len_component = self.emitNewValueWithArg(SsaOp.slice_len, I64, value)
+        }
+
+        self.emitStore(dest_addr, ptr_component)
+        const len_addr = self.emitOffPtr(dest_addr, 8)
+        const len_store = self.emitStore(len_addr, len_component)
+        return len_store
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+fn makeTestFunc(name: string) Func {
+    var params: List(Local) = .{}
+    var locals: List(Local) = .{}
+    var blocks: List(Block) = .{}
+    blocks.append(Block.init(0))
+    var nodes: List(Node) = .{}
+    var string_literals: List(string) = .{}
+    return Func {
+        name: name,
+        type_idx: 0,
+        return_type: VOID,
+        params: params,
+        locals: locals,
+        blocks: blocks,
+        entry: 0,
+        nodes: nodes,
+        span: Span.zero(),
+        frame_size: 0,
+        string_literals: string_literals,
+        is_destructor: false,
+        is_export: false,
+    }
+}
+
+test "SSABuilder init creates entry block" {
+    var type_reg = TypeRegistry.init()
+    var ir_func = makeTestFunc("test_fn")
+    var globals: List(Global) = .{}
+    var builder = SSABuilder.init(ir_func, globals, &type_reg)
+    @assertEq(builder.func.name, "test_fn")
+    @assert(builder.func.entry != null_block)
+    @assert(builder.cur_block != null_block)
+}
+
+test "SSABuilder block transitions" {
+    var type_reg = TypeRegistry.init()
+    var ir_func = makeTestFunc("test_fn")
+    var globals: List(Global) = .{}
+    var builder = SSABuilder.init(ir_func, globals, &type_reg)
+
+    // Entry block is current
+    @assert(builder.cur_block != null_block)
+    const entry = builder.cur_block
+
+    // Create and start a new block
+    const block2 = builder.func.newBlock(SsaBlockKind.plain)
+    builder.startBlock(block2)
+    @assertEq(builder.cur_block, block2)
+
+    // End block
+    const ended = builder.endBlock()
+    @assertEq(ended, block2)
+    @assertEq(builder.cur_block, null_block)
+}
+
+test "SSABuilder variable assign and lookup" {
+    var type_reg = TypeRegistry.init()
+    var ir_func = makeTestFunc("test_fn")
+    var globals: List(Global) = .{}
+    var builder = SSABuilder.init(ir_func, globals, &type_reg)
+
+    // Emit a constant value
+    const const_val = builder.emitConst(SsaOp.const_int, I64, 42)
+
+    // Assign to variable
+    builder.assign(0, const_val)
+
+    // Lookup should return same value
+    const looked_up = builder.variable(0, I64)
+    @assertEq(const_val, looked_up)
+}
+
+test "SSABuilder emitConst and getLoadOp" {
+    var type_reg = TypeRegistry.init()
+    var ir_func = makeTestFunc("test_fn")
+    var globals: List(Global) = .{}
+    var builder = SSABuilder.init(ir_func, globals, &type_reg)
+
+    // Test emitConst
+    const c1 = builder.emitConst(SsaOp.const_int, I64, 100)
+    const v1 = builder.func.getValue(c1)
+    @assertEq(v1.aux_int, 100)
+    @assertEq(v1.op == SsaOp.const_int, true)
+
+    // Test getLoadOp
+    @assertEq(builder.getLoadOp(I8) == SsaOp.load8s, true)
+    @assertEq(builder.getLoadOp(U8) == SsaOp.load8, true)
+    @assertEq(builder.getLoadOp(I32) == SsaOp.load32s, true)
+    @assertEq(builder.getLoadOp(U32) == SsaOp.load32, true)
+    @assertEq(builder.getLoadOp(I64) == SsaOp.load, true)
+
+    // Test getStoreOp
+    @assertEq(builder.getStoreOp(U8) == SsaOp.store8, true)
+    @assertEq(builder.getStoreOp(I16) == SsaOp.store16, true)
+    @assertEq(builder.getStoreOp(I32) == SsaOp.store32, true)
+    @assertEq(builder.getStoreOp(I64) == SsaOp.store, true)
+}
+
+test "SSABuilder defvar helpers" {
+    var type_reg = TypeRegistry.init()
+    var ir_func = makeTestFunc("test_fn")
+    var globals: List(Global) = .{}
+    var builder = SSABuilder.init(ir_func, globals, &type_reg)
+
+    // Initially no defvars
+    @assertEq(builder.lookupDefvar(0, 0), null_value)
+
+    // Set and lookup
+    builder.setDefvar(0, 0, 42)
+    @assertEq(builder.lookupDefvar(0, 0), 42)
+
+    // Update existing
+    builder.setDefvar(0, 0, 99)
+    @assertEq(builder.lookupDefvar(0, 0), 99)
+
+    // Different block
+    builder.setDefvar(1, 0, 55)
+    @assertEq(builder.lookupDefvar(1, 0), 55)
+    @assertEq(builder.lookupDefvar(0, 0), 99)
+}
+
+test "SSABuilder fwd_ref on unknown variable" {
+    var type_reg = TypeRegistry.init()
+    var ir_func = makeTestFunc("test_fn")
+    var globals: List(Global) = .{}
+    var builder = SSABuilder.init(ir_func, globals, &type_reg)
+
+    // Looking up an unknown variable should create a fwd_ref
+    const val = builder.variable(99, I64)
+    @assert(val != null_value)
+    const v = builder.func.getValue(val)
+    @assertEq(v.op == SsaOp.fwd_ref, true)
+    @assertEq(v.aux_int, 99)  // stores the local_idx
+}
+
+test "SSABuilder helper predicates" {
+    var type_reg = TypeRegistry.init()
+    var ir_func = makeTestFunc("test_fn")
+    var globals: List(Global) = .{}
+    var builder = SSABuilder.init(ir_func, globals, &type_reg)
+
+    // String is string_or_slice
+    @assertEq(builder.isStringOrSlice(STRING), true)
+    @assertEq(builder.isStringOrSlice(I64), false)
+
+    // Not compound optional for basic types
+    @assertEq(builder.isCompoundOptional(I64), false)
+    @assertEq(builder.isCompoundOptional(BOOL), false)
+}

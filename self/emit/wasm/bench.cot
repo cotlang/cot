@@ -1,0 +1,536 @@
+/// Bench runtime functions for Wasm.
+///
+/// Zig reference: compiler/codegen/bench_runtime.zig
+///
+/// Timing architecture (same as test_runtime):
+///   Timing is measured INSIDE the runtime functions.
+///   Uses Wasm globals for timing storage.
+///
+/// Three Wasm globals:
+///   bench_start_global:  per-measurement start timestamp (i64, ns)
+///   total_start_global:  total start timestamp (i64, ns), lazy-init
+///   bench_iter_global:   calibrated iteration count (i64), init=1
+///
+/// Seven functions:
+///   __bench_print_name(ptr, len) -> void
+///   __bench_calibrate_start() -> void
+///   __bench_calibrate_end() -> void
+///   __bench_measure_start() -> void
+///   __bench_measure_end() -> void
+///   __bench_get_n() -> i64
+///   __bench_summary(count) -> void
+
+import "std/list"
+import "builder"
+import "link"
+import "types"
+import "test"
+
+// Function names
+const BENCH_PRINT_NAME_NAME: string = "__bench_print_name"
+const BENCH_CALIBRATE_START_NAME: string = "__bench_calibrate_start"
+const BENCH_CALIBRATE_END_NAME: string = "__bench_calibrate_end"
+const BENCH_MEASURE_START_NAME: string = "__bench_measure_start"
+const BENCH_MEASURE_END_NAME: string = "__bench_measure_end"
+const BENCH_GET_N_NAME: string = "__bench_get_n"
+const BENCH_SUMMARY_NAME: string = "__bench_summary"
+
+struct BenchFunctions {
+    bench_print_name_idx: int,
+    bench_calibrate_start_idx: int,
+    bench_calibrate_end_idx: int,
+    bench_measure_start_idx: int,
+    bench_measure_end_idx: int,
+    bench_get_n_idx: int,
+    bench_summary_idx: int,
+}
+
+/// Add bench runtime functions to linker.
+/// user_n: if >= 0, use as fixed iteration count (--n flag). If < 0, auto-calibrate.
+fn addBenchRuntime(linker: *Linker, write_func_idx: int, eprint_int_func_idx: int, time_func_idx: int, user_n: int) BenchFunctions {
+    // Three globals for bench timing/iteration storage (offset by 1 for SP)
+    const bench_start_global = linker.addGlobal(WasmGlobal { val_type: VT_I64, mutable: true, init_val: 0 }) + 1
+    const total_start_global = linker.addGlobal(WasmGlobal { val_type: VT_I64, mutable: true, init_val: 0 }) + 1
+    const bench_iter_global = linker.addGlobal(WasmGlobal { val_type: VT_I64, mutable: true, init_val: 1 }) + 1
+
+    // Type: () -> void
+    var params_void: List(int) = .{}
+    var results_void: List(int) = .{}
+    const void_type = linker.addType(params_void, results_void)
+
+    // Type: (i64, i64) -> void
+    var params_2i64: List(int) = .{}
+    params_2i64.append(VT_I64)
+    params_2i64.append(VT_I64)
+    const type_2i64_void = linker.addType(params_2i64, results_void)
+
+    // Type: () -> i64
+    var results_i64: List(int) = .{}
+    results_i64.append(VT_I64)
+    const type_void_i64 = linker.addType(params_void, results_i64)
+
+    // Type: (i64) -> void
+    var params_1i64: List(int) = .{}
+    params_1i64.append(VT_I64)
+    const type_1i64_void = linker.addType(params_1i64, results_void)
+
+    // __bench_print_name
+    const print_name_body = generateBenchPrintNameBody(write_func_idx, time_func_idx, bench_start_global, total_start_global)
+    const bench_print_name_idx = linker.addFunc(WasmFunc.init(BENCH_PRINT_NAME_NAME, type_2i64_void, print_name_body, false))
+
+    // __bench_calibrate_start
+    const cal_start_body = generateCalibrateStartBody(time_func_idx, bench_start_global)
+    const bench_calibrate_start_idx = linker.addFunc(WasmFunc.init(BENCH_CALIBRATE_START_NAME, void_type, cal_start_body, false))
+
+    // __bench_calibrate_end
+    const cal_end_body = generateCalibrateEndBody(time_func_idx, bench_start_global, bench_iter_global, user_n)
+    const bench_calibrate_end_idx = linker.addFunc(WasmFunc.init(BENCH_CALIBRATE_END_NAME, void_type, cal_end_body, false))
+
+    // __bench_measure_start
+    const meas_start_body = generateMeasureStartBody(time_func_idx, bench_start_global)
+    const bench_measure_start_idx = linker.addFunc(WasmFunc.init(BENCH_MEASURE_START_NAME, void_type, meas_start_body, false))
+
+    // __bench_measure_end
+    const meas_end_body = generateMeasureEndBody(write_func_idx, eprint_int_func_idx, time_func_idx, bench_start_global, bench_iter_global)
+    const bench_measure_end_idx = linker.addFunc(WasmFunc.init(BENCH_MEASURE_END_NAME, void_type, meas_end_body, false))
+
+    // __bench_get_n
+    const get_n_body = generateGetNBody(bench_iter_global)
+    const bench_get_n_idx = linker.addFunc(WasmFunc.init(BENCH_GET_N_NAME, type_void_i64, get_n_body, false))
+
+    // __bench_summary
+    const summary_body = generateBenchSummaryBody(write_func_idx, eprint_int_func_idx, time_func_idx, total_start_global)
+    const bench_summary_idx = linker.addFunc(WasmFunc.init(BENCH_SUMMARY_NAME, type_1i64_void, summary_body, false))
+
+    return BenchFunctions {
+        bench_print_name_idx: bench_print_name_idx,
+        bench_calibrate_start_idx: bench_calibrate_start_idx,
+        bench_calibrate_end_idx: bench_calibrate_end_idx,
+        bench_measure_start_idx: bench_measure_start_idx,
+        bench_measure_end_idx: bench_measure_end_idx,
+        bench_get_n_idx: bench_get_n_idx,
+        bench_summary_idx: bench_summary_idx,
+    }
+}
+
+// ============================================================================
+// __bench_print_name — write 'bench "name" ... ', lazy-init total start
+// ============================================================================
+
+fn generateBenchPrintNameBody(write_func_idx: int, time_func_idx: int, bench_start_global: int, total_start_global: int) List(int) {
+    var code = CodeBuilder.init()
+
+    // param 0 = ptr, param 1 = len, local 2 = buf_ptr
+    var locals: List(int) = .{}
+    locals.append(VT_I32)
+    code.declareLocals(locals)
+
+    // Store per-bench start time
+    code.emitCall(time_func_idx)
+    code.emitGlobalSet(bench_start_global)
+
+    // Lazy-initialize total start time on first bench
+    code.emitGlobalGet(total_start_global)
+    code.emitI64Eqz()
+    code.emitIf(BLOCK_VOID)
+    code.emitGlobalGet(bench_start_global)
+    code.emitGlobalSet(total_start_global)
+    code.emitEnd()
+
+    // Allocate 16 bytes on Wasm stack
+    code.emitGlobalGet(0)
+    code.emitI32Const(16)
+    code.emitI32Sub()
+    code.emitLocalTee(2)
+    code.emitGlobalSet(0)
+
+    // Write 'bench "'
+    emitWriteStr(&code, write_func_idx, 2, "bench \"")
+
+    // Write name bytes (ptr, len from params)
+    code.emitI64Const(2) // fd = stderr
+    code.emitLocalGet(0)
+    code.emitLocalGet(1)
+    code.emitCall(write_func_idx)
+    code.emitDrop()
+
+    // Write '" ... '
+    emitWriteStr(&code, write_func_idx, 2, "\" ... ")
+
+    // Restore stack pointer
+    code.emitLocalGet(2)
+    code.emitI32Const(16)
+    code.emitI32Add()
+    code.emitGlobalSet(0)
+
+    return code.finish()
+}
+
+// ============================================================================
+// __bench_calibrate_start — store @time() in bench_start_global
+// ============================================================================
+
+fn generateCalibrateStartBody(time_func_idx: int, bench_start_global: int) List(int) {
+    var code = CodeBuilder.init()
+
+    code.emitCall(time_func_idx)
+    code.emitGlobalSet(bench_start_global)
+
+    return code.finish()
+}
+
+// ============================================================================
+// __bench_calibrate_end — compute N from single-call timing
+// N = 1_000_000_000 / elapsed_ns, clamped to [1, 10_000_000]
+// If user_n >= 0, use that instead.
+// ============================================================================
+
+fn generateCalibrateEndBody(time_func_idx: int, bench_start_global: int, bench_iter_global: int, user_n: int) List(int) {
+    var code = CodeBuilder.init()
+
+    if (user_n >= 0) {
+        // --n flag: use user-specified iteration count
+        code.emitI64Const(user_n)
+        code.emitGlobalSet(bench_iter_global)
+        return code.finish()
+    }
+
+    // local 0 = elapsed / N (reused)
+    var locals: List(int) = .{}
+    locals.append(VT_I64)
+    code.declareLocals(locals)
+
+    const max_n = 10000000
+
+    // elapsed = @time() - bench_start
+    code.emitCall(time_func_idx)
+    code.emitGlobalGet(bench_start_global)
+    code.emitI64Sub()
+    code.emitLocalTee(0)
+
+    // if elapsed <= 0, set N = max_n
+    code.emitI64Const(0)
+    code.emitI64LeS()
+    code.emitIf(BLOCK_VOID)
+    code.emitI64Const(max_n)
+    code.emitGlobalSet(bench_iter_global)
+    code.emitElse()
+
+    // N = 1_000_000_000 / elapsed
+    code.emitI64Const(1000000000)
+    code.emitLocalGet(0)
+    code.emitI64DivU()
+
+    // Clamp: if N < 1, N = 1
+    code.emitLocalTee(0)
+    code.emitI64Const(1)
+    code.emitI64LtS()
+    code.emitIf(BLOCK_VOID)
+    code.emitI64Const(1)
+    code.emitGlobalSet(bench_iter_global)
+    code.emitElse()
+    // Clamp: if N > max_n, N = max_n
+    code.emitLocalGet(0)
+    code.emitI64Const(max_n)
+    code.emitI64GtS()
+    code.emitIf(BLOCK_VOID)
+    code.emitI64Const(max_n)
+    code.emitGlobalSet(bench_iter_global)
+    code.emitElse()
+    code.emitLocalGet(0)
+    code.emitGlobalSet(bench_iter_global)
+    code.emitEnd() // inner clamp
+    code.emitEnd() // outer clamp
+    code.emitEnd() // elapsed <= 0
+
+    return code.finish()
+}
+
+// ============================================================================
+// __bench_measure_start — store @time() in bench_start_global
+// ============================================================================
+
+fn generateMeasureStartBody(time_func_idx: int, bench_start_global: int) List(int) {
+    var code = CodeBuilder.init()
+
+    code.emitCall(time_func_idx)
+    code.emitGlobalSet(bench_start_global)
+
+    return code.finish()
+}
+
+// ============================================================================
+// __bench_measure_end — compute ns/op, print result line
+// Output: "N iterations  XXXX ns/op (X.XXs)\n"
+// ============================================================================
+
+fn generateMeasureEndBody(write_func_idx: int, eprint_int_func_idx: int, time_func_idx: int, bench_start_global: int, bench_iter_global: int) List(int) {
+    var code = CodeBuilder.init()
+
+    // local 0: buf_ptr (i32), local 1: elapsed_ns (i64)
+    // local 2: ns_op (i64), local 3: elapsed_s_x100 (i64)
+    var locals: List(int) = .{}
+    locals.append(VT_I32)
+    locals.append(VT_I64)
+    locals.append(VT_I64)
+    locals.append(VT_I64)
+    code.declareLocals(locals)
+
+    // elapsed_ns = time() - start
+    code.emitCall(time_func_idx)
+    code.emitGlobalGet(bench_start_global)
+    code.emitI64Sub()
+    code.emitLocalSet(1)
+
+    // ns_op = elapsed_ns / N
+    code.emitLocalGet(1)
+    code.emitGlobalGet(bench_iter_global)
+    code.emitI64DivS()
+    code.emitLocalSet(2)
+
+    // elapsed_s_x100 = elapsed_ns / 10_000_000
+    code.emitLocalGet(1)
+    code.emitI64Const(10000000)
+    code.emitI64DivS()
+    code.emitLocalSet(3)
+
+    // Allocate 32 bytes on stack
+    code.emitGlobalGet(0)
+    code.emitI32Const(32)
+    code.emitI32Sub()
+    code.emitLocalTee(0)
+    code.emitGlobalSet(0)
+
+    // Print N (iterations count)
+    code.emitGlobalGet(bench_iter_global)
+    code.emitCall(eprint_int_func_idx)
+
+    // " iterations  "
+    emitWriteStr(&code, write_func_idx, 0, " iterations  ")
+
+    // Print ns_op
+    code.emitLocalGet(2)
+    code.emitCall(eprint_int_func_idx)
+
+    // " ns/op ("
+    emitWriteStr(&code, write_func_idx, 0, " ns/op (")
+
+    // Print seconds: elapsed_s_x100 / 100
+    code.emitLocalGet(3)
+    code.emitI64Const(100)
+    code.emitI64DivS()
+    code.emitCall(eprint_int_func_idx)
+
+    // "."
+    emitWriteStr(&code, write_func_idx, 0, ".")
+
+    // Fractional: elapsed_s_x100 % 100, made positive
+    code.emitLocalGet(3)
+    code.emitI64Const(100)
+    code.emitI64RemS()
+    code.emitLocalSet(3)
+    code.emitLocalGet(3)
+    code.emitI64Const(0)
+    code.emitI64LtS()
+    code.emitIf(BLOCK_VOID)
+    code.emitI64Const(0)
+    code.emitLocalGet(3)
+    code.emitI64Sub()
+    code.emitLocalSet(3)
+    code.emitEnd()
+
+    // Leading zero if < 10
+    code.emitLocalGet(3)
+    code.emitI64Const(10)
+    code.emitI64LtS()
+    code.emitIf(BLOCK_VOID)
+    emitWriteStr(&code, write_func_idx, 0, "0")
+    code.emitEnd()
+
+    // Print fraction digits
+    code.emitLocalGet(3)
+    code.emitCall(eprint_int_func_idx)
+
+    // "s)\n"
+    emitWriteStr(&code, write_func_idx, 0, "s)\n")
+
+    // Restore stack pointer
+    code.emitLocalGet(0)
+    code.emitI32Const(32)
+    code.emitI32Add()
+    code.emitGlobalSet(0)
+
+    return code.finish()
+}
+
+// ============================================================================
+// __bench_get_n — return bench_iter_global value
+// ============================================================================
+
+fn generateGetNBody(bench_iter_global: int) List(int) {
+    var code = CodeBuilder.init()
+
+    code.emitGlobalGet(bench_iter_global)
+
+    return code.finish()
+}
+
+// ============================================================================
+// __bench_summary — print "\nok | N benchmarks (X.XXs)\n"
+// ============================================================================
+
+fn generateBenchSummaryBody(write_func_idx: int, eprint_int_func_idx: int, time_func_idx: int, total_start_global: int) List(int) {
+    var code = CodeBuilder.init()
+
+    // param 0: count
+    // local 1: buf_ptr (i32), local 2: total_s_x100 (i64)
+    var locals: List(int) = .{}
+    locals.append(VT_I32)
+    locals.append(VT_I64)
+    code.declareLocals(locals)
+
+    // Compute total: (time() - total_start) / 10_000_000
+    code.emitCall(time_func_idx)
+    code.emitGlobalGet(total_start_global)
+    code.emitI64Sub()
+    code.emitI64Const(10000000)
+    code.emitI64DivS()
+    code.emitLocalSet(2)
+
+    // Allocate 32 bytes on stack
+    code.emitGlobalGet(0)
+    code.emitI32Const(32)
+    code.emitI32Sub()
+    code.emitLocalTee(1)
+    code.emitGlobalSet(0)
+
+    // "\n"
+    emitWriteStr(&code, write_func_idx, 1, "\n")
+
+    // Green "ok"
+    emitWriteStr(&code, write_func_idx, 1, "\x1b[1;32mok\x1b[0m")
+
+    // " | "
+    emitWriteStr(&code, write_func_idx, 1, " | ")
+
+    // Print count
+    code.emitLocalGet(0)
+    code.emitCall(eprint_int_func_idx)
+
+    // " benchmarks ("
+    emitWriteStr(&code, write_func_idx, 1, " benchmarks (")
+
+    // Print seconds: total_s_x100 / 100
+    code.emitLocalGet(2)
+    code.emitI64Const(100)
+    code.emitI64DivS()
+    code.emitCall(eprint_int_func_idx)
+
+    // "."
+    emitWriteStr(&code, write_func_idx, 1, ".")
+
+    // Fractional part with leading zero
+    code.emitLocalGet(2)
+    code.emitI64Const(100)
+    code.emitI64RemS()
+    code.emitLocalSet(2)
+    code.emitLocalGet(2)
+    code.emitI64Const(0)
+    code.emitI64LtS()
+    code.emitIf(BLOCK_VOID)
+    code.emitI64Const(0)
+    code.emitLocalGet(2)
+    code.emitI64Sub()
+    code.emitLocalSet(2)
+    code.emitEnd()
+
+    // Leading zero if < 10
+    code.emitLocalGet(2)
+    code.emitI64Const(10)
+    code.emitI64LtS()
+    code.emitIf(BLOCK_VOID)
+    emitWriteStr(&code, write_func_idx, 1, "0")
+    code.emitEnd()
+
+    code.emitLocalGet(2)
+    code.emitCall(eprint_int_func_idx)
+
+    // "s)\n"
+    emitWriteStr(&code, write_func_idx, 1, "s)\n")
+
+    // Restore stack pointer
+    code.emitLocalGet(1)
+    code.emitI32Const(32)
+    code.emitI32Add()
+    code.emitGlobalSet(0)
+
+    return code.finish()
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+test "generateBenchPrintNameBody produces valid bytecode" {
+    const body = generateBenchPrintNameBody(1, 5, 3, 4)
+    @assert(body.count > 20)
+    @assertEq(body.get(body.count - 1), 0x0B)
+}
+
+test "generateCalibrateStartBody produces valid bytecode" {
+    const body = generateCalibrateStartBody(5, 3)
+    @assert(body.count > 2)
+    @assertEq(body.get(body.count - 1), 0x0B)
+}
+
+test "generateCalibrateEndBody auto-calibrate produces valid bytecode" {
+    const body = generateCalibrateEndBody(5, 3, 4, -1)
+    @assert(body.count > 20)
+    @assertEq(body.get(body.count - 1), 0x0B)
+}
+
+test "generateCalibrateEndBody user_n produces valid bytecode" {
+    const body = generateCalibrateEndBody(5, 3, 4, 1000)
+    @assert(body.count > 2)
+    @assertEq(body.get(body.count - 1), 0x0B)
+}
+
+test "generateMeasureStartBody produces valid bytecode" {
+    const body = generateMeasureStartBody(5, 3)
+    @assert(body.count > 2)
+    @assertEq(body.get(body.count - 1), 0x0B)
+}
+
+test "generateMeasureEndBody produces valid bytecode" {
+    const body = generateMeasureEndBody(1, 2, 5, 3, 4)
+    @assert(body.count > 20)
+    @assertEq(body.get(body.count - 1), 0x0B)
+}
+
+test "generateGetNBody produces valid bytecode" {
+    const body = generateGetNBody(4)
+    @assert(body.count > 2)
+    @assertEq(body.get(body.count - 1), 0x0B)
+}
+
+test "generateBenchSummaryBody produces valid bytecode" {
+    const body = generateBenchSummaryBody(1, 2, 5, 4)
+    @assert(body.count > 20)
+    @assertEq(body.get(body.count - 1), 0x0B)
+}
+
+test "addBenchRuntime registers all 7 functions" {
+    var linker = Linker.init()
+    const funcs = addBenchRuntime(&linker, 0, 1, 2, -1)
+    @assert(funcs.bench_print_name_idx >= 0)
+    @assert(funcs.bench_calibrate_start_idx >= 0)
+    @assert(funcs.bench_calibrate_end_idx >= 0)
+    @assert(funcs.bench_measure_start_idx >= 0)
+    @assert(funcs.bench_measure_end_idx >= 0)
+    @assert(funcs.bench_get_n_idx >= 0)
+    @assert(funcs.bench_summary_idx >= 0)
+    // All should be different
+    @assert(funcs.bench_print_name_idx != funcs.bench_calibrate_start_idx)
+    @assert(funcs.bench_measure_start_idx != funcs.bench_measure_end_idx)
+    @assert(funcs.bench_get_n_idx != funcs.bench_summary_idx)
+}

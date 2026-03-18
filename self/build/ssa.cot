@@ -1,0 +1,625 @@
+/// SSA (Static Single Assignment) data structures.
+/// Ported from compiler/ssa/{op,value,block,func}.zig
+///
+/// Consolidates all SSA types into one file, using index-based design
+/// matching ir.cot (int indices into Lists, not raw pointers).
+
+import "std/list"
+import "std/map"
+import "std/string"
+import "../check/types"
+
+// ============================================================================
+// Sentinel constants
+// ============================================================================
+
+const null_value: int = -1
+const null_block: int = -1
+
+// ============================================================================
+// SsaOp — SSA operation kind (generic ops emitted by ssa_builder)
+// ============================================================================
+//
+// Only includes ops produced by the SSA builder (IR→SSA conversion).
+// Architecture-specific ops (ARM64, x64, Wasm bytecodes) are NOT here —
+// they are added by later lowering passes.
+
+const SsaOp = enum(u16) {
+    invalid,
+
+    // === Constants ===
+    const_bool, const_int, const_float, const_nil, const_string, const_ptr,
+    const_8, const_16, const_32, const_64,
+
+    // === Integer Arithmetic (Generic) ===
+    add, sub, mul, div, udiv, mod, umod, neg,
+
+    // === Integer Arithmetic (Sized) ===
+    add8, sub8, mul8, add16, sub16, mul16, add32, sub32, mul32, add64, sub64, mul64,
+    hmul32, hmul32u, hmul64, hmul64u,
+    divmod32, divmod64, divmodu32, divmodu64,
+
+    // === Bitwise (Generic) ===
+    and_, or_, xor, shl, shr, sar, @"not", bool_not,
+
+    // === Bitwise (Sized) ===
+    and8, and16, and32, and64, or8, or16, or32, or64, xor8, xor16, xor32, xor64,
+    shl8, shl16, shl32, shl64, shr8, shr16, shr32, shr64, sar8, sar16, sar32, sar64,
+    com8, com16, com32, com64,
+    ctz32, ctz64, clz32, clz64, popcnt32, popcnt64,
+
+    // === Comparisons (Generic) ===
+    eq, ne, lt, le, gt, ge, ult, ule, ugt, uge,
+
+    // === Comparisons (Sized) ===
+    eq8, eq16, eq32, eq64, ne8, ne16, ne32, ne64,
+    lt32, lt64, le32, le64, gt32, gt64, ge32, ge64,
+
+    // === Type Conversions ===
+    sign_ext8to16, sign_ext8to32, sign_ext8to64, sign_ext16to32, sign_ext16to64, sign_ext32to64,
+    zero_ext8to16, zero_ext8to32, zero_ext8to64, zero_ext16to32, zero_ext16to64, zero_ext32to64,
+    trunc16to8, trunc32to8, trunc32to16, trunc64to8, trunc64to16, trunc64to32,
+    convert,
+    cvt32to32f, cvt32to64f, cvt64to32f, cvt64to64f,
+    cvt32fto32, cvt32fto64, cvt64fto32, cvt64fto64,
+    cvt32fto64f, cvt64fto32f,
+
+    // === Float Operations ===
+    add32f, sub32f, mul32f, div32f, neg32f, sqrt32f,
+    add64f, sub64f, mul64f, div64f, neg64f, sqrt64f,
+
+    // === Float Comparisons ===
+    eq64f, ne64f, lt64f, le64f, gt64f, ge64f,
+    eq32f, ne32f, lt32f, le32f, gt32f, ge32f,
+
+    // === Memory Operations ===
+    load, store,
+    load8, load16, load32, load64, store8, store16, store32, store64,
+    load8s, load16s, load32s,
+    addr, local_addr, global_addr, metadata_addr, off_ptr, add_ptr, sub_ptr,
+    sp, store_sp,
+    store_wb, move, zero,
+    var_def, var_live, var_kill,
+    store_reg, load_reg,
+
+    // === Control Flow ===
+    phi, copy, fwd_ref, arg,
+    select0, select1, make_tuple, select_n, cond_select,
+    string_len, string_ptr, string_make, slice_len, slice_ptr, slice_cap, slice_make, string_concat,
+
+    // === Function Calls ===
+    call, tail_call, static_call, closure_call, inter_call,
+
+    // === Safety Checks ===
+    nil_check, is_non_nil, is_nil, bounds_check, slice_bounds,
+
+    // === ARC (Reference Counting) ===
+    retain, release,
+
+    // === Atomics ===
+    atomic_load32, atomic_load64, atomic_store32, atomic_store64,
+    atomic_add32, atomic_add64, atomic_cas32, atomic_cas64, atomic_exchange32, atomic_exchange64,
+
+    // === Meta / Init ===
+    init_mem,
+
+    // === Wasm-Specific: Constants ===
+    wasm_i64_const, wasm_i32_const, wasm_f64_const, wasm_f32_const,
+
+    // === Wasm-Specific: Integer Arithmetic (i64) ===
+    wasm_i64_add, wasm_i64_sub, wasm_i64_mul, wasm_i64_div_s, wasm_i64_div_u,
+    wasm_i64_rem_s, wasm_i64_rem_u,
+
+    // === Wasm-Specific: Integer Arithmetic (i32) ===
+    wasm_i32_add, wasm_i32_sub, wasm_i32_mul, wasm_i32_div_s, wasm_i32_div_u,
+    wasm_i32_rem_s, wasm_i32_rem_u,
+
+    // === Wasm-Specific: Integer Bitwise (i64) ===
+    wasm_i64_and, wasm_i64_or, wasm_i64_xor, wasm_i64_shl, wasm_i64_shr_s, wasm_i64_shr_u,
+    wasm_i64_clz, wasm_i64_ctz, wasm_i64_popcnt, wasm_i64_rotl, wasm_i64_rotr,
+
+    // === Wasm-Specific: Integer Bitwise (i32) ===
+    wasm_i32_and, wasm_i32_or, wasm_i32_xor, wasm_i32_shl, wasm_i32_shr_s, wasm_i32_shr_u,
+    wasm_i32_clz, wasm_i32_ctz, wasm_i32_popcnt, wasm_i32_rotl, wasm_i32_rotr,
+
+    // === Wasm-Specific: Integer Comparison (i64) ===
+    wasm_i64_eqz, wasm_i64_eq, wasm_i64_ne,
+    wasm_i64_lt_s, wasm_i64_lt_u, wasm_i64_gt_s, wasm_i64_gt_u,
+    wasm_i64_le_s, wasm_i64_le_u, wasm_i64_ge_s, wasm_i64_ge_u,
+
+    // === Wasm-Specific: Integer Comparison (i32) ===
+    wasm_i32_eqz, wasm_i32_eq, wasm_i32_ne,
+    wasm_i32_lt_s, wasm_i32_lt_u, wasm_i32_gt_s, wasm_i32_gt_u,
+    wasm_i32_le_s, wasm_i32_le_u, wasm_i32_ge_s, wasm_i32_ge_u,
+
+    // === Wasm-Specific: Float Arithmetic (f64) ===
+    wasm_f64_add, wasm_f64_sub, wasm_f64_mul, wasm_f64_div,
+    wasm_f64_neg, wasm_f64_abs, wasm_f64_sqrt, wasm_f64_ceil, wasm_f64_floor, wasm_f64_trunc, wasm_f64_nearest,
+    wasm_f64_min, wasm_f64_max, wasm_f64_copysign,
+
+    // === Wasm-Specific: Float Arithmetic (f32) ===
+    wasm_f32_add, wasm_f32_sub, wasm_f32_mul, wasm_f32_div,
+    wasm_f32_neg, wasm_f32_abs, wasm_f32_sqrt, wasm_f32_ceil, wasm_f32_floor, wasm_f32_trunc, wasm_f32_nearest,
+    wasm_f32_min, wasm_f32_max, wasm_f32_copysign,
+
+    // === Wasm-Specific: Float Comparison ===
+    wasm_f64_eq, wasm_f64_ne, wasm_f64_lt, wasm_f64_gt, wasm_f64_le, wasm_f64_ge,
+    wasm_f32_eq, wasm_f32_ne, wasm_f32_lt, wasm_f32_gt, wasm_f32_le, wasm_f32_ge,
+
+    // === Wasm-Specific: Conversions ===
+    wasm_i64_trunc_f64_s, wasm_i64_trunc_f64_u, wasm_i64_trunc_f32_s, wasm_i64_trunc_f32_u,
+    wasm_i32_trunc_f64_s, wasm_i32_trunc_f64_u, wasm_i32_trunc_f32_s, wasm_i32_trunc_f32_u,
+    wasm_f64_convert_i64_s, wasm_f64_convert_i64_u, wasm_f64_convert_i32_s, wasm_f64_convert_i32_u,
+    wasm_f32_convert_i64_s, wasm_f32_convert_i64_u, wasm_f32_convert_i32_s, wasm_f32_convert_i32_u,
+    wasm_i64_extend_i32_s, wasm_i64_extend_i32_u,
+    wasm_i32_wrap_i64,
+    wasm_f64_promote_f32, wasm_f32_demote_f64,
+    wasm_i64_reinterpret_f64, wasm_f64_reinterpret_i64,
+    wasm_i32_reinterpret_f32, wasm_f32_reinterpret_i32,
+
+    // === Wasm-Specific: Memory (i64) ===
+    wasm_i64_load, wasm_i64_store,
+    wasm_i64_load8_s, wasm_i64_load8_u, wasm_i64_load16_s, wasm_i64_load16_u,
+    wasm_i64_load32_s, wasm_i64_load32_u,
+    wasm_i64_store8, wasm_i64_store16, wasm_i64_store32,
+
+    // === Wasm-Specific: Memory (i32) ===
+    wasm_i32_load, wasm_i32_store,
+    wasm_i32_load8_s, wasm_i32_load8_u, wasm_i32_load16_s, wasm_i32_load16_u,
+    wasm_i32_store8, wasm_i32_store16,
+
+    // === Wasm-Specific: Memory (float) ===
+    wasm_f64_load, wasm_f64_store,
+    wasm_f32_load, wasm_f32_store,
+
+    // === Wasm-Specific: Variables ===
+    wasm_local_get, wasm_local_set, wasm_local_tee,
+    wasm_global_get, wasm_global_set,
+
+    // === Wasm-Specific: Control Flow ===
+    wasm_call, wasm_call_indirect, wasm_return_call,
+    wasm_drop, wasm_select,
+    wasm_unreachable, wasm_nop,
+    wasm_return,
+
+    // === Wasm-Specific: Lowered Operations ===
+    wasm_lowered_move, wasm_lowered_zero,
+    wasm_lowered_nil_check,
+    wasm_lowered_static_call, wasm_lowered_closure_call, wasm_lowered_inter_call,
+    wasm_lowered_retain, wasm_lowered_release,
+
+    // === WasmGC ===
+    wasm_gc_struct_new, wasm_gc_struct_get, wasm_gc_struct_set,
+    wasm_gc_array_new, wasm_gc_array_new_default, wasm_gc_array_new_fixed, wasm_gc_array_new_data,
+    wasm_gc_array_get, wasm_gc_array_set, wasm_gc_array_len, wasm_gc_array_copy,
+    wasm_gc_ref_test, wasm_gc_ref_cast, wasm_gc_br_on_cast,
+    wasm_gc_ref_null, wasm_gc_ref_is_null, wasm_gc_ref_eq,
+    wasm_gc_ref_func, wasm_gc_call_ref, wasm_gc_return_call_ref,
+}
+
+// ============================================================================
+// SsaAux — auxiliary data for SSA values
+// ============================================================================
+
+union SsaAux {
+    none,
+    str: string,
+    type_ref: int,
+}
+
+// ============================================================================
+// SsaValue — single SSA value (instruction)
+// ============================================================================
+
+struct SsaValue {
+    id: int,
+    op: SsaOp,
+    type_idx: int,
+    aux_int: int,
+    aux_float: f64,
+    aux: SsaAux,
+    args: List(int),      // indices into SsaFunc.values
+    block: int,           // index into SsaFunc.blocks
+    pos_line: int,
+    pos_col: int,
+    uses: int,
+    in_cache: bool,
+
+    static fn init(id: int, op: SsaOp, type_idx: int, block: int) SsaValue {
+        var args: List(int) = .{}
+        return SsaValue {
+            id: id,
+            op: op,
+            type_idx: type_idx,
+            aux_int: 0,
+            aux_float: 0.0,
+            aux: SsaAux.none,
+            args: args,
+            block: block,
+            pos_line: 0,
+            pos_col: 0,
+            uses: 0,
+            in_cache: false,
+        }
+    }
+
+    fn addArg(arg: int) void {
+        self.args.append(arg)
+    }
+
+    fn addArg2(a: int, b: int) void {
+        self.args.append(a)
+        self.args.append(b)
+    }
+
+    fn addArg3(a: int, b: int, c: int) void {
+        self.args.append(a)
+        self.args.append(b)
+        self.args.append(c)
+    }
+
+    fn argsLen() int {
+        return self.args.count
+    }
+
+    fn free() void {
+        self.args.free()
+    }
+}
+
+// ============================================================================
+// SsaBlockKind — basic block terminator kind
+// ============================================================================
+
+const SsaBlockKind = enum(u8) {
+    invalid,
+    plain,
+    if_,
+    ret,
+    exit,
+    defer_,
+    first,
+    jump_table,
+}
+
+// ============================================================================
+// SsaEdge — CFG edge (block + index for pred/succ lists)
+// ============================================================================
+
+struct SsaEdge {
+    block: int,  // block index
+    index: int,  // position in target's pred/succ list
+}
+
+// ============================================================================
+// SsaBlock — basic block in the SSA control flow graph
+// ============================================================================
+
+struct SsaBlock {
+    id: int,
+    kind: SsaBlockKind,
+    succs: List(SsaEdge),
+    preds: List(SsaEdge),
+    controls: List(int),    // control value indices (for if_: condition; for ret: return value)
+    values: List(int),      // indices into SsaFunc.values
+    pos_line: int,
+    pos_col: int,
+
+    static fn init(id: int, kind: SsaBlockKind) SsaBlock {
+        var succs: List(SsaEdge) = .{}
+        var preds: List(SsaEdge) = .{}
+        var controls: List(int) = .{}
+        var values: List(int) = .{}
+        return SsaBlock {
+            id: id,
+            kind: kind,
+            succs: succs,
+            preds: preds,
+            controls: controls,
+            values: values,
+            pos_line: 0,
+            pos_col: 0,
+        }
+    }
+
+    fn addValue(val_idx: int) void {
+        self.values.append(val_idx)
+    }
+
+    fn setControl(val_idx: int) void {
+        if (self.controls.count == 0) {
+            self.controls.append(val_idx)
+        } else {
+            self.controls.set(0, val_idx)
+        }
+    }
+
+    fn free() void {
+        self.succs.free()
+        self.preds.free()
+        self.controls.free()
+        self.values.free()
+    }
+
+    fn addEdgeTo(target_idx: int, blocks: *List(SsaBlock)) void {
+        // Add successor edge: self → target (stores target's block INDEX)
+        const succ_edge = SsaEdge { block: target_idx, index: 0 }
+        self.succs.append(succ_edge)
+
+        // Add predecessor edge: target ← self
+        // Must store self's block INDEX (not ID) so lookupVarOutgoing can use
+        // func.getBlock(pred.block) correctly. Find self's index by scanning.
+        var self_idx = 0
+        for si in 0..blocks.count {
+            if (blocks.get(si).id == self.id) { self_idx = si; break }
+        }
+        var target = blocks.get(target_idx)
+        const pred_edge = SsaEdge { block: self_idx, index: target.preds.count }
+        target.preds.append(pred_edge)
+        blocks.set(target_idx, target)
+    }
+}
+
+// ============================================================================
+// SsaFunc — SSA function (collection of blocks and values)
+// ============================================================================
+
+struct SsaFunc {
+    name: string,
+    type_idx: int,
+    blocks: List(SsaBlock),
+    values: List(SsaValue),
+    entry: int,                  // entry block index
+    next_block_id: int,
+    next_value_id: int,
+    local_sizes: List(int),
+    local_offsets: List(int),
+    string_literals: List(string),
+    is_export: bool,
+    constants: Map(int, int),    // constant value → value index (dedup)
+
+    static fn init(name: string) SsaFunc {
+        var blocks: List(SsaBlock) = .{}
+        var values: List(SsaValue) = .{}
+        var local_sizes: List(int) = .{}
+        var local_offsets: List(int) = .{}
+        var string_literals: List(string) = .{}
+        var constants: Map(int, int) = .{}
+        return SsaFunc {
+            name: name,
+            type_idx: 0,
+            blocks: blocks,
+            values: values,
+            entry: null_block,
+            next_block_id: 0,
+            next_value_id: 0,
+            local_sizes: local_sizes,
+            local_offsets: local_offsets,
+            string_literals: string_literals,
+            is_export: false,
+            constants: constants,
+        }
+    }
+
+    /// Create a new SSA value and add it to the values list.
+    /// Returns the value's index.
+    fn newValue(op: SsaOp, type_idx: int, block: int, line: int, col: int) int {
+        const id = self.next_value_id
+        self.next_value_id += 1
+        var val = SsaValue.init(id, op, type_idx, block)
+        val.pos_line = line
+        val.pos_col = col
+        const idx = self.values.count
+        self.values.append(val)
+        return idx
+    }
+
+    /// Create a new SSA block. Returns the block's index.
+    fn newBlock(kind: SsaBlockKind) int {
+        const id = self.next_block_id
+        self.next_block_id += 1
+        const block = SsaBlock.init(id, kind)
+        const idx = self.blocks.count
+        self.blocks.append(block)
+        return idx
+    }
+
+    /// Get a value by index.
+    fn getValue(idx: int) SsaValue {
+        return self.values.get(idx)
+    }
+
+    /// Mutate a value by index.
+    fn setValue(idx: int, val: SsaValue) void {
+        self.values.set(idx, val)
+    }
+
+    /// Get a block by index.
+    fn getBlock(idx: int) SsaBlock {
+        return self.blocks.get(idx)
+    }
+
+    /// Mutate a block by index.
+    fn setBlock(idx: int, blk: SsaBlock) void {
+        self.blocks.set(idx, blk)
+    }
+
+    /// Add a value to a block's value list, and update the block in storage.
+    fn addValueToBlock(val_idx: int, block_idx: int) void {
+        var blk = self.blocks.get(block_idx)
+        blk.addValue(val_idx)
+        self.blocks.set(block_idx, blk)
+    }
+
+    /// Create a constant integer value, deduplicating by value.
+    fn constInt(value: int, type_idx: int, block: int, line: int, col: int) int {
+        // Dedup: check if we already have this constant
+        if (self.constants.contains(value)) {
+            return self.constants.get(value)
+        }
+        const idx = self.newValue(SsaOp.const_int, type_idx, block, line, col)
+        var val = self.getValue(idx)
+        val.aux_int = value
+        self.setValue(idx, val)
+        self.addValueToBlock(idx, block)
+        self.constants.set(value, idx)
+        return idx
+    }
+
+    /// Free all memory owned by this function.
+    /// Must be called after codegen is done with the function.
+    fn free() void {
+        // Free each value's args list
+        var i = 0
+        while (i < self.values.count) {
+            var v = self.values.get(i)
+            v.free()
+            i += 1
+        }
+        // Free each block's internal lists
+        i = 0
+        while (i < self.blocks.count) {
+            var b = self.blocks.get(i)
+            b.free()
+            i += 1
+        }
+        // Free the top-level containers
+        self.values.free()
+        self.blocks.free()
+        self.local_sizes.free()
+        self.local_offsets.free()
+        self.string_literals.free()
+        self.constants.free()
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+test "SsaOp enum" {
+    const op = SsaOp.const_int
+    @assertEq(op == SsaOp.const_int, true)
+    @assertEq(op == SsaOp.add, false)
+}
+
+test "SsaValue init and addArg" {
+    var val = SsaValue.init(0, SsaOp.add, I64, 0)
+    @assertEq(val.id, 0)
+    @assertEq(val.op == SsaOp.add, true)
+    @assertEq(val.type_idx, I64)
+    @assertEq(val.argsLen(), 0)
+    val.addArg(1)
+    val.addArg(2)
+    @assertEq(val.argsLen(), 2)
+    @assertEq(val.args.get(0), 1)
+    @assertEq(val.args.get(1), 2)
+}
+
+test "SsaBlock init and addValue" {
+    var blk = SsaBlock.init(0, SsaBlockKind.plain)
+    @assertEq(blk.id, 0)
+    @assertEq(blk.kind == SsaBlockKind.plain, true)
+    @assertEq(blk.values.count, 0)
+    blk.addValue(5)
+    blk.addValue(10)
+    @assertEq(blk.values.count, 2)
+    @assertEq(blk.values.get(0), 5)
+    @assertEq(blk.values.get(1), 10)
+}
+
+test "SsaBlock setControl" {
+    var blk = SsaBlock.init(0, SsaBlockKind.if_)
+    blk.setControl(42)
+    @assertEq(blk.controls.count, 1)
+    @assertEq(blk.controls.get(0), 42)
+    // setControl replaces existing
+    blk.setControl(99)
+    @assertEq(blk.controls.count, 1)
+    @assertEq(blk.controls.get(0), 99)
+}
+
+test "SsaFunc init and newValue" {
+    var func = SsaFunc.init("test_func")
+    @assertEq(func.name, "test_func")
+    @assertEq(func.values.count, 0)
+
+    const blk = func.newBlock(SsaBlockKind.plain)
+    @assertEq(blk, 0)
+    @assertEq(func.blocks.count, 1)
+
+    const v0 = func.newValue(SsaOp.const_int, I64, blk, 0, 0)
+    @assertEq(v0, 0)
+    @assertEq(func.values.count, 1)
+
+    const v1 = func.newValue(SsaOp.add, I64, blk, 0, 0)
+    @assertEq(v1, 1)
+    @assertEq(func.values.count, 2)
+}
+
+test "SsaFunc constInt dedup" {
+    var func = SsaFunc.init("test_dedup")
+    const blk = func.newBlock(SsaBlockKind.plain)
+
+    const c1 = func.constInt(42, I64, blk, 0, 0)
+    const c2 = func.constInt(42, I64, blk, 0, 0)
+    const c3 = func.constInt(99, I64, blk, 0, 0)
+
+    // Same value should be deduped
+    @assertEq(c1, c2)
+    // Different value should be different
+    @assert(c1 != c3)
+}
+
+test "SsaBlock addEdgeTo" {
+    var func = SsaFunc.init("test_edges")
+    const b0 = func.newBlock(SsaBlockKind.plain)
+    const b1 = func.newBlock(SsaBlockKind.plain)
+
+    // Add edge from b0 → b1
+    var blk0 = func.getBlock(b0)
+    blk0.addEdgeTo(b1, &func.blocks)
+    func.setBlock(b0, blk0)
+
+    // Verify successor
+    const updated0 = func.getBlock(b0)
+    @assertEq(updated0.succs.count, 1)
+    @assertEq(updated0.succs.get(0).block, b1)
+
+    // Verify predecessor
+    const updated1 = func.getBlock(b1)
+    @assertEq(updated1.preds.count, 1)
+    @assertEq(updated1.preds.get(0).block, b0)
+}
+
+test "SsaValue addArg2 and addArg3" {
+    var val = SsaValue.init(0, SsaOp.cond_select, I64, 0)
+    val.addArg3(10, 20, 30)
+    @assertEq(val.argsLen(), 3)
+    @assertEq(val.args.get(0), 10)
+    @assertEq(val.args.get(1), 20)
+    @assertEq(val.args.get(2), 30)
+}
+
+test "SsaFunc getValue and setValue" {
+    var func = SsaFunc.init("test_getset")
+    const blk = func.newBlock(SsaBlockKind.plain)
+    const v = func.newValue(SsaOp.const_int, I64, blk, 0, 0)
+
+    var val = func.getValue(v)
+    @assertEq(val.aux_int, 0)
+    val.aux_int = 42
+    func.setValue(v, val)
+
+    const updated = func.getValue(v)
+    @assertEq(updated.aux_int, 42)
+}
+
+test "SsaAux union" {
+    var val = SsaValue.init(0, SsaOp.const_int, I64, 0)
+    // Default aux is none
+    val.aux = SsaAux.str("hello")
+    val.aux = SsaAux.type_ref(5)
+    // Just verify construction doesn't crash
+    @assertEq(val.id, 0)
+}

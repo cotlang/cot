@@ -1,0 +1,247 @@
+/// Dead Code Elimination — Remove unreachable blocks and unused values.
+///
+/// Go reference: cmd/compile/internal/ssa/deadcode.go
+/// Zig reference: compiler/ssa/passes/deadcode.zig
+///
+/// Conservative approach: keeps any value with uses > 0 or side effects.
+/// Only removes values with zero uses and no side effects.
+
+import "std/list"
+import "std/map"
+import "../build/ssa"
+
+/// Remove dead values from all blocks.
+/// A value is dead if: uses == 0 AND not a side-effecting op AND not a block control.
+fn deadcode(func: *SsaFunc) void {
+    // Identify control values (must be kept alive)
+    var is_control: Map(int, bool) = .{}
+    var bi = 0
+    while (bi < func.blocks.count) {
+        const blk = func.getBlock(bi)
+        if (blk.controls.count > 0) {
+            var ci = 0
+            while (ci < blk.controls.count) {
+                is_control.set(blk.controls.get(ci), true)
+                ci += 1
+            }
+        }
+        bi += 1
+    }
+
+    // Compute use counts (SSA passes may have invalidated them)
+    recomputeUses(func)
+
+    // Remove dead values from each block
+    bi = 0
+    while (bi < func.blocks.count) {
+        var blk = func.getBlock(bi)
+        var new_values: List(int) = .{}
+        var vi = 0
+        while (vi < blk.values.count) {
+            const val_idx = blk.values.get(vi)
+            const val = func.getValue(val_idx)
+            if (isLive(val, val_idx, &is_control)) {
+                new_values.append(val_idx)
+            }
+            vi += 1
+        }
+        blk.values.free()
+        blk.values = new_values
+        func.setBlock(bi, blk)
+        bi += 1
+    }
+
+    is_control.free()
+}
+
+/// Recompute use counts for all values.
+fn recomputeUses(func: *SsaFunc) void {
+    // Zero all uses
+    const total = func.next_value_id
+    var vi = 0
+    while (vi < total) {
+        var val = func.getValue(vi)
+        val.uses = 0
+        func.setValue(vi, val)
+        vi += 1
+    }
+
+    // Count uses: for each value, increment uses of all its args
+    vi = 0
+    while (vi < total) {
+        const val = func.getValue(vi)
+        var ai = 0
+        while (ai < val.args_len) {
+            const arg_idx = val.getArg(ai)
+            if (arg_idx >= 0 and arg_idx < total) {
+                var arg_val = func.getValue(arg_idx)
+                arg_val.uses += 1
+                func.setValue(arg_idx, arg_val)
+            }
+            ai += 1
+        }
+        vi += 1
+    }
+
+    // Also count control value uses
+    var bi = 0
+    while (bi < func.blocks.count) {
+        const blk = func.getBlock(bi)
+        var ci = 0
+        while (ci < blk.controls.count) {
+            const ctrl_idx = blk.controls.get(ci)
+            if (ctrl_idx >= 0 and ctrl_idx < total) {
+                var ctrl_val = func.getValue(ctrl_idx)
+                ctrl_val.uses += 1
+                func.setValue(ctrl_idx, ctrl_val)
+            }
+            ci += 1
+        }
+        bi += 1
+    }
+}
+
+/// Check if a value is live (should be kept).
+fn isLive(val: SsaValue, val_idx: int, is_control: *Map(int, bool)) bool {
+    // Control values are always live
+    if (is_control.contains(val_idx)) { return true }
+
+    // Values with uses are live
+    if (val.uses > 0) { return true }
+
+    // Side-effecting ops are live
+    if (isSideEffecting(val.op)) { return true }
+
+    return false
+}
+
+/// Check if an op has side effects (should never be removed).
+fn isSideEffecting(op: SsaOp) bool {
+    return switch (op) {
+        // Stores
+        .store, .store8, .store16, .store32, .store64 => true,
+        .store_wb, .store_sp, .store_reg => true,
+        .move, .zero => true,
+
+        // Calls
+        .call, .tail_call, .static_call, .closure_call, .inter_call => true,
+
+        // ARC
+        .retain, .release => true,
+
+        // Safety checks
+        .nil_check, .bounds_check, .slice_bounds => true,
+
+        // Memory init
+        .init_mem => true,
+
+        // Variable lifecycle
+        .var_def, .var_live, .var_kill => true,
+
+        // Wasm stores
+        .wasm_i64_store, .wasm_i64_store8, .wasm_i64_store16, .wasm_i64_store32 => true,
+        .wasm_i32_store, .wasm_i32_store8, .wasm_i32_store16 => true,
+        .wasm_f64_store, .wasm_f32_store => true,
+        .wasm_local_set, .wasm_local_tee, .wasm_global_set => true,
+
+        // Wasm calls
+        .wasm_call, .wasm_call_indirect, .wasm_return_call => true,
+        .wasm_unreachable, .wasm_return, .wasm_drop => true,
+
+        // Lowered wasm ops
+        .wasm_lowered_move, .wasm_lowered_zero => true,
+        .wasm_lowered_static_call, .wasm_lowered_closure_call, .wasm_lowered_inter_call => true,
+        .wasm_lowered_nil_check => true,
+        .wasm_lowered_retain, .wasm_lowered_release => true,
+
+        // String concat (allocates)
+        .string_concat => true,
+
+        // Atomics
+        .atomic_store32, .atomic_store64 => true,
+        .atomic_add32, .atomic_add64 => true,
+        .atomic_cas32, .atomic_cas64 => true,
+        .atomic_exchange32, .atomic_exchange64 => true,
+
+        // WasmGC (struct/array mutations)
+        .wasm_gc_struct_set, .wasm_gc_array_set, .wasm_gc_array_copy => true,
+
+        else => false,
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+test "deadcode removes unused values" {
+    var func = SsaFunc.init("test_dead")
+    const b0 = func.newBlock(SsaBlockKind.ret)
+
+    // v0 = const_int 42 (dead — no uses)
+    const v0 = func.newValue(SsaOp.const_int, I64, b0, 0, 0)
+    func.addValueToBlock(v0, b0)
+
+    // v1 = const_int 10 (used as control)
+    const v1 = func.newValue(SsaOp.const_int, I64, b0, 0, 0)
+    func.addValueToBlock(v1, b0)
+    var blk = func.getBlock(b0)
+    blk.setControl(v1)
+    func.setBlock(b0, blk)
+
+    deadcode(&func)
+
+    const result_blk = func.getBlock(b0)
+    @assertEq(result_blk.values.count, 1)
+    @assertEq(result_blk.values.get(0), v1)
+}
+
+test "deadcode keeps side effects" {
+    var func = SsaFunc.init("test_sideeffect")
+    const b0 = func.newBlock(SsaBlockKind.ret)
+
+    // v0 = const_int (dead)
+    const v0 = func.newValue(SsaOp.const_int, I64, b0, 0, 0)
+    func.addValueToBlock(v0, b0)
+
+    // v1 = store (side effect — kept)
+    const v1 = func.newValue(SsaOp.store, I64, b0, 0, 0)
+    func.addValueToBlock(v1, b0)
+
+    deadcode(&func)
+
+    const result_blk = func.getBlock(b0)
+    @assertEq(result_blk.values.count, 1)
+    @assertEq(result_blk.values.get(0), v1)
+}
+
+test "deadcode keeps transitive deps" {
+    var func = SsaFunc.init("test_transitive")
+    const b0 = func.newBlock(SsaBlockKind.ret)
+
+    // v0 = const_int 42
+    const v0 = func.newValue(SsaOp.const_int, I64, b0, 0, 0)
+    func.addValueToBlock(v0, b0)
+
+    // v1 = add(v0, v0) — used by control
+    const v1 = func.newValue(SsaOp.add, I64, b0, 0, 0)
+    var val1 = func.getValue(v1)
+    val1.addArg(v0)
+    val1.addArg(v0)
+    func.setValue(v1, val1)
+    func.addValueToBlock(v1, b0)
+
+    // v2 = const_int 99 (dead)
+    const v2 = func.newValue(SsaOp.const_int, I64, b0, 0, 0)
+    func.addValueToBlock(v2, b0)
+
+    var blk = func.getBlock(b0)
+    blk.setControl(v1)
+    func.setBlock(b0, blk)
+
+    deadcode(&func)
+
+    // v0 and v1 kept (v1=control, v0=arg of v1), v2 removed
+    const result_blk = func.getBlock(b0)
+    @assertEq(result_blk.values.count, 2)
+}

@@ -1,0 +1,443 @@
+// ARC Insertion Module - Manages cleanup of reference-counted values
+//
+// Copies Swift's ManagedValue and Cleanup patterns:
+// - ManagedValue.h: Pairs values with optional cleanup handles
+// - Cleanup.h: LIFO cleanup stack for scope-based memory management
+//
+// Reference: compiler/frontend/arc_insertion.zig (444 lines, 1:1 port)
+
+import "std/list"
+import "../check/types"
+
+// Sentinel for invalid cleanup handle index
+const INVALID_HANDLE = -1
+
+// Sentinel for "no local" in Cleanup
+const NO_LOCAL = -1
+
+// ============================================================================
+// CleanupState enum
+// Copies Swift's CleanupState from Cleanup.h:62-77
+// ============================================================================
+
+const CleanupState = enum {
+    dormant,   // Inactive but may be activated later
+    dead,      // Permanently disabled
+    active,    // Currently active
+}
+
+// ============================================================================
+// CleanupKind enum
+// ============================================================================
+
+const CleanupKind = enum {
+    release,          // Release ARC reference
+    unowned_release,  // Decrement unowned RC (Swift unowned reference)
+    weak_release,     // Decrement weak RC in side table (Swift weak reference)
+    end_borrow,       // End a borrow (future borrow checker)
+    defer_expr,       // Deferred expression at scope exit
+    errdefer_expr,    // Error-path only defer (Zig errdefer)
+    scope_destroy,    // Call free()/deinit() on struct at scope exit
+}
+
+// ============================================================================
+// Cleanup struct
+// Copies Swift's Cleanup class from Cleanup.h:85-142
+// ============================================================================
+
+struct Cleanup {
+    kind: CleanupKind,
+    value: int,           // IR node index to clean up
+    type_idx: int,        // Type of the value
+    state: CleanupState,
+    local_idx: int,       // Local variable owning this value (NO_LOCAL if none)
+    func_name: string,    // Mangled function name for scope_destroy (empty if none)
+
+    fn isActive(self: *Cleanup) bool {
+        return self.state == CleanupState.active
+    }
+}
+
+fn makeCleanup(kind: CleanupKind, value: int, type_idx: int) Cleanup {
+    return Cleanup {
+        .kind = kind,
+        .value = value,
+        .type_idx = type_idx,
+        .state = CleanupState.active,
+        .local_idx = NO_LOCAL,
+        .func_name = ""
+    }
+}
+
+fn makeCleanupForLocal(kind: CleanupKind, value: int, type_idx: int, local_idx: int) Cleanup {
+    return Cleanup {
+        .kind = kind,
+        .value = value,
+        .type_idx = type_idx,
+        .state = CleanupState.active,
+        .local_idx = local_idx,
+        .func_name = ""
+    }
+}
+
+fn makeCleanupScopeDestroy(local_idx: int, type_idx: int, func_name: string) Cleanup {
+    return Cleanup {
+        .kind = CleanupKind.scope_destroy,
+        .value = 0,
+        .type_idx = type_idx,
+        .state = CleanupState.active,
+        .local_idx = local_idx,
+        .func_name = func_name
+    }
+}
+
+// ============================================================================
+// CleanupStack - LIFO stack of cleanups
+// Copies Swift's CleanupManager pattern.
+// Cleanups emitted in reverse order (LIFO) at scope exit.
+// ============================================================================
+
+struct CleanupStack {
+    items: List(Cleanup),
+
+    // Push a new cleanup. Returns the handle index (position in the list).
+    fn push(self: *CleanupStack, cleanup: Cleanup) int {
+        const index = self.items.count
+        self.items.append(cleanup)
+        return index
+    }
+
+    // Disable a cleanup by handle index (ownership was forwarded).
+    fn disable(self: *CleanupStack, handle: int) void {
+        if (handle >= 0 and handle < self.items.count) {
+            var c = self.items.get(handle)
+            c.state = CleanupState.dead
+            self.items.set(handle, c)
+        }
+    }
+
+    // Find and disable a cleanup for a specific local variable.
+    // Used when forwarding ownership on return.
+    // Returns true if a cleanup was found and disabled.
+    fn disableForLocal(self: *CleanupStack, local_idx: int) bool {
+        var i = 0
+        while (i < self.items.count) {
+            var c = self.items.get(i)
+            if (c.isActive() and c.local_idx == local_idx) {
+                c.state = CleanupState.dead
+                self.items.set(i, c)
+                return true
+            }
+            i = i + 1
+        }
+        return false
+    }
+
+    // Associate a cleanup handle with a local variable.
+    fn setLocalForHandle(self: *CleanupStack, handle: int, local_idx: int) void {
+        if (handle >= 0 and handle < self.items.count) {
+            var c = self.items.get(handle)
+            c.local_idx = local_idx
+            self.items.set(handle, c)
+        }
+    }
+
+    // Update the value node for a local's cleanup (called on reassignment).
+    fn updateValueForLocal(self: *CleanupStack, local_idx: int, new_value: int) void {
+        var i = 0
+        while (i < self.items.count) {
+            var c = self.items.get(i)
+            if (c.isActive() and c.local_idx != NO_LOCAL and
+                c.local_idx == local_idx and c.kind == CleanupKind.release)
+            {
+                c.value = new_value
+                self.items.set(i, c)
+                return
+            }
+            i = i + 1
+        }
+    }
+
+    // Check if a local variable has an active ARC cleanup registered.
+    fn hasCleanupForLocal(self: *CleanupStack, local_idx: int) bool {
+        var i = 0
+        while (i < self.items.count) {
+            const c = self.items.get(i)
+            if (c.isActive() and c.local_idx == local_idx) {
+                return true
+            }
+            i = i + 1
+        }
+        return false
+    }
+
+    // Get number of active cleanups.
+    fn activeCount(self: *CleanupStack) int {
+        var count = 0
+        var i = 0
+        while (i < self.items.count) {
+            const c = self.items.get(i)
+            if (c.state == CleanupState.active) {
+                count = count + 1
+            }
+            i = i + 1
+        }
+        return count
+    }
+
+    // Mark cleanup depth for scope entry.
+    fn depth(self: *CleanupStack) int {
+        return self.items.count
+    }
+
+    // Mark all cleanups from current depth down to target_depth as dead.
+    // Returns a list of the cleanups that were active (in LIFO order).
+    // Caller iterates the returned list to emit the actual cleanup IR.
+    fn collectAndMarkDead(self: *CleanupStack, target_depth: int) List(Cleanup) {
+        var result: List(Cleanup) = .{}
+        var i = self.items.count
+        while (i > target_depth) {
+            i = i - 1
+            var c = self.items.get(i)
+            if (c.isActive()) {
+                result.append(c)
+                c.state = CleanupState.dead
+                self.items.set(i, c)
+            }
+        }
+        return result
+    }
+
+    // Clear all cleanups (for function reset).
+    fn clear(self: *CleanupStack) void {
+        self.items.clear()
+    }
+
+    // Get a cleanup by index.
+    fn get(self: *CleanupStack, index: int) Cleanup {
+        return self.items.get(index)
+    }
+
+    // Check if handle is valid.
+    fn isValidHandle(handle: int) bool {
+        return handle >= 0
+    }
+}
+
+fn initCleanupStack() CleanupStack {
+    var items: List(Cleanup) = .{}
+    return CleanupStack { .items = items }
+}
+
+// ============================================================================
+// ManagedValue - Pairs a value with an optional cleanup
+// Copies Swift's ManagedValue from ManagedValue.h:59-95
+//
+// +0 value: No cleanup (borrowed or trivial)
+// +1 value: Has cleanup (owned, will be released)
+// forward(): Transfer ownership, disable cleanup
+// ============================================================================
+
+struct ManagedValue {
+    value: int,        // IR node index
+    type_idx: int,     // Type of the value
+    cleanup: int,      // Handle index (INVALID_HANDLE if +0)
+
+    // Check if this value has an active cleanup.
+    fn hasCleanup(self: *ManagedValue) bool {
+        return self.cleanup != INVALID_HANDLE
+    }
+
+    // Forward ownership to another scope.
+    // Disables the cleanup — the receiver is now responsible for release.
+    fn forward(self: *ManagedValue, stack: *CleanupStack) int {
+        if (self.cleanup != INVALID_HANDLE) {
+            stack.disable(self.cleanup)
+            self.cleanup = INVALID_HANDLE
+        }
+        return self.value
+    }
+
+    // Get the underlying value without forwarding ownership.
+    fn getValue(self: *ManagedValue) int {
+        return self.value
+    }
+}
+
+fn makeOwnedValue(value: int, type_idx: int, cleanup: int) ManagedValue {
+    return ManagedValue { .value = value, .type_idx = type_idx, .cleanup = cleanup }
+}
+
+fn makeTrivialValue(value: int, type_idx: int) ManagedValue {
+    return ManagedValue { .value = value, .type_idx = type_idx, .cleanup = INVALID_HANDLE }
+}
+
+// ============================================================================
+// ArcScope - Scope guard for cleanup emission
+// Enters a scope, tracks depth, collects cleanups on exit.
+// ============================================================================
+
+struct ArcScope {
+    stack: *CleanupStack,
+    entry_depth: int,
+
+    // Exit the scope, collecting all cleanups registered since entry.
+    // Returns active cleanups in LIFO order (caller emits the IR).
+    fn exit(self: *ArcScope) List(Cleanup) {
+        return self.stack.collectAndMarkDead(self.entry_depth)
+    }
+
+    // Get entry depth for break/continue handling.
+    fn getDepth(self: *ArcScope) int {
+        return self.entry_depth
+    }
+}
+
+fn enterScope(stack: *CleanupStack) ArcScope {
+    return ArcScope { .stack = stack, .entry_depth = stack.depth() }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+test "CleanupStack push and disable" {
+    var stack = initCleanupStack()
+    const c = makeCleanup(CleanupKind.release, 42, I64)
+    const handle = stack.push(c)
+    @assertEq(handle, 0)
+    @assertEq(stack.items.count, 1)
+    const c0 = stack.get(0)
+    @assertEq(c0.state == CleanupState.active, true)
+    stack.disable(handle)
+    const c1 = stack.get(0)
+    @assertEq(c1.state == CleanupState.dead, true)
+}
+
+test "CleanupStack LIFO order" {
+    var stack = initCleanupStack()
+    stack.push(makeCleanup(CleanupKind.release, 1, I64))
+    stack.push(makeCleanup(CleanupKind.release, 2, I64))
+    stack.push(makeCleanup(CleanupKind.release, 3, I64))
+    @assertEq(stack.items.count, 3)
+
+    // Collect in LIFO order
+    const cleanups = stack.collectAndMarkDead(0)
+    @assertEq(cleanups.count, 3)
+    @assertEq(cleanups.get(0).value, 3)
+    @assertEq(cleanups.get(1).value, 2)
+    @assertEq(cleanups.get(2).value, 1)
+}
+
+test "ManagedValue forward transfers ownership" {
+    var stack = initCleanupStack()
+    const c = makeCleanup(CleanupKind.release, 100, I64)
+    const handle = stack.push(c)
+    var mv = makeOwnedValue(100, I64, handle)
+    @assertEq(mv.hasCleanup(), true)
+    const val = mv.forward(&stack)
+    @assertEq(val, 100)
+    @assertEq(mv.hasCleanup(), false)
+    const got = stack.get(0)
+    @assertEq(got.state == CleanupState.dead, true)
+}
+
+test "ManagedValue trivial has no cleanup" {
+    var mv = makeTrivialValue(42, I64)
+    @assertEq(mv.hasCleanup(), false)
+    @assertEq(mv.getValue(), 42)
+}
+
+test "ArcScope tracks cleanup depth" {
+    var stack = initCleanupStack()
+    stack.push(makeCleanup(CleanupKind.release, 1, I64))
+    stack.push(makeCleanup(CleanupKind.release, 2, I64))
+
+    var scope = enterScope(&stack)
+    @assertEq(scope.entry_depth, 2)
+
+    stack.push(makeCleanup(CleanupKind.release, 3, I64))
+    @assertEq(stack.items.count, 3)
+
+    // Exit inner scope — only cleanup 3 should be collected
+    const emitted = scope.exit()
+    @assertEq(emitted.count, 1)
+    @assertEq(emitted.get(0).value, 3)
+
+    // Cleanup 3 should be dead, 1 and 2 still active
+    const c2 = stack.get(2)
+    @assertEq(c2.state == CleanupState.dead, true)
+    const c0 = stack.get(0)
+    @assertEq(c0.state == CleanupState.active, true)
+    const c1 = stack.get(1)
+    @assertEq(c1.state == CleanupState.active, true)
+}
+
+test "CleanupStack disableForLocal" {
+    var stack = initCleanupStack()
+    stack.push(makeCleanupForLocal(CleanupKind.release, 10, I64, 0))
+    stack.push(makeCleanupForLocal(CleanupKind.release, 20, I64, 1))
+    stack.push(makeCleanupForLocal(CleanupKind.release, 30, I64, 2))
+
+    @assertEq(stack.disableForLocal(1), true)
+    const d1 = stack.get(1)
+    @assertEq(d1.state == CleanupState.dead, true)
+    const d0 = stack.get(0)
+    @assertEq(d0.state == CleanupState.active, true)
+    const d2 = stack.get(2)
+    @assertEq(d2.state == CleanupState.active, true)
+
+    // Not found
+    @assertEq(stack.disableForLocal(99), false)
+}
+
+test "CleanupStack hasCleanupForLocal" {
+    var stack = initCleanupStack()
+    stack.push(makeCleanupForLocal(CleanupKind.release, 10, I64, 5))
+    @assertEq(stack.hasCleanupForLocal(5), true)
+    @assertEq(stack.hasCleanupForLocal(6), false)
+}
+
+test "CleanupStack updateValueForLocal" {
+    var stack = initCleanupStack()
+    stack.push(makeCleanupForLocal(CleanupKind.release, 10, I64, 3))
+    stack.updateValueForLocal(3, 99)
+    @assertEq(stack.get(0).value, 99)
+}
+
+test "CleanupStack setLocalForHandle" {
+    var stack = initCleanupStack()
+    const handle = stack.push(makeCleanup(CleanupKind.release, 10, I64))
+    @assertEq(stack.get(0).local_idx, NO_LOCAL)
+    stack.setLocalForHandle(handle, 7)
+    @assertEq(stack.get(0).local_idx, 7)
+}
+
+test "CleanupStack activeCount" {
+    var stack = initCleanupStack()
+    stack.push(makeCleanup(CleanupKind.release, 1, I64))
+    stack.push(makeCleanup(CleanupKind.release, 2, I64))
+    stack.push(makeCleanup(CleanupKind.release, 3, I64))
+    @assertEq(stack.activeCount(), 3)
+    stack.disable(1)
+    @assertEq(stack.activeCount(), 2)
+}
+
+test "CleanupStack clear" {
+    var stack = initCleanupStack()
+    stack.push(makeCleanup(CleanupKind.release, 1, I64))
+    stack.push(makeCleanup(CleanupKind.release, 2, I64))
+    @assertEq(stack.items.count, 2)
+    stack.clear()
+    @assertEq(stack.items.count, 0)
+}
+
+test "CleanupStack scope destroy" {
+    var stack = initCleanupStack()
+    const c = makeCleanupScopeDestroy(5, I64, "Map(i64,_i64)_free")
+    stack.push(c)
+    const sd = stack.get(0)
+    @assertEq(sd.kind == CleanupKind.scope_destroy, true)
+    @assertEq(sd.local_idx, 5)
+    @assertEq(sd.func_name, "Map(i64,_i64)_free")
+}
