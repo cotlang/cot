@@ -1395,6 +1395,16 @@ pub const SSABuilder = struct {
         try cur.addValue(self.allocator, off_val);
 
         const field_type = self.type_registry.get(type_idx);
+        // Small structs (≤8 bytes): load value so it's usable as a scalar (return, arg).
+        // Without this load, returning an 8-byte struct field returns the ADDRESS, not VALUE.
+        // Large structs stay as addresses (accessed via SRET or further field ops).
+        // Reference: cg_clif value_and_place.rs — CValue::ByVal for small structs.
+        if (field_type == .struct_type and self.type_registry.sizeOf(type_idx) <= 8) {
+            const load = try self.func.newValue(.load, type_idx, cur, self.cur_pos);
+            load.addArg(off_val);
+            try cur.addValue(self.allocator, load);
+            return load;
+        }
         if (field_type == .struct_type or field_type == .array or field_type == .union_type) return off_val;
 
         // Compound optional: return address (like struct), not loaded scalar
