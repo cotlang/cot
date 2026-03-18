@@ -3210,9 +3210,16 @@ pub const Lowerer = struct {
                         } else {
                         // Swift store [assign] pattern (TypeLowering.cpp:1213-1216):
                         // load old → retain new (if +0) → store new → release old
-                        // Uses ManagedValue to determine ownership instead of AST heuristic.
+                        // Use already-lowered value_node — do NOT re-lower assign.value,
+                        // which would double-evaluate side effects (e.g., two newScope calls).
                         const old_value = try fb.emitLoadLocal(local_idx, local_type, assign.span);
-                        const managed = try self.lowerExprManaged(assign.value);
+                        const rhs_node = self.tree.getNode(assign.value);
+                        const rhs_expr = if (rhs_node) |n| n.asExpr() else null;
+                        const is_owned = if (rhs_expr) |e| (e == .new_expr or e == .call) else false;
+                        const managed = if (is_owned)
+                            arc.ManagedValue.forOwned(value_node, local_type, try self.cleanup_stack.push(arc.Cleanup.init(.release, value_node, local_type)))
+                        else
+                            arc.ManagedValue.forTrivial(value_node, local_type);
                         if (managed.hasCleanup()) {
                             // +1 value: forward cleanup, store directly
                             var mv = managed;
