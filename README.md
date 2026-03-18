@@ -11,7 +11,7 @@ Cot is a compiled language that gives you TypeScript's developer experience with
 
 Cot has a `@safe` mode that makes it feel like TypeScript — structs are passed by reference automatically, no `&` or `*` needed, field shorthand works, and methods get implicit `self`:
 
-```cot
+```zig
 @safe
 
 import "std/list"
@@ -108,7 +108,7 @@ test "error handling" {
 
 [Cotty](https://github.com/cot-land/cotty) is a terminal emulator written in Cot with a native macOS frontend — VT100 parser, gap buffer, terminal grid, JSON config, FFI to Metal/CoreText:
 
-```cot
+```zig
 @safe
 
 struct VtParser {
@@ -129,7 +129,7 @@ struct VtParser {
 }
 ```
 
-```cot
+```zig
 static fn loadFromFile(path: string) Config {
     var cfg = Config.init()
     const content = readFile(path) catch { return cfg }  // graceful fallback
@@ -148,7 +148,7 @@ static fn loadFromFile(path: string) Config {
 
 The Cot compiler is being rewritten in Cot itself. The `self/` directory contains a working compiler frontend — scanner, parser, type checker, and IR builder — all in `@safe` mode:
 
-```cot
+```zig
 fn main() void {
     const cmd = arg(1)
     const path = arg(2)
@@ -210,7 +210,7 @@ cot lsp                      # language server (VS Code/Cursor extension availab
 
 ### Types and Variables
 
-```cot
+```zig
 const name = "cot"                   // immutable
 var count: i64 = 0                   // mutable, explicit type
 var ratio = 3.14                     // f64 inferred
@@ -222,7 +222,7 @@ var ratio = 3.14                     // f64 inferred
 
 ### Structs, Enums, Unions
 
-```cot
+```zig
 struct Point {
     x: i64, y: i64
 
@@ -247,7 +247,7 @@ union Shape {
 
 ### Generics
 
-```cot
+```zig
 fn max(T)(a: T, b: T) T {
     if (a > b) { return a }
     return b
@@ -260,7 +260,7 @@ var p = Pair(i64, string) { .first = 42, .second = "hello" }
 
 ### Error Handling
 
-```cot
+```zig
 const FileError = error { NotFound, PermissionDenied }
 
 fn readConfig(path: string) FileError!string {
@@ -282,7 +282,7 @@ var result = readConfig("x") catch |err| switch err {
 
 ### Closures
 
-```cot
+```zig
 var multiplier: i64 = 3
 var triple = fn(x: i64) i64 { return x * multiplier }   // captures multiplier
 println(triple(7))   // 21
@@ -290,7 +290,7 @@ println(triple(7))   // 21
 
 ### Traits
 
-```cot
+```zig
 trait Printable {
     fn display(self: *Self) string
 }
@@ -304,7 +304,7 @@ impl Printable for Point {
 
 ### Optionals and Pattern Matching
 
-```cot
+```zig
 var name: ?string = "cot"
 
 if (name) |val| {                    // unwrap with capture
@@ -322,7 +322,7 @@ var z = x.?                          // force unwrap (traps if null)
 
 ### Switch
 
-```cot
+```zig
 switch color {
     .Red => handleRed(),
     .Green, .Blue => handleCool(),
@@ -338,7 +338,7 @@ switch shape {
 
 ### Defer and Errdefer
 
-```cot
+```zig
 fn processFile(path: string) !void {
     var file = try openFile(path)
     defer closeFile(file)              // runs on ALL exits
@@ -350,7 +350,7 @@ fn processFile(path: string) !void {
 
 ### Concurrency
 
-```cot
+```zig
 import "std/channel"
 
 var ch = Channel(i64).init(10)             // buffered channel
@@ -375,7 +375,7 @@ select {
 
 ### Async/Await
 
-```cot
+```zig
 async fn fetchData(url: string) !string {
     var response = await httpGet(url)
     return response.body
@@ -399,7 +399,7 @@ Enable with `"safe": true` in `cot.json` or `@safe` at the top of a file. Gives 
 
 ### Testing
 
-```cot
+```zig
 test "math works" {
     @assertEq(2 + 2, 4)
     @assert(10 > 5)
