@@ -3854,6 +3854,29 @@ pub const Lowerer = struct {
         };
         const capture_local = try fb.addLocalWithSize(if_stmt.capture, elem_type, false, self.type_reg.sizeOf(elem_type));
         _ = try fb.emitStoreLocal(capture_local, unwrapped, if_stmt.span);
+        // Swift switch_enum pattern: when the payload is extracted, the optional's
+        // ownership transfers to the capture. Disable the optional's cleanup to prevent
+        // double-release (capture cleanup + optional cleanup would both release the same ptr).
+        // Reference: Swift SILGenPattern.cpp — switch_enum forwards payload ownership.
+        if (is_compound_opt) {
+            if (fb.lookupLocal("__opt_if")) |opt_local2| {
+                _ = self.cleanup_stack.disableForLocal(opt_local2);
+            }
+        }
+        // Also disable cleanup for the condition variable itself (pointer-like optionals
+        // don't use __opt_if, but the condition ident has its own cleanup).
+        if (self.type_reg.couldBeARC(opt_type_idx)) {
+            const cond_node = self.tree.getNode(if_stmt.condition);
+            if (cond_node) |cn| {
+                if (cn.asExpr()) |ce| {
+                    if (ce == .ident) {
+                        if (fb.lookupLocal(ce.ident.name)) |cond_local| {
+                            _ = self.cleanup_stack.disableForLocal(cond_local);
+                        }
+                    }
+                }
+            }
+        }
         if (!try self.lowerBlockNode(if_stmt.then_branch)) _ = try fb.emitJump(merge_block, if_stmt.span);
         fb.restoreScope(scope_depth);
 
