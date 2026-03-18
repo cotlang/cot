@@ -118,12 +118,41 @@ of 'Checker_checkFnDeclBody' (source offset 38803)
 
 ---
 
+## Bug 5: ARC refcount regression — use-after-free in multi-file checking (ROOT CAUSE)
+
+**Reproduction:**
+```bash
+# Current selfcot (with ARC fix):
+/tmp/selfcot check /tmp/test_import_sys.cot   # CRASH
+
+# Old selfcot (before ARC fix):
+/tmp/selfcot_nostencil check /tmp/test_import_sys.cot   # OK
+```
+
+Where test_import_sys.cot is:
+```cot
+import "std/sys"
+fn main() { println(42) }
+```
+
+**Error:** SIGSEGV in Scope_lookup → Map.getOrNull with x0 = `0x3173c900e37ae1df` (same garbage every time). Crashes during `collectNonTypeDecl → buildFuncType → resolveTypeExpr` for the imported file.
+
+**Root cause:** Commit `71cbfc9` changed `INITIAL_REFCOUNT` from `STRONG_RC_ONE | PURE_SWIFT_DEALLOC | UNOWNED_RC_ONE` to `PURE_SWIFT_DEALLOC | UNOWNED_RC_ONE`. This reduced the initial strong refcount from 2 logical to 1 logical. The old double-counting masked a missing retain — some ARC-managed object (likely a Scope or Map) was being released too early, causing use-after-free.
+
+**The old selfcot binary was compiled with the old ARC refcount (objects start with 2 refs).** The new selfcot binary is compiled with the fixed refcount (objects start with 1 ref). With 1 ref, a single release frees the object. If there's a missing retain somewhere in the selfcot code (or the Zig compiler's codegen for selfcot), the object gets freed while still in use.
+
+**This is the PRIMARY blocker.** Bugs 1-3 may resolve once this is fixed.
+
+**Investigation:** The missing retain is in the Zig compiler's ARC codegen path for whatever object holds the Scope's Map. Need to trace which ARC-managed object is being freed too early during multi-file checking.
+
+**Zig compiler reference:** `compiler/frontend/lower.zig` (ARC retain/release emission), `compiler/codegen/native/arc_native.zig` (ARC runtime).
+
 ## Investigation Order
 
-1. **Bug 4** first — fix the Zig compiler's orelse lowering. This unblocks Bug 3's fix.
-2. **Bug 3** second — fix the depth counter leak in selfcot's checker. This unblocks map.cot checking.
-3. **Bug 1** third — fix selfcot's enum method self injection. This unblocks token.cot.
-4. **Bug 2** last — may resolve automatically once Bugs 1 and 3 are fixed (the scope corruption is likely caused by error recovery after the other bugs).
+1. **Bug 5** first — the ARC refcount regression. This is the root cause. The old selfcot works; the new one doesn't. The only difference is the ARC initial refcount. Find the missing retain.
+2. **Bug 4** — already fixed (orelse block return lowering).
+3. **Bug 3** — already fixed (body_check_depth decrement).
+4. **Bug 1** and **Bug 2** — may resolve once Bug 5 is fixed.
 
 ## Minimal Test Files Needed
 
