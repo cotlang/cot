@@ -1878,7 +1878,11 @@ const SsaToClifTranslator = struct {
 
     fn getClif(self: *const Self, ssa_val: *const ssa_value.Value) clif.Value {
         return self.value_map.get(ssa_val.id) orelse {
-            debug.log(.codegen, "ssa_to_clif: missing value v{d} (op={s})", .{ ssa_val.id, @tagName(ssa_val.op) });
+            // BUG: Missing SSA value in CLIF translation. Returning value 0 silently
+            // produces wrong code — the wrong base pointer causes all field accesses
+            // to read/write wrong memory. Print diagnostic and return 0 for now.
+            // Reference: Cranelift verifier would reject this as an undefined value.
+            std.debug.print("BUG: ssa_to_clif missing value v{d} (op={s}) in func {s}\n", .{ ssa_val.id, @tagName(ssa_val.op), self.ssa_func.name });
             return clif.Value.fromIndex(0);
         };
     }

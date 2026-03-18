@@ -450,19 +450,20 @@ fn generateRetain(
         const v_expected = try ins.iconst(clif.Type.I64, ARC_HEAP_MAGIC);
         const is_heap = try ins.icmp(.eq, magic, v_expected);
 
-        // ARC diagnostic: if magic doesn't match AND magic != 0 (not uninitialized),
-        // print warning with the bad pointer value. Helps identify use-after-free
-        // (freed memory has wrong magic) vs non-heap pointers (stack/global addresses).
-        // Reference: Swift SWIFT_RT_TRACK_INVOCATION for retain/release tracking.
-        const v_zero_magic = try ins.iconst(clif.Type.I64, 0);
-        const magic_is_zero = try ins.icmp(.eq, magic, v_zero_magic);
-        const is_heap_or_uninit = try ins.bor(is_heap, magic_is_zero);
+        // Double-check: if magic matches, also verify alloc_size is reasonable.
+        // Stack data can coincidentally contain the magic pattern. Checking that
+        // alloc_size (at header + 8) is in range [32, 1GB] prevents false positives.
+        // Reference: Swift's HeapObject layout validation.
+        const alloc_size = try ins.load(clif.Type.I64, clif.MemFlags.DEFAULT, header_ptr, SIZE_OFFSET);
+        const v_min_size = try ins.iconst(clif.Type.I64, HEAP_OBJECT_HEADER_SIZE);
+        const v_max_size = try ins.iconst(clif.Type.I64, 1 << 30); // 1GB
+        const size_above_min = try ins.icmp(.uge, alloc_size, v_min_size);
+        const size_below_max = try ins.icmp(.ule, alloc_size, v_max_size);
+        const size_valid = try ins.band(size_above_min, size_below_max);
+        const is_valid_heap = try ins.band(is_heap, size_valid);
 
-        // Create diagnostic block for non-heap, non-zero magic (likely use-after-free)
         const block_arc_warn = try builder.createBlock();
-        // Skip diagnostic print for now — the write() call during compilation
-        // corrupts stack state. Just return obj unchanged for non-heap pointers.
-        _ = try ins.brif(is_heap_or_uninit, block_check_immortal, &.{}, block_return_obj, &.{});
+        _ = try ins.brif(is_valid_heap, block_check_immortal, &.{}, block_return_obj, &.{});
 
         // Diagnostic block: print "ARC: bad ptr 0xNNNN\n" to stderr, then return obj
         builder.switchToBlock(block_arc_warn);
@@ -691,12 +692,18 @@ fn generateRelease(
         const v_expected = try ins.iconst(clif.Type.I64, ARC_HEAP_MAGIC);
         const is_heap = try ins.icmp(.eq, magic, v_expected);
 
-        const v_zero_magic = try ins.iconst(clif.Type.I64, 0);
-        const magic_is_zero = try ins.icmp(.eq, magic, v_zero_magic);
-        const is_heap_or_uninit = try ins.bor(is_heap, magic_is_zero);
+        // Double-check: verify alloc_size is reasonable to prevent false positives
+        // from stack data that coincidentally contains the magic pattern.
+        const alloc_size = try ins.load(clif.Type.I64, clif.MemFlags.DEFAULT, header_ptr, SIZE_OFFSET);
+        const v_min_size = try ins.iconst(clif.Type.I64, HEAP_OBJECT_HEADER_SIZE);
+        const v_max_size = try ins.iconst(clif.Type.I64, 1 << 30);
+        const size_above_min = try ins.icmp(.uge, alloc_size, v_min_size);
+        const size_below_max = try ins.icmp(.ule, alloc_size, v_max_size);
+        const size_valid = try ins.band(size_above_min, size_below_max);
+        const is_valid_heap = try ins.band(is_heap, size_valid);
 
         const block_release_warn = try builder.createBlock();
-        _ = try ins.brif(is_heap_or_uninit, block_check_immortal, &.{}, block_return, &.{});
+        _ = try ins.brif(is_valid_heap, block_check_immortal, &.{}, block_return, &.{});
 
         // Diagnostic: print bad pointer value then return
         builder.switchToBlock(block_release_warn);
