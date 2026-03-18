@@ -5822,7 +5822,19 @@ pub const Lowerer = struct {
                 if (std.mem.eql(u8, struct_field.name, field_init.name)) {
                     const field_idx: u32 = @intCast(i);
                     const field_offset: i64 = @intCast(struct_field.offset);
-                    const value_node = try self.lowerExprNode(field_init.value);
+                    var value_node = try self.lowerExprNode(field_init.value);
+                    // @safe auto-deref: if value is *T but field expects T (struct),
+                    // load through the pointer. Same as lowerNewExpr field init.
+                    if (value_node != ir.null_node) {
+                        const val_ti = fb.nodes.items[value_node].type_idx;
+                        const val_info = self.type_reg.get(val_ti);
+                        if (val_info == .pointer and val_info.pointer.elem == struct_field.type_idx) {
+                            const fld_info = self.type_reg.get(struct_field.type_idx);
+                            if (fld_info == .struct_type or fld_info == .union_type or fld_info == .tuple) {
+                                value_node = try fb.emitPtrLoadValue(value_node, struct_field.type_idx, si.span);
+                            }
+                        }
+                    }
                     const field_type = self.type_reg.get(struct_field.type_idx);
                     const is_string_field = struct_field.type_idx == TypeRegistry.STRING or field_type == .slice;
                     if (is_string_field) {
@@ -6189,7 +6201,20 @@ pub const Lowerer = struct {
             for (struct_type.fields, 0..) |struct_field, i| {
                 if (std.mem.eql(u8, struct_field.name, field_init.name)) {
                     const field_offset: i64 = @intCast(struct_field.offset);
-                    const value_node = try self.lowerExprNode(field_init.value);
+                    var value_node = try self.lowerExprNode(field_init.value);
+                    // @safe auto-deref: if value is *T but field expects T (struct),
+                    // load through the pointer. @safe wraps fn params to *T but struct
+                    // fields stay as T — bridge the mismatch at init sites.
+                    if (value_node != ir.null_node) {
+                        const val_ti = fb.nodes.items[value_node].type_idx;
+                        const val_info = self.type_reg.get(val_ti);
+                        if (val_info == .pointer and val_info.pointer.elem == struct_field.type_idx) {
+                            const fld_info = self.type_reg.get(struct_field.type_idx);
+                            if (fld_info == .struct_type or fld_info == .union_type or fld_info == .tuple) {
+                                value_node = try fb.emitPtrLoadValue(value_node, struct_field.type_idx, ne.span);
+                            }
+                        }
+                    }
                     const field_type = self.type_reg.get(struct_field.type_idx);
                     const is_string_field = struct_field.type_idx == TypeRegistry.STRING or field_type == .slice;
 
