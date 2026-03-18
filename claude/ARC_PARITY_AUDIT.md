@@ -1,183 +1,140 @@
-# ARC Parity Audit: Cot vs Swift
+# ARC Parity: Cot vs Swift — Status & Remaining Work
 
-**Date:** 2026-03-19
-**Purpose:** Full gap analysis of Cot's ARC implementation against Swift SILGen.
-**Conclusion:** Cot implements ~40% of Swift's ARC. 6 critical gaps identified.
-
----
-
-## Swift's Architecture
-
-Swift's ARC has three layers:
-
-1. **TypeLowering** (TypeLowering.cpp, 5,638 lines) — type-based dispatch for copy/destroy. Every type has a lowering class that knows how to copy and destroy it recursively.
-
-2. **ManagedValue** (ManagedValue.cpp, 329 lines) — per-value ownership tracking. Every value is +1 (owned, has cleanup) or +0 (borrowed, no cleanup). Conversions between +1 and +0 are explicit.
-
-3. **CleanupStack** (Cleanup.cpp, 560 lines) — scope-based LIFO destruction. Each non-trivial value registers a cleanup that fires at scope exit.
-
-### Swift's Key Principle: Recursive Field Copying
-
-When copying a struct, Swift **destructures it into fields** and **recursively copies each non-trivial field**:
-
-```cpp
-// TypeLowering.cpp:1396-1422 — LoadableAggTypeLowering::emitLoweredCopyValue
-asImpl().destructureAggregate(
-    B, loc, aggValue, false,
-    [&](unsigned childIndex, SILValue childValue,
-        const TypeLowering &childLowering) {
-      if (!childLowering.isTrivial())
-        childValue = childLowering.emitLoweredCopyChildValue(
-            B, loc, childValue, style);  // RECURSIVE RETAIN
-      loweredChildValues.push_back(childValue);
-    });
-```
-
-This means copying `struct { a: *Node, b: Map(K,V), c: ?*Scope }` would:
-- retain `a` (managed pointer)
-- recursively copy `b` (aggregate with managed backing buffers)
-- conditionally retain inner pointer of `c` (optional managed pointer)
-
-### Swift's Store [assign] Pattern
-
-```cpp
-// TypeLowering.cpp:1213-1216 — emitStore for non-trivial types
-SILValue old = B.createLoad(loc, addr, LoadOwnershipQualifier::Unqualified);
-B.createStore(loc, value, addr, StoreOwnershipQualifier::Unqualified);
-B.emitDestroyValueOperation(loc, old);
-```
-
-Load old, store new, destroy old. Always in this order. Retain of new value is implicit — the stored value must already be +1.
-
-### Swift's Optional Payload Handling
-
-```cpp
-// TypeLowering.cpp:1603+ — LoadableEnumTypeLowering::emitCopyValue
-// Switches on enum tag, copies non-trivial payload
-switch_enum %optional {
-  case .some(%payload): copy_value %payload  // RETAIN inner pointer
-  case .none: /* no-op */
-}
-```
+**Updated:** 2026-03-19
+**Goal:** Full ARC parity with Swift SILGen for production-ready memory management.
+**Current state:** ~70% parity. 3 gaps remain before full parity.
 
 ---
 
-## Gap Analysis: 6 Critical Gaps
+## Architecture Summary
 
-### Gap 1: No Recursive Struct Field Copy (CRITICAL — ROOT CAUSE OF SELFCOT BUG)
+### Swift's Three Layers
+1. **TypeLowering** (TypeLowering.cpp) — per-type copy/destroy dispatch. Each type category has a lowering class.
+2. **ManagedValue** (ManagedValue.cpp) — per-value ownership (+1 owned / +0 borrowed) with cleanup handle.
+3. **CleanupStack** (Cleanup.cpp) — scope-based LIFO destruction.
 
-**Swift:** `LoadableAggTypeLowering::destructureAggregate` walks all fields, retains each non-trivial one.
-
-**Cot:** `lowerNewExpr` field init (lower.zig:6244) only checks top-level `.pointer` fields. Misses:
-- `?*T` optional pointer fields
-- Nested structs containing managed pointers
-- Slices/strings containing heap pointers (partially handled separately)
-
-**Impact:** `new Scope { parent: old_scope }` doesn't retain `old_scope` through the `?*Scope` field. When the source is released, the pointed-to scope is freed while the new Scope's `parent` still references it.
-
-**Fix:** Implement Swift's destructureAggregate pattern — for each non-trivial field in a struct init, emit the appropriate retain:
-- `.pointer` (managed) → `retain(value)`
-- `.optional` containing managed pointer → unwrap tag, conditionally `retain(inner_ptr)`
-- `.struct_type` containing non-trivial fields → recursive
-
-### Gap 2: No Type Lowering Hierarchy
-
-**Swift:** 8+ TypeLowering subclasses:
-- `TrivialTypeLowering` — i32, f64, etc.
-- `ReferenceTypeLowering` — class instances (single retain/release)
-- `LoadableStructTypeLowering` — structs with non-trivial fields
-- `LoadableEnumTypeLowering` — enums/optionals with non-trivial payloads
-- `AddressOnlyTypeLowering` — types that can't be loaded into registers
-
-**Cot:** Flat `isTrivial()` check. No per-type-category copy/destroy dispatch.
-
-**Impact:** Every ARC operation in Cot is ad-hoc — each call site manually checks type categories and emits retain/release. This leads to inconsistencies (some paths retain, others don't).
-
-**Fix:** Create a `TypeLowering` module that given a type index returns:
-- `isTrivial() bool` — no ARC needed
-- `emitCopy(value) → retained_value` — type-appropriate copy (retain/recursive)
-- `emitDestroy(value)` — type-appropriate destroy (release/recursive)
-
-### Gap 3: ~~No Per-Field Cleanup Registration~~ — MATCHES SWIFT
-
-**Swift audit result:** Swift registers **ONE cleanup per variable, NOT per field** (SILGenDecl.cpp:639). The cleanup emits `destroy_value %struct` which the type lowering dispatches to per-field destruction only if needed (TypeLowering.cpp:1424-1451).
-
-**Cot's approach:** ONE `scope_destroy` cleanup per struct, with `emitFieldReleases` in auto-deinit handling per-field release including `?*T` unwrap-then-release.
-
-**Status:** ✅ ALREADY MATCHES SWIFT. The original audit was wrong — Swift does NOT do per-field cleanup. Cot's one-cleanup-per-struct is the correct pattern.
-
-### Gap 4: Incomplete Ownership Forwarding on Return
-
-**Swift:** `ManagedValue::forward()` disables cleanup and transfers ownership to the caller. For aggregates, this means all field cleanups are disabled.
-
-**Cot:** `cleanup_stack.disableForLocal(local_idx)` — only disables if the return expr is a simple identifier. Doesn't handle:
-- Aggregate returns (returning a struct with multiple non-trivial fields)
-- Field access returns (returning `self.scope` — must retain the field)
-- Nested expressions (returning `process(x)` where x needs forwarding)
-
-**Fix:** Match Swift's `emitReturnExpr` pattern: evaluate RHS to ManagedValue, forward ALL managed values (not just simple idents).
-
-### Gap 5: Double Evaluation in Assignment
-
-**Swift:** `emitAssignToLValue` evaluates RHS exactly once via move-only `RValue`:
-```cpp
-// SILGenLValue.cpp:5965
-RValue srcValue = std::move(src).getAsRValue(*this);
-```
-`RValue` copy constructor is deleted. After move, source is marked `Used`.
-
-**Cot:** `lowerAssign` evaluates `assign.value` twice for managed pointer locals:
-1. Line 3165: `lowerExprNode(assign.value)` — first evaluation
-2. Line 3215: `lowerExprManaged(assign.value)` — second evaluation (FIXED in recent commit but needs Swift audit verification)
-
-Multiple other `lowerExprManaged(assign.value)` call sites remain (lines 3187, 3322, 3403, 3448, 3471, 3507, 3652).
-
-**Fix:** ALL assignment paths should use the already-lowered `value_node` from line 3165. Determine ownership from expression kind, never re-lower.
-
-### Gap 6: No Aggregate Type Expansion
-
-**Swift:** `TypeExpansionKind::DirectChildren` triggers field-by-field processing for ALL aggregate operations (copy, destroy, store, load).
-
-**Cot:** No equivalent. Each operation handles aggregates differently (or not at all).
-
-**Fix:** Long-term — implement TypeExpansionKind equivalent. Short-term — ensure each operation site handles non-trivial fields correctly.
+### Cot's Current Implementation
+1. **Centralized dispatch:** `emitCopyValue`/`emitDestroyValue` in `lower.zig` — recursive type walk for all categories (pointer, optional, struct, error union).
+2. **ManagedValue:** `arc_insertion.zig` defines ManagedValue + CleanupStack. Used via `lowerExprManaged`/`managedFromLowered` at all assignment sites.
+3. **SSA decomposition:** `opt_make`/`opt_tag`/`opt_data` ops for `?*T` (Go IMake/ITab/IData pattern). Parallel to existing string/slice decomposition.
+4. **Alloc separation:** `alloc()` for ARC objects (header + refcount), `alloc_raw()` for backing buffers (no header).
 
 ---
 
-## Priority Fix Order
+## Completed Work
 
-| Priority | Gap | Description | Effort | Unblocks |
-|----------|-----|-------------|--------|----------|
-| **P0** | Gap 1 | ✅ DONE — ?*T field retain via emitOptionalFieldRetain | Small | Selfcot: 8/13 |
-| **P1** | Gap 5 | ✅ DONE — All double-eval sites use managedFromLowered | Small | Correctness |
-| **P2** | Gap 4 | ✅ DONE — ?*T return value unwrap-then-retain | Medium | Complex returns |
-| **P3** | Gap 3 | ✅ ALREADY CORRECT — matches Swift (one cleanup per var) | — | — |
-| **P4** | Gap 2 | TypeLowering hierarchy | Large | Systematic ARC |
-| **P5** | Gap 6 | Aggregate type expansion | Large | Full parity |
+### Done: alloc/alloc_raw Separation
+- `alloc(metadata, size)` → ARC header (magic, refcount=1) for `new T` objects
+- `alloc_raw(size)` → raw malloc for List/Map backing buffers
+- Prevents retain/release from corrupting non-ARC memory
 
-### Immediate Fix: Gap 1 (Unblocks Selfcot)
+### Done: isTrivial for Managed Pointers
+- `isTrivial(.pointer)` returns `!p.managed` — managed pointers are non-trivial
+- Unified `needsARC` = `!isTrivial`
 
-The `?*T` unwrap-then-retain pattern for struct field init:
+### Done: Optional ARC Registration
+- Optionals with managed pointer elem are registered for ARC at init and assignment
+- `?*T` uses compound layout with `opt_make`/`opt_tag`/`opt_data` SSA ops
+- `isPtrLikeOptional` returns false for managed pointer optionals
 
-```
-// For field type ?*T where T is managed:
-// 1. Store the compound optional value (tag + pointer)
-store compound_optional at field_addr
+### Done: ManagedValue Integration
+- `lowerExprManaged` returns ManagedValue with ownership (+1/+0) and cleanup handle
+- `managedFromLowered` wraps pre-lowered values with correct ownership
+- All 6 assignment paths use `managedFromLowered` — zero double evaluation
+- `forward()` transfers ownership on return, disabling cleanup
 
-// 2. Load tag, conditionally retain inner pointer
-tag = load_i64(field_addr)
-if (tag != 0) {
-    inner_ptr = load_i64(field_addr + 8)
-    retain(inner_ptr)
-}
-```
+### Done: Auto-Synthesized Destructors
+- `emitPendingAutoDeinits` generates `_deinit` for structs with ARC fields
+- Per-field release: `.pointer.managed` → release, `?*T` → unwrap-then-release
+- `emitFieldReleases` handles user-defined deinit functions
 
-**Reference:** Swift `LoadableEnumTypeLowering::emitCopyValue` (TypeLowering.cpp:1603+)
+### Done: Parameter Ownership Convention
+- All params are +0 (borrowed). No cleanup entry.
+- Storing a param value into a field always retains (via ManagedValue +0 detection).
 
-Applied to ALL three struct init paths via shared `emitOptionalFieldRetain` helper:
-- ✅ `lowerNewExpr` field init
-- ✅ `lowerStructInitExpr` field init
-- ✅ `lowerStructInit` field init
+### Done: ?*T SSA Decomposition (Go Pattern)
+- `opt_make(tag, payload)` — construct compound optional in SSA
+- `opt_tag(value)` — extract tag component
+- `opt_data(value)` — extract payload component
+- Full pipeline: SSA builder, decompose pass, rewritedec peepholes, CLIF + Wasm codegen
+- Call arg decomposition handles `*T → ?*T` wrapping (tag=1, payload=ptr)
+
+---
+
+## Remaining Gaps (3)
+
+### Gap A: Struct Init Paths Don't Use emitCopyValue (HIGH)
+
+**Problem:** `emitCopyValue` correctly handles all type categories recursively, but two of three struct init paths don't call it. They use inline `.pointer.managed` checks that miss `?*T` fields.
+
+| Init Path | File:Line | Uses emitCopyValue? | Handles ?*T? |
+|-----------|-----------|--------------------:|:------------:|
+| `lowerNewExpr` | lower.zig:6402 | No (inline) | Yes (custom) |
+| `lowerStructInit` | lower.zig:2785 | No (inline) | **No** |
+| `lowerStructInitExpr` | lower.zig:6079 | No (inline) | **No** |
+| Default field values | lower.zig:2825, 6119 | No (inline) | **No** |
+
+**Fix:** Replace inline `.pointer.managed` checks in `lowerStructInit`, `lowerStructInitExpr`, and default value paths with calls to `emitCopyValue`. This handles `?*T`, nested structs with managed fields, and error unions automatically.
+
+**Complexity:** Small — the centralized function already exists and is correct.
+
+**Swift reference:** `SILGenExpr.cpp` — struct literal init calls `emitCopyValue` for each non-trivial field.
+
+### Gap B: emitFieldReleases/emitPendingAutoDeinits Missing Recursive Struct Destruction (MEDIUM)
+
+**Problem:** `emitDestroyValue` correctly walks struct fields recursively in reverse order (LIFO). But `emitFieldReleases` and `emitPendingAutoDeinits` use inline per-field release that only handles `.pointer.managed` and `?*T`. Nested structs containing managed fields are not recursively destroyed.
+
+| Destroy Path | File:Line | Uses emitDestroyValue? | Recursive? |
+|-------------|-----------|:----------------------:|:----------:|
+| `emitFieldReleases` | lower.zig:2066 | No (inline) | **No** |
+| `emitPendingAutoDeinits` | lower.zig:2121 | No (inline) | **No** |
+| Assignment old-value destroy | lower.zig:3324+ | **Yes** | Yes |
+
+**Why not use emitDestroyValue directly:** The comment at lower.zig:2076 says "Can NOT use centralized emitDestroyValue here because the SSA builder treats ?*T as a single-word scalar." **This is now outdated** — the `opt_make`/`opt_tag`/`opt_data` SSA ops fix this. `emitDestroyValue` should now work correctly for `?*T` struct fields.
+
+**Fix:** Replace inline per-field release in `emitFieldReleases` and `emitPendingAutoDeinits` with calls to `emitDestroyValue`. The centralized function handles all types recursively.
+
+**Complexity:** Small — requires re-testing with selfcot after the change. The previous attempt failed because `?*T` SSA was broken; it should work now with the `opt_make` decomposition.
+
+**Swift reference:** `LoadableStructTypeLowering::emitLoweredDestroyValue` — `forEachNonTrivialChild → emitDestroyValue`.
+
+### Gap C: Ad-Hoc Type Dispatch (31+ Sites) (LOW — TECH DEBT)
+
+**Problem:** 31+ locations in `lower.zig` manually check `.pointer.managed` or `.optional and couldBeARC` instead of using centralized `emitCopyValue`/`emitDestroyValue`. This creates inconsistency — some paths handle all type categories, others only handle managed pointers.
+
+**Not blocking:** The centralized functions exist and are correct. The ad-hoc sites mostly work for the types selfcot uses. This is tech debt, not a correctness bug (except for Gaps A and B above).
+
+**Fix:** Long-term refactor to replace ad-hoc checks with centralized dispatch. Lower priority than Gaps A and B.
+
+**Swift reference:** `TypeExpansionKind::DirectChildren` — every operation dispatches through the type lowering hierarchy.
+
+---
+
+## Missing Type Handlers in emitCopyValue/emitDestroyValue
+
+Both functions handle: pointer, optional, string, struct (recursive), error union.
+
+Both functions are **missing** handlers for:
+- `.list` — falls through to no-op (leak if List inside a struct is copied)
+- `.map` — falls through to no-op (leak if Map inside a struct is copied)
+- `.future` — falls through to no-op
+
+**Impact:** Low for selfcot — List/Map/Future fields in structs are rare. The stdlib List/Map types themselves are stack-allocated and use `alloc_raw` for backing buffers. But any struct containing a `List(T)` field would leak if copied.
+
+**Fix:** Add retain/release cases for `.list`, `.map`, `.future` in `emitCopyValue`/`emitDestroyValue`. These are heap-allocated objects with ARC headers, so the handler is the same as `.pointer.managed`: `retain(value)` / `release(value)`.
+
+---
+
+## Priority Order for Full Parity
+
+| # | Gap | Effort | Impact | Unblocks |
+|---|-----|--------|--------|----------|
+| 1 | **Gap A:** Wire emitCopyValue into struct init | Small | Fixes ?*T field leaks in stack structs | Correctness |
+| 2 | **Gap B:** Wire emitDestroyValue into deinit | Small | Fixes nested struct field leaks | Correctness |
+| 3 | **List/Map/Future handlers** | Tiny | Fixes container field leaks | Edge cases |
+| 4 | **Gap C:** Consolidate ad-hoc dispatch | Large | Tech debt, consistency | Maintainability |
+
+After items 1-3, Cot reaches **~95% ARC parity** with Swift SILGen. Item 4 is polish.
 
 ---
 
@@ -189,16 +146,23 @@ Applied to ALL three struct init paths via shared `emitOptionalFieldRetain` help
 | `references/swift/lib/SILGen/ManagedValue.cpp` | 329 | copy(), forward(), ensurePlusOne() |
 | `references/swift/lib/SILGen/Cleanup.cpp` | 560 | CleanupManager, scope-based destruction |
 | `references/swift/lib/SILGen/SILGenLValue.cpp` | 5,993 | emitAssignToLValue, emitLoad, emitSemanticStore |
-| `references/swift/lib/SILGen/SILGenProlog.cpp` | 1,774 | Parameter ownership, cleanup registration |
-| `references/swift/lib/SILGen/SILGenExpr.cpp` | 7,793 | Expression ownership (+1/+0), struct literal init |
-| `references/swift/include/swift/SIL/SILGenManagedValue.h` | 347 | ManagedValue class, +1/+0 semantics |
 
-## Cot Reference Files
+## Cot Implementation Files
 
-| File | Lines | Purpose |
-|------|-------|---------|
-| `compiler/frontend/lower.zig` | ~12,000 | Ad-hoc ARC insertion during lowering |
-| `compiler/frontend/arc_insertion.zig` | 444 | CleanupStack, ManagedValue data structures |
-| `compiler/codegen/native/arc_native.zig` | ~2,100 | Native ARC runtime (alloc/retain/release) |
-| `compiler/codegen/arc.zig` | 1,642 | Wasm ARC runtime |
-| `compiler/frontend/types.zig` | ~800 | Type classification (isTrivial, couldBeARC) |
+| File | Purpose |
+|------|---------|
+| `compiler/frontend/lower.zig` | ARC insertion during lowering (emitCopyValue, emitDestroyValue, field assign, deinit) |
+| `compiler/frontend/arc_insertion.zig` | CleanupStack, ManagedValue data structures |
+| `compiler/frontend/ssa_builder.zig` | opt_make/opt_tag/opt_data compound decomposition |
+| `compiler/frontend/types.zig` | Type classification (isTrivial, couldBeARC) |
+| `compiler/codegen/native/arc_native.zig` | Native ARC runtime (alloc/retain/release/alloc_raw) |
+| `compiler/codegen/wasm/arc.zig` | Wasm ARC runtime |
+| `compiler/ssa/op.zig` | SSA op definitions (opt_make, opt_tag, opt_data) |
+| `compiler/ssa/passes/decompose.zig` | Phi decomposition for compound types |
+| `compiler/ssa/passes/rewritedec.zig` | Peephole rewrites for opt_tag/opt_data |
+
+## Archived Documents
+
+- `claude/archive/ARC_ARCHITECTURE_AUDIT.md` — 8-gap analysis (all resolved)
+- `claude/archive/ARC_ALLOC_SEPARATION.md` — alloc/alloc_raw separation plan (completed)
+- `claude/archive/PHASE3_REGRESSION.md` — ?*T SSA mismatch regression (fixed via opt_make/opt_tag/opt_data)
