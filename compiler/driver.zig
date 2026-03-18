@@ -1320,7 +1320,7 @@ pub const Driver = struct {
             "sched_init",    "sched_worker_spawn", "sched_worker_loop",
             "sched_join_workers", "sched_select",
             // Signal handler runtime (signal_native.generate order)
-            "__cot_print_hex", "__cot_signal_handler", "__cot_install_signals", "__cot_print_backtrace",
+            "__cot_print_hex", "__cot_signal_handler", "__cot_install_signals", "__cot_print_backtrace", "__cot_print_source_loc",
             // Test runtime (test_native.generate order)
             "__test_begin",  "__test_print_name", "__test_pass",
             "__test_fail",   "__test_summary",    "__test_store_fail_values",
@@ -1353,6 +1353,8 @@ pub const Driver = struct {
             "atexit",
             // usleep — used by scheduler for worker idle polling
             "usleep",
+            // dladdr — used by signal handler for source map lookup
+            "dladdr",
         };
         const runtime_start_idx: u32 = @intCast(funcs.len);
         for (runtime_func_names, 0..) |name, i| {
@@ -1421,11 +1423,17 @@ pub const Driver = struct {
         // Scheduler global symbol index — _cot_sched_ptr BSS data for scheduler singleton.
         const sched_symbol_idx: u32 = envp_symbol_idx + 1;
 
+        // Source map global symbol indices — used by signal handler for crash source lines.
+        // Pre-allocated here so signal_native can reference them in CLIF globalValue instructions.
+        const srcmap_entries_symbol_idx: u32 = sched_symbol_idx + 1;
+        const srcmap_count_symbol_idx: u32 = srcmap_entries_symbol_idx + 1;
+        const srcmap_file_symbol_idx: u32 = srcmap_count_symbol_idx + 1;
+
         // Global variable symbol indices — each module-level var gets a data section entry.
         // Maps global name → external name index for globalValue references in ssa_to_clif.
         var global_symbol_map = std.StringHashMapUnmanaged(u32){};
         defer global_symbol_map.deinit(self.allocator);
-        const globals_base_idx: u32 = sched_symbol_idx + 1;
+        const globals_base_idx: u32 = srcmap_file_symbol_idx + 1;
         for (globals, 0..) |g, i| {
             try global_symbol_map.put(self.allocator, g.name, globals_base_idx + @as(u32, @intCast(i)));
         }
@@ -1561,8 +1569,8 @@ pub const Driver = struct {
                 try func_names.append(self.allocator, rf.name);
             }
 
-            // Signal handler runtime: __cot_signal_handler, __cot_install_signals
-            var signal_funcs = try signal_native.generate(self.allocator, isa, &ctrl_plane, &func_index_map, self.target.os);
+            // Signal handler runtime: __cot_signal_handler, __cot_install_signals, __cot_print_source_loc
+            var signal_funcs = try signal_native.generate(self.allocator, isa, &ctrl_plane, &func_index_map, self.target.os, srcmap_entries_symbol_idx, srcmap_count_symbol_idx, srcmap_file_symbol_idx);
             defer signal_funcs.deinit(self.allocator);
             for (signal_funcs.items) |rf| {
                 try compiled_funcs.append(self.allocator, rf.compiled);
@@ -1597,6 +1605,9 @@ pub const Driver = struct {
             argv_symbol_idx,
             envp_symbol_idx,
             sched_symbol_idx,
+            srcmap_entries_symbol_idx,
+            srcmap_count_symbol_idx,
+            srcmap_file_symbol_idx,
             &func_index_map,
             globals,
             globals_base_idx,
@@ -1620,6 +1631,9 @@ pub const Driver = struct {
         argv_symbol_idx: u32,
         envp_symbol_idx: u32,
         sched_symbol_idx: u32,
+        srcmap_entries_symbol_idx: u32,
+        srcmap_count_symbol_idx: u32,
+        srcmap_file_symbol_idx: u32,
         func_index_map: *const std.StringHashMapUnmanaged(u32),
         globals: []const ir_mod.Global,
         globals_base_idx: u32,
@@ -1742,6 +1756,15 @@ pub const Driver = struct {
             try module.declareExternalName(sched_symbol_idx, sched_sym_name);
         }
 
+        // Pass 3b4: Pre-register source map external names so signal handler CLIF code
+        // can reference them via globalValue. The actual data is emitted in Phase 5.
+        // If no source map entries exist, we still register zero-sized placeholders.
+        {
+            try module.declareExternalName(srcmap_entries_symbol_idx, "_cot_srcmap_entries");
+            try module.declareExternalName(srcmap_count_symbol_idx, "_cot_srcmap_count");
+            try module.declareExternalName(srcmap_file_symbol_idx, "_cot_srcmap_file");
+        }
+
         // Pass 3c: Add global variable data section entries.
         // Each module-level var gets an 8-byte zero-initialized data section entry.
         for (globals, 0..) |g, i| {
@@ -1780,6 +1803,8 @@ pub const Driver = struct {
                 if (idx == argc_symbol_idx or idx == argv_symbol_idx or idx == envp_symbol_idx) continue;
                 // Skip scheduler global symbol (already registered in Pass 3b3)
                 if (idx == sched_symbol_idx) continue;
+                // Skip source map symbols (already registered in Pass 3b4)
+                if (idx == srcmap_entries_symbol_idx or idx == srcmap_count_symbol_idx or idx == srcmap_file_symbol_idx) continue;
                 // Skip global variable symbols (already registered in Pass 3c)
                 if (globals.len > 0 and idx >= globals_base_idx and idx < globals_base_idx + @as(u32, @intCast(globals.len))) continue;
 
@@ -1926,11 +1951,114 @@ pub const Driver = struct {
             }
         }
 
+        // Phase 5: Generate DWARF debug line info + runtime source map
+        // Wire srclocs from compiled user functions into DWARF .debug_line entries.
+        // Also build a runtime source map data section for the signal handler.
+        {
+            if (self.debug_source_file.len > 0 and self.debug_source_text.len > 0) {
+                module.setDebugInfo(self.debug_source_file, self.debug_source_text);
+            }
+
+            // Build source map entries: (func_name_hash, code_offset_in_func, line_number)
+            // The signal handler uses dladdr to get func name + offset, then searches this table.
+            var srcmap_data = std.ArrayListUnmanaged(u8){};
+            defer srcmap_data.deinit(self.allocator);
+            var srcmap_count: u32 = 0;
+
+            if (self.debug_source_text.len > 0) {
+                for (compiled_funcs, 0..) |*cf, func_idx| {
+                    // Only process user functions (they have source locations)
+                    if (func_idx >= func_names.len) continue;
+                    const func_code_offset = module.getFuncCodeOffset(func_ids[func_idx]);
+
+                    for (cf.buffer.srclocs.items) |srcloc| {
+                        const src_byte_offset = srcloc.loc.offset;
+                        if (src_byte_offset == 0) continue;
+
+                        // Convert source byte offset to line number
+                        const line = lineFromByteOffset(self.debug_source_text, src_byte_offset);
+                        if (line == 0) continue;
+
+                        // DWARF: absolute code offset in text section
+                        const abs_code_offset = func_code_offset + srcloc.start;
+                        try module.addLineEntry(abs_code_offset, src_byte_offset);
+
+                        // Runtime source map: { func_name_hash: u32, offset_in_func: u32, line: u32, file_idx: u16, pad: u16 }
+                        // Hash the bare function name (dladdr strips the _ prefix on macOS).
+                        const name = func_names[func_idx];
+                        const name_hash = fnvHash(name);
+                        try srcmap_data.appendSlice(self.allocator, std.mem.asBytes(&name_hash));
+                        const offset_in_func: u32 = srcloc.start;
+                        try srcmap_data.appendSlice(self.allocator, std.mem.asBytes(&offset_in_func));
+                        const line_u32: u32 = line;
+                        try srcmap_data.appendSlice(self.allocator, std.mem.asBytes(&line_u32));
+                        const file_idx: u16 = 0; // Single file for now
+                        try srcmap_data.appendSlice(self.allocator, std.mem.asBytes(&file_idx));
+                        const pad: u16 = 0;
+                        try srcmap_data.appendSlice(self.allocator, std.mem.asBytes(&pad));
+                        srcmap_count += 1;
+                    }
+                }
+            }
+
+            // Always emit source map data sections (signal handler references them).
+            // If no entries, emit zero-filled placeholders.
+            {
+                // Entries array (16 bytes per entry, or 16 bytes of zeros)
+                const entries_id = try module.declareData("_cot_srcmap_entries", .Local, false);
+                if (srcmap_data.items.len > 0) {
+                    try module.defineData(entries_id, srcmap_data.items);
+                } else {
+                    const zero16 = &[_]u8{0} ** 16;
+                    try module.defineData(entries_id, zero16);
+                }
+
+                // Count (4 bytes)
+                const count_id = try module.declareData("_cot_srcmap_count", .Local, false);
+                try module.defineData(count_id, std.mem.asBytes(&srcmap_count));
+
+                // Source file name (null-terminated, or just a null byte)
+                const file_id = try module.declareData("_cot_srcmap_file", .Local, false);
+                if (self.debug_source_file.len > 0) {
+                    var file_data = std.ArrayListUnmanaged(u8){};
+                    defer file_data.deinit(self.allocator);
+                    try file_data.appendSlice(self.allocator, self.debug_source_file);
+                    try file_data.append(self.allocator, 0);
+                    while (file_data.items.len % 8 != 0) try file_data.append(self.allocator, 0);
+                    try module.defineData(file_id, file_data.items);
+                } else {
+                    const zero8 = &[_]u8{0} ** 8;
+                    try module.defineData(file_id, zero8);
+                }
+            }
+        }
+
         // Serialize object file to bytes
         var output = std.ArrayListUnmanaged(u8){};
         defer output.deinit(self.allocator);
         try module.finish(output.writer(self.allocator));
         return try output.toOwnedSlice(self.allocator);
+    }
+
+    /// Convert a source byte offset to a 1-based line number by counting newlines.
+    fn lineFromByteOffset(source_text: []const u8, byte_offset: u32) u32 {
+        if (byte_offset >= source_text.len) return 0;
+        var line: u32 = 1;
+        for (source_text[0..byte_offset]) |c| {
+            if (c == '\n') line += 1;
+        }
+        return line;
+    }
+
+    /// FNV-1a hash for function name matching in the source map.
+    /// Used by both the compiler (to build the map) and the signal handler (to look up).
+    fn fnvHash(name: []const u8) u32 {
+        var h: u32 = 0x811c9dc5;
+        for (name) |c| {
+            h ^= c;
+            h *%= 0x01000193;
+        }
+        return h;
     }
 
     /// Generate Mach-O object file from compiled functions.

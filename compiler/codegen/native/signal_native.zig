@@ -56,18 +56,33 @@ const PC_OFFSET: i32 = 256;
 const SA_ONSTACK: i32 = 0x1;
 const SA_SIGINFO: i32 = 0x40;
 
+// GlobalValue support for source map data symbols
+const globalvalue_mod = @import("../../ir/clif/globalvalue.zig");
+const gv_ExternalName = globalvalue_mod.ExternalName;
+const GlobalValueData = globalvalue_mod.GlobalValueData;
+
+// macOS ARM64 Dl_info struct offsets (from <dlfcn.h>)
+// typedef struct { const char *dli_fname; void *dli_fbase; const char *dli_sname; void *dli_saddr; } Dl_info;
+const DL_INFO_SIZE: i32 = 32;
+const DLI_SNAME_OFFSET: i32 = 16; // const char *dli_sname
+const DLI_SADDR_OFFSET: i32 = 24; // void *dli_saddr
+
 /// Generate signal handler runtime functions.
-/// Returns four functions:
-///   1. __cot_signal_handler(sig, info, ucontext) — Go-style crash diagnostics
-///   2. __cot_install_signals() — sigaction with SA_SIGINFO | SA_ONSTACK
-///   3. __cot_print_backtrace() — libc backtrace() + backtrace_symbols_fd()
-///   4. __cot_print_hex(value) — stack-based hex printer (safe during heap corruption)
+/// Returns five functions:
+///   1. __cot_print_hex(value) — stack-based hex printer (safe during heap corruption)
+///   2. __cot_signal_handler(sig, info, ucontext) — Go-style crash diagnostics
+///   3. __cot_install_signals() — sigaction with SA_SIGINFO | SA_ONSTACK
+///   4. __cot_print_backtrace() — libc backtrace() + backtrace_symbols_fd()
+///   5. __cot_print_source_loc(pc) — resolve PC to file:line via runtime source map
 pub fn generate(
     allocator: Allocator,
     isa: native_compile.TargetIsa,
     ctrl_plane: *native_compile.ControlPlane,
     func_index_map: *const std.StringHashMapUnmanaged(u32),
     target_os: target_mod.Os,
+    srcmap_entries_idx: u32,
+    srcmap_count_idx: u32,
+    srcmap_file_idx: u32,
 ) !std.ArrayListUnmanaged(RuntimeFunc) {
     var result = std.ArrayListUnmanaged(RuntimeFunc){};
     errdefer {
@@ -82,7 +97,7 @@ pub fn generate(
 
     try result.append(allocator, .{
         .name = "__cot_signal_handler",
-        .compiled = try generateSignalHandler(allocator, isa, ctrl_plane, func_index_map),
+        .compiled = try generateSignalHandler(allocator, isa, ctrl_plane, func_index_map, srcmap_entries_idx, srcmap_count_idx, srcmap_file_idx),
     });
 
     try result.append(allocator, .{
@@ -93,6 +108,11 @@ pub fn generate(
     try result.append(allocator, .{
         .name = "__cot_print_backtrace",
         .compiled = try generatePrintBacktrace(allocator, isa, ctrl_plane, func_index_map),
+    });
+
+    try result.append(allocator, .{
+        .name = "__cot_print_source_loc",
+        .compiled = try generatePrintSourceLoc(allocator, isa, ctrl_plane, func_index_map, srcmap_entries_idx, srcmap_count_idx, srcmap_file_idx),
     });
 
     return result;
@@ -229,7 +249,13 @@ fn generateSignalHandler(
     isa: native_compile.TargetIsa,
     ctrl_plane: *native_compile.ControlPlane,
     func_index_map: *const std.StringHashMapUnmanaged(u32),
+    srcmap_entries_idx: u32,
+    srcmap_count_idx: u32,
+    srcmap_file_idx: u32,
 ) !native_compile.CompiledCode {
+    _ = srcmap_entries_idx;
+    _ = srcmap_count_idx;
+    _ = srcmap_file_idx;
     var clif_func = clif.Function.init(allocator);
     defer clif_func.deinit();
     var func_ctx = FunctionBuilderContext.init(allocator);
@@ -514,6 +540,23 @@ fn generateSignalHandler(
             _ = try bi.call(hex_func, &[_]clif.Value{fault_addr});
             try writeStringToStderr(bi, &builder, &clif_func, allocator, write_func, "\n");
 
+            // ---- Step 3.5: Source location for crash PC ----
+            // Call __cot_print_source_loc(pc) to print "  at file.cot:42\n"
+            {
+                const srcloc_idx = func_index_map.get("__cot_print_source_loc") orelse 0;
+                var srcloc_sig = clif.Signature.init(.system_v);
+                try srcloc_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+                const srcloc_sig_ref = try builder.importSignature(srcloc_sig);
+                const srcloc_func = try builder.importFunction(.{
+                    .name = .{ .user = .{ .namespace = 0, .index = srcloc_idx } },
+                    .signature = srcloc_sig_ref,
+                    .colocated = true,
+                });
+                // Reload PC from regs
+                const crash_pc = try bi.load(clif.Type.I64, clif.MemFlags.DEFAULT, regs_base, PC_OFFSET);
+                _ = try bi.call(srcloc_func, &[_]clif.Value{crash_pc});
+            }
+
             // ---- Step 4: Backtrace ----
             _ = try bi.call(bt_func, &[_]clif.Value{});
 
@@ -738,6 +781,311 @@ fn generatePrintBacktrace(
     _ = try ins.call(btsf_func, &[_]clif.Value{ adjusted_buf, adjusted_count, v_fd });
 
     _ = try ins.return_(&.{});
+
+    try builder.sealAllBlocks();
+    builder.finalize();
+    return try native_compile.compile(allocator, &clif_func, isa, ctrl_plane);
+}
+
+// ============================================================================
+// __cot_print_source_loc(pc: i64) -> void
+//
+// Resolves a program counter to source file:line using the runtime source map.
+//
+// Algorithm:
+// 1. dladdr(pc) -> dli_sname (function name), dli_saddr (function base)
+// 2. offset_in_func = pc - dli_saddr
+// 3. FNV-1a hash of dli_sname
+// 4. Linear scan _cot_srcmap_entries for matching (hash, offset_in_func)
+// 5. If found, print "  at <file>:<line>\n"
+//
+// Source map entry format (16 bytes):
+//   { func_name_hash: u32, offset_in_func: u32, line: u32, file_idx: u16, pad: u16 }
+// ============================================================================
+fn generatePrintSourceLoc(
+    allocator: Allocator,
+    isa: native_compile.TargetIsa,
+    ctrl_plane: *native_compile.ControlPlane,
+    func_index_map: *const std.StringHashMapUnmanaged(u32),
+    srcmap_entries_idx: u32,
+    srcmap_count_idx: u32,
+    srcmap_file_idx: u32,
+) !native_compile.CompiledCode {
+    var clif_func = clif.Function.init(allocator);
+    defer clif_func.deinit();
+    var func_ctx = FunctionBuilderContext.init(allocator);
+    defer func_ctx.deinit();
+    var builder = FunctionBuilder.init(&clif_func, &func_ctx);
+
+    try clif_func.signature.addParam(allocator, clif.AbiParam.init(clif.Type.I64)); // pc
+
+    // Stack slot for Dl_info struct (32 bytes, 8-byte aligned)
+    const dl_info_slot = try clif_func.createStackSlot(allocator, .{
+        .kind = .explicit_slot,
+        .size = @intCast(DL_INFO_SIZE),
+        .align_shift = 3,
+    });
+
+    // Pre-create all blocks with their parameters
+    const b_entry = try builder.createBlock();
+    const b_dladdr_ok = try builder.createBlock();
+    // FNV hash loop
+    const b_hash_loop = try builder.createBlock();
+    _ = try builder.appendBlockParam(b_hash_loop, clif.Type.I64); // char_ptr
+    _ = try builder.appendBlockParam(b_hash_loop, clif.Type.I32); // hash
+    _ = try builder.appendBlockParam(b_hash_loop, clif.Type.I32); // target_offset (pass-through)
+    const b_hash_step = try builder.createBlock();
+    _ = try builder.appendBlockParam(b_hash_step, clif.Type.I64); // char_ptr
+    _ = try builder.appendBlockParam(b_hash_step, clif.Type.I32); // hash
+    _ = try builder.appendBlockParam(b_hash_step, clif.Type.I32); // target_offset
+    const b_hash_done = try builder.createBlock();
+    _ = try builder.appendBlockParam(b_hash_done, clif.Type.I32); // final_hash
+    _ = try builder.appendBlockParam(b_hash_done, clif.Type.I32); // target_offset
+    // Scan loop
+    const b_scan_loop = try builder.createBlock();
+    _ = try builder.appendBlockParam(b_scan_loop, clif.Type.I64); // cur_ptr
+    _ = try builder.appendBlockParam(b_scan_loop, clif.Type.I64); // end_ptr
+    _ = try builder.appendBlockParam(b_scan_loop, clif.Type.I32); // target_hash
+    _ = try builder.appendBlockParam(b_scan_loop, clif.Type.I32); // target_offset
+    const b_scan_body = try builder.createBlock();
+    _ = try builder.appendBlockParam(b_scan_body, clif.Type.I64);
+    _ = try builder.appendBlockParam(b_scan_body, clif.Type.I64);
+    _ = try builder.appendBlockParam(b_scan_body, clif.Type.I32);
+    _ = try builder.appendBlockParam(b_scan_body, clif.Type.I32);
+    const b_scan_next = try builder.createBlock();
+    _ = try builder.appendBlockParam(b_scan_next, clif.Type.I64);
+    _ = try builder.appendBlockParam(b_scan_next, clif.Type.I64);
+    _ = try builder.appendBlockParam(b_scan_next, clif.Type.I32);
+    _ = try builder.appendBlockParam(b_scan_next, clif.Type.I32);
+    const b_found = try builder.createBlock();
+    _ = try builder.appendBlockParam(b_found, clif.Type.I32); // line_number
+    const b_return = try builder.createBlock();
+
+    // Import dladdr
+    const dladdr_idx = func_index_map.get("dladdr") orelse 0;
+    var dladdr_sig = clif.Signature.init(.system_v);
+    try dladdr_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+    try dladdr_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+    try dladdr_sig.addReturn(allocator, clif.AbiParam.init(clif.Type.I64));
+    const dladdr_sig_ref = try builder.importSignature(dladdr_sig);
+    const dladdr_func = try builder.importFunction(.{
+        .name = .{ .user = .{ .namespace = 0, .index = dladdr_idx } },
+        .signature = dladdr_sig_ref,
+        .colocated = false,
+    });
+    const write_fn = try importWrite(allocator, &builder, func_index_map);
+
+    // Global values for source map data symbols
+    const gv_count = try clif_func.createGlobalValue(GlobalValueData{
+        .symbol = .{ .name = gv_ExternalName.initUser(0, srcmap_count_idx), .offset = 0, .colocated = true, .tls = false },
+    });
+    const gv_entries = try clif_func.createGlobalValue(GlobalValueData{
+        .symbol = .{ .name = gv_ExternalName.initUser(0, srcmap_entries_idx), .offset = 0, .colocated = true, .tls = false },
+    });
+    const gv_file = try clif_func.createGlobalValue(GlobalValueData{
+        .symbol = .{ .name = gv_ExternalName.initUser(0, srcmap_file_idx), .offset = 0, .colocated = true, .tls = false },
+    });
+
+    // === b_entry: call dladdr(pc, &dl_info), check result ===
+    builder.switchToBlock(b_entry);
+    try builder.appendBlockParamsForFunctionParams(b_entry);
+    try builder.ensureInsertedBlock();
+    {
+        const i = builder.ins();
+        const pc_val = builder.blockParams(b_entry)[0];
+        const dl_addr = try i.stackAddr(clif.Type.I64, dl_info_slot, 0);
+        const dl_result = try i.call(dladdr_func, &[_]clif.Value{ pc_val, dl_addr });
+        const dl_ok = dl_result.results[0];
+        const v0 = try i.iconst(clif.Type.I64, 0);
+        const failed = try i.icmp(.eq, dl_ok, v0);
+        _ = try i.brif(failed, b_return, &.{}, b_dladdr_ok, &.{});
+    }
+
+    // === b_dladdr_ok: extract dli_sname + dli_saddr, start hash loop ===
+    builder.switchToBlock(b_dladdr_ok);
+    try builder.ensureInsertedBlock();
+    {
+        const i = builder.ins();
+        const pc_val = builder.blockParams(b_entry)[0];
+        const dl_addr = try i.stackAddr(clif.Type.I64, dl_info_slot, 0);
+        const dli_sname = try i.load(clif.Type.I64, clif.MemFlags.DEFAULT, dl_addr, DLI_SNAME_OFFSET);
+        const dli_saddr = try i.load(clif.Type.I64, clif.MemFlags.DEFAULT, dl_addr, DLI_SADDR_OFFSET);
+        const v0 = try i.iconst(clif.Type.I64, 0);
+        const sname_null = try i.icmp(.eq, dli_sname, v0);
+        const diff = try i.isub(pc_val, dli_saddr);
+        const target_offset = try i.ireduce(clif.Type.I32, diff);
+        const fnv_basis = try i.iconst(clif.Type.I32, @as(i64, @bitCast(@as(i64, 0x811c9dc5))));
+        _ = try i.brif(sname_null, b_return, &.{}, b_hash_loop, &[_]clif.Value{ dli_sname, fnv_basis, target_offset });
+    }
+
+    // === b_hash_loop: check for null terminator ===
+    builder.switchToBlock(b_hash_loop);
+    try builder.ensureInsertedBlock();
+    {
+        const i = builder.ins();
+        const params = builder.blockParams(b_hash_loop);
+        const ptr = params[0];
+        const hash = params[1];
+        const tgt_off = params[2];
+        const byte = try i.load(clif.Type.I8, clif.MemFlags.DEFAULT, ptr, 0);
+        const byte_i32 = try i.uextend(clif.Type.I32, byte);
+        const v0_i32 = try i.iconst(clif.Type.I32, 0);
+        const is_null = try i.icmp(.eq, byte_i32, v0_i32);
+        _ = try i.brif(is_null, b_hash_done, &[_]clif.Value{ hash, tgt_off }, b_hash_step, &[_]clif.Value{ ptr, hash, tgt_off });
+    }
+
+    // === b_hash_step: h = (h ^ c) * 0x01000193; ptr++ ===
+    builder.switchToBlock(b_hash_step);
+    try builder.ensureInsertedBlock();
+    {
+        const i = builder.ins();
+        const params = builder.blockParams(b_hash_step);
+        const ptr = params[0];
+        const hash = params[1];
+        const tgt_off = params[2];
+        const byte = try i.load(clif.Type.I8, clif.MemFlags.DEFAULT, ptr, 0);
+        const byte_i32 = try i.uextend(clif.Type.I32, byte);
+        const h_xor = try i.bxor(hash, byte_i32);
+        const v_prime = try i.iconst(clif.Type.I32, 0x01000193);
+        const h_new = try i.imul(h_xor, v_prime);
+        const v1 = try i.iconst(clif.Type.I64, 1);
+        const ptr_next = try i.iadd(ptr, v1);
+        _ = try i.jump(b_hash_loop, &[_]clif.Value{ ptr_next, h_new, tgt_off });
+    }
+
+    // === b_hash_done: set up srcmap scan ===
+    builder.switchToBlock(b_hash_done);
+    try builder.ensureInsertedBlock();
+    {
+        const i = builder.ins();
+        const params = builder.blockParams(b_hash_done);
+        const target_hash = params[0];
+        const target_offset = params[1];
+        const count_addr = try i.globalValue(clif.Type.I64, gv_count);
+        const count = try i.load(clif.Type.I32, clif.MemFlags.DEFAULT, count_addr, 0);
+        const v0_i32 = try i.iconst(clif.Type.I32, 0);
+        const no_entries = try i.icmp(.eq, count, v0_i32);
+        const entries_base = try i.globalValue(clif.Type.I64, gv_entries);
+        const count_i64 = try i.uextend(clif.Type.I64, count);
+        const v16 = try i.iconst(clif.Type.I64, 16);
+        const total = try i.imul(count_i64, v16);
+        const end_ptr = try i.iadd(entries_base, total);
+        _ = try i.brif(no_entries, b_return, &.{}, b_scan_loop, &[_]clif.Value{ entries_base, end_ptr, target_hash, target_offset });
+    }
+
+    // === b_scan_loop: check bounds ===
+    builder.switchToBlock(b_scan_loop);
+    try builder.ensureInsertedBlock();
+    {
+        const i = builder.ins();
+        const p = builder.blockParams(b_scan_loop);
+        const past_end = try i.icmp(.uge, p[0], p[1]);
+        _ = try i.brif(past_end, b_return, &.{}, b_scan_body, &[_]clif.Value{ p[0], p[1], p[2], p[3] });
+    }
+
+    // === b_scan_body: compare hash AND offset ===
+    builder.switchToBlock(b_scan_body);
+    try builder.ensureInsertedBlock();
+    {
+        const i = builder.ins();
+        const p = builder.blockParams(b_scan_body);
+        const entry_hash = try i.load(clif.Type.I32, clif.MemFlags.DEFAULT, p[0], 0);
+        const entry_offset = try i.load(clif.Type.I32, clif.MemFlags.DEFAULT, p[0], 4);
+        const entry_line = try i.load(clif.Type.I32, clif.MemFlags.DEFAULT, p[0], 8);
+        const hash_match = try i.icmp(.eq, entry_hash, p[2]);
+        const offset_match = try i.icmp(.eq, entry_offset, p[3]);
+        const both_match = try i.band(hash_match, offset_match);
+        _ = try i.brif(both_match, b_found, &[_]clif.Value{entry_line}, b_scan_next, &[_]clif.Value{ p[0], p[1], p[2], p[3] });
+    }
+
+    // === b_scan_next: advance ===
+    builder.switchToBlock(b_scan_next);
+    try builder.ensureInsertedBlock();
+    {
+        const i = builder.ins();
+        const p = builder.blockParams(b_scan_next);
+        const v16 = try i.iconst(clif.Type.I64, 16);
+        const next = try i.iadd(p[0], v16);
+        _ = try i.jump(b_scan_loop, &[_]clif.Value{ next, p[1], p[2], p[3] });
+    }
+
+    // === b_found: print "  at <file>:<line>\n" ===
+    builder.switchToBlock(b_found);
+    try builder.ensureInsertedBlock();
+    {
+        const i = builder.ins();
+        const line_num = builder.blockParams(b_found)[0];
+
+        try writeStringToStderr(i, &builder, &clif_func, allocator, write_fn, "  at ");
+
+        // Print file name via strlen + write
+        const file_addr = try i.globalValue(clif.Type.I64, gv_file);
+        const strlen_idx = func_index_map.get("strlen") orelse 0;
+        var strlen_sig = clif.Signature.init(.system_v);
+        try strlen_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+        try strlen_sig.addReturn(allocator, clif.AbiParam.init(clif.Type.I64));
+        const strlen_sig_ref = try builder.importSignature(strlen_sig);
+        const strlen_func = try builder.importFunction(.{
+            .name = .{ .user = .{ .namespace = 0, .index = strlen_idx } },
+            .signature = strlen_sig_ref,
+            .colocated = false,
+        });
+        const file_len_result = try i.call(strlen_func, &[_]clif.Value{file_addr});
+        const file_len = file_len_result.results[0];
+        const v_fd = try i.iconst(clif.Type.I64, 2);
+        _ = try i.call(write_fn, &[_]clif.Value{ v_fd, file_addr, file_len });
+
+        try writeStringToStderr(i, &builder, &clif_func, allocator, write_fn, ":");
+
+        // Print line number as decimal (unrolled, up to 5 digits)
+        const dec_slot = try clif_func.createStackSlot(allocator, .{ .kind = .explicit_slot, .size = 8, .align_shift = 0 });
+        const dec_buf = try i.stackAddr(clif.Type.I64, dec_slot, 0);
+        const line_i64 = try i.uextend(clif.Type.I64, line_num);
+        const v_10 = try i.iconst(clif.Type.I64, 10);
+        const v_100 = try i.iconst(clif.Type.I64, 100);
+        const v_1000 = try i.iconst(clif.Type.I64, 1000);
+        const v_10000 = try i.iconst(clif.Type.I64, 10000);
+        const v_0x30 = try i.iconst(clif.Type.I64, '0');
+        const v_0_i64 = try i.iconst(clif.Type.I64, 0);
+        const v_1 = try i.iconst(clif.Type.I64, 1);
+        const d4 = try i.udiv(line_i64, v_10000);
+        const r4 = try i.urem(line_i64, v_10000);
+        const d3 = try i.udiv(r4, v_1000);
+        const r3 = try i.urem(r4, v_1000);
+        const d2 = try i.udiv(r3, v_100);
+        const r2 = try i.urem(r3, v_100);
+        const d1 = try i.udiv(r2, v_10);
+        const d0 = try i.urem(r2, v_10);
+        _ = try i.store(clif.MemFlags.DEFAULT, try i.ireduce(clif.Type.I8, try i.iadd(d4, v_0x30)), dec_buf, 0);
+        _ = try i.store(clif.MemFlags.DEFAULT, try i.ireduce(clif.Type.I8, try i.iadd(d3, v_0x30)), dec_buf, 1);
+        _ = try i.store(clif.MemFlags.DEFAULT, try i.ireduce(clif.Type.I8, try i.iadd(d2, v_0x30)), dec_buf, 2);
+        _ = try i.store(clif.MemFlags.DEFAULT, try i.ireduce(clif.Type.I8, try i.iadd(d1, v_0x30)), dec_buf, 3);
+        _ = try i.store(clif.MemFlags.DEFAULT, try i.ireduce(clif.Type.I8, try i.iadd(d0, v_0x30)), dec_buf, 4);
+        const has_d4 = try i.icmp(.ne, d4, v_0_i64);
+        const has_d3 = try i.icmp(.ne, d3, v_0_i64);
+        const has_d2 = try i.icmp(.ne, d2, v_0_i64);
+        const has_d1 = try i.icmp(.ne, d1, v_0_i64);
+        const s4 = try i.iconst(clif.Type.I64, 4);
+        const s3 = try i.select(clif.Type.I64, has_d1, try i.iconst(clif.Type.I64, 3), s4);
+        const s2 = try i.select(clif.Type.I64, has_d2, try i.iconst(clif.Type.I64, 2), s3);
+        const s1 = try i.select(clif.Type.I64, has_d3, v_1, s2);
+        const s0 = try i.select(clif.Type.I64, has_d4, v_0_i64, s1);
+        const v_5 = try i.iconst(clif.Type.I64, 5);
+        const dec_len = try i.isub(v_5, s0);
+        const dec_start = try i.iadd(dec_buf, s0);
+        _ = try i.call(write_fn, &[_]clif.Value{ v_fd, dec_start, dec_len });
+
+        try writeStringToStderr(i, &builder, &clif_func, allocator, write_fn, "\n");
+        _ = try i.jump(b_return, &.{});
+    }
+
+    // === b_return ===
+    builder.switchToBlock(b_return);
+    try builder.ensureInsertedBlock();
+    {
+        const i = builder.ins();
+        _ = try i.return_(&.{});
+    }
 
     try builder.sealAllBlocks();
     builder.finalize();
