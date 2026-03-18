@@ -1885,12 +1885,23 @@ pub const Lowerer = struct {
                     var mv = managed;
                     value_node = mv.forward(&self.cleanup_stack);
                 } else if (managed.getValue() != ir.null_node) {
+                    // Swift SILGen: retain +0 values with managed pointer types.
+                    // Check BOTH the return type AND the value's IR type — in @safe mode
+                    // the return type may be a struct (Scope) while the IR value is *Scope.
+                    // Swift TypeLowering.cpp:1213: emitCopyValue retains based on value type.
                     const fn_ret_type = fb.return_type;
                     const fn_ret_info = self.type_reg.get(fn_ret_type);
-                    if (!self.target.isWasm() and fn_ret_info == .pointer and fn_ret_info.pointer.managed) {
-                        // +0 value with managed return type: retain to produce +1
+                    const val_type = if (managed.getValue() != ir.null_node)
+                        fb.nodes.items[managed.getValue()].type_idx
+                    else
+                        fn_ret_type;
+                    const val_info = self.type_reg.get(val_type);
+                    const needs_retain = !self.target.isWasm() and
+                        ((fn_ret_info == .pointer and fn_ret_info.pointer.managed) or
+                        (val_info == .pointer and val_info.pointer.managed));
+                    if (needs_retain) {
                         var retain_args = [_]ir.NodeIndex{managed.getValue()};
-                        value_node = try fb.emitCall("retain", &retain_args, false, fn_ret_type, ret.span);
+                        value_node = try fb.emitCall("retain", &retain_args, false, val_type, ret.span);
                     } else {
                         value_node = managed.getValue();
                     }

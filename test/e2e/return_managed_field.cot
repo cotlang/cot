@@ -1,0 +1,27 @@
+@safe
+
+struct Scope {
+    name: string,
+}
+
+struct Checker {
+    scope: Scope,
+}
+
+impl Checker {
+    fn getScope() Scope {
+        return self.scope
+    }
+}
+
+fn process() string {
+    var s = new Scope { name: "hello" }
+    var c = new Checker { scope: s }
+    var result = c.getScope()
+    return result.name
+}
+
+test "return managed field" {
+    var name = process()
+    @assertEq(name, "hello")
+}
