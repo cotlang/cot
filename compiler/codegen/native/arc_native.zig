@@ -184,7 +184,7 @@ pub fn generate(
         .compiled = try generateRelease(allocator, isa, ctrl_plane, func_index_map),
     });
     try result.append(allocator, .{
-        .name = "realloc",
+        .name = "cot_realloc",
         .compiled = try generateRealloc(allocator, isa, ctrl_plane, func_index_map),
     });
     try result.append(allocator, .{
@@ -448,6 +448,10 @@ fn generateAllocRaw(
 // Raw realloc without ARC header management.
 // ============================================================================
 
+/// realloc_raw(old_ptr: i64, old_size: i64, new_size: i64) → i64
+/// Go pattern: malloc(new_size) + memcpy(new, old, old_size) + free(old).
+/// Avoids libc realloc naming collision with cot_realloc.
+/// Go reference: runtime/slice.go growslice — allocates new, copies, returns.
 fn generateReallocRaw(
     allocator: Allocator,
     isa: native_compile.TargetIsa,
@@ -460,7 +464,8 @@ fn generateReallocRaw(
     defer func_ctx.deinit();
     var builder = FunctionBuilder.init(&clif_func, &func_ctx);
 
-    // Signature: (i64, i64) -> i64
+    // Signature: (old_ptr: i64, old_size: i64, new_size: i64) -> i64
+    try clif_func.signature.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
     try clif_func.signature.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
     try clif_func.signature.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
     try clif_func.signature.addReturn(allocator, clif.AbiParam.init(clif.Type.I64));
@@ -472,25 +477,67 @@ fn generateReallocRaw(
 
     const ins = builder.ins();
     const params = builder.blockParams(block_entry);
-    const ptr = params[0];
-    const size = params[1];
+    const old_ptr = params[0];
+    const old_size = params[1];
+    const new_size = params[2];
 
-    // Call libc realloc directly (NOT our ARC realloc wrapper which manipulates headers).
-    // "c_realloc" is registered as an external libc symbol in driver.zig.
-    const realloc_idx = func_index_map.get("c_realloc") orelse 0;
-    var realloc_sig = clif.Signature.init(.system_v);
-    try realloc_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
-    try realloc_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
-    try realloc_sig.addReturn(allocator, clif.AbiParam.init(clif.Type.I64));
-    const realloc_sig_ref = try builder.importSignature(realloc_sig);
-    const realloc_func = try builder.importFunction(.{
-        .name = .{ .user = .{ .namespace = 0, .index = realloc_idx } },
-        .signature = realloc_sig_ref,
+    // 1. new_ptr = malloc(new_size)
+    const malloc_idx = func_index_map.get("malloc") orelse func_index_map.get("_malloc") orelse 0;
+    var malloc_sig = clif.Signature.init(.system_v);
+    try malloc_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+    try malloc_sig.addReturn(allocator, clif.AbiParam.init(clif.Type.I64));
+    const malloc_sig_ref = try builder.importSignature(malloc_sig);
+    const malloc_func = try builder.importFunction(.{
+        .name = .{ .user = .{ .namespace = 0, .index = malloc_idx } },
+        .signature = malloc_sig_ref,
         .colocated = false,
     });
+    const malloc_result = try ins.call(malloc_func, &[_]clif.Value{new_size});
+    const new_ptr = malloc_result.results[0];
 
-    const result = try ins.call(realloc_func, &[_]clif.Value{ ptr, size });
-    _ = try ins.return_(&[_]clif.Value{result.results[0]});
+    // 2. memcpy(new_ptr, old_ptr, old_size) — if old_ptr != null
+    const v_zero = try ins.iconst(clif.Type.I64, 0);
+    const is_null = try ins.icmp(.eq, old_ptr, v_zero);
+    const block_copy = try builder.createBlock();
+    const block_done = try builder.createBlock();
+    _ = try ins.brif(is_null, block_done, &.{}, block_copy, &.{});
+
+    builder.switchToBlock(block_copy);
+    try builder.ensureInsertedBlock();
+    {
+        const copy_ins = builder.ins();
+        const memcpy_idx = func_index_map.get("memcpy") orelse 0;
+        var memcpy_sig = clif.Signature.init(.system_v);
+        try memcpy_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+        try memcpy_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+        try memcpy_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+        try memcpy_sig.addReturn(allocator, clif.AbiParam.init(clif.Type.I64));
+        const memcpy_sig_ref = try builder.importSignature(memcpy_sig);
+        const memcpy_func = try builder.importFunction(.{
+            .name = .{ .user = .{ .namespace = 0, .index = memcpy_idx } },
+            .signature = memcpy_sig_ref,
+            .colocated = false,
+        });
+        _ = try copy_ins.call(memcpy_func, &[_]clif.Value{ new_ptr, old_ptr, old_size });
+
+        // 3. free(old_ptr)
+        const free_idx = func_index_map.get("free") orelse func_index_map.get("_free") orelse 0;
+        var free_sig = clif.Signature.init(.system_v);
+        try free_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+        const free_sig_ref = try builder.importSignature(free_sig);
+        const free_func = try builder.importFunction(.{
+            .name = .{ .user = .{ .namespace = 0, .index = free_idx } },
+            .signature = free_sig_ref,
+            .colocated = false,
+        });
+        _ = try copy_ins.call(free_func, &[_]clif.Value{old_ptr});
+        _ = try copy_ins.jump(block_done, &.{});
+    }
+
+    // 4. return new_ptr
+    builder.switchToBlock(block_done);
+    try builder.ensureInsertedBlock();
+    _ = try builder.ins().return_(&[_]clif.Value{new_ptr});
 
     try builder.sealAllBlocks();
     builder.finalize();

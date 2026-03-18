@@ -167,7 +167,7 @@ pub const ALLOC_NAME = "alloc";
 pub const RETAIN_NAME = "retain";
 pub const RELEASE_NAME = "release";
 pub const DEALLOC_NAME = "dealloc";
-pub const REALLOC_NAME = "realloc";
+pub const REALLOC_NAME = "cot_realloc";
 pub const ALLOC_RAW_NAME = "alloc_raw";
 pub const REALLOC_RAW_NAME = "realloc_raw";
 pub const DEALLOC_RAW_NAME = "dealloc_raw";
@@ -337,7 +337,7 @@ pub fn addToLinker(allocator: std.mem.Allocator, linker: *wasm_link.Linker) !Run
         .exported = false,
     });
 
-    const realloc_raw_type = alloc_type; // (i64, i64) -> i64
+    const realloc_raw_type = try linker.addType(&[_]ValType{ .i64, .i64, .i64 }, &[_]ValType{.i64}); // (ptr, old_size, new_size) -> ptr
     const realloc_raw_body = try generateReallocRawBody(allocator, heap_ptr_global, memcpy_idx);
     const realloc_raw_idx = try linker.addFunc(.{
         .name = REALLOC_RAW_NAME,

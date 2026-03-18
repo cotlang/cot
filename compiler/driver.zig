@@ -1297,7 +1297,7 @@ pub const Driver = struct {
             "alloc",         "dealloc",
             "alloc_raw",     "realloc_raw",   "dealloc_raw",
             "retain",        "release",
-            "realloc",       "string_concat",  "string_eq",
+            "cot_realloc",   "string_concat",  "string_eq",
             "unowned_retain", "unowned_release", "unowned_load_strong",
             "weak_form_reference", "weak_retain", "weak_release", "weak_load_strong",
             // I/O runtime (io_native.generate order)
@@ -1346,7 +1346,7 @@ pub const Driver = struct {
             // "memcpy" is here because the Cot signature (dst,src,len)→void is
             // ABI-compatible with libc memcpy(dst,src,n)→void* (return ignored).
             "snprintf",
-            "write",         "malloc",         "free",          "c_realloc", "memset",
+            "write",         "malloc",         "free",          "realloc",   "memset",
             "memcmp",        "memcpy",         "read",          "close",
             "__open",        "lseek",          "_exit",         "gettimeofday",
             "getentropy",    "isatty",         "strlen",        "__error",
@@ -1400,6 +1400,11 @@ pub const Driver = struct {
         }
         if (func_index_map.get("cot_unlink")) |idx| {
             try func_index_map.put(self.allocator, "unlink", idx);
+        }
+        // Alias: user code calls "realloc" → maps to "cot_realloc" (ARC wrapper).
+        // Swift pattern: swift_allocObject vs malloc — prefixed runtime names.
+        if (func_index_map.get("cot_realloc")) |idx| {
+            try func_index_map.put(self.allocator, "realloc", idx);
         }
 
         // User-declared extern fn names (from imported modules like std/sqlite).
@@ -5555,6 +5560,7 @@ pub const Driver = struct {
         try func_indices.put(self.allocator, mem_runtime.ALLOC_NAME, mem_funcs.alloc_idx);
         try func_indices.put(self.allocator, mem_runtime.DEALLOC_NAME, mem_funcs.dealloc_idx);
         try func_indices.put(self.allocator, mem_runtime.REALLOC_NAME, mem_funcs.realloc_idx);
+        try func_indices.put(self.allocator, "realloc", mem_funcs.realloc_idx); // alias for user code
         try func_indices.put(self.allocator, mem_runtime.ALLOC_RAW_NAME, mem_funcs.alloc_raw_idx);
         try func_indices.put(self.allocator, mem_runtime.REALLOC_RAW_NAME, mem_funcs.realloc_raw_idx);
         try func_indices.put(self.allocator, mem_runtime.DEALLOC_RAW_NAME, mem_funcs.dealloc_raw_idx);
