@@ -535,7 +535,10 @@ pub const FuncBuilder = struct {
     /// Insert an instruction at the end of the current block.
     /// Now directly stores InstructionData in the DFG, matching Cranelift's design.
     fn insertInst(self: *Self, data: InstructionData, result_type: ?Type) !struct { inst: Inst, result: ?Value } {
-        const block = self.current_block orelse return error.NoCurrentBlock;
+        const block = self.current_block orelse {
+            std.debug.print("INTERNAL ERROR: NoCurrentBlock in CLIF builder insertInst\n", .{});
+            return error.NoCurrentBlock;
+        };
 
         // Create instruction with data - directly stores InstructionData like Cranelift
         const inst = try self.dfg.makeInst(data);

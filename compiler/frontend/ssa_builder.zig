@@ -273,6 +273,17 @@ pub const SSABuilder = struct {
         };
     }
 
+    /// Report NoCurrentBlock with source location for debugging.
+    /// This is a compiler internal error — the IR lowerer emitted code after a block
+    /// terminator (return/branch), which left cur_block = null.
+    fn reportNoCurrentBlock(self: *const SSABuilder, span: source.Span, context: []const u8) void {
+        const func_name = self.ir_func.name;
+        const offset = span.start.offset;
+        std.debug.print("INTERNAL ERROR: NoCurrentBlock in {s}() during SSA conversion of '{s}' (source offset {d})\n", .{ context, func_name, offset });
+        std.debug.print("  This means the IR lowerer emitted code after a block terminator.\n", .{});
+        std.debug.print("  Check the orelse/if-else/return lowering for the expression at this offset.\n", .{});
+    }
+
     pub fn deinit(self: *SSABuilder) void {
         self.vars.deinit();
         self.fwd_vars.deinit();
@@ -320,7 +331,10 @@ pub const SSABuilder = struct {
     fn variable(self: *SSABuilder, local_idx: ir.LocalIdx, type_idx: TypeIndex) !*Value {
         if (self.vars.get(local_idx)) |v| return v;
         if (self.fwd_vars.get(local_idx)) |v| return v;
-        const cur = self.cur_block orelse return error.NoCurrentBlock;
+        const cur = self.cur_block orelse {
+            self.reportNoCurrentBlock(source.Span.zero, "variable");
+            return error.NoCurrentBlock;
+        };
         const fwd = try self.func.newValue(.fwd_ref, type_idx, cur, self.cur_pos);
         fwd.aux_int = @intCast(local_idx);
         try cur.addValue(self.allocator, fwd);
@@ -392,7 +406,10 @@ pub const SSABuilder = struct {
     fn convertNode(self: *SSABuilder, node_idx: ir.NodeIndex) anyerror!?*Value {
         if (self.node_values.get(node_idx)) |existing| return existing;
         const node = self.ir_func.getNode(node_idx);
-        const cur = self.cur_block orelse return error.NoCurrentBlock;
+        const cur = self.cur_block orelse {
+            self.reportNoCurrentBlock(node.span, "convertNode");
+            return error.NoCurrentBlock;
+        };
         self.cur_pos = .{ .line = node.span.start.offset, .col = 0 };
 
         const result: ?*Value = switch (node.data) {
@@ -2100,7 +2117,10 @@ pub const SSABuilder = struct {
     fn convertLogicalOp(self: *SSABuilder, b: ir.Binary, result_type: TypeIndex) anyerror!*Value {
         const is_and = b.op == .@"and";
         const left = try self.convertNode(b.left) orelse return error.MissingValue;
-        const cur = self.cur_block orelse return error.NoCurrentBlock;
+        const cur = self.cur_block orelse {
+            self.reportNoCurrentBlock(source.Span.zero, "convertLogicalOp");
+            return error.NoCurrentBlock;
+        };
 
         const eval_right_block = try self.func.newBlock(.plain);
         const short_circuit_block = try self.func.newBlock(.plain);
@@ -2128,7 +2148,10 @@ pub const SSABuilder = struct {
         // Eval right block
         self.startBlock(eval_right_block);
         const right = try self.convertNode(b.right) orelse return error.MissingValue;
-        const right_block = self.cur_block orelse return error.NoCurrentBlock;
+        const right_block = self.cur_block orelse {
+            self.reportNoCurrentBlock(source.Span.zero, "convertLogicalOp.right");
+            return error.NoCurrentBlock;
+        };
         try right_block.addEdgeTo(self.allocator, merge_block);
         _ = self.endBlock();
 
