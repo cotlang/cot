@@ -843,8 +843,76 @@ fn generateRetain(
         const size_valid = try ins.band(size_above_min, size_below_max);
         const is_valid_heap = try ins.band(is_heap, size_valid);
 
+        // Tier 2: Check for poison (use-after-free). If magic == 0xDEADDEADDEADDEAD,
+        // the object was freed. Abort with diagnostic instead of silently skipping.
+        // Zig GPA: reports use-after-free with allocation stack trace.
+        // Go ASan: asanpoison marks freed spans, any access is fatal.
+        const v_poison = try ins.iconst(clif.Type.I64, @bitCast(@as(u64, 0xDEAD_DEAD_DEAD_DEAD)));
+        const is_poison = try ins.icmp(.eq, magic, v_poison);
+        const block_uaf = try builder.createBlock();
+        const block_not_uaf = try builder.createBlock();
+        _ = try ins.brif(is_poison, block_uaf, &.{}, block_not_uaf, &.{});
+
+        // Use-after-free: abort with diagnostic
+        builder.switchToBlock(block_uaf);
+        try builder.ensureInsertedBlock();
+        {
+            const uaf_ins = builder.ins();
+            const write_idx = func_index_map.get("write") orelse 0;
+            var write_sig = clif.Signature.init(.system_v);
+            try write_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+            try write_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+            try write_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+            try write_sig.addReturn(allocator, clif.AbiParam.init(clif.Type.I64));
+            const write_sig_ref2 = try builder.importSignature(write_sig);
+            const write_func2 = try builder.importFunction(.{
+                .name = .{ .user = .{ .namespace = 0, .index = write_idx } },
+                .signature = write_sig_ref2,
+                .colocated = false,
+            });
+            const exit_idx = func_index_map.get("_exit") orelse 0;
+            var exit_sig = clif.Signature.init(.system_v);
+            try exit_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+            const exit_sig_ref2 = try builder.importSignature(exit_sig);
+            const exit_func2 = try builder.importFunction(.{
+                .name = .{ .user = .{ .namespace = 0, .index = exit_idx } },
+                .signature = exit_sig_ref2,
+                .colocated = false,
+            });
+            const bt_idx = func_index_map.get("__cot_print_backtrace") orelse 0;
+            const bt_sig = clif.Signature.init(.system_v);
+            const bt_sig_ref2 = try builder.importSignature(bt_sig);
+            const bt_func2 = try builder.importFunction(.{
+                .name = .{ .user = .{ .namespace = 0, .index = bt_idx } },
+                .signature = bt_sig_ref2,
+                .colocated = true,
+            });
+
+            const uaf_slot = try clif_func.createStackSlot(allocator, .{
+                .kind = .explicit_slot,
+                .size = 32,
+                .align_shift = 3,
+            });
+            const uaf_addr = try uaf_ins.stackAddr(clif.Type.I64, uaf_slot, 0);
+            const uaf_msg = "use-after-free in retain\n";
+            for (uaf_msg, 0..) |byte, offset| {
+                const ch = try uaf_ins.iconst(clif.Type.I8, @intCast(byte));
+                _ = try uaf_ins.store(clif.MemFlags.DEFAULT, ch, uaf_addr, @intCast(offset));
+            }
+            const fd = try uaf_ins.iconst(clif.Type.I64, 2);
+            const uaf_len = try uaf_ins.iconst(clif.Type.I64, @intCast(uaf_msg.len));
+            _ = try uaf_ins.call(write_func2, &[_]clif.Value{ fd, uaf_addr, uaf_len });
+            _ = try uaf_ins.call(bt_func2, &[_]clif.Value{});
+            const v_exit_uaf = try uaf_ins.iconst(clif.Type.I64, 78);
+            _ = try uaf_ins.call(exit_func2, &[_]clif.Value{v_exit_uaf});
+            _ = try uaf_ins.trap(.unreachable_code_reached);
+        }
+
+        // Not use-after-free: check if valid heap object
+        builder.switchToBlock(block_not_uaf);
+        try builder.ensureInsertedBlock();
         const block_arc_warn = try builder.createBlock();
-        _ = try ins.brif(is_valid_heap, block_check_immortal, &.{}, block_return_obj, &.{});
+        _ = try builder.ins().brif(is_valid_heap, block_check_immortal, &.{}, block_return_obj, &.{});
 
         // Diagnostic block: print "ARC: bad ptr 0xNNNN\n" to stderr, then return obj
         builder.switchToBlock(block_arc_warn);
@@ -1083,8 +1151,71 @@ fn generateRelease(
         const size_valid = try ins.band(size_above_min, size_below_max);
         const is_valid_heap = try ins.band(is_heap, size_valid);
 
+        // Tier 2: Check for poison (use-after-free) in release path
+        const v_poison_rel = try ins.iconst(clif.Type.I64, @bitCast(@as(u64, 0xDEAD_DEAD_DEAD_DEAD)));
+        const is_poison_rel = try ins.icmp(.eq, magic, v_poison_rel);
+        const block_uaf_rel = try builder.createBlock();
+        const block_not_uaf_rel = try builder.createBlock();
+        _ = try ins.brif(is_poison_rel, block_uaf_rel, &.{}, block_not_uaf_rel, &.{});
+
+        // Use-after-free in release: abort
+        builder.switchToBlock(block_uaf_rel);
+        try builder.ensureInsertedBlock();
+        {
+            const uaf_ins = builder.ins();
+            const write_idx2 = func_index_map.get("write") orelse 0;
+            var write_sig2 = clif.Signature.init(.system_v);
+            try write_sig2.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+            try write_sig2.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+            try write_sig2.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+            try write_sig2.addReturn(allocator, clif.AbiParam.init(clif.Type.I64));
+            const write_sig_ref3 = try builder.importSignature(write_sig2);
+            const write_func3 = try builder.importFunction(.{
+                .name = .{ .user = .{ .namespace = 0, .index = write_idx2 } },
+                .signature = write_sig_ref3,
+                .colocated = false,
+            });
+            const exit_idx2 = func_index_map.get("_exit") orelse 0;
+            var exit_sig2 = clif.Signature.init(.system_v);
+            try exit_sig2.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+            const exit_sig_ref3 = try builder.importSignature(exit_sig2);
+            const exit_func3 = try builder.importFunction(.{
+                .name = .{ .user = .{ .namespace = 0, .index = exit_idx2 } },
+                .signature = exit_sig_ref3,
+                .colocated = false,
+            });
+            const bt_idx2 = func_index_map.get("__cot_print_backtrace") orelse 0;
+            const bt_sig2 = clif.Signature.init(.system_v);
+            const bt_sig_ref3 = try builder.importSignature(bt_sig2);
+            const bt_func3 = try builder.importFunction(.{
+                .name = .{ .user = .{ .namespace = 0, .index = bt_idx2 } },
+                .signature = bt_sig_ref3,
+                .colocated = true,
+            });
+            const uaf_slot = try clif_func.createStackSlot(allocator, .{
+                .kind = .explicit_slot,
+                .size = 32,
+                .align_shift = 3,
+            });
+            const uaf_addr = try uaf_ins.stackAddr(clif.Type.I64, uaf_slot, 0);
+            const uaf_msg = "use-after-free in release\n";
+            for (uaf_msg, 0..) |byte, offset| {
+                const ch = try uaf_ins.iconst(clif.Type.I8, @intCast(byte));
+                _ = try uaf_ins.store(clif.MemFlags.DEFAULT, ch, uaf_addr, @intCast(offset));
+            }
+            const fd = try uaf_ins.iconst(clif.Type.I64, 2);
+            const uaf_len = try uaf_ins.iconst(clif.Type.I64, @intCast(uaf_msg.len));
+            _ = try uaf_ins.call(write_func3, &[_]clif.Value{ fd, uaf_addr, uaf_len });
+            _ = try uaf_ins.call(bt_func3, &[_]clif.Value{});
+            const v_exit_uaf = try uaf_ins.iconst(clif.Type.I64, 79);
+            _ = try uaf_ins.call(exit_func3, &[_]clif.Value{v_exit_uaf});
+            _ = try uaf_ins.trap(.unreachable_code_reached);
+        }
+
+        builder.switchToBlock(block_not_uaf_rel);
+        try builder.ensureInsertedBlock();
         const block_release_warn = try builder.createBlock();
-        _ = try ins.brif(is_valid_heap, block_check_immortal, &.{}, block_return, &.{});
+        _ = try builder.ins().brif(is_valid_heap, block_check_immortal, &.{}, block_return, &.{});
 
         // Diagnostic: print bad pointer value then return
         builder.switchToBlock(block_release_warn);
