@@ -11171,12 +11171,34 @@ pub const Lowerer = struct {
                 return try fb.emitLoadLocal(result_local, elem_type, oe.span);
             }
 
-            // Normal expr fallback: use emitSelect (existing path)
+            // Expr fallback: use branch+merge instead of select.
+            // Select evaluates both branches eagerly, but the fallback may
+            // contain a return/break that terminates the block.
+            // Reference: Go ssagen/ssa.go uses branch-based control flow for optionals.
             const null_val = try fb.emit(ir.Node.init(.const_null, TypeRegistry.UNTYPED_NULL, oe.span));
-            const condition = try fb.emitBinary(.ne, operand, null_val, TypeRegistry.BOOL, oe.span);
+            const is_non_null = try fb.emitBinary(.ne, operand, null_val, TypeRegistry.BOOL, oe.span);
+            const then_block = try fb.newBlock("orelse.nonnull");
+            const else_block = try fb.newBlock("orelse.null");
+            const merge_block = try fb.newBlock("orelse.end");
+            _ = try fb.emitBranch(is_non_null, then_block, else_block, oe.span);
+
+            fb.setBlock(then_block);
             const unwrapped = try fb.emitUnary(.optional_unwrap, operand, elem_type, oe.span);
+            const result_local = try fb.addLocalWithSize("__orelse_result", elem_type, false, self.type_reg.sizeOf(elem_type));
+            _ = try fb.emitStoreLocal(result_local, unwrapped, oe.span);
+            _ = try fb.emitJump(merge_block, oe.span);
+
+            fb.setBlock(else_block);
             const fallback = try self.lowerExprNode(oe.fallback);
-            return try fb.emitSelect(condition, unwrapped, fallback, elem_type, oe.span);
+            if (fallback != ir.null_node) {
+                _ = try fb.emitStoreLocal(result_local, fallback, oe.span);
+            }
+            if (fb.needsTerminator()) {
+                _ = try fb.emitJump(merge_block, oe.span);
+            }
+
+            fb.setBlock(merge_block);
+            return try fb.emitLoadLocal(result_local, elem_type, oe.span);
         }
     }
 

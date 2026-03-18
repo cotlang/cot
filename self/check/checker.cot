@@ -955,7 +955,10 @@ struct Checker {
         if (self.body_check_depth > 1) { return }
         self.body_check_depth = self.body_check_depth + 1
 
-        const sym = self.lookupSymbol(lookup_name) orelse return
+        const sym = self.lookupSymbol(lookup_name) orelse {
+            self.body_check_depth = self.body_check_depth - 1
+            return
+        }
 
         // Get return type from func type
         var return_type: int = VOID
