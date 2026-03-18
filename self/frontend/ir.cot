@@ -563,6 +563,7 @@ struct FuncBuilder {
     static fn initHeap(name: string, type_idx: int, return_type: int, span: Span) *FuncBuilder {
         eprintln("[ir] initHeap: @sizeOf(FuncBuilder) = ${@sizeOf(FuncBuilder)}")
         var fb = FuncBuilder.init(name, type_idx, return_type, span)
+        eprintln("[ir] initHeap: fb_stack = ${@ptrToInt(&fb)}")
         const ptr = new FuncBuilder {
             name: fb.name,
             type_idx: fb.type_idx,
@@ -579,6 +580,7 @@ struct FuncBuilder {
             is_destructor: false,
             is_export: false,
         }
+        eprintln("[ir] initHeap: ptr = ${@ptrToInt(ptr)}")
         return ptr
     }
 
