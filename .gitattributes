@@ -1,0 +1,3 @@
+# Treat .cot files as Zig for GitHub syntax highlighting
+# (until Cot is added to github-linguist)
+*.cot linguist-language=Zig

@@ -66,7 +66,7 @@ No existing language offers all of:
 
 ### 1. Zig-Inspired Syntax, Simplified
 
-```cot
+```zig
 struct User {
     name: string,
     email: string,
@@ -87,7 +87,7 @@ Familiar syntax. No semicolons. Methods inside struct bodies. Type inference. No
 
 Developers don't think about memory. The compiler handles it.
 
-```cot
+```zig
 fn example() {
     let user = User { name: "Alice", email: "alice@example.com" }
     // Compiler inserts: retain(user)
@@ -135,7 +135,7 @@ No other language does all three from the same source without third-party toolin
 
 The Cot framework handles client/server compilation transparently, like Next.js but without the JavaScript:
 
-```cot
+```zig
 // shared — compiled for both targets automatically
 struct User {
     id: i64

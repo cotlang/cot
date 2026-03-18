@@ -6,7 +6,7 @@ Complete reference for every language feature. Examples from `test/e2e/features.
 
 Like Zig: `const` (immutable) and `var` (mutable). `let` is an alias for `var`.
 
-```cot
+```zig
 const x: i64 = 10        // immutable, typed
 const y = 20              // immutable, inferred
 var z = 30                // mutable, inferred
@@ -19,7 +19,7 @@ const MyError = error { Fail, NotFound }
 
 ### Primitive Types
 
-```cot
+```zig
 // Signed integers
 i8  i16  i32  i64
 
@@ -37,7 +37,7 @@ noreturn                   // bottom type (functions that never return)
 
 ### Type Aliases (keywords)
 
-```cot
+```zig
 int                        // alias for i64
 float                      // alias for f64
 byte                       // alias for u8
@@ -46,7 +46,7 @@ string                     // alias for []u8 (ptr + len pair at ABI level)
 
 ### Composite Types
 
-```cot
+```zig
 *T                         // pointer to T
 ?T                         // optional T (can be null)
 E!T                        // error union (E = error set, T = value type)
@@ -61,7 +61,7 @@ fn(T1, T2) -> R            // function type
 
 ## Literals
 
-```cot
+```zig
 // Integers
 42                         // decimal
 0xFF                       // hexadecimal
@@ -94,7 +94,7 @@ error.Fail                 // error literal
 
 ## Functions
 
-```cot
+```zig
 fn add(a: i64, b: i64) i64 { return a + b }
 fn noop() void { return }
 fn apply_fn(f: fn(i64) -> i64, x: i64) i64 { return f(x) }
@@ -105,7 +105,7 @@ extern fn c_function(x: i64) i64
 
 Type params in **separate parens** (not angle brackets):
 
-```cot
+```zig
 fn max(T)(a: T, b: T) T { if (a > b) { return a } return b }
 struct Box(T) { value: T }
 fn Box_getValue(T)(self: *Box(T)) T { return self.value }
@@ -117,7 +117,7 @@ var b = Box(i64) { .value = 42 }
 
 ## Structs
 
-```cot
+```zig
 struct Foo { x: i64 }
 struct Point { x: i64, y: i64 }
 struct Pair(T, U) { first: T, second: U }
@@ -127,7 +127,7 @@ struct Pair(T, U) { first: T, second: U }
 
 Structs and unions can be declared inside function bodies, test blocks, or any block scope (Zig pattern):
 
-```cot
+```zig
 test "local struct" {
     struct Pair { a: i64, b: i64 }
     const p = Pair { .a = 10, .b = 20 }
@@ -151,13 +151,13 @@ Block-scoped types are data-only — `impl` blocks remain top-level. Use unique 
 ## Struct Init — TWO Syntaxes
 
 **Stack (value type):** period prefix `.field`, equals `=`
-```cot
+```zig
 var p = Point { .x = 10, .y = 20 }
 var pair = Pair(i64, i64) { .first = 10, .second = 32 }
 ```
 
 **Heap (pointer via `new`):** NO period, colon `:`
-```cot
+```zig
 var p = new Foo { x: 42 }
 return new Foo { x: val }
 ```
@@ -166,7 +166,7 @@ return new Foo { x: val }
 
 Zig-style: `const Name = enum { ... }`
 
-```cot
+```zig
 const Color = enum { Red, Green, Blue }
 const Status = enum { Ok = 0, Warning = 50, Error = 100 }
 ```
@@ -177,7 +177,7 @@ Access: `Color.Red`, `Status.Ok`
 
 Specify the integer storage type with `enum(T)` (Zig pattern):
 
-```cot
+```zig
 const Token = enum(u8) { Eof, Ident, Int, String }
 const HttpStatus = enum(u16) { Ok = 200, NotFound = 404, ServerError = 500 }
 ```
@@ -188,7 +188,7 @@ Both `enum(u8)` (parenthesized, Zig-style) and `enum: u8` (colon) syntaxes are a
 
 Use `@"name"` to use keywords as enum variant names (Zig pattern):
 
-```cot
+```zig
 const Op = enum { @"and", @"or", @"not", add, sub }
 var op = Op.@"and"
 switch (op) {
@@ -204,7 +204,7 @@ switch (op) {
 
 Enums can have methods directly in the body (preferred) or via `impl` blocks. Enum methods use a value receiver, not a pointer:
 
-```cot
+```zig
 const Color = enum {
     Red, Green, Blue,
 
@@ -223,7 +223,7 @@ var c = Color.Red
 
 ## Unions (tagged)
 
-```cot
+```zig
 union State { Init, Running, Done }
 union Result { Ok: i64, Err: i32 }
 union Event { Click: i64, Hover, KeyPress: i64 }
@@ -231,7 +231,7 @@ union Event { Click: i64, Hover, KeyPress: i64 }
 
 ## Error Sets & Error Handling
 
-```cot
+```zig
 const MyError = error { Fail, NotFound }
 
 fn mayFail(x: i64) MyError!i64 {
@@ -262,7 +262,7 @@ var w = mayFail(-1) catch |*err| { err.* }
 
 Combine error sets with `||` (Zig pattern):
 
-```cot
+```zig
 const FileError = error { NotFound, PermDenied }
 const NetError = error { Timeout, Refused }
 const AllErrors = FileError || NetError    // merged: NotFound, PermDenied, Timeout, Refused
@@ -277,7 +277,7 @@ Duplicate variants are automatically deduplicated.
 
 ## Type Aliases
 
-```cot
+```zig
 type Coord = Point
 ```
 
@@ -285,7 +285,7 @@ type Coord = Point
 
 Methods, static functions, and constants can be declared directly inside struct and enum bodies. This is the **preferred** style for methods on your own types:
 
-```cot
+```zig
 // Preferred: methods inside struct body
 struct Point {
     x: i64, y: i64
@@ -326,7 +326,7 @@ Methods declared with `static fn` have no receiver (`self`). Called as `Type.met
 
 `const` declarations inside type bodies (or `impl` blocks). Accessed as `Type.CONSTANT`.
 
-```cot
+```zig
 struct TypeRegistry {
     const BOOL: int = 1
     const I64: int = 5
@@ -343,7 +343,7 @@ struct TypeRegistry {
 
 For methods on your own types, prefer placing them inside the struct/enum body (see above). Use explicit `impl` blocks for **trait implementations** and **extending types defined in other modules**.
 
-```cot
+```zig
 // Explicit impl — for trait implementations
 impl Printable for Point {
     fn toString(self: *Point) string { ... }
@@ -362,7 +362,7 @@ impl List(T) {
 
 ## Traits
 
-```cot
+```zig
 trait Animal {
     fn speak(self: *Self) i64
 }
@@ -377,7 +377,7 @@ fn bounded_max(T)(a: T, b: T) T where T: Comparable { ... }
 
 ## Control Flow
 
-```cot
+```zig
 // If/else (parens required, like Zig)
 if (x > 0) { ... }
 if (x > 0) { ... } else { ... }
@@ -430,7 +430,7 @@ continue 'label        // continue labeled loop
 
 ## Switch
 
-```cot
+```zig
 switch value {
     1 => result1,
     2, 3 => result2,        // multiple patterns
@@ -461,7 +461,7 @@ switch (name) {
 
 ## Defer / Errdefer
 
-```cot
+```zig
 defer dealloc(ptr)            // runs at end of scope (dealloc from std/sys)
 defer { cleanup_stuff() }     // block form, LIFO order
 errdefer dealloc(ptr)         // runs ONLY if function returns error
@@ -471,7 +471,7 @@ errdefer dealloc(ptr)         // runs ONLY if function returns error
 
 ## Async / Await
 
-```cot
+```zig
 async fn fetchData(url: string) HttpError!string {
     var fd = try await asyncConnect(loop_fd, sock, addr, len)
     var result = try await asyncRead(loop_fd, fd, buf, 1024)
@@ -494,7 +494,7 @@ const data = await fetchData("http://example.com") catch "fallback"
 
 ## Concurrency
 
-```cot
+```zig
 import "std/channel"
 
 // spawn — launch a lightweight task (Go-style goroutine)
@@ -527,7 +527,7 @@ select {
 
 ## Closures / Anonymous Functions
 
-```cot
+```zig
 const f = fn(x: i64) i64 { return x * 2 }
 const g = fn(x: i64) i64 { return captured_var + x }
 apply_fn(fn(x: i64) i64 { return x + 1 }, 5)
@@ -535,7 +535,7 @@ apply_fn(fn(x: i64) i64 { return x + 1 }, 5)
 
 ## String Interpolation
 
-```cot
+```zig
 var msg = "Value is ${x}, next is ${y + 1}"
 ```
 
@@ -596,7 +596,7 @@ In `@safe` mode, `+` auto-desugars to `++` for TypeScript-like DX.
 
 ## Indexing & Slicing
 
-```cot
+```zig
 arr[i]               // index
 arr[start:end]       // slice
 arr[:end]            // slice from start
@@ -605,7 +605,7 @@ arr[start:]          // slice to end
 
 ## Memory & Pointers
 
-```cot
+```zig
 import "std/sys"
 var ptr = @intToPtr(*i64, alloc(0, @sizeOf(i64)))
 ptr.* = 42                          // dereference assign
@@ -713,7 +713,7 @@ dealloc(addr)
 
 Memory, I/O, networking, process control, and other runtime functions are available as regular functions through the standard library. Import `std/sys` to access them directly:
 
-```cot
+```zig
 import "std/sys"
 
 var buf = alloc(0, 1024)          // allocate 1024 bytes
@@ -748,7 +748,7 @@ Higher-level APIs are provided by stdlib modules: `std/fs` (files), `std/os` (pr
 | `@tagName(val)` | Tag name of enum/union value as string |
 | `@errorName(err)` | Error name as string |
 
-```cot
+```zig
 struct Point { x: i64, y: i64 }
 
 // @hasField — comptime reflection
@@ -808,7 +808,7 @@ var green = @as(Color, @enumFromInt(1))           // 1-arg form (Zig parity)
 
 `comptime { ... }` blocks evaluate at compile time. They support mutable variables and produce the final expression as the result:
 
-```cot
+```zig
 const SIZE = comptime { 4 * 1024 }
 
 // Comptime blocks with statements — mutable variables
@@ -832,7 +832,7 @@ const color_names = comptime {
 
 Dead branch elimination: if an `if` condition is comptime-known, only the taken branch is checked. This enables `@compileError` in unreachable branches:
 
-```cot
+```zig
 if @targetOs() == "macos" {
     // macOS code
 } else {
@@ -851,7 +851,7 @@ if @targetOs() == "macos" {
 
 Built-in functions (not regular functions, handled specially by the compiler):
 
-```cot
+```zig
 print(42)              // print to stdout, no newline
 println(42)            // print to stdout with newline
 eprint(42)             // print to stderr, no newline
@@ -863,21 +863,21 @@ All accept `i64`, `f64`, `bool`, or `string` arguments.
 ## ARC (Automatic Reference Counting)
 
 Heap objects (`new`) are reference-counted automatically:
-```cot
+```zig
 var p = new Foo { x: 42 }   // refcount = 1
 var q = p                    // refcount = 2
 // freed when last reference dies
 ```
 
 Destructors: functions named `TypeName_deinit` are called automatically:
-```cot
+```zig
 fn DFoo_deinit(self: *DFoo) void { ... }
 ```
 
 ### Weak References
 
 `weak var` suppresses retain/cleanup — use to break reference cycles:
-```cot
+```zig
 var strong = new Node { value: 1 }
 weak var w = strong            // w does NOT retain strong
 // strong is freed when its last non-weak reference dies
@@ -887,7 +887,7 @@ Use `@arcRetain(value)` and `@arcRelease(value)` for manual refcount control in 
 
 ## Tests
 
-```cot
+```zig
 test "my test" {
     @assertEq(1 + 1, 2)
 }
@@ -897,7 +897,7 @@ Run with: `cot test file.cot`
 
 ## Benchmarks
 
-```cot
+```zig
 bench "fibonacci 20" {
     fib(20)
 }
@@ -912,7 +912,7 @@ Run with: `cot bench file.cot`
 
 ## Import
 
-```cot
+```zig
 import "module/path"
 import "std/list"          // stdlib modules
 ```
@@ -958,7 +958,7 @@ import "std/list"          // stdlib modules
 
 The `@safe` annotation enables **TypeScript/C#-style** ergonomics. Structs behave like objects — passed by reference, no manual `&` or `*`. All features are **opt-in** and never affect the base language.
 
-```cot
+```zig
 @safe  // must be the first line (or "safe": true in cot.json for whole project)
 
 struct Point { x: i64, y: i64 }
@@ -978,7 +978,7 @@ struct Point { x: i64, y: i64 }
 
 The headline feature: structs are passed by reference automatically. No `&` operator needed. Mutations through the callee are visible to the caller — exactly like TypeScript/C# objects.
 
-```cot
+```zig
 struct Counter { value: i64 }
 
 fn increment(c: *Counter) void {    // accepts pointer
@@ -995,7 +995,7 @@ test "no & needed" {
 
 This works for any pattern where locals are passed to pointer params — including the common "init + store pointer" pattern:
 
-```cot
+```zig
 struct Parser { scanner: *Scanner, ast: *Ast }
 
 fn parserInit(scanner: *Scanner, ast: *Ast) Parser {
@@ -1015,7 +1015,7 @@ Explicit `&` still works if you prefer it. Non-lvalue expressions (function retu
 
 ### Unified Init Syntax (Colon Syntax)
 
-```cot
+```zig
 // Standard:   Point { .x = 10, .y = 20 }
 // @safe mode: Point { x: 10, y: 20 }     — colon instead of period+equals
 var p = Point { x: 10, y: 20 }
@@ -1023,7 +1023,7 @@ var p = Point { x: 10, y: 20 }
 
 ### Field Init Shorthand
 
-```cot
+```zig
 var x: i64 = 10
 var y: i64 = 20
 var p = new Point { x, y }        // shorthand for { x: x, y: y }
@@ -1034,7 +1034,7 @@ var q = new Point { x, y: 99 }    // mixed shorthand + explicit
 
 In non-generic impl blocks, `self: *Type` is injected automatically:
 
-```cot
+```zig
 impl Point {
     // Standard:   fn getX(self: *Point) i64 { return self.x }
     // @safe mode: fn getX() i64 { return self.x }
@@ -1049,7 +1049,7 @@ Explicit `self` still works. Generic impl blocks require explicit self.
 
 `new Type(args...)` calls the `init(self: *Type, ...)` method after allocation:
 
-```cot
+```zig
 impl Rect {
     fn init(w: i64, h: i64) void {  // self injected by implicit self
         self.width = w
@@ -1064,7 +1064,7 @@ var r = new Rect(10, 20)  // allocates + calls init
 
 Unpack tuples into multiple variables:
 
-```cot
+```zig
 fn getPair() (i64, i64) { return (10, 20) }
 
 // Destructure a tuple literal
@@ -1087,7 +1087,7 @@ All bindings in a destructure statement share the same mutability (`const` or `v
 
 The `noreturn` type represents functions that never return — they always exit, trap, or loop forever. It is a bottom type that coerces to any other type.
 
-```cot
+```zig
 import "std/sys"
 
 fn exit_wrapper(code: i64) noreturn {
@@ -1104,7 +1104,7 @@ var x = if (cond) { exit(1) } else { 42 }
 
 Embed a file's contents as a `string` at compile time:
 
-```cot
+```zig
 const data = @embedFile("config.txt")
 const template = @embedFile("templates/page.html")
 ```
@@ -1115,7 +1115,7 @@ The path is resolved **relative to the source file**, not the working directory.
 
 `inline for` unrolls a loop at compile time. The loop variable becomes a comptime-known constant on each iteration. Requires comptime-known range bounds.
 
-```cot
+```zig
 // Sum 0..5 unrolled at compile time
 var sum: i64 = 0
 inline for i in 0..5 { sum = sum + i }

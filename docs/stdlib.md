@@ -6,7 +6,7 @@ Cot ships with 34 stdlib modules. Import them with `import "std/<module>"`.
 
 Dynamic array. Import: `import "std/list"`
 
-```cot
+```zig
 var numbers: List(i64) = .{}
 numbers.append(42)
 println(numbers.get(0))    // 42
@@ -52,7 +52,7 @@ println(numbers.get(0))    // 42
 
 Hash map with linear probing. Import: `import "std/map"`
 
-```cot
+```zig
 var ages: Map(i64, i64) = .{}
 ages.set(1, 25)
 ages.set(2, 30)
@@ -82,7 +82,7 @@ println(ages.has(3))       // 0
 
 Hash set (wrapper over Map). Import: `import "std/set"`
 
-```cot
+```zig
 var seen: Set(i64) = .{}
 seen.add(42)
 println(seen.has(42))      // 1
@@ -108,7 +108,7 @@ seen.remove(42)
 
 String manipulation + StringBuilder. Import: `import "std/string"`
 
-```cot
+```zig
 var s = "Hello, World!"
 println(contains(s, "World"))   // true
 println(toUpper(s))             // HELLO, WORLD!
@@ -146,7 +146,7 @@ println(trim("  hi  "))        // hi
 
 ### StringBuilder
 
-```cot
+```zig
 var sb = StringBuilder { .buf = 0, .len = 0, .cap = 0 }
 sb.append("Hello")
 sb.append(", ")
@@ -202,7 +202,7 @@ Math utilities. Import: `import "std/math"`
 
 JSON parser and encoder. Import: `import "std/json"`
 
-```cot
+```zig
 // Parse
 var root = parse("{\"name\": \"Cot\", \"version\": 3}")
 println(jsonObjectGetString(root, "name"))    // Cot
@@ -268,7 +268,7 @@ println(encode(obj))    // {"hello":"world","num":42}
 
 File I/O. Import: `import "std/fs"`
 
-```cot
+```zig
 // Read entire file
 var content = readFile("config.txt")
 
@@ -321,7 +321,7 @@ f.close()
 
 Process args and environment. Import: `import "std/os"`
 
-```cot
+```zig
 // Command-line arguments
 var count = argsCount()
 for i in 0..count {
@@ -352,7 +352,7 @@ exit(0)
 
 Timestamps and timers. Import: `import "std/time"`
 
-```cot
+```zig
 var start = nanoTimestamp()
 // ... work ...
 var elapsed_ms = (nanoTimestamp() - start) / ns_per_ms
@@ -389,7 +389,7 @@ println(t.elapsed())    // nanoseconds
 
 Cryptographic random numbers. Import: `import "std/random"`
 
-```cot
+```zig
 var n = randomInt()              // random i64
 var dice = randomRange(6) + 1    // 1-6
 ```
@@ -408,7 +408,7 @@ var dice = randomRange(6) + 1    // 1-6
 
 Buffered I/O. Import: `import "std/io"`
 
-```cot
+```zig
 // Buffered reading (e.g., from stdin)
 var reader = newBufferedReader(0)
 var line = readLine(reader)
@@ -444,7 +444,7 @@ writerFlush(writer)
 
 Base64 and hex encoding. Import: `import "std/encoding"`
 
-```cot
+```zig
 // Hex
 var hex = hexEncode("Hello")     // "48656c6c6f"
 var raw = hexDecode(hex)          // "Hello"
@@ -471,7 +471,7 @@ var orig = base64Decode(b64)      // "Hello"
 
 URL parsing. Import: `import "std/url"`
 
-```cot
+```zig
 var u = parseUrl("https://example.com:8080/path?q=1#top")
 println(urlScheme(u))     // https
 println(urlHost(u))       // example.com
@@ -500,7 +500,7 @@ println(urlFragment(u))   // top
 
 TCP sockets and HTTP. Import: `import "std/http"`
 
-```cot
+```zig
 // Simple TCP server
 var fd = try tcpListen(8080)
 while (true) {
@@ -544,7 +544,7 @@ while (true) {
 
 Sorting for List(T). Import: `import "std/sort"`
 
-```cot
+```zig
 var nums: List(i64) = .{}
 nums.append(3)
 nums.append(1)
@@ -566,7 +566,7 @@ reverse(i64)(nums)     // [3, 2, 1]
 
 Event loop and async I/O. Import: `import "std/async"`
 
-```cot
+```zig
 var loop_fd = eventLoopCreate()
 var sock = try tcpSocket()
 setNonBlocking(sock)
@@ -611,7 +611,7 @@ try await asyncWriteString(loop_fd, client, "OK")
 
 Typed blocking channels for inter-thread communication. Import: `import "std/channel"`
 
-```cot
+```zig
 var ch = Channel(i64).init(10)
 ch.send(42)
 var val = ch.recv()    // 42
@@ -635,7 +635,7 @@ ch.close()
 
 Command-line argument parsing. Import: `import "std/cli"`
 
-```cot
+```zig
 var args = parseArgs()
 var port = getFlagInt(args, "port", 8080)
 var verbose = hasFlag(args, "verbose")
@@ -662,7 +662,7 @@ Supports `--name=value`, `--flag`, `-f`, and `--` delimiter.
 
 SHA-256 and HMAC-SHA256 hashing. Import: `import "std/crypto"`
 
-```cot
+```zig
 var hash = sha256("hello")
 var mac = hmacSha256("secret", "message")
 ```
@@ -695,7 +695,7 @@ Debug assertions and stderr output. Import: `import "std/debug"`
 
 Parse .env files. Import: `import "std/dotenv"`
 
-```cot
+```zig
 var env = parseEnv(readFile(".env"))
 var db = get(env, "DATABASE_URL")
 ```
@@ -719,7 +719,7 @@ Supports quotes, comments (#), whitespace trimming.
 
 String formatting, ANSI colors, and display helpers. Import: `import "std/fmt"`
 
-```cot
+```zig
 println(red("Error: ") ++ bold("failed"))
 println(formatBytes(1048576))        // 1.0 MB
 println(formatDuration(1500000))     // 1.5ms
@@ -754,7 +754,7 @@ println(formatDuration(1500000))     // 1.5ms
 
 Structured logging with levels and timestamps. Import: `import "std/log"`
 
-```cot
+```zig
 setLevel(LOG_DEBUG)
 info("server started")
 infoKv("listening", "port", "8080")
@@ -808,7 +808,7 @@ Low-level byte memory operations. Import: `import "std/mem"`
 
 POSIX path manipulation (pure string ops). Import: `import "std/path"`
 
-```cot
+```zig
 println(basename("/usr/bin/cot"))    // cot
 println(dirname("/usr/bin/cot"))     // /usr/bin
 println(extname("app.cot"))          // .cot
@@ -835,7 +835,7 @@ println(join("src", "main.cot"))     // src/main.cot
 
 Subprocess spawning and management. Import: `import "std/process"`
 
-```cot
+```zig
 var code = run("ls", "-la")
 var out = output("git", "status")
 ```
@@ -860,7 +860,7 @@ Returns exit code. Uses fork/execve/waitpid.
 
 Thompson NFA regex engine (linear-time). Import: `import "std/regex"`
 
-```cot
+```zig
 var found = regexMatch("[0-9]+", "abc123")    // true
 var pos = regexFind("\\d+", "abc123")         // 3
 var result = regexReplace("world", "hello world", "Cot")
@@ -885,7 +885,7 @@ Supports: `.`, `*`, `+`, `?`, `|`, `()`, `[]`, `[^]`, `[a-z]`, `^`, `$`, `\d`, `
 
 Semantic Versioning 2.0.0 parsing. Import: `import "std/semver"`
 
-```cot
+```zig
 var v = parse("1.2.3-beta+build")
 println(major(v))    // 1
 println(cmp(parse("1.0.0"), parse("2.0.0")))    // -1
@@ -934,7 +934,7 @@ SQLite3 FFI bindings. Import: `import "std/sqlite"`
 
 Requires `"libs": ["sqlite3"]` in `cot.json`.
 
-```cot
+```zig
 var db = sqliteOpen(":memory:")
 sqliteExec(db, "CREATE TABLE t (id INTEGER, name TEXT)")
 
@@ -1050,7 +1050,7 @@ OS-level threading (pthreads). Import: `import "std/thread"`
 
 UUID v4 generation (RFC 4122). Import: `import "std/uuid"`
 
-```cot
+```zig
 var id = v4()    // "550e8400-e29b-41d4-a716-446655440000"
 @assert(isValid(id))
 ```

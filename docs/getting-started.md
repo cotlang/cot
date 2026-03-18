@@ -29,7 +29,7 @@ zig build
 
 Create a file called `hello.cot`:
 
-```cot
+```zig
 fn main() i64 {
     println("Hello, world!")
     return 0
@@ -55,7 +55,7 @@ Every Cot program starts with a `main()` function that returns `i64` (the exit c
 
 Use `const` for immutable values and `var` for mutable ones. Types are inferred when possible.
 
-```cot
+```zig
 fn main() i64 {
     const name = "Cot"              // immutable, type inferred as string
     var count: i64 = 0              // mutable, explicitly typed
@@ -87,7 +87,7 @@ Convenience aliases: `int` = `i64`, `float` = `f64`, `byte` = `u8`.
 
 ### Arrays and Slices
 
-```cot
+```zig
 const arr = [1, 2, 3, 4, 5]     // fixed-size array [5]i64
 const first = arr[0]              // indexing
 const mid = arr[1:3]              // slicing → [2, 3]
@@ -97,7 +97,7 @@ const mid = arr[1:3]              // slicing → [2, 3]
 
 Functions declare parameter types and return type explicitly. No semicolons needed.
 
-```cot
+```zig
 fn add(a: i64, b: i64) i64 {
     return a + b
 }
@@ -117,7 +117,7 @@ fn main() i64 {
 
 `if` and `while` require parentheses around the condition (like Zig, unlike Go).
 
-```cot
+```zig
 fn fizzbuzz(n: i64) i64 {
     var i = 1
     while (i <= n) {
@@ -138,7 +138,7 @@ fn fizzbuzz(n: i64) i64 {
 
 ### For Loops
 
-```cot
+```zig
 // Range-based
 for i in 0..10 {
     println(i)
@@ -157,7 +157,7 @@ for i, item in collection {
 
 ## Structs
 
-```cot
+```zig
 struct Point { x: i64, y: i64 }
 
 fn main() i64 {
@@ -170,7 +170,7 @@ fn main() i64 {
 
 ### Methods with Impl Blocks
 
-```cot
+```zig
 struct Rectangle { width: i64, height: i64 }
 
 impl Rectangle {
@@ -199,7 +199,7 @@ Methods take `self: *Type` as the first parameter (explicit, like Zig).
 
 Cot uses error unions (`E!T`) — a value that is either an error or a success value.
 
-```cot
+```zig
 const MathError = error { DivByZero }
 
 fn divide(a: i64, b: i64) MathError!i64 {
@@ -232,7 +232,7 @@ fn main() i64 {
 
 Type parameters go in **separate parentheses** (not angle brackets):
 
-```cot
+```zig
 fn max(T)(a: T, b: T) T {
     if (a > b) { return a }
     return b
@@ -247,7 +247,7 @@ fn main() i64 {
 
 Generic structs work the same way:
 
-```cot
+```zig
 struct Pair(T) { first: T, second: T }
 
 fn main() i64 {
@@ -261,7 +261,7 @@ fn main() i64 {
 
 Import stdlib modules with `import "std/<module>"`:
 
-```cot
+```zig
 import "std/list"
 import "std/string"
 
@@ -306,7 +306,7 @@ fn main() i64 {
 
 ## Enums and Unions
 
-```cot
+```zig
 enum Color { Red, Green, Blue }
 
 union Shape {
@@ -320,7 +320,7 @@ union Shape {
 
 Define shared behavior across types:
 
-```cot
+```zig
 trait Printable {
     fn display(self: *Self) i64
 }
@@ -346,7 +346,7 @@ Cot uses ARC (Automatic Reference Counting). You rarely need to think about memo
 - **`defer`**: Runs cleanup at scope exit (LIFO order)
 - **`errdefer`**: Runs cleanup only if the function returns an error
 
-```cot
+```zig
 fn example() void {
     // Heap allocation
     var obj = new Foo { x: 42 }
@@ -364,7 +364,7 @@ fn example() void {
 
 Write tests inline with `test "name" { }` blocks:
 
-```cot
+```zig
 fn add(a: i64, b: i64) i64 {
     return a + b
 }
