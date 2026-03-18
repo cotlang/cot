@@ -1,0 +1,20 @@
+@safe
+
+struct Inner {
+    value: i64,
+}
+
+struct Outer {
+    inner: Inner,
+}
+
+fn getInner(o: Outer) Inner {
+    return o.inner
+}
+
+test "return nested struct" {
+    var i = new Inner { value: 42 }
+    var o = new Outer { inner: i }
+    var result = getInner(o)
+    @assertEq(result.value, 42)
+}
