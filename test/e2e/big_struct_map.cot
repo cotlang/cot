@@ -1,0 +1,64 @@
+import "std/list"
+import "std/map"
+
+struct BigStruct {
+    name: string,
+    type_idx: int,
+    return_type: int,
+    span_start: int,
+    span_end: int,
+    locals: List(int),
+    blocks: List(int),
+    nodes: List(int),
+    str_lits: List(string),
+    current_block: int,
+    local_map: Map(string, int),
+    shadow: List(int),
+    sret: ?int,
+    is_destr: bool,
+    is_export: bool,
+}
+
+fn createBig() *BigStruct {
+    return new BigStruct {
+        name: "test", type_idx: 0, return_type: 0,
+        span_start: 0, span_end: 0,
+        locals: .{}, blocks: .{}, nodes: .{},
+        str_lits: .{}, current_block: 0,
+        local_map: .{}, shadow: .{},
+        sret: null, is_destr: false, is_export: false,
+    }
+}
+
+fn addParam(b: *BigStruct, name: string, idx: int) void {
+    b.locals.append(idx)
+    b.local_map.set(name, idx)
+}
+
+fn lookupLocal(b: *BigStruct, name: string) ?int {
+    return b.local_map.getOrNull(name)
+}
+
+test "big struct map operations" {
+    var b = createBig()
+    addParam(b, "self", 0)
+    const r = lookupLocal(b, "self")
+    if (r) |v| { @assertEq(v, 0) }
+    else { @assert(false) }
+}
+
+test "big struct map after list growth" {
+    var b = createBig()
+    addParam(b, "self", 0)
+    // Grow other lists to trigger reallocation
+    var i: int = 0
+    while (i < 20) {
+        b.nodes.append(i)
+        b.blocks.append(i)
+        i += 1
+    }
+    // Map should still work after list reallocations
+    const r = lookupLocal(b, "self")
+    if (r) |v| { @assertEq(v, 0) }
+    else { @assert(false) }
+}

@@ -1,0 +1,39 @@
+import "std/list"
+import "std/map"
+
+struct Builder {
+    name: string,
+    locals: List(int),
+    local_map: Map(string, int),
+}
+
+struct BigContext {
+    a: int, b: int, c: int, d: int, e: int, f: int, g: int, h: int,
+    i: int, j: int, k: int, l: int, m: int, n: int, o: int, p: int,
+    q: List(int), r: List(int), s: List(int), t: List(int),
+    u: Map(string, int), v: Map(string, int),
+    w: List(string), x: List(string),
+}
+
+fn level1(ctx: BigContext) int {
+    return level2(ctx)
+}
+fn level2(ctx: BigContext) int {
+    return level3(ctx)
+}
+fn level3(ctx: BigContext) int {
+    return level4(ctx)
+}
+fn level4(ctx: BigContext) int {
+    var b = new Builder { name: "test", locals: .{}, local_map: .{} }
+    b.local_map.set("self", 0)
+    b.locals.append(0)
+    const r = b.local_map.getOrNull("self")
+    if (r) |v| { return v }
+    return 0 - 1
+}
+
+test "deep chain map" {
+    var ctx: BigContext = .{}
+    @assertEq(level1(ctx), 0)
+}

@@ -1,0 +1,39 @@
+import "std/map"
+
+struct Builder {
+    local_map: Map(string, int),
+    count: int,
+}
+
+fn createBuilder() *Builder {
+    return new Builder { local_map: .{}, count: 0 }
+}
+
+fn addEntry(b: *Builder, name: string, val: int) void {
+    b.local_map.set(name, val)
+    b.count = b.count + 1
+}
+
+fn lookup(b: *Builder, name: string) int {
+    const result = b.local_map.getOrNull(name)
+    if (result) |v| { return v }
+    return 0 - 1
+}
+
+test "map in heap struct" {
+    var b = createBuilder()
+    addEntry(b, "hello", 42)
+    @assertEq(lookup(b, "hello"), 42)
+    @assertEq(lookup(b, "missing"), 0 - 1)
+}
+
+test "map in heap struct multiple entries" {
+    var b = createBuilder()
+    addEntry(b, "a", 1)
+    addEntry(b, "b", 2)
+    addEntry(b, "c", 3)
+    @assertEq(lookup(b, "a"), 1)
+    @assertEq(lookup(b, "b"), 2)
+    @assertEq(lookup(b, "c"), 3)
+    @assertEq(b.count, 3)
+}

@@ -1,0 +1,88 @@
+import "std/list"
+import "std/map"
+
+struct Local {
+    name: string, type_idx: int, mutable: bool, is_param: bool,
+    param_idx: int, size: int, alignment: int, offset: int,
+}
+struct ShadowEntry { name: string, old_idx: ?int }
+struct Span { start: int, end: int }
+struct Node { data: int }
+struct Block { idx: int }
+
+struct FuncBuilder {
+    name: string, type_idx: int, return_type: int, span: Span,
+    locals: List(Local), blocks: List(Block), nodes: List(Node),
+    string_literals: List(string), current_block: int,
+    local_map: Map(string, int), shadow_stack: List(ShadowEntry),
+    sret_return_type: ?int, is_destructor: bool, is_export: bool,
+
+    static fn initHeap(n: string) *FuncBuilder {
+        var blocks: List(Block) = .{}
+        blocks.append(Block { idx: 0 })
+        return new FuncBuilder {
+            name: n, type_idx: 0, return_type: 0,
+            span: Span { start: 0, end: 0 },
+            locals: .{}, blocks: blocks, nodes: .{},
+            string_literals: .{}, current_block: 0,
+            local_map: .{}, shadow_stack: .{},
+            sret_return_type: null, is_destructor: false, is_export: false,
+        }
+    }
+
+    fn addParam(param_name: string, t: int, idx: int, sz: int) int {
+        const i = self.locals.count
+        self.locals.append(Local { name: param_name, type_idx: t, mutable: false, is_param: true, param_idx: idx, size: sz, alignment: 8, offset: 0 })
+        self.local_map.set(param_name, i)
+        return i
+    }
+
+    fn addLocalWithSize(param_name: string, t: int, mutable: bool, sz: int) int {
+        const i = self.locals.count
+        self.locals.append(Local { name: param_name, type_idx: t, mutable: mutable, is_param: false, param_idx: 0, size: sz, alignment: 8, offset: 0 })
+        self.shadow_stack.append(ShadowEntry { name: param_name, old_idx: self.local_map.getOrNull(param_name) })
+        self.local_map.set(param_name, i)
+        return i
+    }
+}
+
+// Simulate the Lowerer: 1000+ bytes of context on the stack
+struct BigLowerer {
+    a: int, b: int, c: int, d: int, e: int, f: int, g: int, h: int,
+    i1: int, j: int, k: int, l: int, m: int, n: int, o: int, p: int,
+    q: List(int), r: List(int), s: List(int), t: List(int),
+    u: Map(string, int), v: Map(string, int), w: Map(string, int),
+    x: List(string), y: List(string),
+    z1: Map(string, int), z2: Map(string, int), z3: Map(string, int),
+    z4: List(int), z5: List(int), z6: List(string),
+    z7: Map(int, string), z8: Map(string, string),
+    z9: bool, z10: bool, z11: int,
+}
+
+fn simulateLowerMethod(ctx: BigLowerer) int {
+    var fb = FuncBuilder.initHeap("method")
+    fb.addParam("self", 5, 0, 8)
+    // Simulate lowering a method body with var declaration
+    fb.addLocalWithSize("a", 3, false, 8)
+    const r = fb.local_map.getOrNull("a")
+    if (r) |v| { return v }
+    return 0 - 1
+}
+
+fn simulateLowerStruct(ctx: BigLowerer) int {
+    // Simulate lowerStructDecl → lowerMethodWithName chain
+    return simulateLowerMethod(ctx)
+}
+
+fn simulateLowerDecl(ctx: BigLowerer) int {
+    return simulateLowerStruct(ctx)
+}
+
+fn simulateLowerToBuilder(ctx: BigLowerer) int {
+    return simulateLowerDecl(ctx)
+}
+
+test "big stack context map" {
+    var ctx: BigLowerer = .{}
+    @assertEq(simulateLowerToBuilder(ctx), 1)
+}
