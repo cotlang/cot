@@ -98,9 +98,6 @@ pub const Driver = struct {
     // Collected from checker scopes after type checking.
     // Registered in func_index_map so native backend can resolve calls.
     user_extern_fns: std.ArrayListUnmanaged([]const u8) = .{},
-    /// Shape stenciling: maps concrete generic names → stenciled function names.
-    /// Populated during lowering, consumed by SSA builder for call resolution.
-    shape_aliases: ?*const std.StringHashMap([]const u8) = null,
     /// Dict dispatch: maps concrete generic name → list of dict helper fn names (extra args).
     dict_arg_names: ?*const std.StringHashMap([]const []const u8) = null,
 
@@ -371,8 +368,7 @@ pub const Driver = struct {
         var ir_result = try lowerer.builder.getIR();
         defer ir_result.deinit();
 
-        // Shape stenciling: pass aliases and dict arg names to code generator for call resolution
-        self.shape_aliases = &lowerer.shape_aliases;
+        // Shape stenciling: pass dict arg names to code generator for call resolution
         self.dict_arg_names = &lowerer.dict_arg_names;
 
         return self.generateCode(ir_result.funcs, ir_result.globals, &type_reg, "<input>", source_text);
@@ -525,10 +521,6 @@ pub const Driver = struct {
         // Shape stenciling: share stencil maps across files (same pattern as lowered_generics).
         var shared_shape_stencils = std.StringHashMap([]const u8).init(self.allocator);
         defer shared_shape_stencils.deinit();
-        var shared_shape_aliases = std.StringHashMap([]const u8).init(self.allocator);
-        defer shared_shape_aliases.deinit();
-        var shared_shape_analysis_cache = std.AutoHashMap(ast_mod.NodeIndex, lower_mod.Lowerer.StencilResult).init(self.allocator);
-        defer shared_shape_analysis_cache.deinit();
         var shared_dict_arg_names = std.StringHashMap([]const []const u8).init(self.allocator);
         defer shared_dict_arg_names.deinit();
         var shared_generated_dict_helpers = std.StringHashMap(void).init(self.allocator);
@@ -552,8 +544,6 @@ pub const Driver = struct {
             var lowerer = lower_mod.Lowerer.initWithBuilder(self.allocator, &pf.tree, &type_reg, &lower_err, &checkers.items[i], shared_builder, self.target);
             lowerer.lowered_generics = shared_lowered_generics;
             lowerer.shape_stencils = shared_shape_stencils;
-            lowerer.shape_aliases = shared_shape_aliases;
-            lowerer.shape_analysis_cache = shared_shape_analysis_cache;
             lowerer.dict_arg_names = shared_dict_arg_names;
             lowerer.generated_dict_helpers = shared_generated_dict_helpers;
             lowerer.module_name = canonical_path_to_module.get(pf.path) orelse "";
@@ -566,8 +556,7 @@ pub const Driver = struct {
             lowerer.lowerToBuilder() catch |e| {
                 shared_lowered_generics = lowerer.lowered_generics;
                 shared_shape_stencils = lowerer.shape_stencils;
-                shared_shape_aliases = lowerer.shape_aliases;
-                shared_shape_analysis_cache = lowerer.shape_analysis_cache;
+
                 shared_dict_arg_names = lowerer.dict_arg_names;
                 shared_generated_dict_helpers = lowerer.generated_dict_helpers;
                 lowerer.deinitWithoutBuilder();
@@ -577,8 +566,7 @@ pub const Driver = struct {
             lowerer.emitPendingAutoDeinits() catch |e| {
                 shared_lowered_generics = lowerer.lowered_generics;
                 shared_shape_stencils = lowerer.shape_stencils;
-                shared_shape_aliases = lowerer.shape_aliases;
-                shared_shape_analysis_cache = lowerer.shape_analysis_cache;
+
                 shared_dict_arg_names = lowerer.dict_arg_names;
                 shared_generated_dict_helpers = lowerer.generated_dict_helpers;
                 lowerer.deinitWithoutBuilder();
@@ -587,8 +575,7 @@ pub const Driver = struct {
             if (lower_err.hasErrors()) {
                 shared_lowered_generics = lowerer.lowered_generics;
                 shared_shape_stencils = lowerer.shape_stencils;
-                shared_shape_aliases = lowerer.shape_aliases;
-                shared_shape_analysis_cache = lowerer.shape_analysis_cache;
+
                 shared_dict_arg_names = lowerer.dict_arg_names;
                 shared_generated_dict_helpers = lowerer.generated_dict_helpers;
                 lowerer.deinitWithoutBuilder();
@@ -601,8 +588,6 @@ pub const Driver = struct {
                 lowerer.generateGlobalInitsNamed(init_name) catch |e| {
                     shared_lowered_generics = lowerer.lowered_generics;
                     shared_shape_stencils = lowerer.shape_stencils;
-                    shared_shape_aliases = lowerer.shape_aliases;
-                    shared_shape_analysis_cache = lowerer.shape_analysis_cache;
                     shared_dict_arg_names = lowerer.dict_arg_names;
                     shared_generated_dict_helpers = lowerer.generated_dict_helpers;
                     lowerer.deinitWithoutBuilder();
@@ -622,8 +607,6 @@ pub const Driver = struct {
             shared_builder = lowerer.builder;
             shared_lowered_generics = lowerer.lowered_generics;
             shared_shape_stencils = lowerer.shape_stencils;
-            shared_shape_aliases = lowerer.shape_aliases;
-            shared_shape_analysis_cache = lowerer.shape_analysis_cache;
             shared_dict_arg_names = lowerer.dict_arg_names;
             shared_generated_dict_helpers = lowerer.generated_dict_helpers;
             lowerer.deinitWithoutBuilder();
@@ -726,7 +709,6 @@ pub const Driver = struct {
         defer final_ir.deinit();
 
         // Shape stenciling: pass aliases and dict arg names to code generator for call resolution
-        self.shape_aliases = &shared_shape_aliases;
         self.dict_arg_names = &shared_dict_arg_names;
 
         const main_file = if (parsed_files.items.len > 0) parsed_files.items[parsed_files.items.len - 1] else ParsedFile{
@@ -1467,7 +1449,6 @@ pub const Driver = struct {
 
             // Build SSA from IR
             var ssa_builder = try ssa_builder_mod.SSABuilder.init(func_alloc, ir_func, globals, type_reg, self.target);
-            ssa_builder.shape_aliases = self.shape_aliases; // Shape stenciling: resolve aliased calls
             ssa_builder.dict_arg_names = self.dict_arg_names; // Dict dispatch: inject fn-ptr args
             errdefer ssa_builder.deinit();
 
@@ -5745,7 +5726,6 @@ pub const Driver = struct {
 
             // Build SSA
             var ssa_builder = try ssa_builder_mod.SSABuilder.init(func_alloc, ir_func, globals, type_reg, self.target);
-            ssa_builder.shape_aliases = self.shape_aliases; // Shape stenciling: resolve aliased calls
             ssa_builder.dict_arg_names = self.dict_arg_names; // Dict dispatch: inject fn-ptr args
             errdefer ssa_builder.deinit();
 

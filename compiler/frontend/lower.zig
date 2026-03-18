@@ -54,12 +54,6 @@ pub const Lowerer = struct {
     /// When a generic function is shape-stencilable and the first instance for a shape,
     /// it's lowered under the stencil name. Subsequent same-shape instances are aliases.
     shape_stencils: std.StringHashMap([]const u8),
-    /// Maps concrete function name → stenciled function name (for call resolution).
-    /// If a concrete generic name is here, calls should go to the stenciled version.
-    shape_aliases: std.StringHashMap([]const u8),
-    /// Cache for stencil analysis results, keyed by generic_node AST index.
-    /// Avoids re-analyzing the same generic function body for each instantiation.
-    shape_analysis_cache: std.AutoHashMap(ast.NodeIndex, StencilResult),
     /// Maps concrete function name → list of dict helper names to pass as extra args.
     /// E.g., "List(17)_indexOf" → &["__cot_dict_i64_eq"]
     dict_arg_names: std.StringHashMap([]const []const u8),
@@ -486,28 +480,15 @@ pub const Lowerer = struct {
 
     /// Dictionary dispatch entry: describes a type-dependent operation on a type parameter.
     /// Go reference: cmd/compile/internal/noder/reader.go — dictionary holds method ptrs per shape.
+    /// Dictionary entry for shaped generic functions.
+    /// Go reference: writerDict.typeParamMethodExprs (writer.go:200).
+    /// Only method calls on type param receivers need dict entries.
+    /// Binary ops use shape type's native operators (no dict dispatch).
     pub const DictEntry = struct {
-        kind: enum { binary_op, method_call },
-        /// For binary_op: the operator token (eql, neq, lss, gtr, leq, geq, add, sub, mul, quo, rem)
-        op: ?Token = null,
-        /// For method_call: the method name on the T-typed receiver
-        method_name: ?[]const u8 = null,
+        /// The method name on the T-typed receiver
+        method_name: []const u8,
         /// Which type parameter this entry applies to (index into type_args)
         type_param_idx: u8 = 0,
-    };
-
-    /// Three-tier classification result for generic function stencilability.
-    /// Tier 1 (shape_only): no type-dependent ops — alias only (existing behavior).
-    /// Tier 2 (dict_stencil): binary ops / method calls on T — share body with fn-ptr args.
-    /// Tier 3 (not_stencilable): closures, async, switch on T, builtins on T — full mono.
-    pub const StencilResult = union(enum) {
-        shape_only,
-        dict_stencil: []const DictEntry,
-        not_stencilable,
-
-        pub fn isStencilable(self: StencilResult) bool {
-            return self != .not_stencilable;
-        }
     };
 
     pub fn init(allocator: Allocator, tree: *const Ast, type_reg: *TypeRegistry, err: *ErrorReporter, chk: *checker.Checker, target: target_mod.Target) Lowerer {
@@ -534,8 +515,6 @@ pub const Lowerer = struct {
             .bench_display_names = .{},
             .lowered_generics = std.StringHashMap(void).init(allocator),
             .shape_stencils = std.StringHashMap([]const u8).init(allocator),
-            .shape_aliases = std.StringHashMap([]const u8).init(allocator),
-            .shape_analysis_cache = std.AutoHashMap(ast.NodeIndex, StencilResult).init(allocator),
             .dict_arg_names = std.StringHashMap([]const []const u8).init(allocator),
             .generated_dict_helpers = std.StringHashMap(void).init(allocator),
             .target = target,
@@ -572,8 +551,6 @@ pub const Lowerer = struct {
         self.bench_display_names.deinit(self.allocator);
         self.lowered_generics.deinit();
         self.shape_stencils.deinit();
-        self.shape_aliases.deinit();
-        self.shape_analysis_cache.deinit();
         self.dict_arg_names.deinit();
         self.generated_dict_helpers.deinit();
         self.comptime_value_vars.deinit();
@@ -4939,30 +4916,9 @@ pub const Lowerer = struct {
             }
         }
 
-        // Dict dispatch: if inside a dict-stenciled body and this op is on a type-param type,
-        // emit indirect call through the dictionary fn-ptr param instead of a direct binary op.
-        if (self.current_dict_entries) |entries| {
-            if (self.current_dict_params) |params| {
-                const left_type_idx = self.inferExprType(bin.left);
-                if (self.type_substitution) |sub| {
-                    var sub_it = sub.valueIterator();
-                    while (sub_it.next()) |vp| {
-                        if (vp.* == left_type_idx) {
-                            // Find the matching dict entry for this (binary_op, op) pair
-                            for (entries, 0..) |entry, di| {
-                                if (entry.kind == .binary_op and entry.op != null and entry.op.? == bin.op) {
-                                    const fn_ptr = try fb.emitLoadLocal(params[di], TypeRegistry.I64, bin.span);
-                                    var call_args = [_]ir.NodeIndex{ left, right };
-                                    return try fb.emitCallIndirect(fn_ptr, &call_args, result_type, bin.span);
-                                }
-                            }
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-
+        // Go pattern: binary ops on type params use the shape type's native operators.
+        // No dictionary dispatch needed — same-shaped types have identical operator behavior.
+        // Reference: reader.go exprBinaryOp (line 2323) — no dict lookup for binary ops.
         const result = try fb.emitBinary(tokenToBinaryOp(bin.op), left, right, result_type, bin.span);
 
         // Div-by-zero check for integer division/modulo.
@@ -8197,8 +8153,7 @@ pub const Lowerer = struct {
                 }
                 const ret_type = if (concrete_info == .func) concrete_info.func.return_type else TypeRegistry.VOID;
                 // Shape stenciling: call sites always use the concrete name.
-                // For dict_stencil: concrete name → wrapper → stencil with dict args.
-                // For shape_only: concrete name → aliased directly in SSA builder.
+                // Shape stenciling: concrete name → wrapper → stencil (with dict args if needed).
                 const call_target = inst_info.concrete_name;
                 // SRET for generic function calls — reuse shared SRET local
                 if (self.needsSret(ret_type)) {
@@ -8452,40 +8407,26 @@ pub const Lowerer = struct {
     // Detects when monomorphized generic functions produce identical code across
     // different types with the same shape (size, alignment, ARC kind).
 
-    /// Three-tier stencilability analysis. Must be called AFTER re-check populates expr_types.
-    /// Returns: shape_only (Tier 1), dict_stencil (Tier 2), or not_stencilable (Tier 3).
-    /// Reference: Go's shapify() groups types by shape; dictionary dispatch handles type-specific ops.
-    fn analyzeStencilability(self: *Lowerer, body_node: ast.NodeIndex, type_param_types: []const TypeIndex) StencilResult {
-        // Stenciling disabled: dict dispatch has false positives (basic types match
-        // non-param expressions) and shape_only aliases break Map method dispatch.
-        // Infrastructure is correct (wrappers, SSA builder, tests pass) but the
-        // type-matching analysis needs Go-style AST provenance tracking before
-        // it can be safely enabled for production code like selfcot.
-        // shape_stencil.cot tests verify the infrastructure works when analysis is correct.
-        if (true) return .not_stencilable;
-        if (type_param_types.len == 0) return .not_stencilable;
-
-        // Collect dict entries (Tier 2 operations) while walking the AST.
-        // If a Tier 3 operation is found, collector is abandoned and we return not_stencilable.
+    /// Go model: scan AST body for method calls on type-param-derived receivers.
+    /// Returns deduplicated DictEntry slice (method_name + type_param_idx).
+    /// Go reference: writer.go typeParamMethodExprIdx — entries added on demand during body encoding.
+    /// This is a simple pre-scan that only looks for method calls where the receiver's
+    /// AST type annotation is a type parameter name (key in type_substitution).
+    fn scanMethodCallDictEntries(self: *Lowerer, body_node: ast.NodeIndex, param_names: []const []const u8, fn_params: []const ast.Field) []const DictEntry {
         var collector = std.ArrayListUnmanaged(DictEntry){};
         defer collector.deinit(self.allocator);
+        self.scanNodeForMethodCalls(body_node, param_names, fn_params, &collector);
 
-        const ok = self.collectNodeDictEntries(body_node, type_param_types, &collector);
-        if (!ok) return .not_stencilable;
+        if (collector.items.len == 0) return &.{};
 
-        if (collector.items.len == 0) return .shape_only;
-
-        // Deduplicate entries: same (kind, op, method_name, type_param_idx) should appear only once.
-        // type_param_idx is included because the same op on different type params may need
-        // different helpers (e.g., T=i64 uses signed <, U=u64 uses unsigned <).
+        // Deduplicate: same (method_name, type_param_idx) only once
         var deduped = std.ArrayListUnmanaged(DictEntry){};
-        deduped.ensureTotalCapacity(self.allocator, collector.items.len) catch return .not_stencilable;
+        deduped.ensureTotalCapacity(self.allocator, collector.items.len) catch return &.{};
         for (collector.items) |entry| {
             var found = false;
             for (deduped.items) |existing| {
-                if (existing.kind == entry.kind and existing.op == entry.op and
-                    existing.type_param_idx == entry.type_param_idx and
-                    std.mem.eql(u8, existing.method_name orelse "", entry.method_name orelse ""))
+                if (existing.type_param_idx == entry.type_param_idx and
+                    std.mem.eql(u8, existing.method_name, entry.method_name))
                 {
                     found = true;
                     break;
@@ -8493,255 +8434,192 @@ pub const Lowerer = struct {
             }
             if (!found) deduped.appendAssumeCapacity(entry);
         }
-
-        const entries = self.allocator.dupe(DictEntry, deduped.items) catch return .not_stencilable;
+        const entries = self.allocator.dupe(DictEntry, deduped.items) catch return &.{};
         deduped.deinit(self.allocator);
-        return .{ .dict_stencil = entries };
+        return entries;
     }
 
-    /// Check if a type matches one of the type parameter concrete types.
-    /// Returns the index of the matching type param, or null.
-    fn typeParamIndex(type_param_types: []const TypeIndex, ty: TypeIndex) ?u8 {
-        for (type_param_types, 0..) |tpt, i| {
-            if (ty == tpt) return @intCast(i);
+    /// Recursive AST walk: find method calls on type-param-derived receivers.
+    /// A receiver is "derived" if its AST type annotation is a type parameter name.
+    fn scanNodeForMethodCalls(self: *Lowerer, node_idx: ast.NodeIndex, param_names: []const []const u8, fn_params: []const ast.Field, collector: *std.ArrayListUnmanaged(DictEntry)) void {
+        const node = self.tree.getNode(node_idx) orelse return;
+        switch (node) {
+            .expr => |expr| self.scanExprForMethodCalls(expr, param_names, fn_params, collector),
+            .stmt => |stmt| self.scanStmtForMethodCalls(stmt, param_names, fn_params, collector),
+            .decl => {},
         }
-        return null;
     }
 
-    fn isTypeParamType(type_param_types: []const TypeIndex, ty: TypeIndex) bool {
-        return typeParamIndex(type_param_types, ty) != null;
-    }
-
-    /// Recursive AST walk: collects DictEntry values for Tier 2 ops.
-    /// Returns false if a Tier 3 (not stencilable) operation is found.
-    fn collectNodeDictEntries(self: *Lowerer, node_idx: ast.NodeIndex, tpt: []const TypeIndex, collector: *std.ArrayListUnmanaged(DictEntry)) bool {
-        const node = self.tree.getNode(node_idx) orelse return true;
-        return switch (node) {
-            .expr => |expr| self.collectExprDictEntries(expr, node_idx, tpt, collector),
-            .stmt => |stmt| self.collectStmtDictEntries(stmt, tpt, collector),
-            .decl => true,
-        };
-    }
-
-    /// Collect dict entries from an expression. Returns false for Tier 3 ops.
-    fn collectExprDictEntries(self: *Lowerer, expr: ast.Expr, node_idx: ast.NodeIndex, tpt: []const TypeIndex, collector: *std.ArrayListUnmanaged(DictEntry)) bool {
+    fn scanExprForMethodCalls(self: *Lowerer, expr: ast.Expr, param_names: []const []const u8, fn_params: []const ast.Field, collector: *std.ArrayListUnmanaged(DictEntry)) void {
         switch (expr) {
-            .binary => |bin| {
-                // Binary ops on T-typed operands → Tier 2 (dict entry)
-                const left_type = self.chk.expr_types.get(bin.left);
-                const right_type = self.chk.expr_types.get(bin.right);
-                const left_param_idx = if (left_type) |lt| typeParamIndex(tpt, lt) else null;
-                const right_param_idx = if (right_type) |rt| typeParamIndex(tpt, rt) else null;
-                if (left_param_idx != null or right_param_idx != null) {
-                    // Only dictionary-ize standard comparison and arithmetic ops
-                    const is_dict_op = switch (bin.op) {
-                        .eql, .neq, .lss, .gtr, .leq, .geq, .add, .sub, .mul, .quo, .rem => true,
-                        else => false,
-                    };
-                    if (!is_dict_op) return false; // Tier 3: unsupported op on T
-                    collector.append(self.allocator, .{
-                        .kind = .binary_op,
-                        .op = bin.op,
-                        .type_param_idx = left_param_idx orelse right_param_idx.?,
-                    }) catch return false;
-                }
-                return self.collectNodeDictEntries(bin.left, tpt, collector) and
-                    self.collectNodeDictEntries(bin.right, tpt, collector);
-            },
             .call => |call| {
-                // Method calls on T-typed receiver → Tier 2 (dict entry with trampoline)
+                // Check if this is a method call on a type-param-derived receiver
                 const callee_node = self.tree.getNode(call.callee);
                 if (callee_node) |cn| {
                     if (cn.asExpr()) |ce| {
                         if (ce == .field_access) {
-                            const receiver_type = self.chk.expr_types.get(ce.field_access.base);
-                            if (receiver_type) |rt| {
-                                // Check if receiver is T or *T (pointer to type param)
-                                const param_idx = typeParamIndex(tpt, rt) orelse blk: {
-                                    const rt_info = self.type_reg.get(rt);
-                                    if (rt_info == .pointer) break :blk typeParamIndex(tpt, rt_info.pointer.elem);
-                                    break :blk null;
-                                };
-                                if (param_idx) |pi| {
-                                    collector.append(self.allocator, .{
-                                        .kind = .method_call,
-                                        .method_name = ce.field_access.field,
-                                        .type_param_idx = pi,
-                                    }) catch return false;
-                                }
+                            // Check receiver's AST type provenance — is it declared as a type param?
+                            if (self.receiverTypeParamIdx(ce.field_access.base, param_names, fn_params)) |pi| {
+                                collector.append(self.allocator, .{
+                                    .method_name = ce.field_access.field,
+                                    .type_param_idx = pi,
+                                }) catch return;
                             }
                         }
                     }
                 }
-                if (!self.collectNodeDictEntries(call.callee, tpt, collector)) return false;
-                for (call.args) |arg| {
-                    if (!self.collectNodeDictEntries(arg, tpt, collector)) return false;
-                }
-                return true;
+                self.scanNodeForMethodCalls(call.callee, param_names, fn_params, collector);
+                for (call.args) |arg| self.scanNodeForMethodCalls(arg, param_names, fn_params, collector);
             },
-            .string_interp => |si| {
-                // String interpolation of T → Tier 3 (not stencilable).
-                // Buffer management is type-specific: int_to_string writes right-aligned,
-                // float_to_string writes left-aligned. No clean helper signature possible
-                // without heap allocation. Rare in generic code.
-                for (si.segments) |seg| {
-                    switch (seg) {
-                        .expr => |seg_expr| {
-                            const seg_type = self.chk.expr_types.get(seg_expr);
-                            if (seg_type) |st| { if (isTypeParamType(tpt, st)) return false; }
-                            if (!self.collectNodeDictEntries(seg_expr, tpt, collector)) return false;
-                        },
-                        .text => {},
-                    }
-                }
-                return true;
+            .binary => |bin| {
+                self.scanNodeForMethodCalls(bin.left, param_names, fn_params, collector);
+                self.scanNodeForMethodCalls(bin.right, param_names, fn_params, collector);
             },
-            // Tier 3: switch on T, builtins on T, closures, async — not stencilable
-            .switch_expr => |se| {
-                const cond_type = self.chk.expr_types.get(se.subject);
-                if (cond_type) |ct| { if (isTypeParamType(tpt, ct)) return false; }
-                if (!self.collectNodeDictEntries(se.subject, tpt, collector)) return false;
-                for (se.cases) |case| {
-                    for (case.patterns) |pat| {
-                        if (!self.collectNodeDictEntries(pat, tpt, collector)) return false;
-                    }
-                    if (!self.collectNodeDictEntries(case.body, tpt, collector)) return false;
-                }
-                if (se.else_body != ast.null_node) {
-                    if (!self.collectNodeDictEntries(se.else_body, tpt, collector)) return false;
-                }
-                return true;
-            },
-            .builtin_call => |bc| {
-                const result_type = self.chk.expr_types.get(node_idx);
-                if (result_type) |rt| { if (isTypeParamType(tpt, rt)) return false; }
-                for (bc.args) |arg| {
-                    if (arg != ast.null_node) {
-                        if (!self.collectNodeDictEntries(arg, tpt, collector)) return false;
-                    }
-                }
-                return true;
-            },
-            // Safe expressions: recurse into children
             .if_expr => |ie| {
-                return self.collectNodeDictEntries(ie.condition, tpt, collector) and
-                    self.collectNodeDictEntries(ie.then_branch, tpt, collector) and
-                    self.collectNodeDictEntries(ie.else_branch, tpt, collector);
+                self.scanNodeForMethodCalls(ie.condition, param_names, fn_params, collector);
+                self.scanNodeForMethodCalls(ie.then_branch, param_names, fn_params, collector);
+                self.scanNodeForMethodCalls(ie.else_branch, param_names, fn_params, collector);
             },
             .block_expr => |be| {
-                for (be.stmts) |stmt| {
-                    if (!self.collectNodeDictEntries(stmt, tpt, collector)) return false;
-                }
-                return self.collectNodeDictEntries(be.expr, tpt, collector);
+                for (be.stmts) |stmt| self.scanNodeForMethodCalls(stmt, param_names, fn_params, collector);
+                self.scanNodeForMethodCalls(be.expr, param_names, fn_params, collector);
             },
-            .unary => |u| return self.collectNodeDictEntries(u.operand, tpt, collector),
-            .index => |ix| return self.collectNodeDictEntries(ix.base, tpt, collector) and self.collectNodeDictEntries(ix.idx, tpt, collector),
+            .unary => |u| self.scanNodeForMethodCalls(u.operand, param_names, fn_params, collector),
+            .index => |ix| {
+                self.scanNodeForMethodCalls(ix.base, param_names, fn_params, collector);
+                self.scanNodeForMethodCalls(ix.idx, param_names, fn_params, collector);
+            },
             .slice_expr => |se| {
-                return self.collectNodeDictEntries(se.base, tpt, collector) and
-                    self.collectNodeDictEntries(se.start, tpt, collector) and
-                    self.collectNodeDictEntries(se.end, tpt, collector);
+                self.scanNodeForMethodCalls(se.base, param_names, fn_params, collector);
+                self.scanNodeForMethodCalls(se.start, param_names, fn_params, collector);
+                self.scanNodeForMethodCalls(se.end, param_names, fn_params, collector);
             },
-            .field_access => |fa| return self.collectNodeDictEntries(fa.base, tpt, collector),
-            .paren => |p| return self.collectNodeDictEntries(p.inner, tpt, collector),
+            .field_access => |fa| self.scanNodeForMethodCalls(fa.base, param_names, fn_params, collector),
+            .paren => |p| self.scanNodeForMethodCalls(p.inner, param_names, fn_params, collector),
             .struct_init => |si| {
-                for (si.fields) |f| {
-                    if (!self.collectNodeDictEntries(f.value, tpt, collector)) return false;
-                }
-                return true;
+                for (si.fields) |f| self.scanNodeForMethodCalls(f.value, param_names, fn_params, collector);
             },
             .new_expr => |ne| {
-                for (ne.fields) |f| {
-                    if (!self.collectNodeDictEntries(f.value, tpt, collector)) return false;
-                }
-                return true;
+                for (ne.fields) |f| self.scanNodeForMethodCalls(f.value, param_names, fn_params, collector);
             },
-            .try_expr => |te| return self.collectNodeDictEntries(te.operand, tpt, collector),
-            .catch_expr => |ce| return self.collectNodeDictEntries(ce.operand, tpt, collector) and self.collectNodeDictEntries(ce.fallback, tpt, collector),
+            .try_expr => |te| self.scanNodeForMethodCalls(te.operand, param_names, fn_params, collector),
+            .catch_expr => |ce_| {
+                self.scanNodeForMethodCalls(ce_.operand, param_names, fn_params, collector);
+                self.scanNodeForMethodCalls(ce_.fallback, param_names, fn_params, collector);
+            },
             .orelse_expr => |oe| {
-                if (!self.collectNodeDictEntries(oe.operand, tpt, collector)) return false;
-                if (oe.fallback != null_node and !self.collectNodeDictEntries(oe.fallback, tpt, collector)) return false;
-                return true;
+                self.scanNodeForMethodCalls(oe.operand, param_names, fn_params, collector);
+                if (oe.fallback != null_node) self.scanNodeForMethodCalls(oe.fallback, param_names, fn_params, collector);
             },
-            .closure_expr => return false, // Tier 3: closures → not stencilable
-            .addr_of => |ao| return self.collectNodeDictEntries(ao.operand, tpt, collector),
-            .deref => |d| return self.collectNodeDictEntries(d.operand, tpt, collector),
+            .addr_of => |ao| self.scanNodeForMethodCalls(ao.operand, param_names, fn_params, collector),
+            .deref => |d| self.scanNodeForMethodCalls(d.operand, param_names, fn_params, collector),
             .array_literal => |al| {
-                for (al.elements) |elem| {
-                    if (!self.collectNodeDictEntries(elem, tpt, collector)) return false;
-                }
-                return true;
+                for (al.elements) |elem| self.scanNodeForMethodCalls(elem, param_names, fn_params, collector);
             },
             .tuple_literal => |tl| {
-                for (tl.elements) |elem| {
-                    if (!self.collectNodeDictEntries(elem, tpt, collector)) return false;
-                }
-                return true;
+                for (tl.elements) |elem| self.scanNodeForMethodCalls(elem, param_names, fn_params, collector);
             },
-            .ident, .literal, .type_expr, .error_literal, .zero_init, .bad_expr => return true,
-            .await_expr, .spawn_expr, .select_expr, .comptime_block => return false, // Tier 3
+            .string_interp => |si| {
+                for (si.segments) |seg| switch (seg) {
+                    .expr => |seg_expr| self.scanNodeForMethodCalls(seg_expr, param_names, fn_params, collector),
+                    .text => {},
+                };
+            },
+            .switch_expr => |se| {
+                self.scanNodeForMethodCalls(se.subject, param_names, fn_params, collector);
+                for (se.cases) |case| {
+                    for (case.patterns) |pat| self.scanNodeForMethodCalls(pat, param_names, fn_params, collector);
+                    self.scanNodeForMethodCalls(case.body, param_names, fn_params, collector);
+                }
+                if (se.else_body != ast.null_node) self.scanNodeForMethodCalls(se.else_body, param_names, fn_params, collector);
+            },
+            .closure_expr, .spawn_expr, .await_expr, .select_expr, .comptime_block => {},
+            .builtin_call => |bc| {
+                for (bc.args) |arg| {
+                    if (arg != ast.null_node) self.scanNodeForMethodCalls(arg, param_names, fn_params, collector);
+                }
+            },
+            .ident, .literal, .type_expr, .error_literal, .zero_init, .bad_expr => {},
         }
     }
 
-    /// Collect dict entries from a statement. Returns false for Tier 3 ops.
-    fn collectStmtDictEntries(self: *Lowerer, stmt: ast.Stmt, tpt: []const TypeIndex, collector: *std.ArrayListUnmanaged(DictEntry)) bool {
+    fn scanStmtForMethodCalls(self: *Lowerer, stmt: ast.Stmt, param_names: []const []const u8, fn_params: []const ast.Field, collector: *std.ArrayListUnmanaged(DictEntry)) void {
         switch (stmt) {
-            .expr_stmt => |es| return self.collectNodeDictEntries(es.expr, tpt, collector),
-            .return_stmt => |rs| return self.collectNodeDictEntries(rs.value, tpt, collector),
-            .var_stmt => |vs| return self.collectNodeDictEntries(vs.value, tpt, collector),
+            .expr_stmt => |es| self.scanNodeForMethodCalls(es.expr, param_names, fn_params, collector),
+            .return_stmt => |rs| self.scanNodeForMethodCalls(rs.value, param_names, fn_params, collector),
+            .var_stmt => |vs| self.scanNodeForMethodCalls(vs.value, param_names, fn_params, collector),
             .assign_stmt => |as_| {
-                // Compound assignment (+=, -=, etc.) on T → Tier 2 (dict entry)
-                if (as_.op != .assign) {
-                    const target_type = self.chk.expr_types.get(as_.target);
-                    if (target_type) |tt| {
-                        if (typeParamIndex(tpt, tt)) |pi| {
-                            // Map compound assignment token to the underlying binary op
-                            const bin_op: ?Token = switch (as_.op) {
-                                .add_assign => .add,
-                                .sub_assign => .sub,
-                                .mul_assign => .mul,
-                                .quo_assign => .quo,
-                                .rem_assign => .rem,
-                                else => null,
-                            };
-                            if (bin_op) |op| {
-                                collector.append(self.allocator, .{
-                                    .kind = .binary_op,
-                                    .op = op,
-                                    .type_param_idx = pi,
-                                }) catch return false;
-                            } else {
-                                return false; // Unsupported compound assignment → Tier 3
-                            }
+                self.scanNodeForMethodCalls(as_.target, param_names, fn_params, collector);
+                self.scanNodeForMethodCalls(as_.value, param_names, fn_params, collector);
+            },
+            .if_stmt => |is_| {
+                self.scanNodeForMethodCalls(is_.condition, param_names, fn_params, collector);
+                self.scanNodeForMethodCalls(is_.then_branch, param_names, fn_params, collector);
+                self.scanNodeForMethodCalls(is_.else_branch, param_names, fn_params, collector);
+            },
+            .while_stmt => |ws| {
+                self.scanNodeForMethodCalls(ws.condition, param_names, fn_params, collector);
+                self.scanNodeForMethodCalls(ws.body, param_names, fn_params, collector);
+                self.scanNodeForMethodCalls(ws.continue_expr, param_names, fn_params, collector);
+            },
+            .for_stmt => |fs| {
+                self.scanNodeForMethodCalls(fs.iterable, param_names, fn_params, collector);
+                self.scanNodeForMethodCalls(fs.body, param_names, fn_params, collector);
+            },
+            .block_stmt => |bs| {
+                for (bs.stmts) |s| self.scanNodeForMethodCalls(s, param_names, fn_params, collector);
+            },
+            .defer_stmt => |ds| self.scanNodeForMethodCalls(ds.expr, param_names, fn_params, collector),
+            .destructure_stmt => |ds| self.scanNodeForMethodCalls(ds.value, param_names, fn_params, collector),
+            .break_stmt, .continue_stmt, .bad_stmt => {},
+        }
+    }
+
+    /// Check if a receiver expression's type annotation refers to a type parameter.
+    /// Go reference: writer.go typIdx — tracks "derived" flag compositionally.
+    /// Here we check the AST: if the receiver is an identifier matching a function parameter
+    /// whose AST type annotation is a type parameter name, it's derived.
+    fn receiverTypeParamIdx(self: *Lowerer, receiver_node: ast.NodeIndex, param_names: []const []const u8, fn_params: []const ast.Field) ?u8 {
+        const node = self.tree.getNode(receiver_node) orelse return null;
+        const expr = node.asExpr() orelse return null;
+
+        // For identifier receivers: check if the variable is a function parameter
+        // whose AST type annotation is a type parameter name.
+        if (expr == .ident) {
+            const receiver_name = expr.ident.name;
+            // Walk AST function params (NOT IR locals) to check type annotations
+            for (fn_params) |param| {
+                if (!std.mem.eql(u8, param.name, receiver_name)) continue;
+                // Check if param's type_expr is a type parameter name identifier
+                if (param.type_expr == null_node) continue;
+                const type_node = self.tree.getNode(param.type_expr) orelse continue;
+                const type_expr = type_node.asExpr() orelse continue;
+                // Direct type param: `x: T` where T is a type parameter
+                if (type_expr == .ident) {
+                    for (param_names, 0..) |pname, i| {
+                        if (std.mem.eql(u8, type_expr.ident.name, pname)) return @intCast(i);
+                    }
+                }
+                // Named type expr: `x: T` as type_expr node
+                if (type_expr == .type_expr and type_expr.type_expr.kind == .named) {
+                    for (param_names, 0..) |pname, i| {
+                        if (std.mem.eql(u8, type_expr.type_expr.kind.named, pname)) return @intCast(i);
+                    }
+                }
+                // Pointer to type param: `x: *T`
+                if (type_expr == .type_expr and type_expr.type_expr.kind == .pointer) {
+                    const elem_node = self.tree.getNode(type_expr.type_expr.kind.pointer) orelse continue;
+                    const elem_expr = elem_node.asExpr() orelse continue;
+                    if (elem_expr == .ident) {
+                        for (param_names, 0..) |pname, i| {
+                            if (std.mem.eql(u8, elem_expr.ident.name, pname)) return @intCast(i);
                         }
                     }
                 }
-                return self.collectNodeDictEntries(as_.target, tpt, collector) and
-                    self.collectNodeDictEntries(as_.value, tpt, collector);
-            },
-            .if_stmt => |is_| {
-                return self.collectNodeDictEntries(is_.condition, tpt, collector) and
-                    self.collectNodeDictEntries(is_.then_branch, tpt, collector) and
-                    self.collectNodeDictEntries(is_.else_branch, tpt, collector);
-            },
-            .while_stmt => |ws| {
-                return self.collectNodeDictEntries(ws.condition, tpt, collector) and
-                    self.collectNodeDictEntries(ws.body, tpt, collector) and
-                    self.collectNodeDictEntries(ws.continue_expr, tpt, collector);
-            },
-            .for_stmt => |fs| {
-                return self.collectNodeDictEntries(fs.iterable, tpt, collector) and
-                    self.collectNodeDictEntries(fs.body, tpt, collector);
-            },
-            .block_stmt => |bs| {
-                for (bs.stmts) |s| {
-                    if (!self.collectNodeDictEntries(s, tpt, collector)) return false;
-                }
-                return true;
-            },
-            .defer_stmt => |ds| return self.collectNodeDictEntries(ds.expr, tpt, collector),
-            .destructure_stmt => |ds| return self.collectNodeDictEntries(ds.value, tpt, collector),
-            .break_stmt, .continue_stmt, .bad_stmt => return true,
+                break; // Found the param, stop searching
+            }
         }
+        return null;
     }
 
     /// Shape stenciling: resolve a call target through shape aliases.
@@ -8778,14 +8656,11 @@ pub const Lowerer = struct {
             while (it.next()) |inst_info| {
                 if (!self.lowered_generics.contains(inst_info.concrete_name)) continue;
                 if (self.builder.hasFunc(inst_info.concrete_name)) continue;
-                // Also skip if already aliased to a stenciled function
-                if (self.shape_aliases.contains(inst_info.concrete_name)) continue;
                 try pending.append(self.allocator, inst_info.*);
             }
             // Process collected snapshot (safe — no iterator active)
             for (pending.items) |inst_info| {
                 if (self.builder.hasFunc(inst_info.concrete_name)) continue;
-                if (self.shape_aliases.contains(inst_info.concrete_name)) continue;
                 try self.lowerGenericFnInstance(inst_info);
                 made_progress = true;
             }
@@ -8852,84 +8727,67 @@ pub const Lowerer = struct {
             self.chk.expr_types = saved_expr_types;
         }
 
-        // Shape stenciling: after re-check populates expr_types, check if this function
-        // can be shared across types with the same shape (size, alignment, ARC kind).
-        // Three-tier: shape_only (alias), dict_stencil (shared body + fn-ptr args), not_stencilable (full mono).
-        // Reference: Go shapify() — groups *User/*Order/*Product into one *T stencil.
-        var stencil_result: StencilResult = .not_stencilable;
-        // Shape stenciling with Go-style wrapper functions.
+        // Go model: every generic with type args gets shaped + wrapper treatment.
+        // No tiering — all generics are stenciled. Dict entries determined by simple
+        // method-call-on-type-param scan (not full body walk).
         // Reference: Go cmd/compile/internal/noder/reader.go:1377-1396.
+        var dict_entries: []const DictEntry = &.{};
+        var has_stencil = false;
+        var stencil_name: []const u8 = inst_info.concrete_name;
+
         if (inst_info.type_args.len > 0) stencil_check: {
-            // Check shape analysis cache, or compute and cache
-            stencil_result = if (self.shape_analysis_cache.get(inst_info.generic_node)) |cached|
-                cached
-            else blk: {
-                const result = self.analyzeStencilability(f.body, inst_info.type_args);
-                self.shape_analysis_cache.put(inst_info.generic_node, result) catch break :stencil_check;
-                break :blk result;
-            };
+            // Scan body for method calls on type-param-derived receivers
+            dict_entries = self.scanMethodCallDictEntries(f.body, param_names, f.params);
 
-            if (stencil_result.isStencilable()) {
-                // Build shape key: "List_append$s8p" (base name with method suffix + shape)
-                var shape_key_buf = std.ArrayListUnmanaged(u8){};
-                defer shape_key_buf.deinit(self.allocator);
-                const base_end = std.mem.indexOf(u8, inst_info.concrete_name, "(") orelse inst_info.concrete_name.len;
-                shape_key_buf.appendSlice(self.allocator, inst_info.concrete_name[0..base_end]) catch break :stencil_check;
-                if (std.mem.indexOf(u8, inst_info.concrete_name, ")")) |paren_close| {
-                    if (paren_close + 1 < inst_info.concrete_name.len) {
-                        shape_key_buf.appendSlice(self.allocator, inst_info.concrete_name[paren_close + 1 ..]) catch break :stencil_check;
-                    }
-                }
-                shape_key_buf.appendSlice(self.allocator, "$") catch break :stencil_check;
-                for (inst_info.type_args, 0..) |type_arg, ti| {
-                    if (ti > 0) shape_key_buf.append(self.allocator, '_') catch break :stencil_check;
-                    const shape = types.Shape.fromType(self.type_reg, type_arg);
-                    const sk = shape.key();
-                    shape_key_buf.appendSlice(self.allocator, sk.slice()) catch break :stencil_check;
-                }
-                const shape_key = self.allocator.dupe(u8, shape_key_buf.items) catch break :stencil_check;
+            // Shape sharing only when dict entries exist — dict entries cover the
+            // type-dependent method calls, making the body safe to share across
+            // same-shape types. Without dict entries, the body may contain internal
+            // calls to other type-specific functions, so monomorphize fully.
+            if (dict_entries.len == 0) break :stencil_check;
 
-                if (self.shape_stencils.get(shape_key)) |existing_stencil_name| {
-                    // Already stenciled for this shape.
-                    if (stencil_result == .dict_stencil) {
-                        // Dict-stencil: wrapper handles redirection. Don't alias in shape_aliases
-                        // because the SSA builder would bypass the wrapper.
-                        self.generateDictHelpers(inst_info, stencil_result.dict_stencil) catch break :stencil_check;
-                        self.buildDictArgNames(inst_info, stencil_result.dict_stencil) catch break :stencil_check;
-                        // Generate wrapper with type substitution active so resolveTypeNode(T)
-                        // resolves to the concrete type (u64, not T).
-                        const saved_sub = self.type_substitution;
-                        self.type_substitution = sub_map;
-                        defer self.type_substitution = saved_sub;
-                        try self.generateDictWrapper(inst_info, existing_stencil_name, f);
-                    } else {
-                        // shape_only: direct alias, no wrapper needed.
-                        // SSA builder resolves this alias to redirect calls.
-                        self.shape_aliases.put(inst_info.concrete_name, existing_stencil_name) catch break :stencil_check;
-                    }
-                    return;
-                }
-
-                // First instance for this shape. Go pattern: lower the shaped body
-                // under an internal stencil name, then generate a concrete wrapper.
-                if (stencil_result == .dict_stencil) {
-                    // Dict-stenciled: use internal name for the stencil body
-                    const stencil_name = std.fmt.allocPrint(self.allocator, "__stencil_{s}", .{inst_info.concrete_name}) catch break :stencil_check;
-                    self.shape_stencils.put(shape_key, stencil_name) catch break :stencil_check;
-                    self.buildDictArgNames(inst_info, stencil_result.dict_stencil) catch break :stencil_check;
-                    // The function body below will use stencil_name (set via inst_info override)
-                    // We'll generate the concrete wrapper after the body is lowered
-                } else {
-                    // Shape-only: stencil under concrete name (no dict params needed)
-                    self.shape_stencils.put(shape_key, inst_info.concrete_name) catch break :stencil_check;
+            // Build shape key: "List_append$s8p" (base name with method suffix + shape)
+            var shape_key_buf = std.ArrayListUnmanaged(u8){};
+            defer shape_key_buf.deinit(self.allocator);
+            const base_end = std.mem.indexOf(u8, inst_info.concrete_name, "(") orelse inst_info.concrete_name.len;
+            shape_key_buf.appendSlice(self.allocator, inst_info.concrete_name[0..base_end]) catch break :stencil_check;
+            if (std.mem.indexOf(u8, inst_info.concrete_name, ")")) |paren_close| {
+                if (paren_close + 1 < inst_info.concrete_name.len) {
+                    shape_key_buf.appendSlice(self.allocator, inst_info.concrete_name[paren_close + 1 ..]) catch break :stencil_check;
                 }
             }
+            shape_key_buf.appendSlice(self.allocator, "$") catch break :stencil_check;
+            for (inst_info.type_args, 0..) |type_arg, ti| {
+                if (ti > 0) shape_key_buf.append(self.allocator, '_') catch break :stencil_check;
+                const shape = types.Shape.fromType(self.type_reg, type_arg);
+                const sk = shape.key();
+                shape_key_buf.appendSlice(self.allocator, sk.slice()) catch break :stencil_check;
+            }
+            const shape_key = self.allocator.dupe(u8, shape_key_buf.items) catch break :stencil_check;
+
+            if (self.shape_stencils.get(shape_key)) |existing_stencil_name| {
+                // Already stenciled for this shape — generate wrapper only.
+                self.generateDictHelpers(inst_info, dict_entries) catch break :stencil_check;
+                self.buildDictArgNames(inst_info, dict_entries) catch break :stencil_check;
+                // Generate wrapper with type substitution active so resolveTypeNode(T)
+                // resolves to the concrete type.
+                const saved_sub = self.type_substitution;
+                self.type_substitution = sub_map;
+                defer self.type_substitution = saved_sub;
+                try self.generateDictWrapper(inst_info, existing_stencil_name, f, true);
+                return;
+            }
+
+            // First instance for this shape — lower the body under stencil name.
+            has_stencil = true;
+            stencil_name = std.fmt.allocPrint(self.allocator, "__stencil_{s}", .{inst_info.concrete_name}) catch break :stencil_check;
+            self.shape_stencils.put(shape_key, stencil_name) catch break :stencil_check;
+            self.buildDictArgNames(inst_info, dict_entries) catch break :stencil_check;
         }
 
         // Generate dict helper functions BEFORE starting the function body
         // (can't nest startFunc/endFunc calls)
-        if (stencil_result == .dict_stencil) {
-            try self.generateDictHelpers(inst_info, stencil_result.dict_stencil);
+        if (dict_entries.len > 0) {
+            try self.generateDictHelpers(inst_info, dict_entries);
         }
 
         // Lower the concrete function body with type substitution active
@@ -8939,14 +8797,9 @@ pub const Lowerer = struct {
         const return_type = self.resolveTypeNode(f.return_type);
         const uses_sret = self.needsSret(return_type);
         const wasm_return_type = if (uses_sret) TypeRegistry.VOID else return_type;
-        // Dict-stenciled canonical instance: use internal stencil name for the body.
-        // A concrete wrapper will be generated after to tail-call this body.
-        // Go pattern: shaped function has internal name, wrapper has concrete name.
-        const func_name = if (stencil_result == .dict_stencil)
-            std.fmt.allocPrint(self.allocator, "__stencil_{s}", .{inst_info.concrete_name}) catch inst_info.concrete_name
-        else
-            inst_info.concrete_name;
-        self.builder.startFunc(func_name, TypeRegistry.VOID, wasm_return_type, f.span);
+        // Go pattern: shaped function has internal name when dict entries exist,
+        // concrete name otherwise. Wrapper bridges the gap.
+        self.builder.startFunc(stencil_name, TypeRegistry.VOID, wasm_return_type, f.span);
         if (self.builder.func()) |fb| {
             if (uses_sret) fb.sret_return_type = return_type;
             fb.is_destructor = std.mem.eql(u8, f.name, "deinit");
@@ -8958,8 +8811,7 @@ pub const Lowerer = struct {
                 _ = try fb.addParam("__sret", TypeRegistry.I64, 8);
             }
             // Dict-stenciled functions: add extra fn-ptr params BEFORE regular params
-            if (stencil_result == .dict_stencil) {
-                const dict_entries = stencil_result.dict_stencil;
+            if (dict_entries.len > 0) {
                 const dict_params = try self.allocator.alloc(ir.LocalIdx, dict_entries.len);
                 for (dict_entries, 0..) |_, di| {
                     const param_name = std.fmt.allocPrint(self.allocator, "__dict_{d}", .{di}) catch "__dict";
@@ -8976,11 +8828,11 @@ pub const Lowerer = struct {
                 const is_substituted = if (self.type_substitution) |sub| blk: {
                     if (param.type_expr != null_node) {
                         if (self.tree.getNode(param.type_expr)) |node| {
-                            if (node.asExpr()) |expr| {
-                                if (expr == .ident) {
-                                    break :blk sub.contains(expr.ident.name);
-                                } else if (expr == .type_expr and expr.type_expr.kind == .named) {
-                                    break :blk sub.contains(expr.type_expr.kind.named);
+                            if (node.asExpr()) |expr_node| {
+                                if (expr_node == .ident) {
+                                    break :blk sub.contains(expr_node.ident.name);
+                                } else if (expr_node == .type_expr and expr_node.type_expr.kind == .named) {
+                                    break :blk sub.contains(expr_node.type_expr.kind.named);
                                 }
                             }
                         }
@@ -9010,20 +8862,20 @@ pub const Lowerer = struct {
         try self.builder.endFunc();
 
         // Go pattern: generate concrete wrapper for dict-stenciled canonical instance.
-        // The stencil body was lowered under "__stencil_ConcreteNam". Now generate
+        // The stencil body was lowered under "__stencil_ConcreteName". Now generate
         // a wrapper under the concrete name that tail-calls the stencil with dict args.
-        if (stencil_result == .dict_stencil) {
-            const stencil_name = std.fmt.allocPrint(self.allocator, "__stencil_{s}", .{inst_info.concrete_name}) catch return;
-            try self.generateDictWrapper(inst_info, stencil_name, f);
+        if (has_stencil and dict_entries.len > 0) {
+            try self.generateDictWrapper(inst_info, stencil_name, f, true);
         }
     }
 
-    /// Generate a wrapper function that tail-calls a dict-stenciled function body.
+    /// Generate a wrapper function that tail-calls a shaped function body.
     /// Go pattern (reader.go:1377-1396): each concrete instantiation gets a wrapper
-    /// that prepends its specific dictionary args and tail-calls the shaped function.
+    /// that prepends its specific dictionary args (if any) and tail-calls the shaped function.
     /// Wrapper signature matches the original concrete function (no dict params).
     /// Wrapper body: load dict fn-ptr addresses, prepend before original args, call stencil.
-    fn generateDictWrapper(self: *Lowerer, inst_info: checker.GenericInstInfo, stencil_name: []const u8, f: ast.FnDecl) !void {
+    fn generateDictWrapper(self: *Lowerer, inst_info: checker.GenericInstInfo, stencil_name: []const u8, f: ast.FnDecl, has_dict: bool) !void {
+        _ = has_dict;
         const fb_outer = self.current_func;
         const saved_cleanup = self.cleanup_stack.items;
 
@@ -9109,89 +8961,27 @@ pub const Lowerer = struct {
 
     /// Generate the dict helper name for a (concrete_type, operation) pair.
     /// E.g., i64 + .binary_op(.eql) → "__cot_dict_i64_eq"
+    /// Generate the dict helper name for a (concrete_type, method) pair.
+    /// Go reference: writerDict.typeParamMethodExprs — method name + type name.
     fn dictHelperName(self: *Lowerer, concrete_type: TypeIndex, entry: DictEntry) ![]const u8 {
         const type_name = self.type_reg.typeName(concrete_type);
-        return switch (entry.kind) {
-            .binary_op => std.fmt.allocPrint(self.allocator, "__cot_dict_{s}_{s}", .{
-                type_name,
-                if (entry.op) |op| dictOpName(op) else "unknown",
-            }),
-            .method_call => std.fmt.allocPrint(self.allocator, "__cot_dict_{s}_{s}", .{
-                type_name,
-                entry.method_name orelse "unknown",
-            }),
-        };
+        return std.fmt.allocPrint(self.allocator, "__cot_dict_{s}_{s}", .{
+            type_name,
+            entry.method_name,
+        });
     }
 
-    /// Sanitized operator names for dict helper function naming.
-    fn dictOpName(op: Token) []const u8 {
-        return switch (op) {
-            .eql => "eq",
-            .neq => "ne",
-            .lss => "lt",
-            .gtr => "gt",
-            .leq => "le",
-            .geq => "ge",
-            .add => "add",
-            .sub => "sub",
-            .mul => "mul",
-            .quo => "div",
-            .rem => "mod",
-            else => "unknown",
-        };
-    }
-
-    /// Generate small helper functions for dictionary dispatch.
-    /// Binary ops: __cot_dict_i64_eq(a, b) -> bool { return a == b }
-    /// Method calls: __cot_dict_i64_toString(val) -> string { return i64_toString(val) }
+    /// Generate method call trampoline functions for dictionary dispatch.
+    /// Go reference: dictNameOf (reader.go:1424) populates typeParamMethodExprs
+    /// with resolved method function pointers for each concrete type.
     fn generateDictHelpers(self: *Lowerer, inst_info: checker.GenericInstInfo, dict_entries: []const DictEntry) !void {
         for (dict_entries) |entry| {
             const concrete_type = inst_info.type_args[entry.type_param_idx];
             const helper_name = try self.dictHelperName(concrete_type, entry);
-            // Dedup: skip if already generated
             if (self.generated_dict_helpers.contains(helper_name)) continue;
             try self.generated_dict_helpers.put(helper_name, {});
-
-            switch (entry.kind) {
-                .binary_op => try self.generateBinaryOpHelper(helper_name, concrete_type, entry.op.?),
-                .method_call => try self.generateMethodCallHelper(helper_name, concrete_type, entry.method_name orelse continue),
-            }
+            try self.generateMethodCallHelper(helper_name, concrete_type, entry.method_name);
         }
-    }
-
-    /// Generate a binary op helper: __cot_dict_TYPE_OP(a: T, b: T) -> result_type
-    fn generateBinaryOpHelper(self: *Lowerer, name: []const u8, concrete_type: TypeIndex, op: Token) !void {
-        // Determine return type: comparison ops → bool, arithmetic → T
-        const return_type: TypeIndex = switch (op) {
-            .eql, .neq, .lss, .gtr, .leq, .geq => TypeRegistry.BOOL,
-            else => concrete_type,
-        };
-        const span = Span.init(Pos.zero, Pos.zero);
-        self.builder.startFunc(name, TypeRegistry.VOID, return_type, span);
-        if (self.builder.func()) |fb| {
-            const param_a = try fb.addParam("a", concrete_type, self.type_reg.sizeOf(concrete_type));
-            const param_b = try fb.addParam("b", concrete_type, self.type_reg.sizeOf(concrete_type));
-            const a_val = try fb.emitLoadLocal(param_a, concrete_type, span);
-            const b_val = try fb.emitLoadLocal(param_b, concrete_type, span);
-            // Map Token to IR binary op
-            const ir_op: ir.BinaryOp = switch (op) {
-                .eql => .eq,
-                .neq => .ne,
-                .lss => .lt,
-                .gtr => .gt,
-                .leq => .le,
-                .geq => .ge,
-                .add => .add,
-                .sub => .sub,
-                .mul => .mul,
-                .quo => .div,
-                .rem => .mod,
-                else => unreachable,
-            };
-            const result = try fb.emitBinary(ir_op, a_val, b_val, return_type, span);
-            _ = try fb.emitRet(result, span);
-        }
-        try self.builder.endFunc();
     }
 
     /// Generate a method call trampoline: __cot_dict_TYPE_METHOD(params...) -> RetType
@@ -9506,9 +9296,9 @@ pub const Lowerer = struct {
                         };
                         if (is_match) {
                             for (entries, 0..) |entry, di| {
-                                if (entry.kind == .method_call) {
-                                    if (entry.method_name) |mn| {
-                                        if (std.mem.eql(u8, mn, fa.field)) {
+                                {
+                                    const mn = entry.method_name;
+                                    if (std.mem.eql(u8, mn, fa.field)) {
                                             const fn_ptr = try fb.emitLoadLocal(params[di], TypeRegistry.I64, call.span);
                                             if (self.needsSret(return_type)) {
                                                 const ret_size = self.type_reg.sizeOf(return_type);
@@ -9545,7 +9335,6 @@ pub const Lowerer = struct {
                                             return try fb.emitCallIndirect(fn_ptr, args.items, return_type, call.span);
                                         }
                                     }
-                                }
                             }
                             break;
                         }
@@ -9561,8 +9350,7 @@ pub const Lowerer = struct {
             try self.resolveMethodName(receiver_type_name, method_info.func_name, method_info.source_tree);
 
         // Shape stenciling: call sites use the concrete name.
-        // For dict_stencil: concrete name → wrapper → stencil with dict args.
-        // For shape_only: SSA builder resolves aliases.
+        // Concrete name → wrapper → stencil (with dict args if needed).
         const method_link_name = method_link_name_raw;
 
         // SRET for method calls returning large types — reuse shared SRET local
