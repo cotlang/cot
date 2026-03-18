@@ -475,7 +475,9 @@ fn generateReallocRaw(
     const ptr = params[0];
     const size = params[1];
 
-    const realloc_idx = func_index_map.get("realloc") orelse func_index_map.get("_realloc") orelse 0;
+    // Call libc realloc directly (NOT our ARC realloc wrapper which manipulates headers).
+    // "c_realloc" is registered as an external libc symbol in driver.zig.
+    const realloc_idx = func_index_map.get("c_realloc") orelse 0;
     var realloc_sig = clif.Signature.init(.system_v);
     try realloc_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
     try realloc_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));

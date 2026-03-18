@@ -11,13 +11,18 @@ This is by design so Cot looks like TypeScript to users. **NEVER change `Type` t
 
 ---
 
-## 🚨🚨🚨 NEVER USE DESTRUCTIVE GIT COMMANDS ON UNCOMMITTED WORK 🚨🚨🚨
+## 🚨🚨🚨 GIT: ONLY COMMIT AND PUSH — ALL OTHER GIT COMMANDS ARE PROHIBITED 🚨🚨🚨
 
-**DOZENS OF HOURS of work have been lost from Claude running `git checkout <file>` or `git restore <file>` to discard uncommitted changes.** This is the single most destructive behavior. NEVER do it.
+**Claude is PROHIBITED from using ANY git commands other than `git add`, `git commit`, `git push`, `git status`, `git log`, and `git diff`.** No exceptions. No stash, no checkout, no restore, no reset, no rebase, no cherry-pick, no worktree. Claude ALWAYS breaks code when using these commands.
 
-- **NEVER** run `git checkout -- <file>` or `git checkout HEAD -- <file>` on modified files
-- **NEVER** run `git restore <file>` on modified files
-- **To save work temporarily:** `git stash` (can be recovered with `git stash pop`)
+- **NEVER** `git stash` — causes merge conflicts that corrupt files
+- **NEVER** `git checkout` — destroys uncommitted work
+- **NEVER** `git restore` — destroys uncommitted work
+- **NEVER** `git reset` — destroys history
+- **NEVER** `git rebase` — corrupts history
+- **NEVER** `git worktree` — leaves orphaned state
+- **To undo changes:** Edit the file manually with the Edit tool
+- **To compare with old code:** Use `git diff` or `git show` to READ, never to modify
 - **To compare with clean state:** `git stash && <test> && git stash pop`
 - **To abandon changes:** ASK THE USER FIRST — never decide unilaterally
 - Uncommitted changes often contain hours of debugging, partial fixes, and diagnostic code

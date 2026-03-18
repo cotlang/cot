@@ -1293,8 +1293,10 @@ pub const Driver = struct {
         // Compiled functions: arc → io → print → test.
         // Uncompiled runtime stubs and libc externals come after.
         const runtime_func_names = [_][]const u8{
-            // ARC runtime (arc_native.generate order)
-            "alloc",         "dealloc",        "retain",        "release",
+            // ARC runtime (arc_native.generate order — order MUST match generate())
+            "alloc",         "dealloc",
+            "alloc_raw",     "realloc_raw",   "dealloc_raw",
+            "retain",        "release",
             "realloc",       "string_concat",  "string_eq",
             "unowned_retain", "unowned_release", "unowned_load_strong",
             "weak_form_reference", "weak_retain", "weak_release", "weak_load_strong",
@@ -1335,8 +1337,6 @@ pub const Driver = struct {
             "sched_spawn",   "sched_shutdown", "sched_get_num_workers",
             "sched_init",    "sched_worker_spawn", "sched_worker_loop",
             "sched_join_workers", "sched_select",
-            // Raw allocation (no ARC header) — for List/Map backing buffers
-            "alloc_raw",     "realloc_raw",   "dealloc_raw",
             // Signal handler runtime (signal_native.generate order)
             "__cot_signal_handler", "__cot_install_signals", "__cot_print_backtrace",
             // Test runtime (test_native.generate order)
@@ -1346,7 +1346,7 @@ pub const Driver = struct {
             // "memcpy" is here because the Cot signature (dst,src,len)→void is
             // ABI-compatible with libc memcpy(dst,src,n)→void* (return ignored).
             "snprintf",
-            "write",         "malloc",         "free",          "memset",
+            "write",         "malloc",         "free",          "c_realloc", "memset",
             "memcmp",        "memcpy",         "read",          "close",
             "__open",        "lseek",          "_exit",         "gettimeofday",
             "getentropy",    "isatty",         "strlen",        "__error",
