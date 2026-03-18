@@ -8846,14 +8846,11 @@ pub const Lowerer = struct {
         // Three-tier: shape_only (alias), dict_stencil (shared body + fn-ptr args), not_stencilable (full mono).
         // Reference: Go shapify() — groups *User/*Order/*Product into one *T stencil.
         var stencil_result: StencilResult = .not_stencilable;
-        // Shape stenciling DISABLED: dict param passing between call sites and
-        // function bodies is incomplete — call sites don't prepend dict function
-        // pointer args but function bodies expect them (Go stencil.go pattern).
-        // Disabling forces all generics to monomorphize directly with concrete
-        // type calls (no indirect dispatch). Re-enable after implementing dict
-        // arg passing at ALL call sites.
-        // Reference: Go 1.18 conservative approach — minimal stenciling initially.
-        if (false and inst_info.type_args.len > 0) stencil_check: {
+        // Shape stenciling with Go-style wrapper functions.
+        // Each concrete instantiation gets a wrapper that tail-calls the shaped
+        // function body with the correct dictionary function pointers prepended.
+        // Reference: Go cmd/compile/internal/noder/reader.go:1377-1396.
+        if (inst_info.type_args.len > 0) stencil_check: {
             // Check shape analysis cache, or compute and cache
             stencil_result = if (self.shape_analysis_cache.get(inst_info.generic_node)) |cached|
                 cached
@@ -8884,22 +8881,34 @@ pub const Lowerer = struct {
                 const shape_key = self.allocator.dupe(u8, shape_key_buf.items) catch break :stencil_check;
 
                 if (self.shape_stencils.get(shape_key)) |existing_stencil_name| {
-                    // Already stenciled for this shape — just alias, skip lowering entirely
+                    // Already stenciled for this shape.
+                    // Go pattern (reader.go:1377-1396): generate a thin wrapper that
+                    // tail-calls the canonical stencil with the correct dictionary.
                     self.shape_aliases.put(inst_info.concrete_name, existing_stencil_name) catch break :stencil_check;
-                    // For dict-stenciled functions, generate helpers AND record dict arg names
                     if (stencil_result == .dict_stencil) {
                         self.generateDictHelpers(inst_info, stencil_result.dict_stencil) catch break :stencil_check;
                         self.buildDictArgNames(inst_info, stencil_result.dict_stencil) catch break :stencil_check;
+                        // Generate wrapper: concrete_name(params...) → stencil_name(dict_args..., params...)
+                        try self.generateDictWrapper(inst_info, existing_stencil_name, f);
+                    } else {
+                        // shape_only: direct alias, no wrapper needed
+                        // The function bodies are identical — just redirect the name
                     }
-                    return; // Skip lowering — huge compile time win
+                    return;
                 }
 
-                // First instance for this shape — lower it under its concrete name,
-                // but record it as the stencil so future same-shape instances alias to it
-                self.shape_stencils.put(shape_key, inst_info.concrete_name) catch break :stencil_check;
-                // For dict-stenciled canonical instances, also record their dict arg names
+                // First instance for this shape. Go pattern: lower the shaped body
+                // under an internal stencil name, then generate a concrete wrapper.
                 if (stencil_result == .dict_stencil) {
+                    // Dict-stenciled: use internal name for the stencil body
+                    const stencil_name = std.fmt.allocPrint(self.allocator, "__stencil_{s}", .{inst_info.concrete_name}) catch break :stencil_check;
+                    self.shape_stencils.put(shape_key, stencil_name) catch break :stencil_check;
                     self.buildDictArgNames(inst_info, stencil_result.dict_stencil) catch break :stencil_check;
+                    // The function body below will use stencil_name (set via inst_info override)
+                    // We'll generate the concrete wrapper after the body is lowered
+                } else {
+                    // Shape-only: stencil under concrete name (no dict params needed)
+                    self.shape_stencils.put(shape_key, inst_info.concrete_name) catch break :stencil_check;
                 }
             }
         }
@@ -8917,7 +8926,14 @@ pub const Lowerer = struct {
         const return_type = self.resolveTypeNode(f.return_type);
         const uses_sret = self.needsSret(return_type);
         const wasm_return_type = if (uses_sret) TypeRegistry.VOID else return_type;
-        self.builder.startFunc(inst_info.concrete_name, TypeRegistry.VOID, wasm_return_type, f.span);
+        // Dict-stenciled canonical instance: use internal stencil name for the body.
+        // A concrete wrapper will be generated after to tail-call this body.
+        // Go pattern: shaped function has internal name, wrapper has concrete name.
+        const func_name = if (stencil_result == .dict_stencil)
+            std.fmt.allocPrint(self.allocator, "__stencil_{s}", .{inst_info.concrete_name}) catch inst_info.concrete_name
+        else
+            inst_info.concrete_name;
+        self.builder.startFunc(func_name, TypeRegistry.VOID, wasm_return_type, f.span);
         if (self.builder.func()) |fb| {
             if (uses_sret) fb.sret_return_type = return_type;
             fb.is_destructor = std.mem.eql(u8, f.name, "deinit");
@@ -8977,6 +8993,92 @@ pub const Lowerer = struct {
             self.current_func = null;
             self.current_dict_entries = null;
             self.current_dict_params = null;
+        }
+        try self.builder.endFunc();
+
+        // Go pattern: generate concrete wrapper for dict-stenciled canonical instance.
+        // The stencil body was lowered under "__stencil_ConcreteNam". Now generate
+        // a wrapper under the concrete name that tail-calls the stencil with dict args.
+        if (stencil_result == .dict_stencil) {
+            const stencil_name = std.fmt.allocPrint(self.allocator, "__stencil_{s}", .{inst_info.concrete_name}) catch return;
+            try self.generateDictWrapper(inst_info, stencil_name, f);
+        }
+    }
+
+    /// Generate a wrapper function that tail-calls a dict-stenciled function body.
+    /// Go pattern (reader.go:1377-1396): each concrete instantiation gets a wrapper
+    /// that prepends its specific dictionary args and tail-calls the shaped function.
+    /// Wrapper signature matches the original concrete function (no dict params).
+    /// Wrapper body: load dict fn-ptr addresses, prepend before original args, call stencil.
+    fn generateDictWrapper(self: *Lowerer, inst_info: checker.GenericInstInfo, stencil_name: []const u8, f: ast.FnDecl) !void {
+        const fb_outer = self.current_func;
+        const saved_cleanup = self.cleanup_stack.items;
+
+        const return_type = self.resolveTypeNode(f.return_type);
+        const uses_sret = self.needsSret(return_type);
+        const wasm_return_type = if (uses_sret) TypeRegistry.VOID else return_type;
+
+        self.builder.startFunc(inst_info.concrete_name, TypeRegistry.VOID, wasm_return_type, f.span);
+        if (self.builder.func()) |fb| {
+            self.current_func = fb;
+            self.cleanup_stack.clear();
+            if (uses_sret) {
+                _ = try fb.addParam("__sret", TypeRegistry.I64, 8);
+            }
+            // Add original params (no dict params — wrapper has concrete signature)
+            for (f.params) |param| {
+                var param_type = self.resolveTypeNode(param.type_expr);
+                param_type = self.chk.safeWrapType(param_type) catch param_type;
+                _ = try fb.addParam(param.name, param_type, self.type_reg.sizeOf(param_type));
+            }
+
+            // Build call args: dict fn-ptrs first, then original params
+            var call_args = std.ArrayListUnmanaged(ir.NodeIndex){};
+            defer call_args.deinit(self.allocator);
+
+            // Prepend dict function pointer addresses
+            if (self.dict_arg_names.get(inst_info.concrete_name)) |helpers| {
+                for (helpers) |helper_name| {
+                    const fn_addr = try fb.emitFuncAddr(helper_name, TypeRegistry.I64, f.span);
+                    try call_args.append(self.allocator, fn_addr);
+                }
+            }
+
+            // Append SRET pointer if needed
+            if (uses_sret) {
+                const sret_val = try fb.emitLoadLocal(0, TypeRegistry.I64, f.span); // __sret param
+                try call_args.append(self.allocator, sret_val);
+            }
+
+            // Forward all original params as-is (same types as stencil expects).
+            // The wrapper and stencil have identical param types — the only
+            // difference is the dict params prepended at the front.
+            // Don't decompose — just load each local and pass through.
+            const param_start: ir.LocalIdx = if (uses_sret) 1 else 0;
+            for (f.params, 0..) |param, pi| {
+                _ = param;
+                const local_idx: ir.LocalIdx = param_start + @as(ir.LocalIdx, @intCast(pi));
+                const local_type = fb.locals.items[local_idx].type_idx;
+                const val = try fb.emitLoadLocal(local_idx, local_type, f.span);
+                try call_args.append(self.allocator, val);
+            }
+
+            // Tail-call the stencil function
+            if (uses_sret) {
+                _ = try fb.emitCall(stencil_name, call_args.items, false, TypeRegistry.VOID, f.span);
+                const sret_local: ir.LocalIdx = 0;
+                const ret_val = try fb.emitLoadLocal(sret_local, return_type, f.span);
+                _ = try fb.emitRet(ret_val, f.span);
+            } else if (return_type == TypeRegistry.VOID) {
+                _ = try fb.emitCall(stencil_name, call_args.items, false, TypeRegistry.VOID, f.span);
+                _ = try fb.emitRet(null, f.span);
+            } else {
+                const result = try fb.emitCall(stencil_name, call_args.items, false, return_type, f.span);
+                _ = try fb.emitRet(result, f.span);
+            }
+
+            self.current_func = fb_outer;
+            self.cleanup_stack.items = saved_cleanup;
         }
         try self.builder.endFunc();
     }
