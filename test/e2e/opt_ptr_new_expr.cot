@@ -1,0 +1,22 @@
+// Test: storing ?*T field in new expr — verifies tag + pointer are both stored
+@safe
+
+struct Node {
+    parent: ?*Node,
+    value: i64,
+}
+
+fn makeChild(parent: ?*Node, val: i64) *Node {
+    return new Node { parent: parent, value: val }
+}
+
+test "optional ptr in new expr" {
+    var root = new Node { parent: null, value: 1 }
+    var child = makeChild(root, 2)
+    @assertEq(child.value, 2)
+    if (child.parent) |p| {
+        @assertEq(p.value, 1)
+    } else {
+        @assert(false)
+    }
+}
