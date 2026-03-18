@@ -5,6 +5,38 @@
 
 ---
 
+## 🚨 CRITICAL FINDING: `analyzeStencilability` Does Not Exist in Go
+
+**Cot invented `analyzeStencilability` — a function that walks the AST body to classify generic functions into tiers (shape_only / dict_stencil / not_stencilable). This function does not exist in Go. It is the root cause of all stenciling bugs.**
+
+Go does NOT analyze function bodies to decide whether to stencil. Go's approach:
+
+1. **EVERY** generic function gets shaped + dictionary + wrapper treatment. No classification.
+2. Dictionary entries are determined during **type encoding** (`writer.go:typIdx`), not by walking the function body.
+3. The `derived` flag propagates compositionally through the type system — a type is derived iff it structurally contains a type parameter. This is tracked during type checking, not during lowering.
+4. There is no "shape_only" vs "dict_stencil" distinction. Every shaped function receives a dictionary. The dictionary may simply be empty if no type-dependent operations exist.
+
+### What Cot Invented (Not In Go)
+
+| Cot Construct | Go Equivalent |
+|---------------|---------------|
+| `analyzeStencilability()` | **Does not exist** — every generic gets dict+shape+wrapper |
+| `StencilResult { shape_only, dict_stencil, not_stencilable }` | **Does not exist** — no tiering |
+| `collectExprDictEntries()` / `collectNodeDictEntries()` | **Does not exist** — dict entries come from type encoding |
+| `typeParamIndex(tpt, resolved_type)` | **Does not exist** — Go uses `w.derived` flag on types |
+| `isTypeParamType()` | **Does not exist** |
+| `shape_analysis_cache` | **Does not exist** — no per-body analysis to cache |
+
+### What Must Change
+
+1. **Delete `analyzeStencilability` and all its helpers** (`collectExprDictEntries`, `collectStmtDictEntries`, `collectNodeDictEntries`, `typeParamIndex`, `isTypeParamType`)
+2. **Delete `StencilResult` enum** — every generic gets the same treatment
+3. **Every generic instantiation** gets: shaped function (with dict param) + wrapper (original sig, tail-calls shaped)
+4. **Dictionary entries** are determined by the type system (derived type tracking during type encoding/checking), not by walking the function body
+5. **Port Go's `w.derived` / `typIdx` pattern** to Cot's checker — mark types as derived during type resolution when they contain type parameters
+
+---
+
 ## Go's Architecture (Reference)
 
 Go uses a **three-tier system** for generic code generation:
@@ -359,21 +391,22 @@ Shape_only should also use wrappers instead of SSA aliases (see Gap 6).
 
 ## Summary: Priority Fixes
 
-| Priority | Gap | Description | Effort |
-|----------|-----|-------------|--------|
-| **P0** | Gap 1 | Derived type tracking (false positive fix) | Medium — add `derived_exprs` map, populate during analysis |
-| **P1** | Gap 6 | Shape_only wrappers (remove SSA aliases) | Small — generate identity wrappers for shape_only |
-| **P2** | Gap 5 | Shape key precision (LinkString vs size+kind) | Small — improve Shape.key() |
-| **P3** | Gap 4 | Tail calls in wrappers | Small — use `return_call` when available |
-| **P4** | Gap 2 | Unified dictionary struct | Large — architectural change, defer to when needed |
-| **P5** | Gap 3 | Dict position (after receiver) | Small but requires coordinated change |
-| **P6** | Gap 8 | Shape_only wrapper generation | Small — tied to Gap 6 |
+| Priority | Description | Effort |
+|----------|-------------|--------|
+| **P0** | **Delete `analyzeStencilability` and tiering system.** Port Go's model: every generic gets shaped+dict+wrapper. No body analysis. | Medium |
+| **P1** | **Port Go's derived type tracking** (`w.derived` / `typIdx`). Types containing type params are "derived". Dict entries determined by type system, not body walk. | Medium |
+| **P2** | **All stencils get wrappers.** Delete `shape_aliases` from SSA builder. No more shape_only vs dict_stencil distinction. | Small |
+| **P3** | Shape key precision (LinkString vs size+kind) | Small |
+| **P4** | Tail calls in wrappers | Small |
+| **P5** | Unified dictionary struct (single `*[N]uintptr` vs individual params) | Large — defer |
 
-### Immediate Action: Fix Gap 1
+### Immediate Action
 
-The `analyzeStencilability` false positive is the **only blocking bug**. All other gaps are either:
-- Working correctly with a different-but-valid approach (Gaps 2, 3, 7)
-- Performance optimizations (Gaps 4, 5)
-- Correctness issues only triggered by shape_only (Gap 6, 8)
+The entire `analyzeStencilability` system is an invention that doesn't exist in Go. The correct port is:
 
-Once Gap 1 is fixed with proper derived type tracking, re-enable stenciling and test against selfcot.
+1. Delete `analyzeStencilability`, `collectExprDictEntries`, `collectStmtDictEntries`, `collectNodeDictEntries`, `typeParamIndex`, `isTypeParamType`, `StencilResult`, `shape_analysis_cache`
+2. Port Go's `typIdx` derived type tracking to the checker — mark types as derived when they contain type parameters
+3. Every generic instantiation: generate shaped function (dict params from derived types) + wrapper (original sig, loads dict, tail-calls shaped)
+4. Dict entries come from the type system (which operations involve derived types), not from walking the body
+5. Delete `shape_aliases` — all stenciled functions use wrappers, no SSA-level redirection
+6. Re-enable and test against selfcot
