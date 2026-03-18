@@ -8847,10 +8847,12 @@ pub const Lowerer = struct {
         // Reference: Go shapify() — groups *User/*Order/*Product into one *T stencil.
         var stencil_result: StencilResult = .not_stencilable;
         // Shape stenciling with Go-style wrapper functions.
-        // Each concrete instantiation gets a wrapper that tail-calls the shaped
-        // function body with the correct dictionary function pointers prepended.
+        // DISABLED: dict dispatch inside stencil body passes string values to
+        // hash/eq helpers that expect *string (@safe auto-pointer). The wrapper
+        // functions work correctly but the dict indirect calls need @safe auto-ref
+        // matching the normal method call path. Re-enable after fixing dict dispatch.
         // Reference: Go cmd/compile/internal/noder/reader.go:1377-1396.
-        if (inst_info.type_args.len > 0) stencil_check: {
+        if (false and inst_info.type_args.len > 0) stencil_check: {
             // Check shape analysis cache, or compute and cache
             stencil_result = if (self.shape_analysis_cache.get(inst_info.generic_node)) |cached|
                 cached
@@ -9507,6 +9509,27 @@ pub const Lowerer = struct {
                                                 try sret_args2.appendSlice(self.allocator, args.items);
                                                 _ = try fb.emitCallIndirect(fn_ptr, sret_args2.items, TypeRegistry.VOID, call.span);
                                                 return try fb.emitLoadLocal(sret_local, return_type, call.span);
+                                            }
+                                            // @safe auto-ref: the dict helper may expect *T
+                                            // (from @safe method signature) but args contain T (value).
+                                            // Auto-ref the receiver if needed, matching normal call path.
+                                            if (self.chk.safe_mode and args.items.len > 0) {
+                                                const recv_type = self.inferExprType(fa.base);
+                                                const recv_info = self.type_reg.get(recv_type);
+                                                if (recv_info != .pointer) {
+                                                    // Receiver is value type — helper expects *T. Take address.
+                                                    const ptr_type = self.type_reg.makePointer(recv_type) catch TypeRegistry.I64;
+                                                    const recv_node = self.tree.getNode(fa.base);
+                                                    if (recv_node) |rn| {
+                                                        if (rn.asExpr()) |re| {
+                                                            if (re == .ident) {
+                                                                if (fb.lookupLocal(re.ident.name)) |local_idx| {
+                                                                    args.items[0] = try fb.emitAddrLocal(local_idx, ptr_type, call.span);
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
                                             }
                                             return try fb.emitCallIndirect(fn_ptr, args.items, return_type, call.span);
                                         }
