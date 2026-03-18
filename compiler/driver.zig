@@ -1320,7 +1320,7 @@ pub const Driver = struct {
             "sched_init",    "sched_worker_spawn", "sched_worker_loop",
             "sched_join_workers", "sched_select",
             // Signal handler runtime (signal_native.generate order)
-            "__cot_signal_handler", "__cot_install_signals", "__cot_print_backtrace",
+            "__cot_print_hex", "__cot_signal_handler", "__cot_install_signals", "__cot_print_backtrace",
             // Test runtime (test_native.generate order)
             "__test_begin",  "__test_print_name", "__test_pass",
             "__test_fail",   "__test_summary",    "__test_store_fail_values",
