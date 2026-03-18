@@ -1069,7 +1069,21 @@ fn generateGrowSlice(
         .signature = memcpy_sig_ref,
         .colocated = false,
     });
-    _ = try ins.call(memcpy_ref, &[_]clif.Value{ new_ptr, old_ptr, old_size });
+    // Go growslice (slice.go:285): if old.array != nil { memmove(...) }
+    // Skip memcpy if old_ptr is null (first growth from empty slice)
+    const v_zero = try ins.iconst(clif.Type.I64, 0);
+    const is_null = try ins.icmp(.eq, old_ptr, v_zero);
+    const block_copy = try builder.createBlock();
+    const block_done = try builder.createBlock();
+    _ = try ins.brif(is_null, block_done, &.{}, block_copy, &.{});
+
+    builder.switchToBlock(block_copy);
+    try builder.ensureInsertedBlock();
+    _ = try builder.ins().call(memcpy_ref, &[_]clif.Value{ new_ptr, old_ptr, old_size });
+    _ = try builder.ins().jump(block_done, &.{});
+
+    builder.switchToBlock(block_done);
+    try builder.ensureInsertedBlock();
 
     // NOTE: Do NOT free(old_ptr) — the old buffer may be stack-allocated
     // (e.g., `var arr = [1, 2, 3]` is on the stack). We can't distinguish
