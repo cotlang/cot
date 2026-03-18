@@ -9416,6 +9416,36 @@ pub const Lowerer = struct {
             method_info.func_name // generic instance: keep bare (TypeIndex makes it unique)
         else
             try self.resolveMethodName(receiver_type_name, method_info.func_name, method_info.source_tree);
+
+        // Go stenciling: if the target is a dict-stenciled function, prepend
+        // dict function pointer args. Go cmd/compile/internal/noder/stencil.go
+        // passes the "dictionary" (type info + method pointers) as the first arg.
+        // We pass individual fn-ptr args (one per dict entry) before regular args.
+        if (self.dict_arg_names.get(method_info.func_name)) |dict_names| {
+            var full_args = std.ArrayListUnmanaged(ir.NodeIndex){};
+            defer full_args.deinit(self.allocator);
+            // Prepend dict function pointer addresses
+            for (dict_names) |helper_name| {
+                const fn_addr = try fb.emitFuncAddr(helper_name, TypeRegistry.I64, call.span);
+                try full_args.append(self.allocator, fn_addr);
+            }
+            // Append regular args
+            try full_args.appendSlice(self.allocator, args.items);
+
+            if (self.needsSret(return_type)) {
+                const ret_size = self.type_reg.sizeOf(return_type);
+                const sret_local = try fb.getOrCreateSretLocal(return_type, ret_size);
+                const sret_addr = try fb.emitAddrLocal(sret_local, TypeRegistry.I64, call.span);
+                var sret_args = std.ArrayListUnmanaged(ir.NodeIndex){};
+                defer sret_args.deinit(self.allocator);
+                try sret_args.append(self.allocator, sret_addr);
+                try sret_args.appendSlice(self.allocator, full_args.items);
+                _ = try fb.emitCall(method_link_name, sret_args.items, false, TypeRegistry.VOID, call.span);
+                return try fb.emitLoadLocal(sret_local, return_type, call.span);
+            }
+            return try fb.emitCall(method_link_name, full_args.items, false, return_type, call.span);
+        }
+
         // SRET for method calls returning large types — reuse shared SRET local
         if (self.needsSret(return_type)) {
             const ret_size = self.type_reg.sizeOf(return_type);
