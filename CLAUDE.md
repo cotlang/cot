@@ -111,7 +111,7 @@ zig build
 /usr/bin/time -l /tmp/selfcot build self/parse/scanner.cot -o /tmp/out.wasm
 
 # Compare with dev compiler for the same file (baseline)
-/usr/bin/time -l ./zig-out/bin/cot build self/parse/scanner.cot --target=wasm32 -o /tmp/out_zig.wasm
+/usr/bin/time -l ./zig-out/bin/cot build self/parse/scanner.cot --target=wasm -o /tmp/out_zig.wasm
 ```
 
 **Key facts:**
@@ -186,7 +186,7 @@ Native and Wasm targets use separate backend paths from SSA onwards.
 
 ```
 Cot Source → Scanner → Parser → Checker → IR → SSA
-  ├── --target=wasm32 → lower_wasm.zig → wasm/ → .wasm file
+  ├── --target=wasm → lower_wasm.zig → wasm/ → .wasm file
   └── --target=native (default) → ssa_to_clif.zig → ir/clif/ → machinst/ → isa/ → emit → .o → linker → executable
 ```
 
@@ -254,12 +254,12 @@ Two categories:
 ```bash
 zig build test                                                        # Compiler internals (run once)
 ./zig-out/bin/cot test test/e2e/features.cot                          # Primary: 350 feature tests, native
-./zig-out/bin/cot test test/e2e/features.cot --target=wasm32          # Primary: same tests, wasm via wasmtime
+./zig-out/bin/cot test test/e2e/features.cot --target=wasm          # Primary: same tests, wasm via wasmtime
 ./zig-out/bin/cot test test/cases/<category>.cot                      # Targeted: specific category
 ./test/run_all.sh                                                     # Full suite (~1,670 tests across 70 files)
 ```
 
-**`cot test --target=wasm32`** runs Wasm binaries via `wasmtime` (must be installed). Use this to verify Wasm codegen — bugs often manifest on one target but not the other.
+**`cot test --target=wasm`** runs Wasm binaries via `wasmtime` (must be installed). Use this to verify Wasm codegen — bugs often manifest on one target but not the other. Targets: `--target=wasm` (WASI/wasmtime), `--target=js` (browser). Aliases `wasm32`, `wasm32-wasi` still accepted.
 
 **Troubleshooting tip:** When a feature works on native but fails on wasm (or vice versa), test both targets to isolate whether the bug is in the shared frontend or in a target-specific backend.
 
@@ -274,7 +274,7 @@ zig build test                                                        # Compiler
 - See `claude/TESTING.md` for full details
 
 **Every new feature must:**
-1. Work on Wasm (`--target=wasm32`)
+1. Work on Wasm (`--target=wasm`)
 2. Work on native (default target)
 3. Have E2E test cases (both Wasm and native)
 4. Copy the reference implementation
@@ -306,7 +306,7 @@ try list.append(allocator, 42);
 
 **DO:**
 - Run `zig build test` once after compiler changes, then use `./zig-out/bin/cot test` for ongoing verification
-- Use `./zig-out/bin/cot test test/e2e/features.cot` (native) and `./zig-out/bin/cot test test/e2e/features.cot --target=wasm32` (wasm) as the primary check — these catch real regressions faster than unit tests
+- Use `./zig-out/bin/cot test test/e2e/features.cot` (native) and `./zig-out/bin/cot test test/e2e/features.cot --target=wasm` (wasm) as the primary check — these catch real regressions faster than unit tests
 - After changing `compiler/lsp/`: run `zig build` to update the LSP binary
 - After changing `editors/vscode/`: rebuild + reinstall extension (see Editor Extensions & LSP section)
 - After changing either: do BOTH — `zig build` AND reinstall extension

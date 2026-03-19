@@ -198,7 +198,8 @@ cot init myapp && cd myapp   # scaffold project with cot.json + src/main.cot
 cot run                      # compile and run (reads main from cot.json)
 cot test                     # run inline tests
 cot build -o myapp           # native binary
-cot build --target=wasm32    # WebAssembly
+cot build --target=wasm      # WebAssembly (WASI — runs via wasmtime)
+cot build --target=js        # WebAssembly (browser — JS glue)
 cot check                    # type-check without compiling
 cot lint                     # warnings
 cot fmt                      # format in-place
@@ -423,7 +424,7 @@ test "error handling" ... ok
 
 ```
 Cot Source → Scanner → Parser → Checker → IR → SSA
-  ├── --target=wasm32 → lower_wasm → wasm/ → .wasm
+  ├── --target=wasm → lower_wasm → wasm/ → .wasm
   └── --target=native (default)
       → ssa_to_clif → CLIF IR → machinst → regalloc
       → isa/{aarch64,x64}/ → emit → .o → linker → executable
