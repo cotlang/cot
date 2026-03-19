@@ -1374,6 +1374,11 @@ pub const Driver = struct {
         if (func_index_map.get("cot_pipe")) |idx| {
             try func_index_map.put(self.allocator, "pipe", idx);
         }
+        // Debug mode: register DWARF resolver (linked from pre-compiled dwarf_reader.o)
+        // Index 9999 is a sentinel — the linker resolves the symbol by name, not index.
+        if (self.debug_mode) {
+            try func_index_map.put(self.allocator, "__cot_dwarf_resolve", 9999);
+        }
         if (func_index_map.get("cot_openpty")) |idx| {
             try func_index_map.put(self.allocator, "openpty", idx);
         }

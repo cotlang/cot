@@ -552,6 +552,22 @@ fn generateSignalHandler(
                 // Reload PC from regs
                 const crash_pc = try bi.load(clif.Type.I64, clif.MemFlags.DEFAULT, regs_base, PC_OFFSET);
                 _ = try bi.call(srcloc_func, &[_]clif.Value{crash_pc});
+
+                // DWARF resolution (debug mode): file:line:column from .debug_line
+                // Zig reference: std.debug reads DWARF from own binary at crash time.
+                // __cot_dwarf_resolve gracefully returns if no DWARF sections present.
+                const dwarf_idx = func_index_map.get("__cot_dwarf_resolve") orelse 0;
+                if (dwarf_idx != 0) {
+                    var dwarf_sig = clif.Signature.init(.system_v);
+                    try dwarf_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+                    const dwarf_sig_ref = try builder.importSignature(dwarf_sig);
+                    const dwarf_func = try builder.importFunction(.{
+                        .name = .{ .user = .{ .namespace = 0, .index = dwarf_idx } },
+                        .signature = dwarf_sig_ref,
+                        .colocated = false,
+                    });
+                    _ = try bi.call(dwarf_func, &[_]clif.Value{crash_pc});
+                }
             }
 
             // ---- Step 4: Backtrace ----

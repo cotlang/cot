@@ -1475,6 +1475,24 @@ fn compileAndLinkFull(
         std.debug.print("Error: Allocation failed\n", .{});
         std.process.exit(1);
     };
+
+    // Debug mode: link DWARF runtime reader for file:line:column in crash traces.
+    // Zig reference: std.debug reads DWARF from own binary at crash time.
+    // The .o is pre-compiled at `zig build` time and embedded in the compiler.
+    if (debug_mode and !compile_target.isWasm()) {
+        const dwarf_obj_bytes: []const u8 = if (compile_target.arch == .arm64)
+            @embedFile("dwarf_reader_arm64_o")
+        else
+            @embedFile("dwarf_reader_x64_o");
+
+        const dwarf_obj_path = std.fs.path.join(allocator, &.{ std.fs.path.dirname(obj_path) orelse "/tmp", "dwarf_reader.o" }) catch "/tmp/dwarf_reader.o";
+        if (std.fs.cwd().createFile(dwarf_obj_path, .{})) |file| {
+            file.writeAll(dwarf_obj_bytes) catch {};
+            file.close();
+            link_args.append(allocator, dwarf_obj_path) catch {};
+        } else |_| {}
+    }
+
     if (compile_target.os == .macos) {
         link_args.appendSlice(allocator, &.{ "-Wl,-stack_size,0x10000000", "-lSystem" }) catch {
             std.debug.print("Error: Allocation failed\n", .{});
