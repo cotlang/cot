@@ -71,6 +71,21 @@ pub const DW_LNE_end_sequence: u8 = 0x01;
 pub const DW_LNE_set_address: u8 = 0x02;
 pub const DW_LNE_define_file: u8 = 0x03;
 
+// Call Frame Information opcodes (DWARF .debug_frame)
+pub const DW_CFA_def_cfa: u8 = 0x0c;
+pub const DW_CFA_def_cfa_offset: u8 = 0x0e;
+pub const DW_CFA_def_cfa_register: u8 = 0x0d;
+pub const DW_CFA_offset: u8 = 0x80; // high 2 bits = 10, low 6 bits = register
+pub const DW_CFA_advance_loc: u8 = 0x40; // high 2 bits = 01, low 6 bits = delta/code_align
+pub const DW_CFA_advance_loc1: u8 = 0x02;
+pub const DW_CFA_advance_loc2: u8 = 0x03;
+pub const DW_CFA_nop: u8 = 0x00;
+
+// ARM64 DWARF register numbers
+pub const DWARF_REG_FP: u8 = 29; // x29
+pub const DWARF_REG_LR: u8 = 30; // x30
+pub const DWARF_REG_SP: u8 = 31; // SP
+
 // Line number program constants (from Go)
 pub const LINE_BASE: i8 = -4;
 pub const LINE_RANGE: u8 = 10;
@@ -129,6 +144,7 @@ pub const DebugFuncInfo = struct {
     code_size: u32,
     source_line: u32, // declaration line number
     locals: []const DebugLocalInfo = &.{},
+    frame_size: u32 = 0, // total stack frame size (for .debug_frame FDE)
 };
 
 pub const DwarfBuilder = struct {
@@ -136,8 +152,10 @@ pub const DwarfBuilder = struct {
     debug_line: std.ArrayListUnmanaged(u8) = .{},
     debug_abbrev: std.ArrayListUnmanaged(u8) = .{},
     debug_info: std.ArrayListUnmanaged(u8) = .{},
+    debug_frame: std.ArrayListUnmanaged(u8) = .{},
     debug_line_relocs: std.ArrayListUnmanaged(DebugReloc) = .{},
     debug_info_relocs: std.ArrayListUnmanaged(DebugReloc) = .{},
+    debug_frame_relocs: std.ArrayListUnmanaged(DebugReloc) = .{},
     source_file: []const u8 = "",
     source_text: []const u8 = "",
     comp_dir: []const u8 = "",
@@ -153,8 +171,10 @@ pub const DwarfBuilder = struct {
         self.debug_line.deinit(self.allocator);
         self.debug_abbrev.deinit(self.allocator);
         self.debug_info.deinit(self.allocator);
+        self.debug_frame.deinit(self.allocator);
         self.debug_line_relocs.deinit(self.allocator);
         self.debug_info_relocs.deinit(self.allocator);
+        self.debug_frame_relocs.deinit(self.allocator);
     }
 
     pub fn setSourceInfo(self: *DwarfBuilder, file: []const u8, text: []const u8) void {
@@ -188,6 +208,7 @@ pub const DwarfBuilder = struct {
         try self.generateDebugAbbrev();
         try self.generateDebugInfo(text_symbol_idx);
         try self.generateDebugLine(line_entries, text_symbol_idx);
+        try self.generateDebugFrame(text_symbol_idx);
     }
 
     fn generateDebugAbbrev(self: *DwarfBuilder) !void {
@@ -618,6 +639,124 @@ pub const DwarfBuilder = struct {
 
         const total_length: u32 = @intCast(buf.items.len - header_start);
         @memcpy(buf.items[total_length_offset..][0..4], &std.mem.toBytes(total_length));
+    }
+
+    /// Generate .debug_frame section with CIE + per-function FDEs for stack unwinding.
+    /// ARM64 CIE/FDE pattern following Cranelift's approach:
+    ///   CIE: code_align=4, data_align=-8, return_reg=30 (LR)
+    ///   FDE: CFA = SP + frame_size after stp, then CFA = FP after mov x29, sp
+    fn generateDebugFrame(self: *DwarfBuilder, text_symbol_idx: u32) !void {
+        const buf = &self.debug_frame;
+        const alloc = self.allocator;
+
+        // ===== CIE (Common Information Entry) =====
+        const cie_start = buf.items.len;
+
+        // Length placeholder (4 bytes)
+        const cie_length_offset = buf.items.len;
+        try buf.appendNTimes(alloc, 0, 4);
+        const cie_data_start = buf.items.len;
+
+        // CIE ID: 0xFFFFFFFF (DWARF32 marker for CIE in .debug_frame)
+        try buf.appendSlice(alloc, &[_]u8{ 0xff, 0xff, 0xff, 0xff });
+
+        // Version: 1
+        try buf.append(alloc, 1);
+
+        // Augmentation: empty string
+        try buf.append(alloc, 0);
+
+        // Code alignment factor: 4 (ARM64 instructions are 4 bytes)
+        try appendUleb128(buf, alloc, 4);
+
+        // Data alignment factor: -8 (signed, 8-byte stack slots)
+        try appendSleb128(buf, alloc, -8);
+
+        // Return address register: 30 (x30/LR on ARM64)
+        try appendUleb128(buf, alloc, DWARF_REG_LR);
+
+        // Initial instructions: CFA = SP + 0
+        try buf.append(alloc, DW_CFA_def_cfa);
+        try appendUleb128(buf, alloc, DWARF_REG_SP);
+        try appendUleb128(buf, alloc, 0);
+
+        // Pad CIE to 8-byte alignment
+        while ((buf.items.len - cie_start) % 8 != 0) {
+            try buf.append(alloc, DW_CFA_nop);
+        }
+
+        // Write CIE length
+        const cie_length: u32 = @intCast(buf.items.len - cie_data_start);
+        @memcpy(buf.items[cie_length_offset..][0..4], &std.mem.toBytes(cie_length));
+
+        // ===== FDEs (Frame Description Entry, one per function) =====
+        for (self.func_infos) |func| {
+            if (func.code_size == 0) continue;
+
+            const fde_length_offset = buf.items.len;
+            try buf.appendNTimes(alloc, 0, 4);
+            const fde_data_start = buf.items.len;
+
+            // CIE pointer: offset from the start of .debug_frame section to the CIE
+            // (In .debug_frame, this is an absolute section offset, not relative like .eh_frame)
+            const cie_pointer: u32 = @intCast(cie_start);
+            try buf.appendSlice(alloc, &std.mem.toBytes(cie_pointer));
+
+            // Initial location: function start address (needs relocation)
+            try self.debug_frame_relocs.append(alloc, .{
+                .offset = @intCast(buf.items.len),
+                .symbol_idx = text_symbol_idx,
+            });
+            // Write code_offset as the addend (linker adds text section base)
+            try buf.appendSlice(alloc, &std.mem.toBytes(@as(u64, func.code_offset)));
+
+            // Address range: function size
+            try buf.appendSlice(alloc, &std.mem.toBytes(@as(u64, func.code_size)));
+
+            // Frame size: use actual frame_size from compiled function metadata,
+            // fall back to 16 (minimum: FP + LR) if not set.
+            const frame_size: u32 = if (func.frame_size > 0) func.frame_size else 16;
+
+            // Instructions:
+            // After first instruction (stp x29, x30, [sp, #-frame_size]!):
+            //   CFA = SP + frame_size
+            //   x29 saved at CFA - frame_size (= SP + 0)
+            //   x30 saved at CFA - frame_size + 8 (= SP + 8)
+
+            // After instruction 0 (4 bytes): stp x29, x30, [sp, #-N]!
+            // Advance by 1 instruction (code_align=4, so delta=1 means 4 bytes)
+            try buf.append(alloc, DW_CFA_advance_loc | 1);
+
+            // CFA = SP + frame_size
+            try buf.append(alloc, DW_CFA_def_cfa_offset);
+            try appendUleb128(buf, alloc, frame_size);
+
+            // x29 (FP) saved at CFA - frame_size
+            // DW_CFA_offset encodes: reg in low 6 bits, offset as ULEB128 factored by |data_align|
+            // offset = frame_size / 8 (data_align = -8, so factor = frame_size/8)
+            try buf.append(alloc, DW_CFA_offset | DWARF_REG_FP);
+            try appendUleb128(buf, alloc, frame_size / 8);
+
+            // x30 (LR) saved at CFA - frame_size + 8
+            // factored offset = (frame_size - 8) / 8
+            try buf.append(alloc, DW_CFA_offset | DWARF_REG_LR);
+            try appendUleb128(buf, alloc, (frame_size - 8) / 8);
+
+            // After instruction 1 (4 more bytes): mov x29, sp
+            // CFA now tracks FP register
+            try buf.append(alloc, DW_CFA_advance_loc | 1);
+            try buf.append(alloc, DW_CFA_def_cfa_register);
+            try appendUleb128(buf, alloc, DWARF_REG_FP);
+
+            // Pad FDE to 8-byte alignment
+            while ((buf.items.len - fde_length_offset) % 8 != 0) {
+                try buf.append(alloc, DW_CFA_nop);
+            }
+
+            // Write FDE length
+            const fde_length: u32 = @intCast(buf.items.len - fde_data_start);
+            @memcpy(buf.items[fde_length_offset..][0..4], &std.mem.toBytes(fde_length));
+        }
     }
 
     fn putPcLcDelta(self: *DwarfBuilder, delta_pc: u64, delta_lc: i64) !void {

@@ -174,8 +174,10 @@ pub const MachOWriter = struct {
     debug_line_data: std.ArrayListUnmanaged(u8) = .{},
     debug_abbrev_data: std.ArrayListUnmanaged(u8) = .{},
     debug_info_data: std.ArrayListUnmanaged(u8) = .{},
+    debug_frame_data: std.ArrayListUnmanaged(u8) = .{},
     debug_line_relocs: std.ArrayListUnmanaged(DebugReloc) = .{},
     debug_info_relocs: std.ArrayListUnmanaged(DebugReloc) = .{},
+    debug_frame_relocs: std.ArrayListUnmanaged(DebugReloc) = .{},
     debug_func_infos: []const dwarf.DebugFuncInfo = &.{},
     debug_type_reg: ?*const @import("../../frontend/types.zig").TypeRegistry = null,
 
@@ -194,7 +196,8 @@ pub const MachOWriter = struct {
             &self.text_data, &self.data, &self.cstring_data, &self.string_literals,
             &self.symbols, &self.relocations, &self.data_relocations, &self.strings,
             &self.line_entries, &self.debug_line_data, &self.debug_abbrev_data,
-            &self.debug_info_data, &self.debug_line_relocs, &self.debug_info_relocs,
+            &self.debug_info_data, &self.debug_frame_data, &self.debug_line_relocs,
+            &self.debug_info_relocs, &self.debug_frame_relocs,
         };
         inline for (lists) |list| list.deinit(self.allocator);
     }
@@ -328,7 +331,7 @@ pub const MachOWriter = struct {
 
         const has_debug = self.debug_line_data.items.len > 0;
         const has_bss = self.bss_size > 0;
-        const num_sections: u32 = (if (has_debug) @as(u32, 5) else @as(u32, 2)) + (if (has_bss) @as(u32, 1) else @as(u32, 0));
+        const num_sections: u32 = (if (has_debug) @as(u32, 6) else @as(u32, 2)) + (if (has_bss) @as(u32, 1) else @as(u32, 0));
         const load_cmds_size = segment_cmd_size + (section_size * num_sections) + symtab_cmd_size;
 
         const text_offset = header_size + load_cmds_size;
@@ -342,8 +345,10 @@ pub const MachOWriter = struct {
         const debug_abbrev_size: u64 = self.debug_abbrev_data.items.len;
         const debug_info_offset = if (has_debug) alignTo(debug_abbrev_offset + debug_abbrev_size, 4) else 0;
         const debug_info_size: u64 = self.debug_info_data.items.len;
+        const debug_frame_offset = if (has_debug) alignTo(debug_info_offset + debug_info_size, 4) else 0;
+        const debug_frame_size: u64 = self.debug_frame_data.items.len;
 
-        const reloc_offset = if (has_debug) alignTo(debug_info_offset + debug_info_size, 4) else alignTo(data_offset + data_size, 4);
+        const reloc_offset = if (has_debug) alignTo(debug_frame_offset + debug_frame_size, 4) else alignTo(data_offset + data_size, 4);
         const num_text_relocs: u32 = @intCast(self.relocations.items.len + self.data_relocations.items.len);
         const text_reloc_size: u64 = @as(u64, num_text_relocs) * @sizeOf(RelocationInfo);
 
@@ -355,7 +360,11 @@ pub const MachOWriter = struct {
         const debug_info_reloc_offset = debug_line_reloc_offset + debug_line_reloc_size;
         const debug_info_reloc_size: u64 = @as(u64, num_debug_info_relocs) * @sizeOf(RelocationInfo);
 
-        const total_reloc_size = text_reloc_size + debug_line_reloc_size + debug_info_reloc_size;
+        const num_debug_frame_relocs: u32 = @intCast(self.debug_frame_relocs.items.len);
+        const debug_frame_reloc_offset = debug_info_reloc_offset + debug_info_reloc_size;
+        const debug_frame_reloc_size: u64 = @as(u64, num_debug_frame_relocs) * @sizeOf(RelocationInfo);
+
+        const total_reloc_size = text_reloc_size + debug_line_reloc_size + debug_info_reloc_size + debug_frame_reloc_size;
         const symtab_offset = alignTo(reloc_offset + total_reloc_size, 8);
         const num_syms: u32 = @intCast(self.symbols.items.len);
         const strtab_offset = symtab_offset + @as(u64, num_syms) * @sizeOf(Nlist64);
@@ -367,7 +376,7 @@ pub const MachOWriter = struct {
 
         // Write segment command
         // filesize = disk bytes (code + data + debug), vmsize = filesize + BSS (zero-fill, no disk)
-        const segment_filesize = if (has_debug) debug_info_offset + debug_info_size - text_offset else data_offset + data_size - text_offset;
+        const segment_filesize = if (has_debug) debug_frame_offset + debug_frame_size - text_offset else data_offset + data_size - text_offset;
         const bss_aligned = alignTo(self.bss_size, 4096); // page-align BSS
         var segment = SegmentCommand64{
             .cmdsize = @intCast(segment_cmd_size + section_size * num_sections),
@@ -415,6 +424,7 @@ pub const MachOWriter = struct {
             try self.writeDebugSectionHeader(writer, "__debug_line", debug_line_offset, debug_line_size, debug_line_reloc_offset, num_debug_line_relocs);
             try self.writeDebugSectionHeader(writer, "__debug_abbrev", debug_abbrev_offset, debug_abbrev_size, 0, 0);
             try self.writeDebugSectionHeader(writer, "__debug_info", debug_info_offset, debug_info_size, debug_info_reloc_offset, num_debug_info_relocs);
+            try self.writeDebugSectionHeader(writer, "__debug_frame", debug_frame_offset, debug_frame_size, debug_frame_reloc_offset, num_debug_frame_relocs);
         }
 
         // Write symtab command
@@ -433,9 +443,11 @@ pub const MachOWriter = struct {
             try writer.writeAll(self.debug_abbrev_data.items);
             try self.writePadding(writer, debug_info_offset - (debug_abbrev_offset + debug_abbrev_size));
             try writer.writeAll(self.debug_info_data.items);
+            try self.writePadding(writer, debug_frame_offset - (debug_info_offset + debug_info_size));
+            try writer.writeAll(self.debug_frame_data.items);
         }
 
-        const last_section_end = if (has_debug) debug_info_offset + debug_info_size else data_offset + data_size;
+        const last_section_end = if (has_debug) debug_frame_offset + debug_frame_size else data_offset + data_size;
         try self.writePadding(writer, reloc_offset - last_section_end);
 
         // Write relocations
@@ -467,6 +479,13 @@ pub const MachOWriter = struct {
         }
 
         for (self.debug_info_relocs.items) |reloc| {
+            try writer.writeAll(std.mem.asBytes(&RelocationInfo{
+                .r_address = reloc.offset,
+                .r_info = RelocationInfo.makeInfo(@intCast(reloc.symbol_idx), false, 3, true, ARM64_RELOC_UNSIGNED),
+            }));
+        }
+
+        for (self.debug_frame_relocs.items) |reloc| {
             try writer.writeAll(std.mem.asBytes(&RelocationInfo{
                 .r_address = reloc.offset,
                 .r_info = RelocationInfo.makeInfo(@intCast(reloc.symbol_idx), false, 3, true, ARM64_RELOC_UNSIGNED),
@@ -547,12 +566,16 @@ pub const MachOWriter = struct {
         try self.debug_abbrev_data.appendSlice(self.allocator, builder.debug_abbrev.items);
         try self.debug_info_data.appendSlice(self.allocator, builder.debug_info.items);
         try self.debug_line_data.appendSlice(self.allocator, builder.debug_line.items);
+        try self.debug_frame_data.appendSlice(self.allocator, builder.debug_frame.items);
 
         for (builder.debug_line_relocs.items) |reloc| {
             try self.debug_line_relocs.append(self.allocator, .{ .offset = reloc.offset, .symbol_idx = reloc.symbol_idx });
         }
         for (builder.debug_info_relocs.items) |reloc| {
             try self.debug_info_relocs.append(self.allocator, .{ .offset = reloc.offset, .symbol_idx = reloc.symbol_idx });
+        }
+        for (builder.debug_frame_relocs.items) |reloc| {
+            try self.debug_frame_relocs.append(self.allocator, .{ .offset = reloc.offset, .symbol_idx = reloc.symbol_idx });
         }
     }
 };

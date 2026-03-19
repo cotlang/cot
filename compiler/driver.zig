@@ -2022,6 +2022,7 @@ pub const Driver = struct {
                         .code_size = func_code_size,
                         .source_line = decl_line,
                         .locals = owned_locals,
+                        .frame_size = cf.frame_size,
                     });
                 }
 
@@ -3147,6 +3148,7 @@ pub const Driver = struct {
                         .code_size = func_code_size,
                         .source_line = decl_line,
                         .locals = owned_locals,
+                        .frame_size = compiled_funcs[i].frame_size,
                     });
                 }
             }
