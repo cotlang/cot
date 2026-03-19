@@ -652,7 +652,7 @@ struct TypeRegistry {
 
     fn makeTuple(elems: List(int)) int {
         const count = elems.count
-        const ptr = alloc(0, count * 8)
+        const ptr = alloc_raw(count * 8)
         for i in 0..count {
             @intToPtr(*int, ptr + i * 8).* = elems.get(i)
         }
@@ -661,7 +661,7 @@ struct TypeRegistry {
 
     fn makeFunc(params: List(FuncParam), return_type: int) int {
         const count = params.count
-        const ptr = alloc(0, count * @sizeOf(FuncParam))
+        const ptr = alloc_raw(count * @sizeOf(FuncParam))
         for i in 0..count {
             const p = params.get(i)
             const fp = @intToPtr(*FuncParam, ptr + i * @sizeOf(FuncParam))
@@ -1186,10 +1186,10 @@ struct TypeRegistry {
             const t = self.get(i)
             if (t.tag == TAG_TUPLE) {
                 const tup = switch (t) { Type.tuple |tup| => tup, else => TupleType { elem_count: 0, elem_types: 0 } }
-                if (tup.elem_types != 0) { dealloc(tup.elem_types) }
+                if (tup.elem_types != 0) { dealloc_raw(tup.elem_types) }
             } else if (t.tag == TAG_FUNC) {
                 const f = switch (t) { Type.func |f| => f, else => FuncType { param_count: 0, params: 0, return_type: 0 } }
-                if (f.params != 0) { dealloc(f.params) }
+                if (f.params != 0) { dealloc_raw(f.params) }
             }
         }
     }

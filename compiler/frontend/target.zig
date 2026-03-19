@@ -67,8 +67,13 @@ pub const Target = struct {
     }
 
     pub fn parse(s: []const u8) ?Target {
+        // Primary targets (clean names)
+        if (std.mem.eql(u8, s, "wasm")) return wasm32_wasi; // WASI — wasmtime, server-side
+        if (std.mem.eql(u8, s, "js")) return wasm32; // Browser — JS glue, console.log
+
+        // Aliases (backwards compatibility)
         if (std.mem.eql(u8, s, "wasm32-wasi") or std.mem.eql(u8, s, "wasi")) return wasm32_wasi;
-        if (std.mem.eql(u8, s, "wasm32") or std.mem.eql(u8, s, "wasm")) return wasm32;
+        if (std.mem.eql(u8, s, "wasm32")) return wasm32;
         if (std.mem.eql(u8, s, "arm64-macos")) return arm64_macos;
         if (std.mem.eql(u8, s, "amd64-linux")) return amd64_linux;
         if (std.mem.eql(u8, s, "arm64-linux")) return .{ .arch = .arm64, .os = .linux };

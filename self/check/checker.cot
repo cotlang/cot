@@ -78,7 +78,7 @@ struct Symbol {
 fn copyString(s: string) string {
     const len = @lenOf(s)
     if (len == 0) { return "" }
-    const buf = alloc(0, len)
+    const buf = alloc_raw(len)
     var i: i64 = 0
     while (i < len) {
         @intToPtr(*u8, buf + i).* = @intToPtr(*u8, @ptrOf(s) + i).*
@@ -546,7 +546,7 @@ struct Checker {
             const variants_count = esd.variants.count
             var variant_names_ptr: int = 0
             if (variants_count > 0) {
-                variant_names_ptr = alloc(0, variants_count * @sizeOf(ErrorVariant))
+                variant_names_ptr = alloc_raw(variants_count * @sizeOf(ErrorVariant))
                 for vi in 0..variants_count {
                     const v_str = esd.variants.get(vi)
                     const ev = @intToPtr(*ErrorVariant, variant_names_ptr + vi * @sizeOf(ErrorVariant))
@@ -623,7 +623,7 @@ struct Checker {
             const variants_count = esd.variants.count
             var variant_names_ptr: int = 0
             if (variants_count > 0) {
-                variant_names_ptr = alloc(0, variants_count * @sizeOf(ErrorVariant))
+                variant_names_ptr = alloc_raw(variants_count * @sizeOf(ErrorVariant))
                 for vi in 0..variants_count {
                     const v_str = esd.variants.get(vi)
                     const ev = @intToPtr(*ErrorVariant, variant_names_ptr + vi * @sizeOf(ErrorVariant))
@@ -2198,7 +2198,7 @@ struct Checker {
                 if (!is_type_access) {
                     return uv.payload_type
                 }
-                const ctor_params = alloc(0, @sizeOf(FuncParam))
+                const ctor_params = alloc_raw(@sizeOf(FuncParam))
                 const fp = @intToPtr(*FuncParam, ctor_params)
                 fp.name = "payload"
                 fp.type_idx = uv.payload_type
@@ -3666,7 +3666,7 @@ struct Checker {
         const params_count = cl_params.count
 
         // Build function type from closure signature
-        const params_ptr = alloc(0, params_count * @sizeOf(FuncParam))
+        const params_ptr = alloc_raw(params_count * @sizeOf(FuncParam))
         for pi in 0..params_count {
             const param_idx = cl_params.get(pi)
             var pname = ""
@@ -3849,7 +3849,7 @@ struct Checker {
         const is_packed = sd_layout == StructLayout.@"packed"
 
         // Build struct fields using raw pointer array
-        const fields_ptr = alloc(0, fields_count * @sizeOf(StructField))
+        const fields_ptr = alloc_raw(fields_count * @sizeOf(StructField))
         const result = self.buildStructFields(sd_fields, fields_count, fields_ptr, is_packed)
 
         // Final padding: packed=1, extern=max field align, auto=8
@@ -3922,7 +3922,7 @@ struct Checker {
             backing_type = self.resolveTypeExpr(backing_n)
         }
 
-        const variants_ptr = alloc(0, variants_count * @sizeOf(EnumVariant))
+        const variants_ptr = alloc_raw(variants_count * @sizeOf(EnumVariant))
         var next_value: int = 0
         for vi in 0..variants_count {
             const v_idx = ed_variants.get(vi)
@@ -3957,7 +3957,7 @@ struct Checker {
         const name = ud_name
         const variants_count = ud_variants.count
 
-        const variants_ptr = alloc(0, variants_count * @sizeOf(UnionVariant))
+        const variants_ptr = alloc_raw(variants_count * @sizeOf(UnionVariant))
         for vi in 0..variants_count {
             const v_idx = ud_variants.get(vi)
             var vname = ""
@@ -4445,7 +4445,7 @@ struct Checker {
             self.expr_types = fresh_et
             self.checkFnDeclBody(fn_node, cache_key)
             // Heap-copy the populated expr_types so they survive this scope
-            et_ptr = alloc(0, @sizeOf(Map(int, int)))
+            et_ptr = alloc_raw(@sizeOf(Map(int, int)))
             @intToPtr(*Map(int, int), et_ptr).* = self.expr_types
             self.expr_types = saved_expr_types
         } else {
@@ -4655,7 +4655,7 @@ struct Checker {
         switch (self.ast.getNode(idx)) { Node.decl |d| => switch (d) { Decl.fn_decl |fd| => { fn_params = fd.params; ret_type_n = fd.return_type }, else => {} }, else => {} }
         const params_count = fn_params.count
 
-        const params_ptr = alloc(0, params_count * @sizeOf(FuncParam))
+        const params_ptr = alloc_raw(params_count * @sizeOf(FuncParam))
         for pi in 0..params_count {
             self.buildFuncParam(fn_params.get(pi), params_ptr, pi)
         }
@@ -5216,7 +5216,7 @@ struct Checker {
         // Allocate merged variant array
         var merged_ptr: int = 0
         if (merged.count > 0) {
-            merged_ptr = alloc(0, merged.count * @sizeOf(ErrorVariant))
+            merged_ptr = alloc_raw(merged.count * @sizeOf(ErrorVariant))
             for i in 0..merged.count {
                 const dest = @intToPtr(*ErrorVariant, merged_ptr + i * @sizeOf(ErrorVariant))
                 dest.name = merged.get(i)
@@ -5352,8 +5352,8 @@ struct Checker {
 
         // Allocate two rows: prev and curr
         const row_size = (s1len + 1) * 8
-        const prev_ptr = alloc(0, row_size)
-        const curr_ptr = alloc(0, row_size)
+        const prev_ptr = alloc_raw(row_size)
+        const curr_ptr = alloc_raw(row_size)
 
         // Initialize prev row: [0, 1, 2, ..., s1len]
         for i in 0..s1len + 1 {
@@ -5530,7 +5530,7 @@ struct Checker {
 /// Returns the raw pointer (int) to the Map struct.
 fn allocMap() int {
     const size = 40  // Map has 5 fields × 8 bytes: keys, values, states, count, capacity
-    const ptr = alloc(0, size)
+    const ptr = alloc_raw(size)
     // Zero-init all fields
     var mp = @intToPtr(*Map(string, int), ptr)
     mp.keys = 0
@@ -5546,7 +5546,7 @@ fn allocMap() int {
 /// Uses alloc+zero because selfcot can't resolve `new List(Symbol)` in free functions.
 /// TODO: fix selfcot's type resolution for generic types in free functions.
 fn allocSymbolList() *List(Symbol) {
-    const ptr = alloc(0, 24)
+    const ptr = alloc_raw(24)
     memset_zero(ptr, 24)
     return @intToPtr(*List(Symbol), ptr)
 }

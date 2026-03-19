@@ -143,7 +143,7 @@ pub const WasiFunctions = struct {
 // =============================================================================
 
 pub fn addToLinker(allocator: std.mem.Allocator, linker: *@import("wasm/link.zig").Linker, target: Target) !WasiFunctions {
-    if (target.isWasm()) {
+    if (target.isWasi()) {
         return addWasiImports(allocator, linker);
     } else {
         return addNativeStubs(allocator, linker);
