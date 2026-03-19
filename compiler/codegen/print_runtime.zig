@@ -48,15 +48,20 @@ pub const PrintFunctions = struct {
 // addToLinker — register all print runtime functions
 // =============================================================================
 
-pub fn addToLinker(allocator: std.mem.Allocator, linker: *@import("wasm/link.zig").Linker) !PrintFunctions {
+pub fn addToLinker(allocator: std.mem.Allocator, linker: *@import("wasm/link.zig").Linker, import_offset: u32, wasi_write_idx: ?u32) !PrintFunctions {
     // cot_write: (fd: i64, ptr: i64, len: i64) -> i64
     // Must be added FIRST (print_int calls it by index)
-    // Stub body: native overrides with ARM64/x64 syscall in driver.zig
+    // When wasi_write_idx is provided (Wasm target), the body forwards to the
+    // WASI fd_write_simple shim. Otherwise it's a stub (native overrides with
+    // ARM64/x64 syscall in driver.zig).
     const write_type = try linker.addType(
         &[_]ValType{ .i64, .i64, .i64 },
         &[_]ValType{.i64},
     );
-    const write_body = try generateWriteStubBody(allocator);
+    const write_body = if (wasi_write_idx) |wasi_idx|
+        try generateWriteForwardBody(allocator, wasi_idx)
+    else
+        try generateWriteStubBody(allocator);
     const write_idx = try linker.addFunc(.{
         .name = WRITE_NAME,
         .type_idx = write_type,
@@ -64,12 +69,17 @@ pub fn addToLinker(allocator: std.mem.Allocator, linker: *@import("wasm/link.zig
         .exported = true, // So generateMachO can find it by name
     });
 
+    // The Wasm function index for write = import_offset + write_idx.
+    // All internal cross-references (print_int calling write) must use
+    // the full Wasm function index, not the func-local index.
+    const write_wasm_idx = write_idx + import_offset;
+
     // cot_print_int: (value: i64) -> void
     const print_int_type = try linker.addType(
         &[_]ValType{.i64},
         &[_]ValType{},
     );
-    const print_int_body = try generatePrintIntBody(allocator, write_idx, 1); // fd=1 (stdout)
+    const print_int_body = try generatePrintIntBody(allocator, write_wasm_idx, 1); // fd=1 (stdout)
     const print_int_idx = try linker.addFunc(.{
         .name = PRINT_INT_NAME,
         .type_idx = print_int_type,
@@ -78,7 +88,7 @@ pub fn addToLinker(allocator: std.mem.Allocator, linker: *@import("wasm/link.zig
     });
 
     // cot_eprint_int: (value: i64) -> void — same as print_int but fd=2
-    const eprint_int_body = try generatePrintIntBody(allocator, write_idx, 2); // fd=2 (stderr)
+    const eprint_int_body = try generatePrintIntBody(allocator, write_wasm_idx, 2); // fd=2 (stderr)
     const eprint_int_idx = try linker.addFunc(.{
         .name = EPRINT_INT_NAME,
         .type_idx = print_int_type, // Same type: (i64) -> void
@@ -101,7 +111,7 @@ pub fn addToLinker(allocator: std.mem.Allocator, linker: *@import("wasm/link.zig
     });
 
     // cot_print_float: (value: i64) -> void — format f64 to stdout
-    const print_float_body = try generatePrintFloatBody(allocator, write_idx, 1);
+    const print_float_body = try generatePrintFloatBody(allocator, write_wasm_idx, 1);
     const print_float_idx = try linker.addFunc(.{
         .name = PRINT_FLOAT_NAME,
         .type_idx = print_int_type, // Same type: (i64) -> void
@@ -110,7 +120,7 @@ pub fn addToLinker(allocator: std.mem.Allocator, linker: *@import("wasm/link.zig
     });
 
     // cot_eprint_float: (value: i64) -> void — format f64 to stderr
-    const eprint_float_body = try generatePrintFloatBody(allocator, write_idx, 2);
+    const eprint_float_body = try generatePrintFloatBody(allocator, write_wasm_idx, 2);
     const eprint_float_idx = try linker.addFunc(.{
         .name = EPRINT_FLOAT_NAME,
         .type_idx = print_int_type, // Same type: (i64) -> void
@@ -127,14 +137,15 @@ pub fn addToLinker(allocator: std.mem.Allocator, linker: *@import("wasm/link.zig
         .exported = false,
     });
 
+    // Return indices offset by import_offset so they are valid Wasm function indices
     return PrintFunctions{
-        .write_idx = write_idx,
-        .print_int_idx = print_int_idx,
-        .eprint_int_idx = eprint_int_idx,
-        .int_to_string_idx = int_to_string_idx,
-        .print_float_idx = print_float_idx,
-        .eprint_float_idx = eprint_float_idx,
-        .float_to_string_idx = float_to_string_idx,
+        .write_idx = write_idx + import_offset,
+        .print_int_idx = print_int_idx + import_offset,
+        .eprint_int_idx = eprint_int_idx + import_offset,
+        .int_to_string_idx = int_to_string_idx + import_offset,
+        .print_float_idx = print_float_idx + import_offset,
+        .eprint_float_idx = eprint_float_idx + import_offset,
+        .float_to_string_idx = float_to_string_idx + import_offset,
     };
 }
 
@@ -287,6 +298,21 @@ fn generateWriteStubBody(allocator: std.mem.Allocator) ![]const u8 {
     // Stub: just return 0 (native overrides with ARM64/x64 syscall)
     try code.emitI64Const(0);
     // Stack has i64 return value; finish() adds end opcode
+    return try code.finish();
+}
+
+/// Generate write body that forwards to the WASI fd_write_simple shim.
+/// Used on Wasm targets where WASI fd_write provides real I/O.
+fn generateWriteForwardBody(allocator: std.mem.Allocator, wasi_write_idx: u32) ![]const u8 {
+    var code = wasm.CodeBuilder.init(allocator);
+    defer code.deinit();
+
+    // Parameters: fd (local 0), ptr (local 1), len (local 2) — all i64
+    // Forward all args to WASI fd_write_simple(fd, ptr, len) -> i64
+    try code.emitLocalGet(0); // fd
+    try code.emitLocalGet(1); // ptr
+    try code.emitLocalGet(2); // len
+    try code.emitCall(wasi_write_idx);
     return try code.finish();
 }
 

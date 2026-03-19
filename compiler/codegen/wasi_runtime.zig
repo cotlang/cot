@@ -77,7 +77,7 @@ pub const UNLINK_NAME = "unlink";
 // Used by adapter shims to build iov structs and read WASI output params
 const SCRATCH_BASE: i32 = 0xE0000; // iov struct: 8 bytes (ptr + len)
 const SCRATCH_NWRITTEN: i32 = 0xE0008; // nwritten/nread output: 4 bytes
-const SCRATCH_RESULT: i32 = 0xE000C; // generic i32/i64 result output: 8 bytes
+const SCRATCH_RESULT: i32 = 0xE0010; // generic i32/i64 result output: 8 bytes (8-byte aligned for i64 stores)
 const SCRATCH_ARGV: i32 = 0xE1000; // argv pointer array (1024 entries * 4 bytes)
 const SCRATCH_ARGV_BUF: i32 = 0xE2000; // argv string buffer (8KB)
 const SCRATCH_ENVIRON: i32 = 0xE4000; // environ pointer array
@@ -143,7 +143,7 @@ pub const WasiFunctions = struct {
 // =============================================================================
 
 pub fn addToLinker(allocator: std.mem.Allocator, linker: *@import("wasm/link.zig").Linker, target: Target) !WasiFunctions {
-    if (target.isWasi()) {
+    if (target.isWasm()) {
         return addWasiImports(allocator, linker);
     } else {
         return addNativeStubs(allocator, linker);

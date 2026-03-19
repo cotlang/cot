@@ -5750,6 +5750,18 @@ pub const Driver = struct {
         const heap_ptr_global = heap_ptr_dynamic_idx + 1; // Offset by SP
 
         // ====================================================================
+        // Add WASI runtime functions FIRST (adds WASI host imports for Wasm targets)
+        // Must be before other runtimes so import_count is known for index offsetting.
+        // Reference: WASI preview1 fd_write
+        // ====================================================================
+        const wasi_funcs = try wasi_runtime.addToLinker(self.allocator, &linker, self.target);
+
+        // On Wasm targets, WASI imports shift all module function indices.
+        // All module function indices must be offset by import_count to get
+        // the correct Wasm function index for call instructions.
+        const import_count = linker.numImports();
+
+        // ====================================================================
         // Add memory utility functions (memcpy, memset_zero, string_eq, string_concat)
         // These are non-ARC, needed by stdlib on both ARC and WasmGC paths.
         // ====================================================================
@@ -5763,17 +5775,12 @@ pub const Driver = struct {
 
         // ====================================================================
         // Add print runtime functions (Go style)
-        // Note: cot_write is a stub on Wasm (native overrides with ARM64 syscall).
-        // Wasm test output is handled host-side in main.zig testCommand.
+        // On Wasm: write forwards to WASI fd_write_simple for real I/O.
+        // On native: write is a stub, overridden with ARM64/x64 syscall.
         // Reference: Go runtime/print.go
         // ====================================================================
-        const print_funcs = try print_runtime.addToLinker(self.allocator, &linker);
-
-        // ====================================================================
-        // Add WASI runtime functions (fd_write)
-        // Reference: WASI preview1 fd_write
-        // ====================================================================
-        const wasi_funcs = try wasi_runtime.addToLinker(self.allocator, &linker, self.target);
+        const wasi_write_override: ?u32 = if (self.target.isWasm()) wasi_funcs.fd_write_simple_idx else null;
+        const print_funcs = try print_runtime.addToLinker(self.allocator, &linker, import_count, wasi_write_override);
 
         // ====================================================================
         // Add test runtime functions (Zig test runner pattern)
@@ -5799,21 +5806,22 @@ pub const Driver = struct {
         defer func_indices.deinit(self.allocator);
 
         // Add memory utility function names to index map
-        try func_indices.put(self.allocator, mem_runtime.ALLOC_NAME, mem_funcs.alloc_idx);
-        try func_indices.put(self.allocator, mem_runtime.DEALLOC_NAME, mem_funcs.dealloc_idx);
-        try func_indices.put(self.allocator, mem_runtime.REALLOC_NAME, mem_funcs.realloc_idx);
-        try func_indices.put(self.allocator, "realloc", mem_funcs.realloc_idx); // alias for user code
-        try func_indices.put(self.allocator, mem_runtime.ALLOC_RAW_NAME, mem_funcs.alloc_raw_idx);
-        try func_indices.put(self.allocator, mem_runtime.REALLOC_RAW_NAME, mem_funcs.realloc_raw_idx);
-        try func_indices.put(self.allocator, mem_runtime.DEALLOC_RAW_NAME, mem_funcs.dealloc_raw_idx);
-        try func_indices.put(self.allocator, mem_runtime.MEMCPY_NAME, mem_funcs.memcpy_idx);
-        try func_indices.put(self.allocator, mem_runtime.MEMSET_ZERO_NAME, mem_funcs.memset_zero_idx);
-        try func_indices.put(self.allocator, mem_runtime.STRING_EQ_NAME, mem_funcs.string_eq_idx);
-        try func_indices.put(self.allocator, mem_runtime.STRING_CONCAT_NAME, mem_funcs.string_concat_idx);
+        // Module function indices are offset by import_count to get Wasm function indices
+        try func_indices.put(self.allocator, mem_runtime.ALLOC_NAME, mem_funcs.alloc_idx + import_count);
+        try func_indices.put(self.allocator, mem_runtime.DEALLOC_NAME, mem_funcs.dealloc_idx + import_count);
+        try func_indices.put(self.allocator, mem_runtime.REALLOC_NAME, mem_funcs.realloc_idx + import_count);
+        try func_indices.put(self.allocator, "realloc", mem_funcs.realloc_idx + import_count); // alias for user code
+        try func_indices.put(self.allocator, mem_runtime.ALLOC_RAW_NAME, mem_funcs.alloc_raw_idx + import_count);
+        try func_indices.put(self.allocator, mem_runtime.REALLOC_RAW_NAME, mem_funcs.realloc_raw_idx + import_count);
+        try func_indices.put(self.allocator, mem_runtime.DEALLOC_RAW_NAME, mem_funcs.dealloc_raw_idx + import_count);
+        try func_indices.put(self.allocator, mem_runtime.MEMCPY_NAME, mem_funcs.memcpy_idx + import_count);
+        try func_indices.put(self.allocator, mem_runtime.MEMSET_ZERO_NAME, mem_funcs.memset_zero_idx + import_count);
+        try func_indices.put(self.allocator, mem_runtime.STRING_EQ_NAME, mem_funcs.string_eq_idx + import_count);
+        try func_indices.put(self.allocator, mem_runtime.STRING_CONCAT_NAME, mem_funcs.string_concat_idx + import_count);
 
         // Add slice function names to index map (Go)
-        try func_indices.put(self.allocator, slice_runtime.GROWSLICE_NAME, slice_funcs.growslice_idx);
-        try func_indices.put(self.allocator, slice_runtime.NEXTSLICECAP_NAME, slice_funcs.nextslicecap_idx);
+        try func_indices.put(self.allocator, slice_runtime.GROWSLICE_NAME, slice_funcs.growslice_idx + import_count);
+        try func_indices.put(self.allocator, slice_runtime.NEXTSLICECAP_NAME, slice_funcs.nextslicecap_idx + import_count);
 
         // Add print function names to index map (Go)
         try func_indices.put(self.allocator, print_runtime.WRITE_NAME, print_funcs.write_idx);
@@ -5873,25 +5881,25 @@ pub const Driver = struct {
         try func_indices.put(self.allocator, wasi_runtime.UNLINK_NAME, wasi_funcs.unlink_idx);
 
         // Add test function names to index map (Zig)
-        try func_indices.put(self.allocator, test_runtime.TEST_BEGIN_NAME, test_funcs.test_begin_idx);
-        try func_indices.put(self.allocator, test_runtime.TEST_PRINT_NAME_NAME, test_funcs.test_print_name_idx);
-        try func_indices.put(self.allocator, test_runtime.TEST_PASS_NAME, test_funcs.test_pass_idx);
-        try func_indices.put(self.allocator, test_runtime.TEST_FAIL_NAME, test_funcs.test_fail_idx);
-        try func_indices.put(self.allocator, test_runtime.TEST_SUMMARY_NAME, test_funcs.test_summary_idx);
-        try func_indices.put(self.allocator, test_runtime.TEST_STORE_FAIL_VALUES_NAME, test_funcs.test_store_fail_values_idx);
+        try func_indices.put(self.allocator, test_runtime.TEST_BEGIN_NAME, test_funcs.test_begin_idx + import_count);
+        try func_indices.put(self.allocator, test_runtime.TEST_PRINT_NAME_NAME, test_funcs.test_print_name_idx + import_count);
+        try func_indices.put(self.allocator, test_runtime.TEST_PASS_NAME, test_funcs.test_pass_idx + import_count);
+        try func_indices.put(self.allocator, test_runtime.TEST_FAIL_NAME, test_funcs.test_fail_idx + import_count);
+        try func_indices.put(self.allocator, test_runtime.TEST_SUMMARY_NAME, test_funcs.test_summary_idx + import_count);
+        try func_indices.put(self.allocator, test_runtime.TEST_STORE_FAIL_VALUES_NAME, test_funcs.test_store_fail_values_idx + import_count);
 
         // Add bench function names to index map (Go testing.B)
-        try func_indices.put(self.allocator, bench_runtime.BENCH_PRINT_NAME_NAME, bench_funcs.bench_print_name_idx);
-        try func_indices.put(self.allocator, bench_runtime.BENCH_CALIBRATE_START_NAME, bench_funcs.bench_calibrate_start_idx);
-        try func_indices.put(self.allocator, bench_runtime.BENCH_CALIBRATE_END_NAME, bench_funcs.bench_calibrate_end_idx);
-        try func_indices.put(self.allocator, bench_runtime.BENCH_MEASURE_START_NAME, bench_funcs.bench_measure_start_idx);
-        try func_indices.put(self.allocator, bench_runtime.BENCH_MEASURE_END_NAME, bench_funcs.bench_measure_end_idx);
-        try func_indices.put(self.allocator, bench_runtime.BENCH_GET_N_NAME, bench_funcs.bench_get_n_idx);
-        try func_indices.put(self.allocator, bench_runtime.BENCH_SUMMARY_NAME, bench_funcs.bench_summary_idx);
+        try func_indices.put(self.allocator, bench_runtime.BENCH_PRINT_NAME_NAME, bench_funcs.bench_print_name_idx + import_count);
+        try func_indices.put(self.allocator, bench_runtime.BENCH_CALIBRATE_START_NAME, bench_funcs.bench_calibrate_start_idx + import_count);
+        try func_indices.put(self.allocator, bench_runtime.BENCH_CALIBRATE_END_NAME, bench_funcs.bench_calibrate_end_idx + import_count);
+        try func_indices.put(self.allocator, bench_runtime.BENCH_MEASURE_START_NAME, bench_funcs.bench_measure_start_idx + import_count);
+        try func_indices.put(self.allocator, bench_runtime.BENCH_MEASURE_END_NAME, bench_funcs.bench_measure_end_idx + import_count);
+        try func_indices.put(self.allocator, bench_runtime.BENCH_GET_N_NAME, bench_funcs.bench_get_n_idx + import_count);
+        try func_indices.put(self.allocator, bench_runtime.BENCH_SUMMARY_NAME, bench_funcs.bench_summary_idx + import_count);
 
-        // Add user function names (offset by ARC function count)
+        // Add user function names (offset by runtime func count + import count)
         for (funcs, 0..) |*ir_func, i| {
-            try func_indices.put(self.allocator, ir_func.name, @intCast(i + runtime_func_count));
+            try func_indices.put(self.allocator, ir_func.name, @intCast(i + runtime_func_count + import_count));
         }
 
         // ====================================================================
@@ -6216,6 +6224,36 @@ pub const Driver = struct {
                 .code = body, // Linker takes ownership
                 .exported = exported,
             });
+        }
+
+        // Add _start wrapper for WASI compatibility (wasmtime expects _start, not main)
+        // _start calls main and drops the return value (if any).
+        if (self.target.isWasm()) {
+            if (func_indices.get("main")) |main_wasm_idx| {
+                const start_type = try linker.addType(&[_]wasm.ValType{}, &[_]wasm.ValType{});
+                var start_code = wasm_old.CodeBuilder.init(self.allocator);
+                defer start_code.deinit();
+                try start_code.emitCall(main_wasm_idx);
+                // If main returns a value, drop it (_start must return void)
+                const main_returns_value = blk: {
+                    for (funcs) |*ir_func| {
+                        if (std.mem.eql(u8, ir_func.name, "main")) {
+                            break :blk ir_func.return_type != types_mod.TypeRegistry.VOID;
+                        }
+                    }
+                    break :blk false;
+                };
+                if (main_returns_value) {
+                    try start_code.emitDrop();
+                }
+                const start_body = try start_code.finish();
+                _ = try linker.addFunc(.{
+                    .name = "_start",
+                    .type_idx = start_type,
+                    .code = start_body,
+                    .exported = true,
+                });
+            }
         }
 
         // Emit Wasm binary using Go-style linker

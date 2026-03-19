@@ -7338,8 +7338,9 @@ pub const Lowerer = struct {
                     (ie.else_branch != null_node and self.exprMayHaveSideEffects(ie.else_branch));
             },
             .switch_expr => true,
-            // Pure expressions
-            .literal, .ident, .field_access, .error_literal, .binary, .unary, .index, .slice_expr => false,
+            // Pure expressions (except unreachable which traps)
+            .literal => |lit| lit.kind == .unreachable_lit,
+            .ident, .field_access, .error_literal, .binary, .unary, .index, .slice_expr => false,
             // Conservative: unknown expression types assumed side-effectful
             else => true,
         };
