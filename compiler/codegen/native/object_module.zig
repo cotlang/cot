@@ -199,6 +199,8 @@ pub const ObjectModule = struct {
     debug_source_text: []const u8 = "",
     debug_line_entries: std.ArrayListUnmanaged(macho.LineEntry) = .{},
     debug_func_infos: std.ArrayListUnmanaged(dwarf_mod.DebugFuncInfo) = .{},
+    /// Owned debug local slices — freed in deinit after DWARF generation completes.
+    owned_debug_locals: std.ArrayListUnmanaged([]const dwarf_mod.DebugLocalInfo) = .{},
 
     /// Accumulated relocations (for object file).
     relocations: std.ArrayListUnmanaged(ObjectReloc),
@@ -249,6 +251,10 @@ pub const ObjectModule = struct {
         self.relocations.deinit(self.allocator);
         self.data_relocations.deinit(self.allocator);
         self.debug_line_entries.deinit(self.allocator);
+        for (self.owned_debug_locals.items) |locals_slice| {
+            self.allocator.free(locals_slice);
+        }
+        self.owned_debug_locals.deinit(self.allocator);
         self.debug_func_infos.deinit(self.allocator);
     }
 
@@ -385,6 +391,11 @@ pub const ObjectModule = struct {
     /// Set DWARF debug function info for subprogram DIEs.
     pub fn setFuncInfos(self: *Self, infos: []const dwarf_mod.DebugFuncInfo) !void {
         try self.debug_func_infos.appendSlice(self.allocator, infos);
+    }
+
+    /// Register owned debug locals so they are freed in deinit.
+    pub fn addOwnedDebugLocals(self: *Self, locals: []const dwarf_mod.DebugLocalInfo) !void {
+        try self.owned_debug_locals.append(self.allocator, locals);
     }
 
     /// Get the code offset of a defined function in the text section.

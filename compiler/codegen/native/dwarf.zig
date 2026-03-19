@@ -24,6 +24,14 @@ pub const DW_AT_decl_file: u8 = 0x3a;
 pub const DW_AT_decl_line: u8 = 0x3b;
 pub const DW_AT_external: u8 = 0x3f;
 pub const DW_AT_frame_base: u8 = 0x40;
+pub const DW_AT_type: u8 = 0x49;
+pub const DW_AT_location: u8 = 0x02;
+pub const DW_AT_byte_size: u8 = 0x0b;
+pub const DW_AT_encoding: u8 = 0x3e;
+pub const DW_AT_data_member_location: u8 = 0x38;
+
+pub const DW_FORM_exprloc: u8 = 0x18;
+pub const DW_FORM_ref4: u8 = 0x13;
 
 pub const DW_LANG_C: u8 = 0x02;
 
@@ -37,6 +45,15 @@ pub const DW_FORM_flag: u8 = 0x0c;
 pub const DW_FORM_sec_offset: u8 = 0x17;
 
 pub const DW_OP_call_frame_cfa: u8 = 0x9c;
+pub const DW_OP_fbreg: u8 = 0x91;
+
+pub const DW_ATE_signed: u8 = 0x05;
+pub const DW_ATE_unsigned: u8 = 0x07;
+pub const DW_ATE_float: u8 = 0x04;
+pub const DW_ATE_boolean: u8 = 0x02;
+
+pub const DW_TAG_pointer_type: u8 = 0x0f;
+pub const DW_TAG_structure_type: u8 = 0x13;
 
 pub const DW_LNS_copy: u8 = 0x01;
 pub const DW_LNS_advance_pc: u8 = 0x02;
@@ -97,11 +114,20 @@ pub const DebugReloc = struct {
     symbol_idx: u32,
 };
 
+pub const DebugLocalInfo = struct {
+    name: []const u8,
+    type_name: []const u8, // e.g., "i64", "string", "*Scope"
+    frame_offset: i32, // DW_OP_fbreg offset
+    size: u32,
+    is_param: bool,
+};
+
 pub const DebugFuncInfo = struct {
     name: []const u8,
     code_offset: u32,
     code_size: u32,
     source_line: u32, // declaration line number
+    locals: []const DebugLocalInfo = &.{},
 };
 
 pub const DwarfBuilder = struct {
@@ -207,6 +233,69 @@ pub const DwarfBuilder = struct {
         try appendUleb128(buf, alloc, 0); // End attr list
         try appendUleb128(buf, alloc, 0);
 
+        // Abbreviation 3: DW_TAG_formal_parameter (DW_CHILDREN_no)
+        try appendUleb128(buf, alloc, 3);
+        try appendUleb128(buf, alloc, DW_TAG_formal_parameter);
+        try buf.append(alloc, DW_CHILDREN_no);
+        const param_attrs = [_][2]u8{
+            .{ DW_AT_name, DW_FORM_string },
+            .{ DW_AT_location, DW_FORM_exprloc },
+            .{ DW_AT_type, DW_FORM_ref4 },
+        };
+        for (param_attrs) |attr| {
+            try appendUleb128(buf, alloc, attr[0]);
+            try appendUleb128(buf, alloc, attr[1]);
+        }
+        try appendUleb128(buf, alloc, 0);
+        try appendUleb128(buf, alloc, 0);
+
+        // Abbreviation 4: DW_TAG_variable (DW_CHILDREN_no)
+        try appendUleb128(buf, alloc, 4);
+        try appendUleb128(buf, alloc, DW_TAG_variable);
+        try buf.append(alloc, DW_CHILDREN_no);
+        const var_attrs = [_][2]u8{
+            .{ DW_AT_name, DW_FORM_string },
+            .{ DW_AT_location, DW_FORM_exprloc },
+            .{ DW_AT_type, DW_FORM_ref4 },
+        };
+        for (var_attrs) |attr| {
+            try appendUleb128(buf, alloc, attr[0]);
+            try appendUleb128(buf, alloc, attr[1]);
+        }
+        try appendUleb128(buf, alloc, 0);
+        try appendUleb128(buf, alloc, 0);
+
+        // Abbreviation 5: DW_TAG_base_type (DW_CHILDREN_no)
+        try appendUleb128(buf, alloc, 5);
+        try appendUleb128(buf, alloc, DW_TAG_base_type);
+        try buf.append(alloc, DW_CHILDREN_no);
+        const bt_attrs = [_][2]u8{
+            .{ DW_AT_name, DW_FORM_string },
+            .{ DW_AT_byte_size, DW_FORM_data1 },
+            .{ DW_AT_encoding, DW_FORM_data1 },
+        };
+        for (bt_attrs) |attr| {
+            try appendUleb128(buf, alloc, attr[0]);
+            try appendUleb128(buf, alloc, attr[1]);
+        }
+        try appendUleb128(buf, alloc, 0);
+        try appendUleb128(buf, alloc, 0);
+
+        // Abbreviation 6: DW_TAG_pointer_type (DW_CHILDREN_no)
+        try appendUleb128(buf, alloc, 6);
+        try appendUleb128(buf, alloc, DW_TAG_pointer_type);
+        try buf.append(alloc, DW_CHILDREN_no);
+        const ptr_attrs = [_][2]u8{
+            .{ DW_AT_byte_size, DW_FORM_data1 },
+            .{ DW_AT_type, DW_FORM_ref4 },
+        };
+        for (ptr_attrs) |attr| {
+            try appendUleb128(buf, alloc, attr[0]);
+            try appendUleb128(buf, alloc, attr[1]);
+        }
+        try appendUleb128(buf, alloc, 0);
+        try appendUleb128(buf, alloc, 0);
+
         try appendUleb128(buf, alloc, 0); // End abbreviations table
     }
 
@@ -251,6 +340,52 @@ pub const DwarfBuilder = struct {
         try buf.appendSlice(alloc, "Cot 0.3.6");
         try buf.append(alloc, 0);
 
+        // Emit base type DIEs BEFORE subprogram DIEs so type references are valid.
+        // Track each type's offset in .debug_info for DW_FORM_ref4 references.
+        const BaseTypeEntry = struct {
+            name: []const u8,
+            byte_size: u8,
+            encoding: u8,
+        };
+        const base_types = [_]BaseTypeEntry{
+            .{ .name = "i8", .byte_size = 1, .encoding = DW_ATE_signed },
+            .{ .name = "i16", .byte_size = 2, .encoding = DW_ATE_signed },
+            .{ .name = "i32", .byte_size = 4, .encoding = DW_ATE_signed },
+            .{ .name = "i64", .byte_size = 8, .encoding = DW_ATE_signed },
+            .{ .name = "u8", .byte_size = 1, .encoding = DW_ATE_unsigned },
+            .{ .name = "u16", .byte_size = 2, .encoding = DW_ATE_unsigned },
+            .{ .name = "u32", .byte_size = 4, .encoding = DW_ATE_unsigned },
+            .{ .name = "u64", .byte_size = 8, .encoding = DW_ATE_unsigned },
+            .{ .name = "f32", .byte_size = 4, .encoding = DW_ATE_float },
+            .{ .name = "f64", .byte_size = 8, .encoding = DW_ATE_float },
+            .{ .name = "bool", .byte_size = 1, .encoding = DW_ATE_boolean },
+            .{ .name = "void", .byte_size = 0, .encoding = DW_ATE_signed },
+        };
+
+        // Map type name → offset in .debug_info for DW_FORM_ref4 references
+        var type_offsets: std.StringHashMapUnmanaged(u32) = .{};
+        defer type_offsets.deinit(alloc);
+
+        for (base_types) |bt| {
+            const die_offset: u32 = @intCast(buf.items.len);
+            try type_offsets.put(alloc, bt.name, die_offset);
+
+            try appendUleb128(buf, alloc, 5); // Abbreviation code 5 = base_type
+            try buf.appendSlice(alloc, bt.name);
+            try buf.append(alloc, 0); // null terminator
+            try buf.append(alloc, bt.byte_size); // DW_AT_byte_size
+            try buf.append(alloc, bt.encoding); // DW_AT_encoding
+        }
+
+        // Also emit a pointer type DIE pointing to i64 (used for pointer-typed variables)
+        const ptr_die_offset: u32 = @intCast(buf.items.len);
+        try type_offsets.put(alloc, "pointer", ptr_die_offset);
+        try appendUleb128(buf, alloc, 6); // Abbreviation code 6 = pointer_type
+        try buf.append(alloc, 8); // DW_AT_byte_size = 8 (64-bit pointer)
+        // DW_AT_type: reference to i64 type DIE
+        const i64_offset = type_offsets.get("i64") orelse 0;
+        try buf.appendSlice(alloc, &std.mem.toBytes(i64_offset));
+
         // Emit DW_TAG_subprogram DIEs as children of compile_unit
         for (self.func_infos) |func_info| {
             try appendUleb128(buf, alloc, 2); // Abbreviation code 2 = subprogram
@@ -283,6 +418,49 @@ pub const DwarfBuilder = struct {
             // DW_AT_external: 1-byte flag (1 if externally visible)
             const is_external: u8 = if (func_info.name.len > 0 and func_info.name[0] != '_') 1 else 0;
             try buf.append(alloc, is_external);
+
+            // Emit child DW_TAG_formal_parameter and DW_TAG_variable DIEs
+            for (func_info.locals) |local| {
+                // Abbreviation code: 3 for parameter, 4 for variable
+                const abbrev_code: u64 = if (local.is_param) 3 else 4;
+                try appendUleb128(buf, alloc, abbrev_code);
+
+                // DW_AT_name: null-terminated string
+                try buf.appendSlice(alloc, local.name);
+                try buf.append(alloc, 0);
+
+                // DW_AT_location: DW_FORM_exprloc
+                // Encode DW_OP_fbreg <frame_offset> using a stack buffer
+                var expr_bytes: [16]u8 = undefined;
+                var expr_len: usize = 0;
+                expr_bytes[0] = DW_OP_fbreg;
+                expr_len = 1;
+                // Encode SLEB128 of frame_offset into expr_bytes
+                {
+                    var value = local.frame_offset;
+                    while (true) {
+                        const c: u8 = @truncate(@as(u64, @bitCast(@as(i64, value))) & 0x7f);
+                        const s: u8 = @truncate(@as(u64, @bitCast(@as(i64, value))) & 0x40);
+                        value >>= 7;
+                        if ((value != -1 or s == 0) and (value != 0 or s != 0)) {
+                            expr_bytes[expr_len] = c | 0x80;
+                            expr_len += 1;
+                        } else {
+                            expr_bytes[expr_len] = c;
+                            expr_len += 1;
+                            break;
+                        }
+                    }
+                }
+                // Emit ULEB128 expression length, then expression bytes
+                try appendUleb128(buf, alloc, expr_len);
+                try buf.appendSlice(alloc, expr_bytes[0..expr_len]);
+
+                // DW_AT_type: DW_FORM_ref4 — offset to type DIE in .debug_info
+                const type_ref = type_offsets.get(local.type_name) orelse
+                    type_offsets.get("i64") orelse 0;
+                try buf.appendSlice(alloc, &std.mem.toBytes(type_ref));
+            }
 
             // Null DIE terminator to close subprogram's children list
             try buf.append(alloc, 0);

@@ -95,6 +95,7 @@ pub const Driver = struct {
     debug_source_file: []const u8 = "",
     debug_source_text: []const u8 = "",
     debug_ir_funcs: []const ir_mod.Func = &.{},
+    debug_type_reg: ?*const types_mod.TypeRegistry = null,
     // User-declared extern fn names (from imported modules like std/sqlite).
     // Collected from checker scopes after type checking.
     // Registered in func_index_map so native backend can resolve calls.
@@ -925,6 +926,7 @@ pub const Driver = struct {
         self.debug_source_file = source_file;
         self.debug_source_text = source_text;
         self.debug_ir_funcs = funcs;
+        self.debug_type_reg = type_reg;
 
         // Direct native path: SSA → CLIF → native (bypass Wasm entirely)
         if (self.direct_native) {
@@ -1979,11 +1981,47 @@ pub const Driver = struct {
                         }
                     }
 
+                    // Collect locals from IR function for DWARF variable/parameter DIEs
+                    var debug_locals = std.ArrayListUnmanaged(dwarf_mod.DebugLocalInfo){};
+                    defer debug_locals.deinit(self.allocator);
+
+                    if (func_idx < self.debug_ir_funcs.len and func_idx < func_names.len) {
+                        const ir_func = &self.debug_ir_funcs[func_idx];
+                        // Collect parameters
+                        for (ir_func.params) |param| {
+                            if (param.name.len == 0) continue;
+                            try debug_locals.append(self.allocator, .{
+                                .name = param.name,
+                                .type_name = if (self.debug_type_reg) |tr| tr.typeName(param.type_idx) else "i64",
+                                .frame_offset = param.offset,
+                                .size = param.size,
+                                .is_param = true,
+                            });
+                        }
+                        // Collect locals (skip compiler temporaries)
+                        for (ir_func.locals) |local| {
+                            if (local.name.len == 0) continue;
+                            if (local.name.len >= 2 and local.name[0] == '_' and local.name[1] == '_') continue;
+                            if (local.is_param) continue; // already collected above
+                            try debug_locals.append(self.allocator, .{
+                                .name = local.name,
+                                .type_name = if (self.debug_type_reg) |tr| tr.typeName(local.type_idx) else "i64",
+                                .frame_offset = local.offset,
+                                .size = local.size,
+                                .is_param = false,
+                            });
+                        }
+                    }
+
+                    const owned_locals = try self.allocator.dupe(dwarf_mod.DebugLocalInfo, debug_locals.items);
+                    try module.addOwnedDebugLocals(owned_locals);
+
                     try debug_func_infos.append(self.allocator, .{
                         .name = func_names[func_idx],
                         .code_offset = func_code_offset,
                         .code_size = func_code_size,
                         .source_line = decl_line,
+                        .locals = owned_locals,
                     });
                 }
 
@@ -3039,6 +3077,13 @@ pub const Driver = struct {
             var debug_func_infos = std.ArrayListUnmanaged(dwarf_mod.DebugFuncInfo){};
             defer debug_func_infos.deinit(self.allocator);
 
+            // Build IR function name → IR func mapping for local variable info
+            var ir_name_to_func = std.StringHashMap(*const ir_mod.Func).init(self.allocator);
+            defer ir_name_to_func.deinit();
+            for (self.debug_ir_funcs) |*ir_func| {
+                try ir_name_to_func.put(ir_func.name, ir_func);
+            }
+
             // For each compiled function, look up its source span via export name
             for (compiled_funcs, 0..) |_, i| {
                 // Find this function's export name (same logic as Pass 1)
@@ -3059,11 +3104,48 @@ pub const Driver = struct {
                     const func_code_size: u32 = @intCast(compiled_funcs[i].buffer.data.items.len);
                     const decl_line = lineFromByteOffset(self.debug_source_text, source_offset);
 
+                    // Collect locals from IR function for DWARF variable/parameter DIEs
+                    var debug_locals = std.ArrayListUnmanaged(dwarf_mod.DebugLocalInfo){};
+                    defer debug_locals.deinit(self.allocator);
+
+                    if (ir_name_to_func.get(func_name)) |ir_func| {
+                        // Collect parameters
+                        for (ir_func.params) |param| {
+                            if (param.name.len == 0) continue;
+                            const type_name = if (self.debug_type_reg) |tr| tr.typeName(param.type_idx) else "i64";
+                            try debug_locals.append(self.allocator, .{
+                                .name = param.name,
+                                .type_name = type_name,
+                                .frame_offset = param.offset,
+                                .size = param.size,
+                                .is_param = true,
+                            });
+                        }
+                        // Collect locals (skip compiler temporaries)
+                        for (ir_func.locals) |local| {
+                            if (local.name.len == 0) continue;
+                            if (local.name.len >= 2 and local.name[0] == '_' and local.name[1] == '_') continue;
+                            if (local.is_param) continue;
+                            const type_name = if (self.debug_type_reg) |tr| tr.typeName(local.type_idx) else "i64";
+                            try debug_locals.append(self.allocator, .{
+                                .name = local.name,
+                                .type_name = type_name,
+                                .frame_offset = local.offset,
+                                .size = local.size,
+                                .is_param = false,
+                            });
+                        }
+                    }
+
+                    const owned_locals = try self.allocator.dupe(dwarf_mod.DebugLocalInfo, debug_locals.items);
+                    try module.addOwnedDebugLocals(owned_locals);
+
                     try debug_func_infos.append(self.allocator, .{
                         .name = func_name,
                         .code_offset = code_offset,
                         .code_size = func_code_size,
                         .source_line = decl_line,
+                        .locals = owned_locals,
                     });
                 }
             }
