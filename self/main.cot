@@ -746,8 +746,8 @@ fn writeByteList(path: string, bytes: List(int)) void {
         // Process up to 4096 bytes at a time
         var chunk_size = bytes.count - i
         if (chunk_size > 4096) { chunk_size = 4096 }
-        // Pack bytes into memory via alloc (metadata=0, size=chunk_size)
-        const buf_ptr = alloc(0, chunk_size)
+        // Pack bytes into raw memory buffer
+        const buf_ptr = alloc_raw(chunk_size)
         var j = 0
         while (j < chunk_size) {
             const addr = buf_ptr + j
@@ -1012,9 +1012,9 @@ fn checkAndStoreChecker(pf: ParsedFile, types: TypeRegistry, shared: *SharedChec
     // backing arrays. When the stack locals go out of scope, ARC would free
     // those arrays. We prevent this by zero-clearing the stack locals AFTER
     // copying — so ARC's cleanup sees zero pointers and skips release.
-    const errs_heap = alloc(0, @sizeOf(ErrorReporter))
+    const errs_heap = alloc_raw(@sizeOf(ErrorReporter))
     copyBytes(errs_heap, @ptrToInt(&check_errs), @sizeOf(ErrorReporter))
-    const chk_heap = alloc(0, @sizeOf(Checker))
+    const chk_heap = alloc_raw(@sizeOf(Checker))
     copyBytes(chk_heap, @ptrToInt(&checker), @sizeOf(Checker))
     // Zero the stack locals so ARC doesn't free the shared backing arrays
     // when they go out of scope. The heap copies own the data now.
