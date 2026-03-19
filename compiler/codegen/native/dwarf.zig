@@ -18,12 +18,20 @@ pub const DW_AT_stmt_list: u8 = 0x10;
 pub const DW_AT_low_pc: u8 = 0x11;
 pub const DW_AT_high_pc: u8 = 0x12;
 pub const DW_AT_comp_dir: u8 = 0x1b;
+pub const DW_AT_decl_file: u8 = 0x3a;
+pub const DW_AT_decl_line: u8 = 0x3b;
+pub const DW_AT_external: u8 = 0x3f;
+pub const DW_AT_frame_base: u8 = 0x40;
 
 pub const DW_FORM_addr: u8 = 0x01;
 pub const DW_FORM_data4: u8 = 0x06;
 pub const DW_FORM_data8: u8 = 0x07;
 pub const DW_FORM_string: u8 = 0x08;
+pub const DW_FORM_block1: u8 = 0x0a;
+pub const DW_FORM_flag: u8 = 0x0c;
 pub const DW_FORM_sec_offset: u8 = 0x17;
+
+pub const DW_OP_call_frame_cfa: u8 = 0x9c;
 
 pub const DW_LNS_copy: u8 = 0x01;
 pub const DW_LNS_advance_pc: u8 = 0x02;
@@ -84,6 +92,13 @@ pub const DebugReloc = struct {
     symbol_idx: u32,
 };
 
+pub const DebugFuncInfo = struct {
+    name: []const u8,
+    code_offset: u32,
+    code_size: u32,
+    source_line: u32, // declaration line number
+};
+
 pub const DwarfBuilder = struct {
     allocator: std.mem.Allocator,
     debug_line: std.ArrayListUnmanaged(u8) = .{},
@@ -95,6 +110,7 @@ pub const DwarfBuilder = struct {
     source_text: []const u8 = "",
     comp_dir: []const u8 = "",
     text_size: u64 = 0,
+    func_infos: []const DebugFuncInfo = &.{},
 
     pub fn init(allocator: std.mem.Allocator) DwarfBuilder {
         return .{ .allocator = allocator };
@@ -118,6 +134,10 @@ pub const DwarfBuilder = struct {
         self.text_size = size;
     }
 
+    pub fn setFuncInfos(self: *DwarfBuilder, infos: []const DebugFuncInfo) void {
+        self.func_infos = infos;
+    }
+
     fn sourceOffsetToLine(self: *DwarfBuilder, offset: u32) u32 {
         if (offset >= self.source_text.len) return 1;
         var line: u32 = 1;
@@ -137,25 +157,49 @@ pub const DwarfBuilder = struct {
         const buf = &self.debug_abbrev;
         const alloc = self.allocator;
 
+        // Abbreviation 1: DW_TAG_compile_unit (DW_CHILDREN_yes — contains subprograms)
         try appendUleb128(buf, alloc, 1); // Abbreviation code
         try appendUleb128(buf, alloc, DW_TAG_compile_unit);
-        try buf.append(alloc, DW_CHILDREN_no);
+        try buf.append(alloc, DW_CHILDREN_yes);
 
         // Attributes: name, comp_dir, stmt_list, low_pc, high_pc
-        const attrs = [_][2]u8{
+        const cu_attrs = [_][2]u8{
             .{ DW_AT_name, DW_FORM_string },
             .{ DW_AT_comp_dir, DW_FORM_string },
             .{ DW_AT_stmt_list, DW_FORM_sec_offset },
             .{ DW_AT_low_pc, DW_FORM_addr },
             .{ DW_AT_high_pc, DW_FORM_data8 },
         };
-        for (attrs) |attr| {
+        for (cu_attrs) |attr| {
             try appendUleb128(buf, alloc, attr[0]);
             try appendUleb128(buf, alloc, attr[1]);
         }
+        try appendUleb128(buf, alloc, 0); // End attr list
         try appendUleb128(buf, alloc, 0);
+
+        // Abbreviation 2: DW_TAG_subprogram (DW_CHILDREN_yes — allows child variable DIEs later)
+        // Following Go's DW_ABRV_FUNCTION pattern (dwarf.go line 462-474)
+        try appendUleb128(buf, alloc, 2); // Abbreviation code
+        try appendUleb128(buf, alloc, DW_TAG_subprogram);
+        try buf.append(alloc, DW_CHILDREN_yes);
+
+        const sp_attrs = [_][2]u8{
+            .{ DW_AT_name, DW_FORM_string },
+            .{ DW_AT_low_pc, DW_FORM_addr },
+            .{ DW_AT_high_pc, DW_FORM_data8 },
+            .{ DW_AT_frame_base, DW_FORM_block1 },
+            .{ DW_AT_decl_file, DW_FORM_data4 },
+            .{ DW_AT_decl_line, DW_FORM_data4 },
+            .{ DW_AT_external, DW_FORM_flag },
+        };
+        for (sp_attrs) |attr| {
+            try appendUleb128(buf, alloc, attr[0]);
+            try appendUleb128(buf, alloc, attr[1]);
+        }
+        try appendUleb128(buf, alloc, 0); // End attr list
         try appendUleb128(buf, alloc, 0);
-        try appendUleb128(buf, alloc, 0); // End abbreviations
+
+        try appendUleb128(buf, alloc, 0); // End abbreviations table
     }
 
     fn generateDebugInfo(self: *DwarfBuilder, text_symbol_idx: u32) !void {
@@ -186,6 +230,46 @@ pub const DwarfBuilder = struct {
 
         // high_pc (size)
         try buf.appendSlice(alloc, &std.mem.toBytes(self.text_size));
+
+        // Emit DW_TAG_subprogram DIEs as children of compile_unit
+        for (self.func_infos) |func_info| {
+            try appendUleb128(buf, alloc, 2); // Abbreviation code 2 = subprogram
+
+            // DW_AT_name: null-terminated string
+            try buf.appendSlice(alloc, func_info.name);
+            try buf.append(alloc, 0);
+
+            // DW_AT_low_pc: 8-byte address (needs relocation to text symbol + func offset)
+            // Write code_offset as the value — linker adds symbol's address to this
+            try self.debug_info_relocs.append(alloc, .{
+                .offset = @intCast(buf.items.len),
+                .symbol_idx = text_symbol_idx,
+            });
+            try buf.appendSlice(alloc, &std.mem.toBytes(@as(u64, func_info.code_offset)));
+
+            // DW_AT_high_pc: 8-byte function size (DWARF4 convention)
+            try buf.appendSlice(alloc, &std.mem.toBytes(@as(u64, func_info.code_size)));
+
+            // DW_AT_frame_base: 1-byte block containing DW_OP_call_frame_cfa
+            try buf.append(alloc, 1); // block length
+            try buf.append(alloc, DW_OP_call_frame_cfa);
+
+            // DW_AT_decl_file: 4-byte file index (1 = main source file)
+            try buf.appendSlice(alloc, &std.mem.toBytes(@as(u32, 1)));
+
+            // DW_AT_decl_line: 4-byte line number
+            try buf.appendSlice(alloc, &std.mem.toBytes(func_info.source_line));
+
+            // DW_AT_external: 1-byte flag (1 if externally visible)
+            const is_external: u8 = if (func_info.name.len > 0 and func_info.name[0] != '_') 1 else 0;
+            try buf.append(alloc, is_external);
+
+            // Null DIE terminator to close subprogram's children list
+            try buf.append(alloc, 0);
+        }
+
+        // Null DIE terminator to close compile_unit's children list
+        try buf.append(alloc, 0);
 
         const unit_length: u32 = @intCast(buf.items.len - unit_start);
         @memcpy(buf.items[unit_length_offset..][0..4], &std.mem.toBytes(unit_length));

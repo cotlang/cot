@@ -176,6 +176,7 @@ pub const MachOWriter = struct {
     debug_info_data: std.ArrayListUnmanaged(u8) = .{},
     debug_line_relocs: std.ArrayListUnmanaged(DebugReloc) = .{},
     debug_info_relocs: std.ArrayListUnmanaged(DebugReloc) = .{},
+    debug_func_infos: []const dwarf.DebugFuncInfo = &.{},
 
     pub fn init(allocator: std.mem.Allocator) MachOWriter {
         var writer = MachOWriter{ .allocator = allocator };
@@ -258,6 +259,10 @@ pub const MachOWriter = struct {
     pub fn setDebugInfo(self: *MachOWriter, source_file: []const u8, source_text: []const u8) void {
         self.source_file = source_file;
         self.source_text = source_text;
+    }
+
+    pub fn setFuncInfos(self: *MachOWriter, infos: []const dwarf.DebugFuncInfo) void {
+        self.debug_func_infos = infos;
     }
 
     pub fn addLineEntries(self: *MachOWriter, entries: []const LineEntry) !void {
@@ -511,6 +516,7 @@ pub const MachOWriter = struct {
 
         builder.setSourceInfo(self.source_file orelse "unknown.cot", self.source_text orelse "");
         builder.setTextSize(self.text_data.items.len);
+        builder.setFuncInfos(self.debug_func_infos);
 
         // Find first text section symbol
         var text_symbol_idx: u32 = 0;

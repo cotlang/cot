@@ -58,6 +58,7 @@ const clif = @import("ir/clif/mod.zig");
 const macho = @import("codegen/native/macho.zig");
 const elf = @import("codegen/native/elf.zig");
 const object_module = @import("codegen/native/object_module.zig");
+const dwarf_mod = @import("codegen/native/dwarf.zig");
 const buffer_mod = @import("codegen/native/machinst/buffer.zig");
 
 const project_mod = @import("project.zig");
@@ -1959,6 +1960,36 @@ pub const Driver = struct {
                 module.setDebugInfo(self.debug_source_file, self.debug_source_text);
             }
 
+            // Collect function debug info for DWARF DW_TAG_subprogram DIEs
+            if (self.debug_source_text.len > 0) {
+                var debug_func_infos = std.ArrayListUnmanaged(dwarf_mod.DebugFuncInfo){};
+                defer debug_func_infos.deinit(self.allocator);
+
+                for (compiled_funcs, 0..) |*cf, func_idx| {
+                    if (func_idx >= func_names.len) continue;
+                    const func_code_offset = module.getFuncCodeOffset(func_ids[func_idx]);
+                    const func_code_size: u32 = @intCast(cf.buffer.data.items.len);
+
+                    // Find declaration line from first srcloc
+                    var decl_line: u32 = 0;
+                    if (cf.buffer.srclocs.items.len > 0) {
+                        const first_src = cf.buffer.srclocs.items[0].loc.offset;
+                        if (first_src > 0) {
+                            decl_line = lineFromByteOffset(self.debug_source_text, first_src);
+                        }
+                    }
+
+                    try debug_func_infos.append(self.allocator, .{
+                        .name = func_names[func_idx],
+                        .code_offset = func_code_offset,
+                        .code_size = func_code_size,
+                        .source_line = decl_line,
+                    });
+                }
+
+                try module.setFuncInfos(debug_func_infos.items);
+            }
+
             // Build source map entries: (func_name_hash, code_offset_in_func, line_number)
             // The signal handler uses dladdr to get func name + offset, then searches this table.
             var srcmap_data = std.ArrayListUnmanaged(u8){};
@@ -3004,6 +3035,10 @@ pub const Driver = struct {
                 try ir_name_to_span.put(ir_func.name, ir_func.span.start.offset);
             }
 
+            // Collect function debug info for DWARF DW_TAG_subprogram DIEs
+            var debug_func_infos = std.ArrayListUnmanaged(dwarf_mod.DebugFuncInfo){};
+            defer debug_func_infos.deinit(self.allocator);
+
             // For each compiled function, look up its source span via export name
             for (compiled_funcs, 0..) |_, i| {
                 // Find this function's export name (same logic as Pass 1)
@@ -3020,8 +3055,20 @@ pub const Driver = struct {
                 if (ir_name_to_span.get(func_name)) |source_offset| {
                     const code_offset = module.getFuncCodeOffset(func_ids[i]);
                     try module.addLineEntry(code_offset, source_offset);
+
+                    const func_code_size: u32 = @intCast(compiled_funcs[i].buffer.data.items.len);
+                    const decl_line = lineFromByteOffset(self.debug_source_text, source_offset);
+
+                    try debug_func_infos.append(self.allocator, .{
+                        .name = func_name,
+                        .code_offset = code_offset,
+                        .code_size = func_code_size,
+                        .source_line = decl_line,
+                    });
                 }
             }
+
+            try module.setFuncInfos(debug_func_infos.items);
         }
 
         // Write to memory buffer

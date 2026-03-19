@@ -33,6 +33,7 @@ const CompiledCode = compile_mod.CompiledCode;
 // Import object file writers
 const macho = @import("macho.zig");
 const elf = @import("elf.zig");
+const dwarf_mod = @import("dwarf.zig");
 
 // =============================================================================
 // FuncId / DataId - Function and Data identifiers
@@ -197,6 +198,7 @@ pub const ObjectModule = struct {
     debug_source_file: []const u8 = "",
     debug_source_text: []const u8 = "",
     debug_line_entries: std.ArrayListUnmanaged(macho.LineEntry) = .{},
+    debug_func_infos: std.ArrayListUnmanaged(dwarf_mod.DebugFuncInfo) = .{},
 
     /// Accumulated relocations (for object file).
     relocations: std.ArrayListUnmanaged(ObjectReloc),
@@ -247,6 +249,7 @@ pub const ObjectModule = struct {
         self.relocations.deinit(self.allocator);
         self.data_relocations.deinit(self.allocator);
         self.debug_line_entries.deinit(self.allocator);
+        self.debug_func_infos.deinit(self.allocator);
     }
 
     // =========================================================================
@@ -377,6 +380,11 @@ pub const ObjectModule = struct {
     /// Add DWARF line entry (code_offset → source_offset mapping).
     pub fn addLineEntry(self: *Self, code_offset: u32, source_offset: u32) !void {
         try self.debug_line_entries.append(self.allocator, .{ .code_offset = code_offset, .source_offset = source_offset });
+    }
+
+    /// Set DWARF debug function info for subprogram DIEs.
+    pub fn setFuncInfos(self: *Self, infos: []const dwarf_mod.DebugFuncInfo) !void {
+        try self.debug_func_infos.appendSlice(self.allocator, infos);
     }
 
     /// Get the code offset of a defined function in the text section.
@@ -548,6 +556,7 @@ pub const ObjectModule = struct {
         // Generate DWARF debug sections if line entries are present
         if (self.debug_line_entries.items.len > 0) {
             macho_writer.setDebugInfo(self.debug_source_file, self.debug_source_text);
+            macho_writer.setFuncInfos(self.debug_func_infos.items);
             try macho_writer.addLineEntries(self.debug_line_entries.items);
             try macho_writer.generateDebugSections();
         }
