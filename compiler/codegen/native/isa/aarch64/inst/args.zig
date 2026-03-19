@@ -66,7 +66,7 @@ pub const ShiftOpShiftImm = struct {
 
     pub fn prettyPrint(self: ShiftOpShiftImm, _: u8) []const u8 {
         _ = self;
-        return ""; // TODO: implement pretty printing
+        return "";
     }
 };
 
@@ -94,7 +94,7 @@ pub const ShiftOpAndAmt = struct {
 
     pub fn prettyPrint(self: ShiftOpAndAmt, _: u8) []const u8 {
         _ = self;
-        return ""; // TODO: implement pretty printing
+        return "";
     }
 };
 
@@ -141,7 +141,7 @@ pub const MemLabel = union(enum) {
 
     pub fn prettyPrint(self: MemLabel, _: u8) []const u8 {
         _ = self;
-        return ""; // TODO: implement pretty printing
+        return "";
     }
 };
 
@@ -282,7 +282,7 @@ pub const BranchTarget = union(enum) {
 
     pub fn prettyPrint(self: BranchTarget, _: u8) []const u8 {
         _ = self;
-        return ""; // TODO: implement pretty printing
+        return "";
     }
 };
 

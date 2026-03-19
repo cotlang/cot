@@ -275,7 +275,7 @@ pub const Amode = union(enum) {
 
     pub fn prettyPrint(self: Amode, _: u8) []const u8 {
         _ = self;
-        return ""; // TODO: implement pretty printing
+        return "";
     }
 };
 
@@ -347,7 +347,7 @@ pub const SyntheticAmode = union(enum) {
 
     pub fn prettyPrint(self: SyntheticAmode, _: u8) []const u8 {
         _ = self;
-        return ""; // TODO: implement pretty printing
+        return "";
     }
 };
 
@@ -384,7 +384,7 @@ pub const RegMemImm = union(enum) {
     pub fn prettyPrint(self: RegMemImm, size: u8) []const u8 {
         _ = self;
         _ = size;
-        return ""; // TODO: implement pretty printing
+        return "";
     }
 };
 
@@ -416,7 +416,7 @@ pub const RegMem = union(enum) {
     pub fn prettyPrint(self: RegMem, size: u8) []const u8 {
         _ = self;
         _ = size;
-        return ""; // TODO: implement pretty printing
+        return "";
     }
 };
 

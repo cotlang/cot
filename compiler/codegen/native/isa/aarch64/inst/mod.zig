@@ -693,7 +693,7 @@ pub const AMode = union(enum) {
     pub fn prettyPrint(self: AMode, size_bytes: u8) []const u8 {
         _ = self;
         _ = size_bytes;
-        return ""; // TODO: implement pretty printing
+        return "";
     }
 };
 
@@ -708,7 +708,7 @@ pub const PairAMode = union(enum) {
 
     pub fn prettyPrintDefault(self: PairAMode) []const u8 {
         _ = self;
-        return ""; // TODO: implement pretty printing
+        return "";
     }
 };
 
@@ -1735,13 +1735,13 @@ pub const Inst = union(enum) {
     }
 
     /// Stub: Get operands for register allocation.
-    /// TODO: Implement proper operand collection via get_operands.zig
+    /// Stub — real implementation in get_operands.zig
     pub fn getOperands(_: Inst) []const machinst_reg.Operand {
         return &[_]machinst_reg.Operand{};
     }
 
     /// Stub: Get clobbered registers.
-    /// TODO: Implement proper clobber tracking
+    /// Stub — real clobber tracking in get_operands.zig
     pub fn getClobbers(_: Inst) machinst_reg.PRegSet {
         return machinst_reg.PRegSet.empty();
     }

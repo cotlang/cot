@@ -883,7 +883,7 @@ pub fn Callee(comptime M: type) type {
         /// Is forward-edge CFI enabled?
         pub fn isForwardEdgeCfiEnabled(self: *const Self) bool {
             _ = self;
-            return false; // TODO: implement based on ISA flags
+            return false; // CFI not implemented
         }
 
         /// Compute the frame layout.

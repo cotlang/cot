@@ -1470,7 +1470,7 @@ pub const Driver = struct {
             // Set function type for CLIF signature building (not set by SSA builder)
             ssa_func.type_idx = ir_func.type_idx;
 
-            // Run SSA passes (native path — copyelim TODO after CLIF translation fix)
+            // Run SSA passes (native path — copyelim not in native SSA pipeline)
             try rewritegeneric.rewrite(func_alloc, ssa_func, &string_offsets);
             try decompose_builtin.decompose(func_alloc, ssa_func, type_reg);
             try rewritedec.rewrite(func_alloc, ssa_func);

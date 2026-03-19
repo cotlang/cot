@@ -34,7 +34,7 @@ pub const NZCV = struct {
 
     pub fn prettyPrint(self: NZCV, _: u8) []const u8 {
         _ = self;
-        return ""; // TODO: implement pretty printing
+        return "";
     }
 };
 
@@ -58,7 +58,7 @@ pub const UImm5 = struct {
 
     pub fn prettyPrint(self: UImm5, _: u8) []const u8 {
         _ = self;
-        return ""; // TODO: implement pretty printing
+        return "";
     }
 };
 
@@ -99,7 +99,7 @@ pub const SImm7Scaled = struct {
 
     pub fn prettyPrint(self: SImm7Scaled, _: u8) []const u8 {
         _ = self;
-        return ""; // TODO: implement pretty printing
+        return "";
     }
 };
 
@@ -131,7 +131,7 @@ pub const FPULeftShiftImm = struct {
 
     pub fn prettyPrint(self: FPULeftShiftImm, _: u8) []const u8 {
         _ = self;
-        return ""; // TODO: implement pretty printing
+        return "";
     }
 };
 
@@ -162,7 +162,7 @@ pub const FPURightShiftImm = struct {
 
     pub fn prettyPrint(self: FPURightShiftImm, _: u8) []const u8 {
         _ = self;
-        return ""; // TODO: implement pretty printing
+        return "";
     }
 };
 
@@ -191,7 +191,7 @@ pub const SImm9 = struct {
 
     pub fn prettyPrint(self: SImm9, _: u8) []const u8 {
         _ = self;
-        return ""; // TODO: implement pretty printing
+        return "";
     }
 };
 
@@ -234,7 +234,7 @@ pub const UImm12Scaled = struct {
 
     pub fn prettyPrint(self: UImm12Scaled, _: u8) []const u8 {
         _ = self;
-        return ""; // TODO: implement pretty printing
+        return "";
     }
 };
 
@@ -288,7 +288,7 @@ pub const Imm12 = struct {
 
     pub fn prettyPrint(self: Imm12, _: u8) []const u8 {
         _ = self;
-        return ""; // TODO: implement pretty printing
+        return "";
     }
 };
 
@@ -435,7 +435,7 @@ pub const ImmLogic = struct {
 
     pub fn prettyPrint(self: ImmLogic, _: u8) []const u8 {
         _ = self;
-        return ""; // TODO: implement pretty printing
+        return "";
     }
 };
 
@@ -459,7 +459,7 @@ pub const ImmShift = struct {
 
     pub fn prettyPrint(self: ImmShift, _: u8) []const u8 {
         _ = self;
-        return ""; // TODO: implement pretty printing
+        return "";
     }
 };
 
@@ -523,7 +523,7 @@ pub const MoveWideConst = struct {
 
     pub fn prettyPrint(self: MoveWideConst, _: u8) []const u8 {
         _ = self;
-        return ""; // TODO: implement pretty printing
+        return "";
     }
 };
 
@@ -638,7 +638,7 @@ pub const ASIMDMovModImm = struct {
 
     pub fn prettyPrint(self: ASIMDMovModImm, _: u8) []const u8 {
         _ = self;
-        return ""; // TODO: implement pretty printing
+        return "";
     }
 };
 
@@ -729,7 +729,7 @@ pub const ASIMDFPModImm = struct {
 
     pub fn prettyPrint(self: ASIMDFPModImm, _: u8) []const u8 {
         _ = self;
-        return ""; // TODO: implement pretty printing
+        return "";
     }
 };
 

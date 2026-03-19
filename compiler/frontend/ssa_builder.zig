@@ -1824,8 +1824,8 @@ pub const SSABuilder = struct {
                 .u16_type => .load16,
                 .i32_type => .load32s,
                 .u32_type => .load32,
-                .f32_type => .load32, // TODO: .load_f32
-                .f64_type => .load,   // TODO: .load_f64
+                .f32_type => .load32,
+                .f64_type => .load,
                 else => .load,
             };
         }

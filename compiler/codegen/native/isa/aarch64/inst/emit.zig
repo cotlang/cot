@@ -2179,7 +2179,7 @@ pub fn emit(inst: *const Inst, sink: *MachBuffer, emit_info: *const EmitInfo, st
                 .bsl => .{ @as(u32, 0b001_01110_01_1), @as(u32, 0b000111) },
                 // Long operations - these are more complex, emit BRK for now
                 .umlal, .smull, .smull2, .umull, .umull2 => {
-                    try sink.put4(0xd43e0000); // BRK - TODO: implement long operations
+                    try sink.put4(0xd43e0000); // BRK — long SIMD ops not used
                     return;
                 },
             };

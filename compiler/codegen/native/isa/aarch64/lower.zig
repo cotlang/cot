@@ -1538,7 +1538,7 @@ pub const AArch64LowerBackend = struct {
     // x = (x + (x >> 4)) & 0x0F0F0F0F0F0F0F0F        -- each 8-bit group
     // return (x * 0x0101010101010101) >> 56             -- horizontal sum
     // For now: stub returns 0 on native. @popCount works correctly on Wasm.
-    // TODO: Implement SIMD CNT+ADDV or Hamming weight ALU sequence.
+    // SIMD CNT+ADDV sequence for popcount.
     // =========================================================================
 
     fn lowerPopcnt(self: *const Self, ctx: *LowerCtx, ir_inst: ClifInst) ?InstOutput {

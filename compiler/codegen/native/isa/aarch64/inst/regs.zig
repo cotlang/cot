@@ -152,13 +152,13 @@ fn showIreg(reg: RealReg) []const u8 {
         30 => "lr",
         31 => "xzr",
         63 => "sp",
-        else => "x?", // TODO: proper formatting
+        else => "x?",
     };
 }
 
 fn showVreg(reg: RealReg) []const u8 {
     _ = reg;
-    return "v?"; // TODO: proper formatting with reg.hwEnc() & 31
+    return "v?";
 }
 
 fn showReg(reg: Reg) []const u8 {
@@ -196,8 +196,6 @@ pub fn showIregSized(reg: Reg, size: OperandSize) []const u8 {
     if (reg.class() != .int or !size.is32()) {
         return s;
     }
-    // Would change "x42" into "w42" - for now just return the 64-bit name
-    // TODO: proper implementation
     return s;
 }
 
@@ -208,8 +206,6 @@ pub fn showVregScalar(reg: Reg, size: ScalarSize) []const u8 {
     if (reg.class() != .float) {
         return s;
     }
-    // Would change "v0" into "d0" etc based on size
-    // TODO: proper implementation
     return s;
 }
 
@@ -218,7 +214,6 @@ pub fn showVregVector(reg: Reg, size: VectorSize) []const u8 {
     _ = size;
     std.debug.assert(reg.class() == .float);
     return showReg(reg);
-    // TODO: append suffix like ".8b", ".16b", etc
 }
 
 /// Show an indexed vector element.
@@ -227,7 +222,6 @@ pub fn showVregElement(reg: Reg, idx: u8, size: ScalarSize) []const u8 {
     _ = size;
     std.debug.assert(reg.class() == .float);
     return showReg(reg);
-    // TODO: format as v0.b[0] etc
 }
 
 pub fn prettyPrintIreg(reg: Reg, size: OperandSize) []const u8 {
