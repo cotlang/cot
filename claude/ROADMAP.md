@@ -1,8 +1,8 @@
 # Cot Roadmap
 
-## Current: 0.3.5 (Mar 2026)
+## Current: 0.3.6 (Mar 2026)
 
-Concurrency system complete. Go-style `select` statement, work-stealing scheduler with per-worker Chase-Lev deques, Channel tryRecv/trySend/len, atomic weak references, bool equality comparison. 72 test files (~1,700 tests, 72/72 passing on native). Previous: 34 stdlib modules, LSP with 7 features, @safe mode, comptime, ARC, OS threading primitives, CI/CD, C source bundling. Self-hosted compiler at ~70% frontend parity (21,264 lines across 10 files, 237 tests).
+ARC at ~98% Swift SILGen parity: `opt_make`/`opt_tag`/`opt_data` SSA decomposition for `?*T`, centralized `emitCopyValue`/`emitDestroyValue` dispatch, zero ad-hoc retain/release. 84 test files (~1,790 tests, 83/83 passing on native + Wasm). Self-hosted compiler: 44,700 lines across 42 files, zero crashes (all 13 frontend files reach selfcot checker stage). Previous: concurrency (Go-style select, work-stealing scheduler), 34 stdlib modules, LSP, @safe mode, comptime, ARC, CI/CD.
 
 **What ships:** A developer can `cot init`, write an HTTP server with crypto + regex + path handling + SQLite, `cot test --watch` during development, `cot lint` + `cot check` for fast feedback, `cot bench` for performance, `cot doc` for API docs, and `cot build` for a native binary. Like Deno, but compiled to native with zero runtime overhead.
 
@@ -25,7 +25,7 @@ All language features and stdlib are done. What remains is distribution polish:
 | 7 | `cot init` improvements (test template, next-steps) | Not started |
 | 8 | Logo & brand assets | Not started |
 | 9 | cot.dev launch (docs site + playground) | Not started |
-| 10 | Self-hosting progress (frontend in Cot) | ~70% frontend (21,264 lines, 237 tests). ir.cot complete, lower.cot ~66% (6,618 lines, 20 tests). ssa_builder.zig (~2,178 lines), arc_insertion.zig (~444 lines) remaining. |
+| 10 | Self-hosting progress (frontend in Cot) | 44,700 lines across 42 files. All 13 frontend files reach selfcot checker stage (0 crashes). 2 selfcot checker bugs remain (enum method resolution, stdlib type mismatch). |
 
 **Release criteria:** `brew install cotlang/tap/cot` works, VS Code extension on marketplace, all tests pass on native + Wasm.
 

@@ -1,6 +1,6 @@
-# src/ Structure — Self-Hosted Compiler Layout
+# self/ Structure — Self-Hosted Compiler Layout
 
-The self-hosted Cot compiler (`self/`, becoming `src/`) is organized as a pipeline.
+The self-hosted Cot compiler (`self/`) is organized as a pipeline.
 Each folder is a stage. The folder names read as the compilation flow:
 
 **parse → check → build → optimize → emit**
@@ -10,7 +10,7 @@ Each folder is a stage. The folder names read as the compilation flow:
 ## Pipeline
 
 ```
-src/
+self/
   main.cot
 
   parse/                # text → tree
@@ -107,49 +107,49 @@ would add nesting without clarity.
 
 ## Migration Path
 
-Current `self/` → future `src/`:
+Current `self/` → future `self/`:
 
 | Current | Future | Notes |
 |---------|--------|-------|
-| `self/frontend/token.cot` | `src/parse/token.cot` | |
-| `self/frontend/scanner.cot` | `src/parse/scanner.cot` | |
-| `self/frontend/parser.cot` | `src/parse/parser.cot` | |
-| `self/frontend/ast.cot` | `src/parse/ast.cot` | |
-| `self/frontend/source.cot` | `src/parse/source.cot` | |
-| `self/frontend/checker.cot` | `src/check/checker.cot` | |
-| `self/frontend/types.cot` | `src/check/types.cot` | |
-| `self/frontend/errors.cot` | `src/check/errors.cot` | |
-| `self/frontend/ir.cot` | `src/build/ir.cot` | SSA IR definitions |
-| `self/frontend/lower.cot` | `src/build/lower.cot` | 9K lines, biggest file |
-| `self/frontend/ssa_builder.cot` | `src/build/builder.cot` | |
-| `self/frontend/ssa.cot` | `src/build/ir.cot` | Merged with ir.cot |
-| `self/frontend/arc_insertion.cot` | `src/build/arc.cot` | |
-| `self/ssa/passes/copyelim.cot` | `src/optimize/copyelim.cot` | |
-| `self/ssa/passes/cse.cot` | `src/optimize/cse.cot` | |
-| `self/ssa/passes/deadcode.cot` | `src/optimize/deadcode.cot` | |
-| `self/ssa/passes/decompose.cot` | `src/optimize/decompose.cot` | |
-| `self/ssa/passes/layout.cot` | `src/optimize/layout.cot` | |
-| `self/ssa/passes/rewritegeneric.cot` | `src/optimize/rewrite.cot` | Combined with rewritedec |
-| `self/ssa/passes/rewritedec.cot` | `src/optimize/rewrite.cot` | Combined with rewritegeneric |
-| `self/ssa/passes/schedule.cot` | `src/optimize/schedule.cot` | |
-| `self/ssa/passes/lower_wasm.cot` | `src/emit/wasm/lower.cot` | Wasm-specific, belongs in emit |
-| `self/codegen/wasm/wasm_gen.cot` | `src/emit/wasm/gen.cot` | |
-| `self/codegen/wasm/assemble.cot` | `src/emit/wasm/assemble.cot` | |
-| `self/codegen/wasm/link.cot` | `src/emit/wasm/link.cot` | |
-| `self/codegen/wasm/preprocess.cot` | `src/emit/wasm/preprocess.cot` | |
-| `self/codegen/wasm/wasm_types.cot` | `src/emit/wasm/types.cot` | |
-| `self/codegen/wasm/constants.cot` | `src/emit/wasm/constants.cot` | |
-| `self/codegen/wasm/code_builder.cot` | `src/emit/wasm/builder.cot` | |
-| `self/codegen/wasm/prog.cot` | `src/emit/wasm/prog.cot` | |
-| `self/codegen/wasm/mem_runtime.cot` | `src/emit/wasm/mem.cot` | |
-| `self/codegen/wasm/print_runtime.cot` | `src/emit/wasm/print.cot` | |
-| `self/codegen/wasm/wasi_runtime.cot` | `src/emit/wasm/wasi.cot` | |
-| `self/codegen/wasm/test_runtime.cot` | `src/emit/wasm/test.cot` | |
-| `self/codegen/wasm/bench_runtime.cot` | `src/emit/wasm/bench.cot` | |
-| `self/codegen/wasm/slice_runtime.cot` | `src/emit/wasm/slice.cot` | |
-| `self/codegen/wasm/driver.cot` | `src/emit/wasm/driver.cot` | Pipeline orchestration |
-| `self/codegen/wasm/ssa_passes.cot` | `src/emit/wasm/passes.cot` | |
-| `self/codegen/wasm/ssa_passes_dec.cot` | `src/emit/wasm/passes.cot` | Merged |
+| `self/frontend/token.cot` | `self/parse/token.cot` | |
+| `self/frontend/scanner.cot` | `self/parse/scanner.cot` | |
+| `self/frontend/parser.cot` | `self/parse/parser.cot` | |
+| `self/frontend/ast.cot` | `self/parse/ast.cot` | |
+| `self/frontend/source.cot` | `self/parse/source.cot` | |
+| `self/frontend/checker.cot` | `self/check/checker.cot` | |
+| `self/frontend/types.cot` | `self/check/types.cot` | |
+| `self/frontend/errors.cot` | `self/check/errors.cot` | |
+| `self/frontend/ir.cot` | `self/build/ir.cot` | SSA IR definitions |
+| `self/frontend/lower.cot` | `self/build/lower.cot` | 9K lines, biggest file |
+| `self/frontend/ssa_builder.cot` | `self/build/builder.cot` | |
+| `self/frontend/ssa.cot` | `self/build/ir.cot` | Merged with ir.cot |
+| `self/frontend/arc_insertion.cot` | `self/build/arc.cot` | |
+| `self/ssa/passes/copyelim.cot` | `self/optimize/copyelim.cot` | |
+| `self/ssa/passes/cse.cot` | `self/optimize/cse.cot` | |
+| `self/ssa/passes/deadcode.cot` | `self/optimize/deadcode.cot` | |
+| `self/ssa/passes/decompose.cot` | `self/optimize/decompose.cot` | |
+| `self/ssa/passes/layout.cot` | `self/optimize/layout.cot` | |
+| `self/ssa/passes/rewritegeneric.cot` | `self/optimize/rewrite.cot` | Combined with rewritedec |
+| `self/ssa/passes/rewritedec.cot` | `self/optimize/rewrite.cot` | Combined with rewritegeneric |
+| `self/ssa/passes/schedule.cot` | `self/optimize/schedule.cot` | |
+| `self/ssa/passes/lower_wasm.cot` | `self/emit/wasm/lower.cot` | Wasm-specific, belongs in emit |
+| `self/codegen/wasm/wasm_gen.cot` | `self/emit/wasm/gen.cot` | |
+| `self/codegen/wasm/assemble.cot` | `self/emit/wasm/assemble.cot` | |
+| `self/codegen/wasm/link.cot` | `self/emit/wasm/link.cot` | |
+| `self/codegen/wasm/preprocess.cot` | `self/emit/wasm/preprocess.cot` | |
+| `self/codegen/wasm/wasm_types.cot` | `self/emit/wasm/types.cot` | |
+| `self/codegen/wasm/constants.cot` | `self/emit/wasm/constants.cot` | |
+| `self/codegen/wasm/code_builder.cot` | `self/emit/wasm/builder.cot` | |
+| `self/codegen/wasm/prog.cot` | `self/emit/wasm/prog.cot` | |
+| `self/codegen/wasm/mem_runtime.cot` | `self/emit/wasm/mem.cot` | |
+| `self/codegen/wasm/print_runtime.cot` | `self/emit/wasm/print.cot` | |
+| `self/codegen/wasm/wasi_runtime.cot` | `self/emit/wasm/wasi.cot` | |
+| `self/codegen/wasm/test_runtime.cot` | `self/emit/wasm/test.cot` | |
+| `self/codegen/wasm/bench_runtime.cot` | `self/emit/wasm/bench.cot` | |
+| `self/codegen/wasm/slice_runtime.cot` | `self/emit/wasm/slice.cot` | |
+| `self/codegen/wasm/driver.cot` | `self/emit/wasm/driver.cot` | Pipeline orchestration |
+| `self/codegen/wasm/ssa_passes.cot` | `self/emit/wasm/passes.cot` | |
+| `self/codegen/wasm/ssa_passes_dec.cot` | `self/emit/wasm/passes.cot` | Merged |
 
 ---
 
