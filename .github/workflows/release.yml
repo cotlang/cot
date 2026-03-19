@@ -84,3 +84,55 @@ jobs:
             cot-x86_64-linux.tar.gz
             cot-x86_64-linux.tar.gz.sha256
           generate_release_notes: true
+
+      - name: Update Homebrew formula
+        env:
+          TAP_TOKEN: ${{ secrets.STD_REPO_TOKEN }}
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          MACOS_SHA=$(cat cot-aarch64-macos.tar.gz.sha256 | awk '{print $1}')
+          LINUX_SHA=$(cat cot-x86_64-linux.tar.gz.sha256 | awk '{print $1}')
+
+          cat > /tmp/cot.rb << EOF
+          class Cot < Formula
+            desc "Write like TypeScript, run like Rust, deploy anywhere"
+            homepage "https://github.com/cotlang/cot"
+            version "${VERSION}"
+            license "MIT"
+
+            on_macos do
+              on_arm do
+                url "https://github.com/cotlang/cot/releases/download/v${VERSION}/cot-aarch64-macos.tar.gz"
+                sha256 "${MACOS_SHA}"
+              end
+            end
+
+            on_linux do
+              on_intel do
+                url "https://github.com/cotlang/cot/releases/download/v${VERSION}/cot-x86_64-linux.tar.gz"
+                sha256 "${LINUX_SHA}"
+              end
+            end
+
+            def install
+              bin.install "bin/cot"
+              (lib/"cot").install "lib/std"
+            end
+
+            test do
+              assert_match "cot #{version}", shell_output("#{bin}/cot version")
+            end
+          end
+          EOF
+
+          # Remove leading whitespace from heredoc
+          sed -i 's/^          //' /tmp/cot.rb
+
+          git clone https://x-access-token:${TAP_TOKEN}@github.com/cotlang/homebrew-tap.git /tmp/tap
+          cp /tmp/cot.rb /tmp/tap/Formula/cot.rb
+          cd /tmp/tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/cot.rb
+          git commit -m "Update cot to ${VERSION}"
+          git push

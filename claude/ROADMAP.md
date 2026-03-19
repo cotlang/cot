@@ -87,7 +87,7 @@ Everything before this is building the compiler. This version is about making it
 | CLI polish | `cot upgrade` (self-update), shell completions (zsh/bash/fish), `cot init` improvements |
 | Branding | Logo, color palette, cot.dev launch (docs site + playground) |
 | Package manager | `cot add`, `cot remove`, `cot publish`, lockfile, dependency resolution |
-| Registry | cot.land — package registry |
+| Registry | cot.land deployed, packages installable |
 | Documentation | Getting started guide, language tour, stdlib API docs, examples |
 
 **Release criteria:** `brew install cotlang/tap/cot` works. VS Code extension installs from marketplace. cot.dev is live. A developer can go from zero to running project in 5 minutes.
@@ -100,14 +100,42 @@ Everything before this is building the compiler. This version is about making it
 
 The ecosystem matures. Developers can build, test, and deploy real applications.
 
+### Package ecosystem — `cot.land` (`~/cot-land/pkg`)
+
+The registry server and CLI tool are largely built. Written entirely in Cot as a dogfooding exercise (18 source files, 55 tests).
+
+| Component | Status |
+|-----------|--------|
+| HTTP server (accept loop, routing, request/response) | **Done** |
+| REST API (list, get, search, create, publish packages) | **Done** |
+| Web UI (landing, package list, detail, version, search pages) | **Done** |
+| JSON persistence + disk storage for package files | **Done** |
+| Semver validation, immutable versions, SHA-256 checksums | **Done** |
+| CLI tool (init, publish, add, install, remove, search, info, list, login) | **Done** |
+| Transitive dependency resolution + lock file (`cot.lock`) | **Done** |
+| Compiler integration (import from `~/.cache/cot/packages/`) | Not started |
+| Real auth (user accounts, signed tokens, package ownership) | Not started |
+| Production hardening (rate limiting, logging, error handling) | Not started |
+| Deploy to Fly.io at `cot.land` | Not started |
+
+### Other 0.8 work
+
 | Category | Items |
 |----------|-------|
-| C interop | C source bundling in packages, cross-compile C dependencies |
+| C interop | C source bundling in packages (`c_sources` in cot.json), cross-compile C dependencies |
 | Web | `std/dom` for browser Wasm, web framework prototype |
-| Database | Database drivers as registry packages (SQLite, Postgres) |
+| Database | Database drivers as registry packages (SQLite, Postgres via C source bundling) |
 | Safety | Permission system (`--allow-read`, `--allow-net`), ASAN in debug mode |
 | Observability | Built-in OpenTelemetry, auto-instrument HTTP |
 | Stdlib | `std/csv`, `std/toml`, `std/streams`, `std/net` (DNS, TLS) |
+
+### Real-world Cot projects (`~/cot-land/`)
+
+| Project | Description | Lines | Status |
+|---------|-------------|-------|--------|
+| **Cotty** | GPU-accelerated code editor + terminal — VT100 parser, gap buffer, syntax highlighting, file tree, project search. Cot core compiled to `libcotty.dylib`, Swift/Metal macOS frontend via C FFI (`cotty.h`). Proves Cot's native library + C interop story. | 22,732 (Cot) + Swift/Metal UI | Active |
+| **cot.land/pkg** | Package registry — HTTP server, REST API, web UI, CLI tool, dependency resolution | 18 files, 55 tests | See above |
+| **dex** | Web framework (Svelte reference) | Early | Planned |
 
 ---
 
