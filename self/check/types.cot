@@ -313,6 +313,12 @@ const TAG_ENUM: int = 11
 const TAG_UNION: int = 12
 const TAG_FUNC: int = 13
 const TAG_FUTURE: int = 14
+const TAG_DISTINCT: int = 15
+
+struct DistinctType {
+    name: string,
+    underlying: int,
+}
 
 union Type {
     basic: BasicKind,
@@ -330,6 +336,7 @@ union Type {
     union_type: UnionType,
     func: FuncType,
     future: FutureType,
+    distinct_type: DistinctType,
 }
 
 // ============================================================================
@@ -533,8 +540,19 @@ struct TypeRegistry {
             Type.tuple |_| => "tuple",
             Type.future |_| => "Future",
             Type.func |_| => "function",
+            Type.distinct_type |d| => d.name,
             else => "unknown",
         }
+    }
+
+    /// Resolve distinct types to their underlying type.
+    fn resolveDistinct(idx: int) int {
+        const t = self.get(idx)
+        if (t.tag == TAG_DISTINCT) {
+            const d = switch (t) { Type.distinct_type |d| => d, else => DistinctType { name: "", underlying: 0 } }
+            return self.resolveDistinct(d.underlying)
+        }
+        return idx
     }
 
     // ---- Factory methods ----
@@ -656,7 +674,7 @@ struct TypeRegistry {
         for i in 0..count {
             @intToPtr(*int, ptr + i * 8).* = elems.get(i)
         }
-        return self.add(Type.tuple(TupleType { elem_count: count, elem_types: ptr }))
+        return self.add(Type.tuple(TupleType { elem_count: count, elem_types: @intCast(i64, ptr) }))
     }
 
     fn makeFunc(params: List(FuncParam), return_type: int) int {
@@ -668,7 +686,7 @@ struct TypeRegistry {
             fp.name = p.name
             fp.type_idx = p.type_idx
         }
-        return self.add(Type.func(FuncType { param_count: count, params: ptr, return_type: return_type }))
+        return self.add(Type.func(FuncType { param_count: count, params: @intCast(i64, ptr), return_type: return_type }))
     }
 
     fn makeFuture(result_type: int) int {
@@ -793,6 +811,7 @@ struct TypeRegistry {
                 if (max_payload > 0) { payload_aligned = ((max_payload + 7) / 8) * 8 }
                 return 8 + payload_aligned
             },
+            Type.distinct_type |d| => self.sizeOf(d.underlying),
         }
     }
 
@@ -818,6 +837,7 @@ struct TypeRegistry {
             Type.array |a| => self.alignmentOf(a.elem),
             Type.struct_type |s| => s.alignment,
             Type.enum_type |e| => self.alignmentOf(e.backing_type),
+            Type.distinct_type |d| => self.alignmentOf(d.underlying),
         }
     }
 
@@ -968,6 +988,7 @@ struct TypeRegistry {
             return self.typeName(a) == self.typeName(b)
         }
         if (ta.tag == TAG_TUPLE) { return self.equalTuple(a, b) }
+        if (ta.tag == TAG_DISTINCT) { return self.typeName(a) == self.typeName(b) }
         return false
     }
 
@@ -1020,6 +1041,22 @@ struct TypeRegistry {
         if (from == NORETURN) { return true }
         const from_t = self.get(from)
         const to_t = self.get(to)
+
+        // Distinct types: only assignable from same distinct type or untyped literals
+        // Go reference: named types require explicit conversion from underlying type
+        if (to_t.tag == TAG_DISTINCT) {
+            if (from_t.tag == TAG_DISTINCT) { return self.typeName(from) == self.typeName(to) }
+            // Allow untyped literal coercion: var x: RawPtr = 42
+            if (from_t.tag == TAG_BASIC) {
+                const fk = switch (from_t) { Type.basic |k| => k, else => BasicKind.invalid }
+                if (fk.isUntyped()) {
+                    const underlying = switch (to_t) { Type.distinct_type |d| => d.underlying, else => 0 }
+                    return self.isAssignable(from, underlying)
+                }
+            }
+            return false
+        }
+        if (from_t.tag == TAG_DISTINCT) { return false }
 
         // Untyped conversions
         if (from_t.tag == TAG_BASIC) {
@@ -1186,10 +1223,10 @@ struct TypeRegistry {
             const t = self.get(i)
             if (t.tag == TAG_TUPLE) {
                 const tup = switch (t) { Type.tuple |tup| => tup, else => TupleType { elem_count: 0, elem_types: 0 } }
-                if (tup.elem_types != 0) { dealloc_raw(tup.elem_types) }
+                if (tup.elem_types != 0) { dealloc_raw(RawPtr(tup.elem_types)) }
             } else if (t.tag == TAG_FUNC) {
                 const f = switch (t) { Type.func |f| => f, else => FuncType { param_count: 0, params: 0, return_type: 0 } }
-                if (f.params != 0) { dealloc_raw(f.params) }
+                if (f.params != 0) { dealloc_raw(RawPtr(f.params)) }
             }
         }
     }

@@ -73,6 +73,7 @@ pub const MapType = struct { key: TypeIndex, value: TypeIndex };
 pub const ListType = struct { elem: TypeIndex };
 pub const TupleType = struct { element_types: []const TypeIndex };
 pub const FutureType = struct { result_type: TypeIndex };
+pub const DistinctType = struct { name: []const u8, underlying: TypeIndex };
 
 // Aggregate types
 pub const StructField = struct { name: []const u8, type_idx: TypeIndex, offset: u32, default_value: @import("ast.zig").NodeIndex = @import("ast.zig").null_node };
@@ -101,6 +102,7 @@ pub const Type = union(enum) {
     union_type: UnionType,
     func: FuncType,
     future: FutureType,
+    distinct: DistinctType,
 
     pub fn underlying(self: Type) Type { return self; }
     pub fn isInvalid(self: Type) bool { return self == .basic and self.basic == .invalid; }
@@ -245,8 +247,18 @@ pub const TypeRegistry = struct {
             .tuple => "tuple",
             .future => "Future",
             .func => "function",
+            .distinct => |d| d.name,
             else => "unknown",
         };
+    }
+
+    /// Resolve distinct types to their underlying type (recursively).
+    /// Zero-cost abstraction: distinct types are identical to underlying at runtime.
+    /// Go reference: Type.Underlying() returns the base type for named types.
+    pub fn resolveDistinct(self: *const TypeRegistry, idx: TypeIndex) TypeIndex {
+        const t = self.get(idx);
+        if (t == .distinct) return self.resolveDistinct(t.distinct.underlying);
+        return idx;
     }
 
     pub fn add(self: *TypeRegistry, t: Type) !TypeIndex {
@@ -401,6 +413,7 @@ pub const TypeRegistry = struct {
                 const payload_aligned = if (max_payload == 0) @as(u32, 0) else ((max_payload + 7) / 8) * 8;
                 break :blk 8 + payload_aligned;
             },
+            .distinct => |d| self.sizeOf(d.underlying),
         };
     }
 
@@ -411,6 +424,7 @@ pub const TypeRegistry = struct {
             .array => |a| self.alignmentOf(a.elem),
             .struct_type => |s| s.alignment,
             .enum_type => |e| self.alignmentOf(e.backing_type),
+            .distinct => |d| self.alignmentOf(d.underlying),
         };
     }
 
@@ -455,6 +469,8 @@ pub const TypeRegistry = struct {
                 for (tup.element_types) |et| if (!self.isTrivial(et)) return false;
                 return true;
             },
+            // Distinct types inherit triviality from their underlying type
+            .distinct => |d| self.isTrivial(d.underlying),
         };
     }
 
@@ -563,6 +579,7 @@ pub const TypeRegistry = struct {
             },
             .func => false,
             .future => |fa| self.equal(fa.result_type, tb.future.result_type),
+            .distinct => |da| std.mem.eql(u8, da.name, tb.distinct.name),
         };
     }
 
@@ -581,6 +598,16 @@ pub const TypeRegistry = struct {
             if (from_t.basic == .untyped_bool and to_t == .basic and to_t.basic == .bool_type) return true;
             if (from_t.basic == .untyped_null and (to_t == .optional or to_t == .pointer)) return true;
         }
+
+        // Distinct types: only assignable from same distinct type or untyped literals
+        // Go reference: named types require explicit conversion from underlying type
+        if (to_t == .distinct) {
+            if (from_t == .distinct) return std.mem.eql(u8, from_t.distinct.name, to_t.distinct.name);
+            // Allow untyped literal coercion: var x: RawPtr = 42
+            if (from_t == .basic and from_t.basic.isUntyped()) return self.isAssignable(from, to_t.distinct.underlying);
+            return false;
+        }
+        if (from_t == .distinct) return false; // distinct → non-distinct requires explicit cast
 
         // T -> ?T
         if (to_t == .optional) return self.isAssignable(from, to_t.optional.elem);

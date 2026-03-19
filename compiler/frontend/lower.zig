@@ -8040,10 +8040,20 @@ pub const Lowerer = struct {
     }
 
     fn lowerCall(self: *Lowerer, call: ast.Call) Error!ir.NodeIndex {
-        const fb = self.current_func orelse return ir.null_node;
         const callee_node = self.tree.getNode(call.callee) orelse return ir.null_node;
         const callee_expr = callee_node.asExpr() orelse return ir.null_node;
 
+        // Distinct type constructor: RawPtr(expr) — zero-cost, just lower the argument
+        if (callee_expr == .ident) {
+            if (self.type_reg.lookupByName(callee_expr.ident.name)) |type_idx| {
+                if (self.type_reg.get(type_idx) == .distinct) {
+                    if (call.args.len == 1) return try self.lowerExprNode(call.args[0]);
+                    return ir.null_node;
+                }
+            }
+        }
+
+        const fb = self.current_func orelse return ir.null_node;
         // Method call (Type.method or value.method)
         if (callee_expr == .field_access) {
             const fa = callee_expr.field_access;
@@ -11356,7 +11366,11 @@ pub const Lowerer = struct {
     }
 
     fn inferExprType(self: *Lowerer, idx: NodeIndex) TypeIndex {
-        return self.chk.expr_types.get(idx) orelse TypeRegistry.VOID;
+        const type_idx = self.chk.expr_types.get(idx) orelse TypeRegistry.VOID;
+        // Distinct types are zero-cost: resolve to underlying for all IR emission
+        const t = self.type_reg.get(type_idx);
+        if (t == .distinct) return t.distinct.underlying;
+        return type_idx;
     }
 
     fn inferBinaryType(self: *Lowerer, op: Token, left: NodeIndex, right: NodeIndex) TypeIndex {

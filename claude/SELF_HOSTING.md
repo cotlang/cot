@@ -14,18 +14,18 @@
 
 | File | Location | Lines | Status | Blocker |
 |------|----------|------:|--------|---------|
-| token.cot | parse/ | 448 | **OK** | — |
+| token.cot | parse/ | 450 | **OK** | — |
 | source.cot | parse/ | 315 | **OK** | — |
 | errors.cot | check/ | 545 | **OK** | — |
-| ast.cot | parse/ | 1,532 | **OK** | — |
+| ast.cot | parse/ | 1,533 | **OK** | — |
 | arc.cot | build/ | 443 | **OK** | — |
 | scanner.cot | parse/ | 774 | **OK** | — |
-| types.cot | check/ | 1,572 | **OK** | — |
-| parser.cot | parse/ | 3,258 | **OK** | — |
+| types.cot | check/ | 1,600 | **OK** | — |
+| parser.cot | parse/ | 3,262 | **OK** | — |
 | ir.cot | build/ | 1,467 | SIGSEGV | Crash during codegen |
 | ssa.cot | build/ | 625 | SIGSEGV | Crash during codegen |
 | builder.cot | build/ | 2,364 | SIGSEGV | Crash during codegen |
-| checker.cot | check/ | 5,909 | Error | Check errors on imported files |
+| checker.cot | check/ | 5,930 | Error | Check errors on imported files |
 | lower.cot | build/ | 9,201 | Error | Check errors on imported files |
 
 **Key facts:**
@@ -33,11 +33,32 @@
 - 3 files crash with SIGSEGV during Wasm codegen (ir, ssa, builder)
 - 2 files fail with check errors on multi-file imports (checker, lower)
 - After frontend (13 files), codegen/ (17 files) and main.cot still need to compile
-- ~44,700 lines across 42 files
+- ~44,900 lines across 42 files
+
+### Recent Changes (2026-03-19)
+
+**`distinct` type feature** — added to both the Zig compiler and selfcot:
+- Syntax: `type RawPtr = distinct i64` creates a nominally distinct type
+- Go named type model: prevents implicit assignment between distinct and underlying types
+- Zero-cost at runtime (compiles to underlying type)
+- Selfcot parses and type-checks `distinct` keyword; constructor calls not yet handled
+- Applied to `stdlib/sys.cot`: `alloc_raw` returns `RawPtr`, `dealloc_raw` takes `RawPtr`
+- Prevents alloc/dealloc mismatch bugs at compile time (the crash that started this investigation)
+
+**Crash fixes in selfcot:**
+- Fixed `dealloc()` on `alloc_raw()` memory in `editDistance()` (heap corruption)
+- Fixed Map state read as `*u8` instead of `*i64` in `findSimilarType()` (wrong slot access)
+- Both were manual pointer arithmetic errors, not ARC bugs
 
 ---
 
 ## Resolved Bugs
+
+### Bug 5: `dealloc()` on `alloc_raw()` memory — FIXED (2026-03-19)
+**Root cause:** `editDistance()` in `checker.cot` allocated with `alloc_raw()` (no ARC header) but freed with `dealloc()` (expects 32-byte ARC header at ptr-32). Caused `POINTER_BEING_FREED_WAS_NOT_ALLOCATED`. Fix: `dealloc()` → `dealloc_raw()`. Now **impossible to reintroduce** — `alloc_raw` returns `RawPtr` (distinct type), `dealloc` takes `i64`. Mismatch is a compile error.
+
+### Bug 6: Map states read as `*u8` instead of `*i64` — FIXED (2026-03-19)
+**Root cause:** `findSimilarType()` iterated Map internal arrays reading states as single bytes instead of 8-byte i64 values. Only every 8th slot was correctly checked, and those matched wrong key slots. Fix: `@intToPtr(*u8, states + ki)` → `@intToPtr(*i64, states + ki * @sizeOf(i64))`.
 
 ### Bug 2: Multi-Param Function Call Type Mismatch — FIXED
 **Root cause:** `alloc(0, ...)` used for raw buffers (FuncParam arrays, ErrorVariant arrays). The ARC header on these allocations caused memory corruption when the allocator reused the memory. Fix: `alloc(0, ...) → alloc_raw(...)` for all raw buffer allocations in `self/check/checker.cot` and `self/check/types.cot`.

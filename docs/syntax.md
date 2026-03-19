@@ -281,6 +281,27 @@ Duplicate variants are automatically deduplicated.
 type Coord = Point
 ```
 
+## Distinct Types
+
+Create nominally distinct types that prevent accidental mixing at compile time. Zero-cost at runtime (compiles to the underlying type).
+
+```zig
+type UserId = distinct i64
+type GroupId = distinct i64
+
+var uid = UserId(42)          // constructor: wrap underlying value
+var raw = @intCast(i64, uid)  // explicit unwrap to underlying type
+// var bad: GroupId = uid      // ERROR: type mismatch (different distinct types)
+// var bad2: i64 = uid         // ERROR: type mismatch (distinct ≠ underlying)
+var x: UserId = 42            // OK: untyped literals coerce into distinct types
+```
+
+Distinct types support arithmetic and comparison when the underlying type does:
+```zig
+var a = UserId(10) + UserId(20)  // UserId(30)
+var cmp = UserId(1) < UserId(2)  // true
+```
+
 ## Methods in Type Bodies (Inferred Impl)
 
 Methods, static functions, and constants can be declared directly inside struct and enum bodies. This is the **preferred** style for methods on your own types:

@@ -84,7 +84,7 @@ fn copyString(s: string) string {
         @intToPtr(*u8, buf + i).* = @intToPtr(*u8, @ptrOf(s) + i).*
         i = i + 1
     }
-    return @string(buf, len)
+    return @string(@intCast(i64, buf), len)
 }
 
 fn makeSymbol(name: string, type_idx: int, node: int, mutable: bool) Symbol {
@@ -526,8 +526,14 @@ struct Checker {
             Decl.type_alias |ta| => {
                 const qualified = "${parent_name}_${ta.name}"
                 const target_type = self.resolveTypeExpr(ta.target)
-                self.defineSymbol(makeTypeSymbol(qualified, target_type, nested_idx))
-                self.types.registerNamed(qualified, target_type)
+                if (ta.is_distinct) {
+                    const distinct_idx = self.types.add(Type.distinct_type(DistinctType { name: qualified, underlying: target_type }))
+                    self.defineSymbol(makeTypeSymbol(qualified, distinct_idx, nested_idx))
+                    self.types.registerNamed(qualified, distinct_idx)
+                } else {
+                    self.defineSymbol(makeTypeSymbol(qualified, target_type, nested_idx))
+                    self.types.registerNamed(qualified, target_type)
+                }
             },
             Decl.var_decl |v| => {
                 const qualified = "${parent_name}_${v.name}"
@@ -546,7 +552,7 @@ struct Checker {
             const variants_count = esd.variants.count
             var variant_names_ptr: int = 0
             if (variants_count > 0) {
-                variant_names_ptr = alloc_raw(variants_count * @sizeOf(ErrorVariant))
+                variant_names_ptr = @intCast(i64, alloc_raw(variants_count * @sizeOf(ErrorVariant)))
                 for vi in 0..variants_count {
                     const v_str = esd.variants.get(vi)
                     const ev = @intToPtr(*ErrorVariant, variant_names_ptr + vi * @sizeOf(ErrorVariant))
@@ -606,8 +612,15 @@ struct Checker {
                 return
             }
             const target_type = self.resolveTypeExpr(ta.target)
-            self.defineSymbol(makeTypeSymbol(name, target_type, idx))
-            self.types.registerNamed(name, target_type)
+            if (ta.is_distinct) {
+                // Rust newtype pattern: create nominally distinct type wrapping underlying
+                const distinct_idx = self.types.add(Type.distinct_type(DistinctType { name: name, underlying: target_type }))
+                self.defineSymbol(makeTypeSymbol(name, distinct_idx, idx))
+                self.types.registerNamed(name, distinct_idx)
+            } else {
+                self.defineSymbol(makeTypeSymbol(name, target_type, idx))
+                self.types.registerNamed(name, target_type)
+            }
         }, else => {} }, else => {} }
     }
 
@@ -623,7 +636,7 @@ struct Checker {
             const variants_count = esd.variants.count
             var variant_names_ptr: int = 0
             if (variants_count > 0) {
-                variant_names_ptr = alloc_raw(variants_count * @sizeOf(ErrorVariant))
+                variant_names_ptr = @intCast(i64, alloc_raw(variants_count * @sizeOf(ErrorVariant)))
                 for vi in 0..variants_count {
                     const v_str = esd.variants.get(vi)
                     const ev = @intToPtr(*ErrorVariant, variant_names_ptr + vi * @sizeOf(ErrorVariant))
@@ -2198,7 +2211,7 @@ struct Checker {
                 if (!is_type_access) {
                     return uv.payload_type
                 }
-                const ctor_params = alloc_raw(@sizeOf(FuncParam))
+                const ctor_params = @intCast(i64, alloc_raw(@sizeOf(FuncParam)))
                 const fp = @intToPtr(*FuncParam, ctor_params)
                 fp.name = "payload"
                 fp.type_idx = uv.payload_type
@@ -3666,7 +3679,7 @@ struct Checker {
         const params_count = cl_params.count
 
         // Build function type from closure signature
-        const params_ptr = alloc_raw(params_count * @sizeOf(FuncParam))
+        const params_ptr = @intCast(i64, alloc_raw(params_count * @sizeOf(FuncParam)))
         for pi in 0..params_count {
             const param_idx = cl_params.get(pi)
             var pname = ""
@@ -3849,7 +3862,7 @@ struct Checker {
         const is_packed = sd_layout == StructLayout.@"packed"
 
         // Build struct fields using raw pointer array
-        const fields_ptr = alloc_raw(fields_count * @sizeOf(StructField))
+        const fields_ptr = @intCast(i64, alloc_raw(fields_count * @sizeOf(StructField)))
         const result = self.buildStructFields(sd_fields, fields_count, fields_ptr, is_packed)
 
         // Final padding: packed=1, extern=max field align, auto=8
@@ -3922,7 +3935,7 @@ struct Checker {
             backing_type = self.resolveTypeExpr(backing_n)
         }
 
-        const variants_ptr = alloc_raw(variants_count * @sizeOf(EnumVariant))
+        const variants_ptr = @intCast(i64, alloc_raw(variants_count * @sizeOf(EnumVariant)))
         var next_value: int = 0
         for vi in 0..variants_count {
             const v_idx = ed_variants.get(vi)
@@ -3957,7 +3970,7 @@ struct Checker {
         const name = ud_name
         const variants_count = ud_variants.count
 
-        const variants_ptr = alloc_raw(variants_count * @sizeOf(UnionVariant))
+        const variants_ptr = @intCast(i64, alloc_raw(variants_count * @sizeOf(UnionVariant)))
         for vi in 0..variants_count {
             const v_idx = ud_variants.get(vi)
             var vname = ""
@@ -4445,7 +4458,7 @@ struct Checker {
             self.expr_types = fresh_et
             self.checkFnDeclBody(fn_node, cache_key)
             // Heap-copy the populated expr_types so they survive this scope
-            et_ptr = alloc_raw(@sizeOf(Map(int, int)))
+            et_ptr = @intCast(i64, alloc_raw(@sizeOf(Map(int, int))))
             @intToPtr(*Map(int, int), et_ptr).* = self.expr_types
             self.expr_types = saved_expr_types
         } else {
@@ -4655,7 +4668,7 @@ struct Checker {
         switch (self.ast.getNode(idx)) { Node.decl |d| => switch (d) { Decl.fn_decl |fd| => { fn_params = fd.params; ret_type_n = fd.return_type }, else => {} }, else => {} }
         const params_count = fn_params.count
 
-        const params_ptr = alloc_raw(params_count * @sizeOf(FuncParam))
+        const params_ptr = @intCast(i64, alloc_raw(params_count * @sizeOf(FuncParam)))
         for pi in 0..params_count {
             self.buildFuncParam(fn_params.get(pi), params_ptr, pi)
         }
@@ -5216,7 +5229,7 @@ struct Checker {
         // Allocate merged variant array
         var merged_ptr: int = 0
         if (merged.count > 0) {
-            merged_ptr = alloc_raw(merged.count * @sizeOf(ErrorVariant))
+            merged_ptr = @intCast(i64, alloc_raw(merged.count * @sizeOf(ErrorVariant)))
             for i in 0..merged.count {
                 const dest = @intToPtr(*ErrorVariant, merged_ptr + i * @sizeOf(ErrorVariant))
                 dest.name = merged.get(i)
@@ -5381,8 +5394,8 @@ struct Checker {
         }
 
         const result = @intToPtr(*int, prev_ptr + s1len * 8).*
-        dealloc(prev_ptr)
-        dealloc(curr_ptr)
+        dealloc_raw(prev_ptr)
+        dealloc_raw(curr_ptr)
         return result
     }
 
@@ -5481,8 +5494,9 @@ struct Checker {
         var best_dist = 999
 
         // Search type registry name_map
+        // States are i64 per slot (matching Map internals: @intToPtr(*i64, states + idx * @sizeOf(i64)))
         for ki in 0..self.types.name_map.capacity {
-            if (@intToPtr(*u8, self.types.name_map.states + ki).* != 1) { continue }
+            if (@intToPtr(*i64, self.types.name_map.states + ki * @sizeOf(i64)).* != 1) { continue }
             const candidate = @intToPtr(*string, self.types.name_map.keys + ki * @sizeOf(string)).*
             if (candidate == name) { continue }
             if (!self.isUserVisibleName(candidate)) { continue }
@@ -5496,7 +5510,7 @@ struct Checker {
         // Also check generic struct names
         const _gs = @intToPtr(*Map(string, int), self.generic_structs)
         for ki in 0.._gs.capacity {
-            if (@intToPtr(*u8, _gs.states + ki).* != 1) { continue }
+            if (@intToPtr(*i64, _gs.states + ki * @sizeOf(i64)).* != 1) { continue }
             const candidate = @intToPtr(*string, _gs.keys + ki * @sizeOf(string)).*
             if (candidate == name) { continue }
             const d = self.editDistance(name, candidate)
@@ -5530,7 +5544,7 @@ struct Checker {
 /// Returns the raw pointer (int) to the Map struct.
 fn allocMap() int {
     const size = 40  // Map has 5 fields × 8 bytes: keys, values, states, count, capacity
-    const ptr = alloc_raw(size)
+    const ptr = @intCast(i64, alloc_raw(size))
     // Zero-init all fields
     var mp = @intToPtr(*Map(string, int), ptr)
     mp.keys = 0
@@ -5546,7 +5560,7 @@ fn allocMap() int {
 /// Uses alloc+zero because selfcot can't resolve `new List(Symbol)` in free functions.
 /// TODO: fix selfcot's type resolution for generic types in free functions.
 fn allocSymbolList() *List(Symbol) {
-    const ptr = alloc_raw(24)
+    const ptr = @intCast(i64, alloc_raw(24))
     memset_zero(ptr, 24)
     return @intToPtr(*List(Symbol), ptr)
 }

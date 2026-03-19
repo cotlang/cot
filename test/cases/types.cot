@@ -15,3 +15,44 @@ test "struct alias" {
     var pt = CtCoord { .x = 10, .y = 20 }
     @assertEq(pt.x + pt.y, 30)
 }
+
+// ============================================================================
+// Distinct types — Rust newtype / Go named type pattern
+// ============================================================================
+
+type UserId = distinct i64
+type GroupId = distinct i64
+
+fn acceptUserId(id: UserId) i64 {
+    return @intCast(i64, id)
+}
+
+test "distinct type constructor" {
+    var uid = UserId(42)
+    @assertEq(@intCast(i64, uid), 42)
+}
+
+test "distinct type arithmetic" {
+    var a = UserId(10)
+    var b = UserId(20)
+    var c = a + b
+    @assertEq(@intCast(i64, c), 30)
+}
+
+test "distinct type comparison" {
+    var a = UserId(10)
+    var b = UserId(20)
+    @assert(a < b)
+    @assert(a != b)
+    @assert(a == UserId(10))
+}
+
+test "distinct type function parameter" {
+    var uid = UserId(99)
+    @assertEq(acceptUserId(uid), 99)
+}
+
+test "distinct type untyped literal" {
+    var uid: UserId = 42
+    @assertEq(@intCast(i64, uid), 42)
+}

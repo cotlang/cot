@@ -68,7 +68,7 @@ pub const TestDecl = struct { name: []const u8, body: NodeIndex, span: Span };
 pub const BenchDecl = struct { name: []const u8, body: NodeIndex, span: Span };
 pub const EnumDecl = struct { name: []const u8, backing_type: NodeIndex, variants: []const EnumVariant, nested_decls: []const NodeIndex = &.{}, doc_comment: []const u8 = "", span: Span };
 pub const UnionDecl = struct { name: []const u8, variants: []const UnionVariant, doc_comment: []const u8 = "", span: Span };
-pub const TypeAlias = struct { name: []const u8, target: NodeIndex, doc_comment: []const u8 = "", span: Span };
+pub const TypeAlias = struct { name: []const u8, target: NodeIndex, is_distinct: bool = false, doc_comment: []const u8 = "", span: Span };
 pub const ImportDecl = struct { path: []const u8, span: Span };
 pub const ErrorSetDecl = struct { name: []const u8, variants: []const []const u8, doc_comment: []const u8 = "", span: Span };
 pub const BadDecl = struct { span: Span };

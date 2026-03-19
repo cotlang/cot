@@ -120,9 +120,11 @@ zig build
 - selfcot is compiled to a native binary by the Zig `cot` compiler
 - The pipeline: `self/main.cot` → `self/parse/` → `self/check/` → `self/build/` → `self/optimize/` → `self/emit/wasm/`
 - `self/test_tiny.cot` is a minimal test file for smoke-testing selfcot
-- ~44,700 lines across 41 files — parse, check, build, optimize, emit all complete
+- ~44,900 lines across 42 files — parse, check, build, optimize, emit all complete
 
-**Current status (as of 2026-03-18):** selfcot compiles **5 of 13 parse/check/build files** to valid Wasm: token, source, errors, ast, arc. Eight remaining crash during check or lowering phases. See `claude/SELF_HOSTING.md` for detailed status.
+**Current status (as of 2026-03-19):** selfcot compiles **9 of 13 parse/check/build files** to valid Wasm: token, source, errors, ast, arc, scanner, types, parser. Four remaining: ir/ssa/builder (SIGSEGV in codegen), checker/lower (check errors on imports). See `claude/SELF_HOSTING.md` for detailed status.
+
+**`distinct` types:** Both the Zig compiler and selfcot support `type X = distinct T`. Used in stdlib: `alloc_raw` returns `RawPtr` (distinct i64), `dealloc_raw` takes `RawPtr` — mismatching alloc/dealloc is now a compile-time error.
 
 **Stdlib** is a separate repo (`cotlang/std`) included as a git submodule at `stdlib/`. After cloning: `git submodule update --init stdlib`. When modifying stdlib files, changes must be committed in the submodule first (`cd stdlib && git add . && git commit && git push`), then the updated submodule ref committed in the parent repo.
 
@@ -367,6 +369,7 @@ cursor --uninstall-extension cot-lang.cot-lang 2>/dev/null; cursor --install-ext
 | `VISION.md` | Language vision, design principles, execution roadmap |
 | `claude/BUSINESS_MODEL.md` | Licensing, trademark, revenue model, funding strategy |
 | `claude/RELEASE_PLAN.md` | 0.4 release plan: branding, distribution, polish, criteria |
-| `claude/TESTING.md` | Test system: 70 files, ~1,670 tests, error-union isolation |
+| `claude/TESTING.md` | Test system: 84 files, ~1,790 tests, error-union isolation |
+| `claude/SELFCOT_CRASH_INVESTIGATION.md` | Selfcot crash root cause analysis (alloc/dealloc + Map state bugs) |
 | `claude/LINUX_X64_PARITY.md` | Linux x86_64 backend investigation notes |
 | `claude/archive/` | Historical: archived docs (completed milestones, past plans) |

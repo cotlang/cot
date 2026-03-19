@@ -556,8 +556,16 @@ pub const Checker = struct {
             .type_alias => |t| {
                 if (self.scope.isDefined(t.name)) { self.reportRedefined(t.span.start, t.name); return; }
                 const target_type = self.resolveTypeExpr(t.target) catch invalid_type;
-                try self.defineInFileScope(Symbol.init(t.name, .type_name, target_type, idx, false));
-                try self.types.registerNamed(t.name, target_type);
+                if (t.is_distinct) {
+                    // Rust reference: newtype pattern — create a nominally distinct type
+                    // wrapping the underlying type. Prevents cross-type assignment at compile time.
+                    const distinct_idx = try self.types.add(.{ .distinct = .{ .name = t.name, .underlying = target_type } });
+                    try self.defineInFileScope(Symbol.init(t.name, .type_name, distinct_idx, idx, false));
+                    try self.types.registerNamed(t.name, distinct_idx);
+                } else {
+                    try self.defineInFileScope(Symbol.init(t.name, .type_name, target_type, idx, false));
+                    try self.types.registerNamed(t.name, target_type);
+                }
             },
             .impl_block => |impl_b| {
                 // Generic impl blocks: store definition, instantiate when struct is instantiated
@@ -1710,6 +1718,64 @@ pub const Checker = struct {
         const left = self.types.get(left_type);
         const right = self.types.get(right_type);
 
+        // Distinct types: Go spec — "if one operand is an untyped constant and the other
+        // is not, the constant is implicitly converted to the type of the other operand."
+        // Go reference: expr.go:810 (identity check), predicates.go:37 (underlying check)
+        {
+            // Resolve: if one side is distinct and the other is untyped, treat as same-distinct
+            var eff_left = left_type;
+            var eff_right = right_type;
+            var distinct_type: ?TypeIndex = null;
+
+            if (left == .distinct and right == .distinct and
+                std.mem.eql(u8, left.distinct.name, right.distinct.name))
+            {
+                distinct_type = left_type;
+            } else if (left == .distinct and types.isUntyped(right)) {
+                if (self.types.isAssignable(right_type, left.distinct.underlying)) {
+                    distinct_type = left_type;
+                    eff_right = left_type;
+                }
+            } else if (right == .distinct and types.isUntyped(left)) {
+                if (self.types.isAssignable(left_type, right.distinct.underlying)) {
+                    distinct_type = right_type;
+                    eff_left = right_type;
+                }
+            }
+            // Pointer arithmetic: distinct_int + typed_int → distinct_int
+            // C reference: pointer + int → pointer (not Go — Go has no pointer arithmetic)
+            // Only for add/sub, only when underlying is integer
+            if (distinct_type == null) {
+                if (left == .distinct and types.isInteger(self.types.get(left.distinct.underlying)) and types.isInteger(right)) {
+                    if (bin.op == .add or bin.op == .sub) distinct_type = left_type;
+                } else if (right == .distinct and types.isInteger(self.types.get(right.distinct.underlying)) and types.isInteger(left)) {
+                    if (bin.op == .add) distinct_type = right_type; // int + ptr → ptr (add only, not sub)
+                }
+            }
+
+            if (distinct_type) |dt| {
+                const ul = self.types.get(self.types.get(dt).distinct.underlying);
+                switch (bin.op) {
+                    .eql, .neq, .lss, .leq, .gtr, .geq => {
+                        if (types.isNumeric(ul) or (ul == .basic and ul.basic == .bool_type)) return TypeRegistry.BOOL;
+                        self.err.errorWithCode(bin.span.start, .e300, "invalid operation");
+                        return invalid_type;
+                    },
+                    .add, .sub, .mul, .quo, .rem => {
+                        if (types.isNumeric(ul)) return dt;
+                        self.err.errorWithCode(bin.span.start, .e300, "invalid operation");
+                        return invalid_type;
+                    },
+                    .@"and", .@"or", .xor, .shl, .shr => {
+                        if (types.isInteger(ul)) return dt;
+                        self.err.errorWithCode(bin.span.start, .e300, "invalid operation");
+                        return invalid_type;
+                    },
+                    else => {},
+                }
+            }
+        }
+
         switch (bin.op) {
             .concat => {
                 // String ++ String → String
@@ -1861,6 +1927,23 @@ pub const Checker = struct {
                 _ = try self.checkExpr(c.args[0]);
                 _ = try self.checkExpr(c.args[1]);
                 return TypeRegistry.STRING;
+            }
+            // Distinct type constructor: RawPtr(expr) — Go reference: type conversion T(expr)
+            if (self.types.lookupByName(name)) |type_idx| {
+                const t = self.types.get(type_idx);
+                if (t == .distinct) {
+                    if (c.args.len != 1) { self.err.errorWithCode(c.span.start, .e300, "type conversion requires exactly 1 argument"); return invalid_type; }
+                    const arg_type = try self.checkExpr(c.args[0]);
+                    // Go conversions.go:153 — allow conversion when underlying types are identical:
+                    //   underlying → distinct, same distinct → distinct, cross-distinct with same underlying
+                    const arg_underlying = self.types.resolveDistinct(arg_type);
+                    if (!self.types.isAssignable(arg_underlying, t.distinct.underlying) and !self.types.equal(arg_type, type_idx)) {
+                        self.err.errorWithCode(c.span.start, .e300, "cannot convert to distinct type");
+                        return invalid_type;
+                    }
+                    try self.expr_types.put(c.callee, type_idx);
+                    return type_idx;
+                }
             }
             // Generic function instantiation: max(i64) where max is generic
             if (self.generics.generic_functions.get(name)) |gen_info| {

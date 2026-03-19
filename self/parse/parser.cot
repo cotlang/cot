@@ -1098,8 +1098,10 @@ struct Parser {
         if (!self.expect(Token.assign as int)) {
             return null_node
         }
+        var is_distinct = false
+        if (self.tok == Token.kw_distinct) { self.advance(); is_distinct = true }
         const target = self.parseType()
-        return self.ast.addDecl(Decl.type_alias(TypeAlias { .name = name, .target = target, .doc_comment = doc, .span = self.spanSE(start, self.tok_end) }))
+        return self.ast.addDecl(Decl.type_alias(TypeAlias { .name = name, .target = target, .is_distinct = is_distinct, .doc_comment = doc, .span = self.spanSE(start, self.tok_end) }))
     }
 
     /// async fn name(...) { ... }

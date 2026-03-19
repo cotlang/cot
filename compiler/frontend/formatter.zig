@@ -388,6 +388,7 @@ pub const Formatter = struct {
         self.write("type ") catch {};
         self.write(d.name) catch {};
         self.write(" = ") catch {};
+        if (d.is_distinct) self.write("distinct ") catch {};
         self.printNode(d.target);
     }
 

@@ -754,7 +754,7 @@ fn writeByteList(path: string, bytes: List(int)) void {
             @intToPtr(*u8, addr).* = @intCast(u8, bytes.get(i + j))
             j += 1
         }
-        fd_write(fd, buf_ptr, chunk_size)
+        fd_write(fd, @intCast(i64, buf_ptr), chunk_size)
         i += chunk_size
     }
     fd_close(fd)
@@ -1012,9 +1012,9 @@ fn checkAndStoreChecker(pf: ParsedFile, types: TypeRegistry, shared: *SharedChec
     // backing arrays. When the stack locals go out of scope, ARC would free
     // those arrays. We prevent this by zero-clearing the stack locals AFTER
     // copying — so ARC's cleanup sees zero pointers and skips release.
-    const errs_heap = alloc_raw(@sizeOf(ErrorReporter))
+    const errs_heap = @intCast(i64, alloc_raw(@sizeOf(ErrorReporter)))
     copyBytes(errs_heap, @ptrToInt(&check_errs), @sizeOf(ErrorReporter))
-    const chk_heap = alloc_raw(@sizeOf(Checker))
+    const chk_heap = @intCast(i64, alloc_raw(@sizeOf(Checker)))
     copyBytes(chk_heap, @ptrToInt(&checker), @sizeOf(Checker))
     // Zero the stack locals so ARC doesn't free the shared backing arrays
     // when they go out of scope. The heap copies own the data now.

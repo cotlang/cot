@@ -782,9 +782,10 @@ pub const Parser = struct {
         const name = self.tok.text;
         self.advance();
         if (!self.expect(.assign)) return null;
+        const is_distinct = self.match(.kw_distinct);
         const target = try self.parseType() orelse return null;
         _ = self.match(.semicolon);
-        return try self.tree.addDecl(.{ .type_alias = .{ .name = name, .target = target, .doc_comment = doc_comment, .span = Span.init(start, self.pos()) } });
+        return try self.tree.addDecl(.{ .type_alias = .{ .name = name, .target = target, .is_distinct = is_distinct, .doc_comment = doc_comment, .span = Span.init(start, self.pos()) } });
     }
 
     fn parseImportDecl(self: *Parser) ParseError!?NodeIndex {
