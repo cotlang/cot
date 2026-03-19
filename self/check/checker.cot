@@ -1680,6 +1680,42 @@ struct Checker {
         const left_t = self.types.get(left_type)
         const right_t = self.types.get(right_type)
 
+        // Distinct types: same-distinct ops, untyped coercion, pointer arithmetic
+        // Mirrors Zig compiler checker.zig checkBinary distinct handling
+        if (left_t.tag == TAG_DISTINCT or right_t.tag == TAG_DISTINCT) {
+            var distinct_type = -1
+            // Both same distinct type
+            if (left_t.tag == TAG_DISTINCT and right_t.tag == TAG_DISTINCT and
+                self.types.typeName(left_type) == self.types.typeName(right_type)) {
+                distinct_type = left_type
+            }
+            // distinct + untyped literal
+            if (distinct_type < 0 and left_t.tag == TAG_DISTINCT and right_t.tag == TAG_BASIC) {
+                const rk = switch (right_t) { Type.basic |k| => k, else => BasicKind.invalid }
+                if (rk.isUntyped()) { distinct_type = left_type }
+            }
+            if (distinct_type < 0 and right_t.tag == TAG_DISTINCT and left_t.tag == TAG_BASIC) {
+                const lk = switch (left_t) { Type.basic |k| => k, else => BasicKind.invalid }
+                if (lk.isUntyped()) { distinct_type = right_type }
+            }
+            // Pointer arithmetic: distinct_int + typed_int (C pointer model)
+            if (distinct_type < 0 and left_t.tag == TAG_DISTINCT and self.isIntegerType(right_type)) {
+                if (op == Token.add or op == Token.sub) { distinct_type = left_type }
+            }
+            if (distinct_type < 0 and right_t.tag == TAG_DISTINCT and self.isIntegerType(left_type)) {
+                if (op == Token.add) { distinct_type = right_type }
+            }
+
+            if (distinct_type >= 0) {
+                // Comparison returns bool, arithmetic returns distinct type
+                if (op == Token.eql or op == Token.neq or op == Token.lss or
+                    op == Token.leq or op == Token.gtr or op == Token.geq) {
+                    return BOOL
+                }
+                return distinct_type
+            }
+        }
+
         // Concat: ++
         if (op == Token.concat) {
             if (left_type == STRING and right_type == STRING) { return STRING }
@@ -1879,6 +1915,25 @@ struct Checker {
                     self.checkExpr(call_args.get(0))
                 }
                 return INT
+            }
+            // Distinct type constructor: RawPtr(expr) — Go type conversion T(expr)
+            if (self.types.lookupByName(name) >= 0) {
+                const type_idx = self.types.lookupByName(name)
+                const t = self.types.get(type_idx)
+                if (t.tag == TAG_DISTINCT) {
+                    if (args_count == 1) {
+                        const arg_type = self.checkExpr(call_args.get(0))
+                        // Allow: underlying → distinct, same distinct → distinct,
+                        // cross-distinct with same underlying (Go conversions.go:153)
+                        const underlying = switch (t) { Type.distinct_type |d| => d.underlying, else => 0 }
+                        const arg_resolved = self.types.resolveDistinct(arg_type)
+                        if (!self.types.isAssignable(arg_resolved, underlying) and !self.types.equal(arg_type, type_idx)) {
+                            self.reportError(idx, ErrorCode.e300, "cannot convert to distinct type")
+                            return invalid_type
+                        }
+                    }
+                    return type_idx
+                }
             }
             // Generic function instantiation: max(i64) where max is generic
             if (self.generic_functions.contains(name)) {
