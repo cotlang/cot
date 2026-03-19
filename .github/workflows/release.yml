@@ -87,7 +87,7 @@ jobs:
 
       - name: Update Homebrew formula
         env:
-          TAP_TOKEN: ${{ secrets.STD_REPO_TOKEN }}
+          TAP_TOKEN: ${{ secrets.TAP_TOKEN }}
         run: |
           VERSION="${GITHUB_REF#refs/tags/v}"
           MACOS_SHA=$(cat cot-aarch64-macos.tar.gz.sha256 | awk '{print $1}')
