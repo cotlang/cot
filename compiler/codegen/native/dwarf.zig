@@ -17,13 +17,18 @@ pub const DW_AT_name: u8 = 0x03;
 pub const DW_AT_stmt_list: u8 = 0x10;
 pub const DW_AT_low_pc: u8 = 0x11;
 pub const DW_AT_high_pc: u8 = 0x12;
+pub const DW_AT_language: u8 = 0x13;
 pub const DW_AT_comp_dir: u8 = 0x1b;
+pub const DW_AT_producer: u8 = 0x25;
 pub const DW_AT_decl_file: u8 = 0x3a;
 pub const DW_AT_decl_line: u8 = 0x3b;
 pub const DW_AT_external: u8 = 0x3f;
 pub const DW_AT_frame_base: u8 = 0x40;
 
+pub const DW_LANG_C: u8 = 0x02;
+
 pub const DW_FORM_addr: u8 = 0x01;
+pub const DW_FORM_data1: u8 = 0x0b;
 pub const DW_FORM_data4: u8 = 0x06;
 pub const DW_FORM_data8: u8 = 0x07;
 pub const DW_FORM_string: u8 = 0x08;
@@ -162,13 +167,16 @@ pub const DwarfBuilder = struct {
         try appendUleb128(buf, alloc, DW_TAG_compile_unit);
         try buf.append(alloc, DW_CHILDREN_yes);
 
-        // Attributes: name, comp_dir, stmt_list, low_pc, high_pc
+        // Attributes following Go's DW_ABRV_COMPUNIT order:
+        // name, language, stmt_list, low_pc, high_pc, comp_dir, producer
         const cu_attrs = [_][2]u8{
             .{ DW_AT_name, DW_FORM_string },
-            .{ DW_AT_comp_dir, DW_FORM_string },
+            .{ DW_AT_language, DW_FORM_data1 },
             .{ DW_AT_stmt_list, DW_FORM_sec_offset },
             .{ DW_AT_low_pc, DW_FORM_addr },
             .{ DW_AT_high_pc, DW_FORM_data8 },
+            .{ DW_AT_comp_dir, DW_FORM_string },
+            .{ DW_AT_producer, DW_FORM_string },
         };
         for (cu_attrs) |attr| {
             try appendUleb128(buf, alloc, attr[0]);
@@ -215,21 +223,33 @@ pub const DwarfBuilder = struct {
 
         try appendUleb128(buf, alloc, 1); // DIE: compile_unit
 
+        // DW_AT_name (DW_FORM_string)
         try buf.appendSlice(alloc, self.source_file);
         try buf.append(alloc, 0);
-        try buf.appendSlice(alloc, self.comp_dir);
-        try buf.append(alloc, 0);
-        try buf.appendNTimes(alloc, 0, 4); // stmt_list offset
 
-        // low_pc - needs relocation
+        // DW_AT_language (DW_FORM_data1) — DW_LANG_C for lldb compatibility
+        try buf.append(alloc, DW_LANG_C);
+
+        // DW_AT_stmt_list (DW_FORM_sec_offset)
+        try buf.appendNTimes(alloc, 0, 4);
+
+        // DW_AT_low_pc (DW_FORM_addr) — needs relocation
         try self.debug_info_relocs.append(alloc, .{
             .offset = @intCast(buf.items.len),
             .symbol_idx = text_symbol_idx,
         });
         try buf.appendNTimes(alloc, 0, 8);
 
-        // high_pc (size)
+        // DW_AT_high_pc (DW_FORM_data8) — size of text section
         try buf.appendSlice(alloc, &std.mem.toBytes(self.text_size));
+
+        // DW_AT_comp_dir (DW_FORM_string)
+        try buf.appendSlice(alloc, self.comp_dir);
+        try buf.append(alloc, 0);
+
+        // DW_AT_producer (DW_FORM_string)
+        try buf.appendSlice(alloc, "Cot 0.3.6");
+        try buf.append(alloc, 0);
 
         // Emit DW_TAG_subprogram DIEs as children of compile_unit
         for (self.func_infos) |func_info| {
