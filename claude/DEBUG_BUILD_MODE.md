@@ -1,162 +1,99 @@
 # Debug Build Mode — `cot build --debug`
 
+**Updated:** 2026-03-19
+
 ## Overview
 
-A `--debug` flag for `cot build` that embeds additional safety checks and diagnostic information in the compiled binary. Modeled after Zig's `ReleaseSafe` mode and Rust's `debug_assertions`.
-
-When enabled, the compiled binary includes:
-- Function name strings embedded in the binary (better backtraces)
-- Bounds checks on all array/list/slice accesses
-- Null checks before pointer dereferences
-- ARC diagnostic messages (bad pointer, double-free, underflow)
-- Optional unwrap checks with file:line messages
-
-When disabled (default), these checks are omitted for performance.
+A `--debug` flag for `cot build` that controls safety check verbosity and diagnostic output. Most safety checks already exist in the compiler — the flag gates whether they print detailed diagnostics + abort (debug) or silently skip (release).
 
 ---
 
-## Reference Implementations
+## What Cot Already Implements
 
-### Zig — Build Modes
-- **Debug**: All safety checks on, no optimizations, fast compile
-- **ReleaseSafe**: Optimized but retains safety checks (bounds, overflow, null)
-- **ReleaseFast**: All checks removed, maximum performance
-- **ReleaseSmall**: Size-optimized, no checks
+Most debug features are **already in the compiled binary**. The `--debug` flag primarily controls their diagnostic output.
 
-Key file: `std/debug.zig` — Zig's safety check infrastructure.
+### Safety Trap Codes (always active)
+| Check | Trap Code | Location |
+|-------|-----------|----------|
+| Integer overflow | `integer_overflow` | x64/aarch64 inst/mod.zig |
+| Division by zero | `integer_division_by_zero` | x64/aarch64 lower.zig |
+| Unreachable code | `unreachable_code_reached` | x64/aarch64 inst/mod.zig |
+| Stack overflow | `stack_overflow` | x64/aarch64 inst/mod.zig |
+| Heap misalignment | `heap_misaligned` | x64 inst/mod.zig |
+| Bad integer cast | `bad_conversion_to_integer` | x64 inst/mod.zig |
+| Corrupt switch value | `corruptSwitch` | x64/aarch64 inst/mod.zig |
 
-Pattern: Zig uses `@import("builtin").mode` to branch at comptime:
-```zig
-if (builtin.mode == .Debug or builtin.mode == .ReleaseSafe) {
-    if (index >= len) @panic("index out of bounds");
-}
-```
+### ARC Memory Safety (always active)
+| Feature | Status | Location |
+|---------|--------|----------|
+| Redzone guards (0xFA left, 0xFB right) | Done | arc_native.zig:412-750 |
+| Redzone validation on dealloc/realloc | Done | arc_native.zig:508-750 |
+| Poison magic on free (0xDEADDEAD) | Done | arc_native.zig |
+| Double-free detection (IsDeiniting) | Done | arc_native.zig |
+| ARC magic sentinel (0xC07A8C00) | Done | arc_native.zig |
+| Pointer range check (< 4096) | Done | arc_native.zig |
+| ARC bad pointer diagnostics | Done | arc_native.zig |
 
-### Rust — debug_assertions
-- `cargo build` (debug): includes `debug_assert!`, bounds checks, overflow checks
-- `cargo build --release`: strips all debug assertions
+### Crash Diagnostics (always active)
+| Feature | Status | Location |
+|---------|--------|----------|
+| Signal handler (SIGSEGV/SIGILL/SIGBUS/SIGFPE/SIGABRT) | Done | signal_native.zig |
+| Register dump (x0-x7, x16, fp, lr, sp, pc) | Done | signal_native.zig |
+| Backtrace with symbols | Done | signal_native.zig |
+| Source location (file:line via srcmap + dladdr) | Done | signal_native.zig |
+| DWARF .debug_line section | Done | dwarf.zig, driver.zig |
 
-Pattern: `#[cfg(debug_assertions)]` gates debug-only code:
-```rust
-#[cfg(debug_assertions)]
-fn check_bounds(idx: usize, len: usize) {
-    assert!(idx < len, "index out of bounds: {idx} >= {len}");
-}
-```
-
-### Swift — -Onone vs -O
-- `-Onone` (debug): includes precondition checks, ARC logging, exclusivity checks
-- `-O` (release): strips most checks, optimizes ARC
-
-Pattern: `_isDebugAssertConfiguration()` runtime check:
-```swift
-if _isDebugAssertConfiguration() {
-    precondition(index < count, "Index out of range")
-}
-```
-
-### Go — GORACE / -race
-- `go build -race`: enables data race detector
-- Go doesn't have a general debug mode, but uses build tags for assertions
+### Bounds & Null Checks (always active)
+| Feature | Status | Location |
+|---------|--------|----------|
+| Array/slice bounds checks | Done | lower.zig |
+| Null pointer checks | Done | lower.zig |
+| Optional unwrap checks | Done | lower.zig |
 
 ---
 
-## Implementation Plan
+## What `--debug` Would Add
 
-### Phase 1: CLI Flag + Lowerer Plumbing
+### Phase 1: CLI Flag + Gating (~30 min)
 
-**Files:** `self/main.cot`, `compiler/main.zig`, `compiler/cli.zig`
+Add `--debug` flag to CLI. Pass `debug_mode: bool` through compile options. The flag gates:
+- ARC diagnostics: debug → print + abort; release → silent skip
+- Redzone corruption: debug → print details + abort; release → abort only
+- Use-after-free (poison): debug → print diagnostic + backtrace; release → silent
 
-1. Add `--debug` flag to `cot build` CLI parsing
-2. Pass `debug_mode: bool` through `LowerOptions` / `CompileOptions`
-3. Store in `Lowerer.debug_mode` field
-4. The lowerer checks `self.debug_mode` before emitting safety checks
+### Phase 2: Enhanced Diagnostic Messages (~1 hour)
 
-### Phase 2: Bounds Checks
+In debug mode, safety checks print detailed context before aborting:
+- Bounds check: `"index out of bounds: index=5, length=3 at file.cot:42"`
+- Null deref: `"null pointer dereference at file.cot:42 in func_name"`
+- Optional unwrap: `"unwrap of null optional at file.cot:42"`
+- Use-after-free: `"use-after-free: retain on freed object at 0xNNNN"`
 
-**Files:** `compiler/frontend/lower.zig` (index access lowering)
+Release mode: same checks fire, but with minimal output (just trap/abort).
 
-When `debug_mode` is true, emit bounds checks before every index operation:
-```
-if debug_mode:
-    if index < 0 or index >= length:
-        print "file:line: index out of bounds (index=N, length=M) in func_name"
-        backtrace()
-        exit(2)
-```
+### Phase 3: Fill-on-Alloc (gated by --debug) (~30 min)
 
-Currently, `@trap()` in List.get/set handles this. In debug mode, the trap message should include the index value and array length, not just file:line.
+- `alloc_raw`: fill user data with 0xAA (detects uninitialized reads)
+- `dealloc_raw`: fill user data with 0xDD (detects use-after-free reads)
+- Currently disabled because it overwrites Map buffers that callers immediately initialize. Debug flag enables it only when explicitly requested.
 
-Reference: Zig `std.ArrayList` bounds check prints the actual values.
+### Phase 4: Wasm Function Name Section (~1 hour)
 
-### Phase 3: Null Pointer Checks
-
-**Files:** `compiler/frontend/lower.zig` (pointer deref lowering)
-
-When `debug_mode` is true, emit null check before every pointer dereference:
-```
-if debug_mode and ptr == null:
-    print "file:line: null pointer dereference in func_name"
-    backtrace()
-    exit(2)
-```
-
-Reference: Zig emits `@panic("reached unreachable")` for undefined behavior in safe modes.
-
-### Phase 4: ARC Debug Output Control
-
-**Files:** `compiler/codegen/native/arc_native.zig`
-
-The ARC diagnostics (bad pointer, double-free, underflow) are currently ALWAYS emitted. In release mode they should be silent. In debug mode they should print AND abort.
-
-Debug mode ARC behavior:
-- Bad pointer in retain/release: print diagnostic + abort (currently prints + continues)
-- Double-free: print diagnostic + abort (currently prints + continues)
-- Refcount underflow: print diagnostic + abort
-- Use-after-free (poison magic): print "ARC: use-after-free at 0xNNNN" + abort
-
-Release mode ARC behavior:
-- Bad pointer: silently skip (current behavior without diagnostics)
-- Double-free: silently skip
-- Everything else: no overhead
-
-Implementation: The ARC runtime functions check a global `__cot_debug_mode` variable (set at startup from the CLI flag). If set, print + abort. If not, skip silently.
-
-### Phase 5: Function Name Embedding
-
-**Files:** `compiler/codegen/wasm/`, `compiler/codegen/native/`
-
-In debug mode, embed function name strings in the binary so backtraces show readable names instead of hex addresses. Currently the native backend already includes symbol names (from `nm`), but wasm binaries don't have this.
-
-For wasm: add a custom name section (Wasm name section, spec §5.5.10) with function names.
-For native: already works via linker symbols.
-
-### Phase 6: Optional Unwrap Checks
-
-**Files:** `compiler/frontend/lower.zig` (if-optional lowering)
-
-When `debug_mode` is true and an optional is force-unwrapped (`.?` operator), emit a check:
-```
-if debug_mode and optional.tag == 0:
-    print "file:line: unwrap of null optional in func_name"
-    backtrace()
-    exit(2)
-```
+In debug mode, emit Wasm custom name section (spec §5.5.10) so browser devtools and wasmtime show function names in stack traces. Native already has symbols via linker.
 
 ---
 
-## Global Debug Mode Variable
+## Not Planned (Future / Post-1.0)
 
-To avoid passing `debug_mode` through every function, use a global variable:
-
-```cot
-// In the compiled binary's data section:
-var __cot_debug_mode: i64 = 0  // set to 1 by main() if --debug was passed
-```
-
-The ARC runtime and safety checks read this global. The lowerer emits loads from `__cot_debug_mode` before each check, so the overhead in release mode is just a single load + branch-not-taken (predictable, minimal).
-
-Reference: Go's `runtime.raceenabled` global for race detector gating.
+| Feature | Why Deferred | Reference |
+|---------|-------------|-----------|
+| Race detection | Requires ThreadSanitizer integration | Go `-race` |
+| Memory statistics | Runtime heap metering | Go `ReadMemStats` |
+| Full shadow memory ASan | ~5000 lines, LLVM-style | ASAN_IMPLEMENTATION.md |
+| Sentinel value validation | Niche, Zig-specific | Zig `sentinelMismatch` |
+| Union field tracking | Low priority | Zig `inactiveUnionField` |
+| Escape analysis debugging | Compiler internals | Go `-gcflags='-m'` |
+| Error unwrap checks | Beyond optional unwrap | Zig `unwrapError` |
 
 ---
 
@@ -164,20 +101,10 @@ Reference: Go's `runtime.raceenabled` global for race detector gating.
 
 | Phase | Description | Effort |
 |-------|-------------|--------|
-| 1 | CLI flag + plumbing | 30 min |
-| 2 | Bounds checks with values | 1 hour |
-| 3 | Null pointer checks | 1 hour |
-| 4 | ARC debug output control | 30 min |
-| 5 | Function name embedding | 2 hours |
-| 6 | Optional unwrap checks | 30 min |
-| **Total** | | **~5.5 hours** |
+| 1 | CLI flag + gating plumbing | 30 min |
+| 2 | Enhanced diagnostic messages | 1 hour |
+| 3 | Fill-on-alloc (debug-gated) | 30 min |
+| 4 | Wasm name section | 1 hour |
+| **Total** | | **~3 hours** |
 
----
-
-## Interaction with Existing Features
-
-- `COT_DEBUG=phase` (pipeline_debug.zig): Unrelated — this is for Zig compiler internals
-- `@trap()`: Debug mode enhances trap messages with more context
-- `@panic()`: Already includes file:line + backtrace, no change needed
-- Signal handler: Debug mode doesn't change signal handling (already has backtrace)
-- `--release` flag (future): Opposite of `--debug`, strips ALL checks for maximum performance
+Most safety infrastructure is already built. The `--debug` flag is polish, not architecture.
