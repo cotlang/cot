@@ -1896,24 +1896,9 @@ pub const Lowerer = struct {
                         fb.nodes.items[managed.getValue()].type_idx
                     else
                         fb.return_type;
-                    // Swift SILGen: retain +0 return values for managed types.
-                    // Use inline retain (not emitCopyValue) because return path needs
-                    // the retained value as the return node, not just the side effect.
-                    const vi = self.type_reg.get(val_type);
-                    if (!self.target.isWasm() and vi == .pointer and vi.pointer.managed) {
-                        var retain_args = [_]ir.NodeIndex{managed.getValue()};
-                        value_node = try fb.emitCall("retain", &retain_args, false, val_type, ret.span);
-                    } else if (!self.target.isWasm() and vi == .optional) {
-                        const ei = self.type_reg.get(vi.optional.elem);
-                        if (ei == .pointer and ei.pointer.managed) {
-                            try self.emitOptionalFieldRetain(fb, managed.getValue(), val_type, ret.span);
-                            value_node = managed.getValue();
-                        } else {
-                            value_node = managed.getValue();
-                        }
-                    } else {
-                        value_node = managed.getValue();
-                    }
+                    // Swift SILGen: copy +0 return values to produce +1.
+                    // emitCopyValue handles all type categories (pointer, ?*T, struct, etc.)
+                    value_node = try self.emitCopyValue(fb, managed.getValue(), val_type, ret.span);
                 }
             }
 
@@ -2186,40 +2171,13 @@ pub const Lowerer = struct {
                 switch (cleanup.kind) {
                     .release => {
                         if (self.target.isWasm()) continue; // Wasm: no ARC runtime
-                        const ctype = self.type_reg.get(cleanup.type_idx);
-                        // Optional managed pointers (?*T): unwrap then conditionally release.
-                        // Swift LoadableEnumTypeLowering::emitDestroyValue (TypeLowering.cpp:1603-1609)
-                        // uses release_value which is type-aware. We emit the unwrap manually:
-                        // load tag → if non-null → load payload ptr → release(ptr)
-                        if (ctype == .optional and self.type_reg.couldBeARC(cleanup.type_idx)) {
-                            if (cleanup.local_idx) |lidx| {
-                                const ptr_type = self.type_reg.makePointer(TypeRegistry.U8) catch TypeRegistry.VOID;
-                                const local_addr = try fb.emitAddrLocal(lidx, ptr_type, Span.zero);
-                                // Tag at offset 0
-                                const tag = try fb.emitPtrLoadValue(local_addr, TypeRegistry.I64, Span.zero);
-                                const zero = try fb.emitConstInt(0, TypeRegistry.I64, Span.zero);
-                                const is_some = try fb.emitBinary(.ne, tag, zero, TypeRegistry.BOOL, Span.zero);
-                                const then_blk = try fb.newBlock("opt.release.then");
-                                const end_blk = try fb.newBlock("opt.release.end");
-                                _ = try fb.emitBranch(is_some, then_blk, end_blk, Span.zero);
-                                fb.setBlock(then_blk);
-                                // Payload at offset 8
-                                const payload_addr = try fb.emitAddrOffset(local_addr, 8, ptr_type, Span.zero);
-                                const inner_ptr = try fb.emitPtrLoadValue(payload_addr, ctype.optional.elem, Span.zero);
-                                var rel_args = [_]ir.NodeIndex{inner_ptr};
-                                _ = try fb.emitCall("release", &rel_args, false, TypeRegistry.VOID, Span.zero);
-                                _ = try fb.emitJump(end_blk, Span.zero);
-                                fb.setBlock(end_blk);
-                            }
-                            continue;
-                        }
-                        // For locals: reload current value (may have been reassigned)
+                        // Centralized destroy: handles all type categories
+                        // (pointer, ?*T, struct, list/map, error union)
                         const value = if (cleanup.local_idx) |lidx|
                             try fb.emitLoadLocal(lidx, cleanup.type_idx, Span.zero)
                         else
                             cleanup.value;
-                        var args = [_]ir.NodeIndex{value};
-                        _ = try fb.emitCall("release", &args, false, TypeRegistry.VOID, Span.zero);
+                        try self.emitDestroyValue(fb, value, cleanup.type_idx, Span.zero);
                     },
                     .unowned_release => {
                         if (self.target.isWasm()) continue;
@@ -2477,18 +2435,11 @@ pub const Lowerer = struct {
                             const cleanup = arc.Cleanup.initForLocal(.release, fwd_value, type_idx, local_idx);
                             _ = try self.cleanup_stack.push(cleanup);
                         } else if (managed.getValue() != ir.null_node) {
-                            const type_info = self.type_reg.get(type_idx);
-                            if (type_info == .optional) {
-                                _ = try fb.emitStoreLocal(local_idx, managed.getValue(), var_stmt.span);
-                                const cleanup = arc.Cleanup.initForLocal(.release, managed.getValue(), type_idx, local_idx);
-                                _ = try self.cleanup_stack.push(cleanup);
-                            } else {
-                                var retain_args = [_]ir.NodeIndex{managed.getValue()};
-                                const retained = try fb.emitCall("retain", &retain_args, false, type_idx, var_stmt.span);
-                                _ = try fb.emitStoreLocal(local_idx, retained, var_stmt.span);
-                                const cleanup = arc.Cleanup.initForLocal(.release, retained, type_idx, local_idx);
-                                _ = try self.cleanup_stack.push(cleanup);
-                            }
+                            // +0 value: copy to produce +1 for the local
+                            _ = try self.emitCopyValue(fb, managed.getValue(), type_idx, var_stmt.span);
+                            _ = try fb.emitStoreLocal(local_idx, managed.getValue(), var_stmt.span);
+                            const cleanup = arc.Cleanup.initForLocal(.release, managed.getValue(), type_idx, local_idx);
+                            _ = try self.cleanup_stack.push(cleanup);
                         }
                     } else {
                         // Non-ARC path (trivial types, weak, unowned)
@@ -3096,51 +3047,27 @@ pub const Lowerer = struct {
                         const local_type = fb.locals.items[local_idx].type_idx;
                         const lt_info = self.type_reg.get(local_type);
                         if (lt_info == .optional and self.type_reg.couldBeARC(local_type)) {
-                            // ?*T assignment: unwrap old, store new, conditionally release old.
-                            // Swift LoadableEnumTypeLowering (TypeLowering.cpp:1603):
-                            // switch_enum old → .some: destroy_value payload, .none: skip
-                            const ptr_type = self.type_reg.makePointer(TypeRegistry.U8) catch TypeRegistry.VOID;
-                            const local_addr = try fb.emitAddrLocal(local_idx, ptr_type, assign.span);
-                            // Load old tag
-                            const old_tag = try fb.emitPtrLoadValue(local_addr, TypeRegistry.I64, assign.span);
-                            // Store new value first (retain-before-release for self-assign safety)
-                            // Use already-lowered value_node — Swift RValue is move-only (RValue.h:100)
-                            const managed_rhs = try self.managedFromLowered(value_node, assign.value, local_type);
+                            // ?*T local assignment: Swift store [assign] via centralized dispatch.
+                            // load old → copy new (if +0) → store → destroy old
+                            const old_value = try fb.emitLoadLocal(local_idx, local_type, assign.span);
+                            var managed_rhs = try self.managedFromLowered(value_node, assign.value, local_type);
                             if (managed_rhs.hasCleanup()) {
                                 var mv = managed_rhs;
                                 _ = try fb.emitStoreLocal(local_idx, mv.forward(&self.cleanup_stack), assign.span);
                             } else {
+                                _ = try self.emitCopyValue(fb, managed_rhs.getValue(), local_type, assign.span);
                                 _ = try fb.emitStoreLocal(local_idx, managed_rhs.getValue(), assign.span);
                             }
-                            // Conditionally release old inner pointer
-                            const zero_tag = try fb.emitConstInt(0, TypeRegistry.I64, assign.span);
-                            const old_is_some = try fb.emitBinary(.ne, old_tag, zero_tag, TypeRegistry.BOOL, assign.span);
-                            const then_blk = try fb.newBlock("opt.assign.release");
-                            const end_blk = try fb.newBlock("opt.assign.end");
-                            _ = try fb.emitBranch(old_is_some, then_blk, end_blk, assign.span);
-                            fb.setBlock(then_blk);
-                            const old_payload_addr = try fb.emitAddrOffset(local_addr, 8, ptr_type, assign.span);
-                            const old_inner = try fb.emitPtrLoadValue(old_payload_addr, lt_info.optional.elem, assign.span);
-                            var rel_args = [_]ir.NodeIndex{old_inner};
-                            _ = try fb.emitCall("release", &rel_args, false, TypeRegistry.VOID, assign.span);
-                            _ = try fb.emitJump(end_blk, assign.span);
-                            fb.setBlock(end_blk);
+                            try self.emitDestroyValue(fb, old_value, local_type, assign.span);
                         } else if (lt_info == .optional) {
                             // Non-ARC optional: just store
                             _ = try fb.emitStoreLocal(local_idx, value_node, assign.span);
                         } else {
                         // Swift store [assign] pattern (TypeLowering.cpp:1213-1216):
-                        // load old → retain new (if +0) → store new → release old
-                        // Use already-lowered value_node — do NOT re-lower assign.value,
-                        // which would double-evaluate side effects (e.g., two newScope calls).
+                        // load old → copy new (if +0) → store → destroy old
+                        // Use already-lowered value_node — do NOT re-lower assign.value.
                         const old_value = try fb.emitLoadLocal(local_idx, local_type, assign.span);
-                        const rhs_node = self.tree.getNode(assign.value);
-                        const rhs_expr = if (rhs_node) |n| n.asExpr() else null;
-                        const is_owned = if (rhs_expr) |e| (e == .new_expr or e == .call) else false;
-                        const managed = if (is_owned)
-                            arc.ManagedValue.forOwned(value_node, local_type, try self.cleanup_stack.push(arc.Cleanup.init(.release, value_node, local_type)))
-                        else
-                            arc.ManagedValue.forTrivial(value_node, local_type);
+                        var managed = try self.managedFromLowered(value_node, assign.value, local_type);
                         if (managed.hasCleanup()) {
                             // +1 value: forward cleanup, store directly
                             var mv = managed;
@@ -3148,15 +3075,13 @@ pub const Lowerer = struct {
                             _ = try fb.emitStoreLocal(local_idx, fwd, assign.span);
                             self.cleanup_stack.updateValueForLocal(local_idx, fwd);
                         } else if (managed.getValue() != ir.null_node) {
-                            // +0 value: retain to produce +1, then store
-                            var retain_args = [_]ir.NodeIndex{managed.getValue()};
-                            const retained = try fb.emitCall("retain", &retain_args, false, local_type, assign.span);
-                            _ = try fb.emitStoreLocal(local_idx, retained, assign.span);
-                            self.cleanup_stack.updateValueForLocal(local_idx, retained);
+                            // +0 value: copy to produce +1, then store
+                            _ = try self.emitCopyValue(fb, managed.getValue(), local_type, assign.span);
+                            _ = try fb.emitStoreLocal(local_idx, managed.getValue(), assign.span);
+                            self.cleanup_stack.updateValueForLocal(local_idx, managed.getValue());
                         }
-                        // Release old value AFTER store (safe even if old == new)
-                        var release_args = [_]ir.NodeIndex{old_value};
-                        _ = try fb.emitCall("release", &release_args, false, TypeRegistry.VOID, assign.span);
+                        // Destroy old value AFTER store (safe even if old == new)
+                        try self.emitDestroyValue(fb, old_value, local_type, assign.span);
                         }
                     } else {
                         const local_type = fb.locals.items[local_idx].type_idx;
@@ -3558,19 +3483,17 @@ pub const Lowerer = struct {
         if (arc_elem) {
             if (base_expr == .ident) {
                 if (fb.lookupLocal(base_expr.ident.name)) |local_idx| {
-                    // Load old value BEFORE store (needed for release after)
+                    // Swift store [assign]: copy +0 → store → destroy old
                     const old_val = try fb.emitIndexLocal(local_idx, index_node, elem_size, elem_type, span);
-                    const managed = try self.managedFromLowered(value_node, rhs_ast, elem_type);
+                    var managed = try self.managedFromLowered(value_node, rhs_ast, elem_type);
                     if (managed.hasCleanup()) {
                         var mv = managed;
                         _ = try fb.emitStoreIndexLocal(local_idx, index_node, mv.forward(&self.cleanup_stack), elem_size, span);
                     } else if (managed.getValue() != ir.null_node) {
-                        var retain_args = [_]ir.NodeIndex{managed.getValue()};
-                        const retained = try fb.emitCall("retain", &retain_args, false, elem_type, span);
-                        _ = try fb.emitStoreIndexLocal(local_idx, index_node, retained, elem_size, span);
+                        _ = try self.emitCopyValue(fb, managed.getValue(), elem_type, span);
+                        _ = try fb.emitStoreIndexLocal(local_idx, index_node, managed.getValue(), elem_size, span);
                     }
-                    var release_args = [_]ir.NodeIndex{old_val};
-                    _ = try fb.emitCall("release", &release_args, false, TypeRegistry.VOID, span);
+                    try self.emitDestroyValue(fb, old_val, elem_type, span);
                     return;
                 }
             }
