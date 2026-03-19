@@ -2943,26 +2943,25 @@ pub const Lowerer = struct {
                         try parts.append(self.allocator, str_node);
                     } else if (expr_type == TypeRegistry.F32 or expr_type == TypeRegistry.F64 or expr_type == TypeRegistry.FLOAT or expr_type == TypeRegistry.UNTYPED_FLOAT) {
                         // Float expression: convert via float_to_string
-                        const buf_local = try fb.addLocalWithSize("__interp_buf", TypeRegistry.I64, true, 32); // 32 bytes (aligned)
+                        const buf_local = try fb.addLocalWithSize("__interp_buf", TypeRegistry.I64, true, 32);
                         const buf_addr = try fb.emitAddrLocal(buf_local, TypeRegistry.I64, si.span);
                         var fts_args = [_]ir.NodeIndex{ expr_val, buf_addr };
                         const str_len = try fb.emitCall("float_to_string", &fts_args, false, TypeRegistry.I64, si.span);
-                        // float_to_string writes from start of buffer, returns length
                         const str_node = try fb.emit(ir.Node.init(.{ .string_header = .{ .ptr = buf_addr, .len = str_len } }, TypeRegistry.STRING, si.span));
                         try parts.append(self.allocator, str_node);
                     } else {
                         // Integer expression: convert via int_to_string
-                        // Allocate 21-byte stack buffer for digit conversion
-                        const buf_local = try fb.addLocalWithSize("__interp_buf", TypeRegistry.I64, true, 24); // 24 bytes (aligned)
+                        // Use stack buffer (24 bytes). The result is immediately consumed
+                        // by string_concat which copies the data to a heap buffer, so the
+                        // stack buffer lifetime is sufficient within the interpolation chain.
+                        const buf_local = try fb.addLocalWithSize("__interp_buf", TypeRegistry.I64, true, 24);
                         const buf_addr = try fb.emitAddrLocal(buf_local, TypeRegistry.I64, si.span);
                         var its_args = [_]ir.NodeIndex{ expr_val, buf_addr };
                         const str_len = try fb.emitCall("int_to_string", &its_args, false, TypeRegistry.I64, si.span);
                         // String starts at buf_addr + 21 - str_len
-                        // str_ptr = buf_addr + 21 - str_len
                         const twenty_one = try fb.emitConstInt(21, TypeRegistry.I64, si.span);
                         const offset = try fb.emitBinary(.sub, twenty_one, str_len, TypeRegistry.I64, si.span);
                         const str_ptr = try fb.emitBinary(.add, buf_addr, offset, TypeRegistry.I64, si.span);
-                        // Build string_header(str_ptr, str_len)
                         const str_node = try fb.emit(ir.Node.init(.{ .string_header = .{ .ptr = str_ptr, .len = str_len } }, TypeRegistry.STRING, si.span));
                         try parts.append(self.allocator, str_node);
                     }
