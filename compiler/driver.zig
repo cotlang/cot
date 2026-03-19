@@ -1426,17 +1426,19 @@ pub const Driver = struct {
         // Scheduler global symbol index — _cot_sched_ptr BSS data for scheduler singleton.
         const sched_symbol_idx: u32 = envp_symbol_idx + 1;
 
-        // Source map global symbol indices — used by signal handler for crash source lines.
+        // PC→line table symbol indices — Go-style pctab/functab for crash source lines.
         // Pre-allocated here so signal_native can reference them in CLIF globalValue instructions.
-        const srcmap_entries_symbol_idx: u32 = sched_symbol_idx + 1;
-        const srcmap_count_symbol_idx: u32 = srcmap_entries_symbol_idx + 1;
-        const srcmap_file_symbol_idx: u32 = srcmap_count_symbol_idx + 1;
+        const pctab_symbol_idx: u32 = sched_symbol_idx + 1;
+        const functab_symbol_idx: u32 = pctab_symbol_idx + 1;
+        const functab_count_symbol_idx: u32 = functab_symbol_idx + 1;
+        const filetab_symbol_idx: u32 = functab_count_symbol_idx + 1;
+        const funcnames_symbol_idx: u32 = filetab_symbol_idx + 1;
 
         // Global variable symbol indices — each module-level var gets a data section entry.
         // Maps global name → external name index for globalValue references in ssa_to_clif.
         var global_symbol_map = std.StringHashMapUnmanaged(u32){};
         defer global_symbol_map.deinit(self.allocator);
-        const globals_base_idx: u32 = srcmap_file_symbol_idx + 1;
+        const globals_base_idx: u32 = funcnames_symbol_idx + 1;
         for (globals, 0..) |g, i| {
             try global_symbol_map.put(self.allocator, g.name, globals_base_idx + @as(u32, @intCast(i)));
         }
@@ -1573,7 +1575,7 @@ pub const Driver = struct {
             }
 
             // Signal handler runtime: __cot_signal_handler, __cot_install_signals, __cot_print_source_loc
-            var signal_funcs = try signal_native.generate(self.allocator, isa, &ctrl_plane, &func_index_map, self.target.os, srcmap_entries_symbol_idx, srcmap_count_symbol_idx, srcmap_file_symbol_idx);
+            var signal_funcs = try signal_native.generate(self.allocator, isa, &ctrl_plane, &func_index_map, self.target.os, pctab_symbol_idx, functab_symbol_idx, functab_count_symbol_idx, filetab_symbol_idx, funcnames_symbol_idx);
             defer signal_funcs.deinit(self.allocator);
             for (signal_funcs.items) |rf| {
                 try compiled_funcs.append(self.allocator, rf.compiled);
@@ -1608,9 +1610,11 @@ pub const Driver = struct {
             argv_symbol_idx,
             envp_symbol_idx,
             sched_symbol_idx,
-            srcmap_entries_symbol_idx,
-            srcmap_count_symbol_idx,
-            srcmap_file_symbol_idx,
+            pctab_symbol_idx,
+            functab_symbol_idx,
+            functab_count_symbol_idx,
+            filetab_symbol_idx,
+            funcnames_symbol_idx,
             &func_index_map,
             globals,
             globals_base_idx,
@@ -1634,9 +1638,11 @@ pub const Driver = struct {
         argv_symbol_idx: u32,
         envp_symbol_idx: u32,
         sched_symbol_idx: u32,
-        srcmap_entries_symbol_idx: u32,
-        srcmap_count_symbol_idx: u32,
-        srcmap_file_symbol_idx: u32,
+        pctab_symbol_idx: u32,
+        functab_symbol_idx: u32,
+        functab_count_symbol_idx: u32,
+        filetab_symbol_idx: u32,
+        funcnames_symbol_idx: u32,
         func_index_map: *const std.StringHashMapUnmanaged(u32),
         globals: []const ir_mod.Global,
         globals_base_idx: u32,
@@ -1759,13 +1765,14 @@ pub const Driver = struct {
             try module.declareExternalName(sched_symbol_idx, sched_sym_name);
         }
 
-        // Pass 3b4: Pre-register source map external names so signal handler CLIF code
+        // Pass 3b4: Pre-register pctab/functab external names so signal handler CLIF code
         // can reference them via globalValue. The actual data is emitted in Phase 5.
-        // If no source map entries exist, we still register zero-sized placeholders.
         {
-            try module.declareExternalName(srcmap_entries_symbol_idx, "_cot_srcmap_entries");
-            try module.declareExternalName(srcmap_count_symbol_idx, "_cot_srcmap_count");
-            try module.declareExternalName(srcmap_file_symbol_idx, "_cot_srcmap_file");
+            try module.declareExternalName(pctab_symbol_idx, "_cot_pctab");
+            try module.declareExternalName(functab_symbol_idx, "_cot_functab");
+            try module.declareExternalName(functab_count_symbol_idx, "_cot_functab_count");
+            try module.declareExternalName(filetab_symbol_idx, "_cot_filetab");
+            try module.declareExternalName(funcnames_symbol_idx, "_cot_funcnames");
         }
 
         // Pass 3c: Add global variable data section entries.
@@ -1807,7 +1814,7 @@ pub const Driver = struct {
                 // Skip scheduler global symbol (already registered in Pass 3b3)
                 if (idx == sched_symbol_idx) continue;
                 // Skip source map symbols (already registered in Pass 3b4)
-                if (idx == srcmap_entries_symbol_idx or idx == srcmap_count_symbol_idx or idx == srcmap_file_symbol_idx) continue;
+                if (idx == pctab_symbol_idx or idx == functab_symbol_idx or idx == functab_count_symbol_idx or idx == filetab_symbol_idx or idx == funcnames_symbol_idx) continue;
                 // Skip global variable symbols (already registered in Pass 3c)
                 if (globals.len > 0 and idx >= globals_base_idx and idx < globals_base_idx + @as(u32, @intCast(globals.len))) continue;
 
@@ -2030,23 +2037,29 @@ pub const Driver = struct {
                 if (self.debug_type_reg) |tr| module.setTypeRegistry(tr);
             }
 
-            // Build source map entries: (func_name_hash, code_offset_in_func, line_number)
-            // The signal handler uses dladdr to get func name + offset, then searches this table.
-            var srcmap_data = std.ArrayListUnmanaged(u8){};
-            defer srcmap_data.deinit(self.allocator);
-            var srcmap_count: u32 = 0;
+            // Build Go-style PC→line tables (reference: Go cmd/internal/obj/pcln.go:funcpctab).
+            // Per-function varint-encoded PC→line delta streams in _cot_pctab.
+            // Functab: {name_hash:u32, pctab_off:u32, file_idx:u16, pad:u16, pad2:u32} = 16 bytes per entry.
+            var pctab_data = std.ArrayListUnmanaged(u8){};
+            defer pctab_data.deinit(self.allocator);
+            var functab_data = std.ArrayListUnmanaged(u8){};
+            defer functab_data.deinit(self.allocator);
+            var functab_count: u32 = 0;
 
             if (self.debug_source_text.len > 0) {
                 for (compiled_funcs, 0..) |*cf, func_idx| {
-                    // Only process user functions (they have source locations)
                     if (func_idx >= func_names.len) continue;
                     const func_code_offset = module.getFuncCodeOffset(func_ids[func_idx]);
+
+                    // Collect (pc_offset, line) pairs sorted by pc_offset for this function.
+                    // Also emit DWARF line entries.
+                    const PcLine = struct { pc: u32, line: u32 };
+                    var pc_lines = std.ArrayListUnmanaged(PcLine){};
+                    defer pc_lines.deinit(self.allocator);
 
                     for (cf.buffer.srclocs.items) |srcloc| {
                         const src_byte_offset = srcloc.loc.offset;
                         if (src_byte_offset == 0) continue;
-
-                        // Convert source byte offset to line number
                         const line = lineFromByteOffset(self.debug_source_text, src_byte_offset);
                         if (line == 0) continue;
 
@@ -2054,53 +2067,116 @@ pub const Driver = struct {
                         const abs_code_offset = func_code_offset + srcloc.start;
                         try module.addLineEntry(abs_code_offset, src_byte_offset);
 
-                        // Runtime source map: { func_name_hash: u32, offset_in_func: u32, line: u32, file_idx: u16, pad: u16 }
-                        // Hash the bare function name (dladdr strips the _ prefix on macOS).
-                        const name = func_names[func_idx];
-                        const name_hash = fnvHash(name);
-                        try srcmap_data.appendSlice(self.allocator, std.mem.asBytes(&name_hash));
-                        const offset_in_func: u32 = srcloc.start;
-                        try srcmap_data.appendSlice(self.allocator, std.mem.asBytes(&offset_in_func));
-                        const line_u32: u32 = line;
-                        try srcmap_data.appendSlice(self.allocator, std.mem.asBytes(&line_u32));
-                        const file_idx: u16 = 0; // Single file for now
-                        try srcmap_data.appendSlice(self.allocator, std.mem.asBytes(&file_idx));
-                        const pad: u16 = 0;
-                        try srcmap_data.appendSlice(self.allocator, std.mem.asBytes(&pad));
-                        srcmap_count += 1;
+                        try pc_lines.append(self.allocator, .{ .pc = srcloc.start, .line = line });
                     }
+
+                    if (pc_lines.items.len == 0) continue;
+
+                    // Sort by pc offset (srclocs should already be sorted, but ensure)
+                    std.sort.insertion(PcLine, pc_lines.items, {}, struct {
+                        fn lessThan(_: void, a: PcLine, b: PcLine) bool {
+                            return a.pc < b.pc;
+                        }
+                    }.lessThan);
+
+                    // Record pctab offset for this function's stream
+                    const pctab_off: u32 = @intCast(pctab_data.items.len);
+
+                    // Go-style encoding: alternating (value_delta_zigzag, pc_delta) varint pairs.
+                    // Initial value: -1 (Go pcln.go line 37: val = -1)
+                    var prev_line: i32 = -1;
+                    var prev_pc: u32 = 0;
+
+                    const func_code_size: u32 = @intCast(cf.buffer.data.items.len);
+                    // Deduplicate: only emit entries where the line actually changes.
+                    // Go's pctab never emits delta=0 entries because zigzag(0)=0 is
+                    // the stream terminator (reference: cmd/internal/obj/pcln.go).
+                    var deduped = std.ArrayListUnmanaged(PcLine){};
+                    defer deduped.deinit(self.allocator);
+                    for (pc_lines.items) |entry| {
+                        const line_i32: i32 = @intCast(entry.line);
+                        if (line_i32 != prev_line or prev_line == -1) {
+                            try deduped.append(self.allocator, entry);
+                            prev_line = line_i32;
+                        }
+                    }
+                    // Reset for actual encoding
+                    prev_line = -1;
+                    for (deduped.items, 0..) |entry, idx| {
+                        const line_i32: i32 = @intCast(entry.line);
+                        const delta = line_i32 - prev_line;
+                        // Zigzag encode: (delta << 1) ^ (delta >> 31)
+                        const zigzag: u32 = @bitCast((delta << 1) ^ (delta >> 31));
+                        try appendUvarint(&pctab_data, self.allocator, zigzag);
+                        // For the last entry, extend PC to end of function so the line covers
+                        // all remaining instructions (Go pcln.go pattern: full coverage).
+                        const is_last = (idx == deduped.items.len - 1);
+                        const pc_end = if (is_last) func_code_size else entry.pc;
+                        const pc_delta = pc_end - prev_pc;
+                        try appendUvarint(&pctab_data, self.allocator, pc_delta);
+                        prev_line = line_i32;
+                        prev_pc = pc_end;
+                    }
+                    // Terminator: 0 byte (Go pcln.go: terminated by a 0 value delta)
+                    try pctab_data.append(self.allocator, 0);
+
+                    // Functab entry: {name_hash:u32, pctab_off:u32, file_idx:u16, pad:u16, pad2:u32}
+                    const name = func_names[func_idx];
+                    const name_hash = fnvHash(name);
+                    try functab_data.appendSlice(self.allocator, std.mem.asBytes(&name_hash));
+                    try functab_data.appendSlice(self.allocator, std.mem.asBytes(&pctab_off));
+                    const file_idx: u16 = 0;
+                    try functab_data.appendSlice(self.allocator, std.mem.asBytes(&file_idx));
+                    const pad: u16 = 0;
+                    try functab_data.appendSlice(self.allocator, std.mem.asBytes(&pad));
+                    const pad2: u32 = 0;
+                    try functab_data.appendSlice(self.allocator, std.mem.asBytes(&pad2));
+                    functab_count += 1;
                 }
             }
 
-            // Always emit source map data sections (signal handler references them).
-            // If no entries, emit zero-filled placeholders.
+            // Always emit pctab data sections (signal handler references them).
             {
-                // Entries array (16 bytes per entry, or 16 bytes of zeros)
-                const entries_id = try module.declareData("_cot_srcmap_entries", .Local, false);
-                if (srcmap_data.items.len > 0) {
-                    try module.defineData(entries_id, srcmap_data.items);
+                // _cot_pctab: varint-encoded PC→line streams
+                const pctab_id = try module.declareData("_cot_pctab", .Local, false);
+                if (pctab_data.items.len > 0) {
+                    try module.defineData(pctab_id, pctab_data.items);
                 } else {
-                    const zero16 = &[_]u8{0} ** 16;
-                    try module.defineData(entries_id, zero16);
+                    const zero8 = &[_]u8{0} ** 8;
+                    try module.defineData(pctab_id, zero8);
                 }
 
-                // Count (4 bytes)
-                const count_id = try module.declareData("_cot_srcmap_count", .Local, false);
-                try module.defineData(count_id, std.mem.asBytes(&srcmap_count));
+                // _cot_functab: array of functab entries (16 bytes each)
+                const functab_id = try module.declareData("_cot_functab", .Local, false);
+                if (functab_data.items.len > 0) {
+                    try module.defineData(functab_id, functab_data.items);
+                } else {
+                    const zero16 = &[_]u8{0} ** 16;
+                    try module.defineData(functab_id, zero16);
+                }
 
-                // Source file name (null-terminated, or just a null byte)
-                const file_id = try module.declareData("_cot_srcmap_file", .Local, false);
+                // _cot_functab_count: u32
+                const ftcount_id = try module.declareData("_cot_functab_count", .Local, false);
+                try module.defineData(ftcount_id, std.mem.asBytes(&functab_count));
+
+                // _cot_filetab: source file name (null-terminated)
+                const filetab_id = try module.declareData("_cot_filetab", .Local, false);
                 if (self.debug_source_file.len > 0) {
                     var file_data = std.ArrayListUnmanaged(u8){};
                     defer file_data.deinit(self.allocator);
                     try file_data.appendSlice(self.allocator, self.debug_source_file);
                     try file_data.append(self.allocator, 0);
                     while (file_data.items.len % 8 != 0) try file_data.append(self.allocator, 0);
-                    try module.defineData(file_id, file_data.items);
+                    try module.defineData(filetab_id, file_data.items);
                 } else {
                     const zero8 = &[_]u8{0} ** 8;
-                    try module.defineData(file_id, zero8);
+                    try module.defineData(filetab_id, zero8);
                 }
+
+                // _cot_funcnames: placeholder (not used yet, reserved for future name lookup)
+                const funcnames_id = try module.declareData("_cot_funcnames", .Local, false);
+                const zero8 = &[_]u8{0} ** 8;
+                try module.defineData(funcnames_id, zero8);
             }
         }
 
@@ -2109,6 +2185,17 @@ pub const Driver = struct {
         defer output.deinit(self.allocator);
         try module.finish(output.writer(self.allocator));
         return try output.toOwnedSlice(self.allocator);
+    }
+
+    /// Append a u32 as an unsigned varint (LEB128-style, 7 bits per byte, high bit = continuation).
+    /// Reference: Go encoding/binary PutUvarint / runtime readvarint.
+    fn appendUvarint(list: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, value: u32) !void {
+        var v = value;
+        while (v >= 0x80) {
+            try list.append(allocator, @as(u8, @truncate(v)) | 0x80);
+            v >>= 7;
+        }
+        try list.append(allocator, @as(u8, @truncate(v)));
     }
 
     /// Convert a source byte offset to a 1-based line number by counting newlines.
