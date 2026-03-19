@@ -88,6 +88,7 @@ pub const Driver = struct {
     bench_filter: ?[]const u8 = null,
     bench_n: ?i64 = null,
     release_mode: bool = false,
+    debug_mode: bool = false, // --debug / -g: emit full DWARF for lldb + DWARF-based crash traces
     lib_mode: bool = false,
     direct_native: bool = false, // Use direct SSA → CLIF path (bypass Wasm)
     project_safe: ?bool = null, // cached cot.json "safe" field, loaded lazily
