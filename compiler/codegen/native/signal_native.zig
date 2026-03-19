@@ -728,8 +728,13 @@ fn generateInstallSignals(
 // ============================================================================
 // __cot_print_backtrace() -> void
 //
-// Calls libc backtrace() + backtrace_symbols_fd() to print stack trace.
-// Reference: macOS/Linux backtrace(3)
+// Per-frame backtrace with source resolution.
+// Reference: Go runtime/traceback.go:gentraceback() — walks frames,
+//            resolves each to file:line.
+//            Zig std/debug.zig:656-742 — loop calling printSourceAtAddress.
+//
+// For each frame: dladdr(pc) -> symbol name + offset, then
+// __cot_print_source_loc(pc) for pctab file:line resolution.
 // ============================================================================
 fn generatePrintBacktrace(
     allocator: Allocator,
@@ -743,11 +748,9 @@ fn generatePrintBacktrace(
     defer func_ctx.deinit();
     var builder = FunctionBuilder.init(&clif_func, &func_ctx);
 
-    const block_entry = try builder.createBlock();
-    builder.switchToBlock(block_entry);
-    try builder.appendBlockParamsForFunctionParams(block_entry);
-    try builder.ensureInsertedBlock();
+    // -- Import functions --
 
+    // backtrace(buf, size) -> count
     const bt_idx = func_index_map.get("backtrace") orelse 0;
     var bt_sig = clif.Signature.init(.system_v);
     try bt_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
@@ -760,40 +763,246 @@ fn generatePrintBacktrace(
         .colocated = false,
     });
 
-    const btsf_idx = func_index_map.get("backtrace_symbols_fd") orelse 0;
-    var btsf_sig = clif.Signature.init(.system_v);
-    try btsf_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
-    try btsf_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
-    try btsf_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
-    const btsf_sig_ref = try builder.importSignature(btsf_sig);
-    const btsf_func = try builder.importFunction(.{
-        .name = .{ .user = .{ .namespace = 0, .index = btsf_idx } },
-        .signature = btsf_sig_ref,
+    // dladdr(addr, info) -> success (i32 widened to i64)
+    const dladdr_idx = func_index_map.get("dladdr") orelse 0;
+    var dladdr_sig = clif.Signature.init(.system_v);
+    try dladdr_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+    try dladdr_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+    try dladdr_sig.addReturn(allocator, clif.AbiParam.init(clif.Type.I64));
+    const dladdr_sig_ref = try builder.importSignature(dladdr_sig);
+    const dladdr_func = try builder.importFunction(.{
+        .name = .{ .user = .{ .namespace = 0, .index = dladdr_idx } },
+        .signature = dladdr_sig_ref,
         .colocated = false,
     });
 
+    // write(fd, buf, len) -> ssize_t
+    const write_func = try importWrite(allocator, &builder, func_index_map);
+
+    // strlen(str) -> len
+    const strlen_idx = func_index_map.get("strlen") orelse 0;
+    var strlen_sig = clif.Signature.init(.system_v);
+    try strlen_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+    try strlen_sig.addReturn(allocator, clif.AbiParam.init(clif.Type.I64));
+    const strlen_sig_ref = try builder.importSignature(strlen_sig);
+    const strlen_func = try builder.importFunction(.{
+        .name = .{ .user = .{ .namespace = 0, .index = strlen_idx } },
+        .signature = strlen_sig_ref,
+        .colocated = false,
+    });
+
+    // __cot_print_hex(value) -> void
+    const hex_idx = func_index_map.get("__cot_print_hex") orelse 0;
+    var hex_sig = clif.Signature.init(.system_v);
+    try hex_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+    const hex_sig_ref = try builder.importSignature(hex_sig);
+    const hex_func = try builder.importFunction(.{
+        .name = .{ .user = .{ .namespace = 0, .index = hex_idx } },
+        .signature = hex_sig_ref,
+        .colocated = true,
+    });
+
+    // __cot_print_source_loc(pc) -> void
+    const srcloc_idx = func_index_map.get("__cot_print_source_loc") orelse 0;
+    var srcloc_sig = clif.Signature.init(.system_v);
+    try srcloc_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+    const srcloc_sig_ref = try builder.importSignature(srcloc_sig);
+    const srcloc_func = try builder.importFunction(.{
+        .name = .{ .user = .{ .namespace = 0, .index = srcloc_idx } },
+        .signature = srcloc_sig_ref,
+        .colocated = true,
+    });
+
+    // -- Stack slots --
     const bt_slot = try clif_func.createStackSlot(allocator, .{
         .kind = .explicit_slot,
-        .size = 512,
+        .size = 512, // 64 pointers x 8 bytes
+        .align_shift = 3,
+    });
+    const dl_info_slot = try clif_func.createStackSlot(allocator, .{
+        .kind = .explicit_slot,
+        .size = @intCast(DL_INFO_SIZE),
         .align_shift = 3,
     });
 
-    const ins = builder.ins();
-    const bt_buf = try ins.stackAddr(clif.Type.I64, bt_slot, 0);
-    const v_64 = try ins.iconst(clif.Type.I64, 64);
-    const bt_result = try ins.call(bt_func, &[_]clif.Value{ bt_buf, v_64 });
-    const count = bt_result.results[0];
+    // -- Pre-create ALL blocks --
+    // b_entry: call backtrace, jump to loop
+    // b_loop [idx, count, buf]: check idx < count
+    // b_frame [idx, count, buf]: load pc, dladdr, branch sym/nosym
+    // b_sym [idx, count, buf, sname, pc, saddr]: print symbol + offset
+    // b_nosym [idx, count, buf, pc]: print <unknown> + raw pc
+    // b_after [idx, count, buf, pc]: source loc, newline, advance idx
+    // b_done: return
+    const b_entry = try builder.createBlock();
 
-    // Skip first 2 frames (signal handler internals)
-    const v_16 = try ins.iconst(clif.Type.I64, 16);
-    const adjusted_buf = try ins.iadd(bt_buf, v_16);
-    const v_2 = try ins.iconst(clif.Type.I64, 2);
-    const adjusted_count = try ins.isub(count, v_2);
+    const b_loop = try builder.createBlock();
+    _ = try builder.appendBlockParam(b_loop, clif.Type.I64); // idx
+    _ = try builder.appendBlockParam(b_loop, clif.Type.I64); // count
+    _ = try builder.appendBlockParam(b_loop, clif.Type.I64); // buf
 
-    const v_fd = try ins.iconst(clif.Type.I64, 2);
-    _ = try ins.call(btsf_func, &[_]clif.Value{ adjusted_buf, adjusted_count, v_fd });
+    const b_frame = try builder.createBlock();
+    _ = try builder.appendBlockParam(b_frame, clif.Type.I64); // idx
+    _ = try builder.appendBlockParam(b_frame, clif.Type.I64); // count
+    _ = try builder.appendBlockParam(b_frame, clif.Type.I64); // buf
 
-    _ = try ins.return_(&.{});
+    const b_sym = try builder.createBlock();
+    _ = try builder.appendBlockParam(b_sym, clif.Type.I64); // idx
+    _ = try builder.appendBlockParam(b_sym, clif.Type.I64); // count
+    _ = try builder.appendBlockParam(b_sym, clif.Type.I64); // buf
+    _ = try builder.appendBlockParam(b_sym, clif.Type.I64); // sname
+    _ = try builder.appendBlockParam(b_sym, clif.Type.I64); // pc
+    _ = try builder.appendBlockParam(b_sym, clif.Type.I64); // saddr
+
+    const b_nosym = try builder.createBlock();
+    _ = try builder.appendBlockParam(b_nosym, clif.Type.I64); // idx
+    _ = try builder.appendBlockParam(b_nosym, clif.Type.I64); // count
+    _ = try builder.appendBlockParam(b_nosym, clif.Type.I64); // buf
+    _ = try builder.appendBlockParam(b_nosym, clif.Type.I64); // pc
+
+    const b_after = try builder.createBlock();
+    _ = try builder.appendBlockParam(b_after, clif.Type.I64); // idx
+    _ = try builder.appendBlockParam(b_after, clif.Type.I64); // count
+    _ = try builder.appendBlockParam(b_after, clif.Type.I64); // buf
+    _ = try builder.appendBlockParam(b_after, clif.Type.I64); // pc
+
+    const b_done = try builder.createBlock();
+
+    // ---- b_entry: call backtrace, set up loop ----
+    builder.switchToBlock(b_entry);
+    try builder.appendBlockParamsForFunctionParams(b_entry);
+    try builder.ensureInsertedBlock();
+    {
+        const ins = builder.ins();
+        const bt_buf = try ins.stackAddr(clif.Type.I64, bt_slot, 0);
+        const v_64 = try ins.iconst(clif.Type.I64, 64);
+        const bt_result = try ins.call(bt_func, &[_]clif.Value{ bt_buf, v_64 });
+        const raw_count = bt_result.results[0];
+
+        try writeStringToStderr(ins, &builder, &clif_func, allocator, write_func, "\nbacktrace:\n");
+
+        // Skip first 2 frames (signal handler internals)
+        const v_2 = try ins.iconst(clif.Type.I64, 2);
+        const adjusted_count = try ins.isub(raw_count, v_2);
+        const v_0 = try ins.iconst(clif.Type.I64, 0);
+        const v_16 = try ins.iconst(clif.Type.I64, 16); // 2 * 8 bytes
+        const adjusted_buf = try ins.iadd(bt_buf, v_16);
+        _ = try ins.jump(b_loop, &[_]clif.Value{ v_0, adjusted_count, adjusted_buf });
+    }
+
+    // ---- b_loop: check idx < count ----
+    builder.switchToBlock(b_loop);
+    try builder.ensureInsertedBlock();
+    {
+        const p = builder.blockParams(b_loop);
+        const ins = builder.ins();
+        const cmp = try ins.icmp(.slt, p[0], p[1]);
+        _ = try ins.brif(cmp, b_frame, &[_]clif.Value{ p[0], p[1], p[2] }, b_done, &.{});
+    }
+
+    // ---- b_frame: load PC, call dladdr, branch to sym/nosym ----
+    builder.switchToBlock(b_frame);
+    try builder.ensureInsertedBlock();
+    {
+        const p = builder.blockParams(b_frame);
+        const idx = p[0];
+        const count = p[1];
+        const buf = p[2];
+        const ins = builder.ins();
+
+        // Load PC from buf[idx * 8]
+        const v_8 = try ins.iconst(clif.Type.I64, 8);
+        const byte_offset = try ins.imul(idx, v_8);
+        const pc_addr = try ins.iadd(buf, byte_offset);
+        const pc = try ins.load(clif.Type.I64, clif.MemFlags.DEFAULT, pc_addr, 0);
+
+        // Call dladdr(pc, &dl_info)
+        const dl_info_addr = try ins.stackAddr(clif.Type.I64, dl_info_slot, 0);
+        const dladdr_result = try ins.call(dladdr_func, &[_]clif.Value{ pc, dl_info_addr });
+        const dladdr_ok = dladdr_result.results[0];
+
+        // Check dladdr succeeded AND sname is non-null
+        const v_0 = try ins.iconst(clif.Type.I64, 0);
+        const ok = try ins.icmp(.ne, dladdr_ok, v_0);
+        const sname = try ins.load(clif.Type.I64, clif.MemFlags.DEFAULT, dl_info_addr, DLI_SNAME_OFFSET);
+        const saddr = try ins.load(clif.Type.I64, clif.MemFlags.DEFAULT, dl_info_addr, DLI_SADDR_OFFSET);
+        const sname_ok = try ins.icmp(.ne, sname, v_0);
+        const both_ok = try ins.band(ok, sname_ok);
+
+        _ = try ins.brif(both_ok, b_sym, &[_]clif.Value{ idx, count, buf, sname, pc, saddr }, b_nosym, &[_]clif.Value{ idx, count, buf, pc });
+    }
+
+    // ---- b_sym: print "  symbol + 0xOFFSET" ----
+    builder.switchToBlock(b_sym);
+    try builder.ensureInsertedBlock();
+    {
+        const p = builder.blockParams(b_sym);
+        const idx = p[0];
+        const count = p[1];
+        const buf = p[2];
+        const sname = p[3];
+        const pc = p[4];
+        const saddr = p[5];
+        const ins = builder.ins();
+
+        try writeStringToStderr(ins, &builder, &clif_func, allocator, write_func, "  ");
+
+        // Print symbol name via strlen + write
+        const name_len_result = try ins.call(strlen_func, &[_]clif.Value{sname});
+        const name_len = name_len_result.results[0];
+        const v_fd = try ins.iconst(clif.Type.I64, 2);
+        _ = try ins.call(write_func, &[_]clif.Value{ v_fd, sname, name_len });
+
+        try writeStringToStderr(ins, &builder, &clif_func, allocator, write_func, " + ");
+
+        // Print hex offset: pc - saddr
+        const offset_val = try ins.isub(pc, saddr);
+        _ = try ins.call(hex_func, &[_]clif.Value{offset_val});
+
+        _ = try ins.jump(b_after, &[_]clif.Value{ idx, count, buf, pc });
+    }
+
+    // ---- b_nosym: print "  <unknown> 0xPC" ----
+    builder.switchToBlock(b_nosym);
+    try builder.ensureInsertedBlock();
+    {
+        const p = builder.blockParams(b_nosym);
+        const ins = builder.ins();
+
+        try writeStringToStderr(ins, &builder, &clif_func, allocator, write_func, "  <unknown> ");
+        _ = try ins.call(hex_func, &[_]clif.Value{p[3]});
+
+        _ = try ins.jump(b_after, &[_]clif.Value{ p[0], p[1], p[2], p[3] });
+    }
+
+    // ---- b_after: print source loc + newline, advance idx ----
+    builder.switchToBlock(b_after);
+    try builder.ensureInsertedBlock();
+    {
+        const p = builder.blockParams(b_after);
+        const idx = p[0];
+        const count = p[1];
+        const buf = p[2];
+        const pc = p[3];
+        const ins = builder.ins();
+
+        // Call __cot_print_source_loc(pc) for pctab file:line resolution
+        _ = try ins.call(srcloc_func, &[_]clif.Value{pc});
+
+        try writeStringToStderr(ins, &builder, &clif_func, allocator, write_func, "\n");
+
+        // Advance idx and loop
+        const v_1 = try ins.iconst(clif.Type.I64, 1);
+        const next_idx = try ins.iadd(idx, v_1);
+        _ = try ins.jump(b_loop, &[_]clif.Value{ next_idx, count, buf });
+    }
+
+    // ---- b_done: return ----
+    builder.switchToBlock(b_done);
+    try builder.ensureInsertedBlock();
+    {
+        const ins = builder.ins();
+        _ = try ins.return_(&.{});
+    }
 
     try builder.sealAllBlocks();
     builder.finalize();
@@ -838,6 +1047,14 @@ fn generatePrintSourceLoc(
     const dl_info_slot = try clif_func.createStackSlot(allocator, .{
         .kind = .explicit_slot,
         .size = @intCast(DL_INFO_SIZE),
+        .align_shift = 3,
+    });
+
+    // Stack slot for file_idx (stored when functab match is found, loaded in b_found).
+    // This avoids threading file_idx through the entire pctab decode block chain.
+    const file_idx_slot = try clif_func.createStackSlot(allocator, .{
+        .kind = .explicit_slot,
+        .size = 8,
         .align_shift = 3,
     });
 
@@ -1096,23 +1313,32 @@ fn generatePrintSourceLoc(
         _ = try builder.appendBlockParam(b_ft_next, clif.Type.I64);
 
         const b_ft_match = try builder.createBlock();
-        _ = try builder.appendBlockParam(b_ft_match, clif.Type.I64);
-        _ = try builder.appendBlockParam(b_ft_match, clif.Type.I64);
+        _ = try builder.appendBlockParam(b_ft_match, clif.Type.I64); // pctab_off
+        _ = try builder.appendBlockParam(b_ft_match, clif.Type.I64); // target_offset
+        _ = try builder.appendBlockParam(b_ft_match, clif.Type.I64); // file_idx
 
         // Load pctab_off (u32) from functab entry at offset 4
         const pctab_off_i32 = try i.load(clif.Type.I32, clif.MemFlags.DEFAULT, ftc_cur, 4);
         const pctab_off = try i.uextend(clif.Type.I64, pctab_off_i32);
 
-        _ = try i.brif(hash_match, b_ft_match, &[_]clif.Value{ pctab_off, ftc_off }, b_ft_next, &[_]clif.Value{ ftc_cur, ftc_end, ftc_hash, ftc_off });
+        // Load file_idx (u16) from functab entry at offset 8
+        const entry_file_idx_i16 = try i.load(clif.Type.I16, clif.MemFlags.DEFAULT, ftc_cur, 8);
+        const entry_file_idx = try i.uextend(clif.Type.I64, entry_file_idx_i16);
 
-        // b_ft_match: jump to b_ft_found
+        _ = try i.brif(hash_match, b_ft_match, &[_]clif.Value{ pctab_off, ftc_off, entry_file_idx }, b_ft_next, &[_]clif.Value{ ftc_cur, ftc_end, ftc_hash, ftc_off });
+
+        // b_ft_match: store file_idx to stack slot, jump to b_ft_found
         builder.switchToBlock(b_ft_match);
         try builder.ensureInsertedBlock();
         {
             const mi = builder.ins();
             const mp = builder.blockParams(b_ft_match);
-            const m0 = mp[0];
-            const m1 = mp[1];
+            const m0 = mp[0]; // pctab_off
+            const m1 = mp[1]; // target_offset
+            const m2 = mp[2]; // file_idx
+            // Store file_idx to stack slot for later retrieval in b_found
+            const fidx_addr = try mi.stackAddr(clif.Type.I64, file_idx_slot, 0);
+            _ = try mi.store(clif.MemFlags.DEFAULT, m2, fidx_addr, 0);
             _ = try mi.jump(b_ft_found, &[_]clif.Value{ m0, m1 });
         }
 
@@ -1317,16 +1543,88 @@ fn generatePrintSourceLoc(
     }
 
     // === b_found: print "  at <file>:<line>\n" ===
+    // Multi-file filetab: walk past file_idx null-terminated strings to find correct path.
+    // Reference: Go runtime/symtab.go:funcfile() — per-CU file tables via cutab.
+    //
+    // Filetab layout: "path0\0path1\0path2\0..."
+    // To find file N, skip N strings (each terminated by \0).
+    // Sub-blocks: b_skip_loop, b_skip_scan, b_skip_done for walking filetab.
+    const b_skip_loop = try builder.createBlock();
+    _ = try builder.appendBlockParam(b_skip_loop, clif.Type.I64); // ptr into filetab
+    _ = try builder.appendBlockParam(b_skip_loop, clif.Type.I64); // remaining files to skip
+    _ = try builder.appendBlockParam(b_skip_loop, clif.Type.I64); // line_num
+
+    const b_skip_scan = try builder.createBlock();
+    _ = try builder.appendBlockParam(b_skip_scan, clif.Type.I64); // ptr
+    _ = try builder.appendBlockParam(b_skip_scan, clif.Type.I64); // remaining
+    _ = try builder.appendBlockParam(b_skip_scan, clif.Type.I64); // line_num
+
+    const b_skip_done = try builder.createBlock();
+    _ = try builder.appendBlockParam(b_skip_done, clif.Type.I64); // file_addr (start of correct filename)
+    _ = try builder.appendBlockParam(b_skip_done, clif.Type.I64); // line_num
+
     builder.switchToBlock(b_found);
     try builder.ensureInsertedBlock();
     {
         const i = builder.ins();
         const line_num = builder.blockParams(b_found)[0]; // I64
 
+        // Load file_idx from stack slot
+        const fidx_addr = try i.stackAddr(clif.Type.I64, file_idx_slot, 0);
+        const file_idx_val = try i.load(clif.Type.I64, clif.MemFlags.DEFAULT, fidx_addr, 0);
+
+        // Start walking filetab from the beginning
+        const filetab_base = try i.globalValue(clif.Type.I64, gv_filetab);
+        _ = try i.jump(b_skip_loop, &[_]clif.Value{ filetab_base, file_idx_val, line_num });
+    }
+
+    // b_skip_loop: if remaining == 0, done; else scan for next \0
+    builder.switchToBlock(b_skip_loop);
+    try builder.ensureInsertedBlock();
+    {
+        const i = builder.ins();
+        const p = builder.blockParams(b_skip_loop);
+        const ptr = p[0];
+        const remaining = p[1];
+        const line_num = p[2];
+        const v_0 = try i.iconst(clif.Type.I64, 0);
+        const done = try i.icmp(.eq, remaining, v_0);
+        _ = try i.brif(done, b_skip_done, &[_]clif.Value{ ptr, line_num }, b_skip_scan, &[_]clif.Value{ ptr, remaining, line_num });
+    }
+
+    // b_skip_scan: scan forward past one null-terminated string
+    builder.switchToBlock(b_skip_scan);
+    try builder.ensureInsertedBlock();
+    {
+        const i = builder.ins();
+        const p = builder.blockParams(b_skip_scan);
+        const ptr = p[0];
+        const remaining = p[1];
+        const line_num = p[2];
+        // Load byte at ptr
+        const byte_val = try i.load(clif.Type.I8, clif.MemFlags.DEFAULT, ptr, 0);
+        const byte_ext = try i.uextend(clif.Type.I64, byte_val);
+        const v_0 = try i.iconst(clif.Type.I64, 0);
+        const v_1 = try i.iconst(clif.Type.I64, 1);
+        const next_ptr = try i.iadd(ptr, v_1);
+        const is_null = try i.icmp(.eq, byte_ext, v_0);
+        // If null: we've passed one string; decrement remaining, continue from next_ptr
+        const new_remaining = try i.isub(remaining, v_1);
+        _ = try i.brif(is_null, b_skip_loop, &[_]clif.Value{ next_ptr, new_remaining, line_num }, b_skip_scan, &[_]clif.Value{ next_ptr, remaining, line_num });
+    }
+
+    // b_skip_done: we've found the correct file path pointer; print it
+    builder.switchToBlock(b_skip_done);
+    try builder.ensureInsertedBlock();
+    {
+        const i = builder.ins();
+        const p = builder.blockParams(b_skip_done);
+        const file_addr = p[0];
+        const line_num = p[1];
+
         try writeStringToStderr(i, &builder, &clif_func, allocator, write_fn, "  at ");
 
         // Print file name via strlen + write
-        const file_addr = try i.globalValue(clif.Type.I64, gv_filetab);
         const strlen_idx = func_index_map.get("strlen") orelse 0;
         var strlen_sig = clif.Signature.init(.system_v);
         try strlen_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));

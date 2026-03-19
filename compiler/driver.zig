@@ -97,6 +97,12 @@ pub const Driver = struct {
     debug_source_text: []const u8 = "",
     debug_ir_funcs: []const ir_mod.Func = &.{},
     debug_type_reg: ?*const types_mod.TypeRegistry = null,
+    // Multi-file source map: per-file paths/texts and func→file mapping.
+    // Reference: Go runtime/symtab.go:funcfile() — per-CU file tables via cutab.
+    // Reference: Zig Dwarf.zig:SrcLocCache — per-CU file arrays.
+    parsed_file_paths: []const []const u8 = &.{},
+    parsed_file_texts: []const []const u8 = &.{},
+    func_file_indices: []const u16 = &.{},
     // User-declared extern fn names (from imported modules like std/sqlite).
     // Collected from checker scopes after type checking.
     // Registered in func_index_map so native backend can resolve calls.
@@ -542,7 +548,22 @@ pub const Driver = struct {
         var init_func_names = std.ArrayListUnmanaged([]const u8){};
         defer init_func_names.deinit(self.allocator);
 
+        // Multi-file source map: track per-file paths/texts and func→file mapping.
+        // Reference: Go runtime/symtab.go:funcfile() — per-CU file tables via cutab.
+        var file_paths_list = std.ArrayListUnmanaged([]const u8){};
+        defer file_paths_list.deinit(self.allocator);
+        var file_texts_list = std.ArrayListUnmanaged([]const u8){};
+        defer file_texts_list.deinit(self.allocator);
+        var func_file_idx_list = std.ArrayListUnmanaged(u16){};
+        defer func_file_idx_list.deinit(self.allocator);
+        for (parsed_files.items) |*pf| {
+            try file_paths_list.append(self.allocator, pf.path);
+            try file_texts_list.append(self.allocator, pf.source_text);
+        }
+
         for (parsed_files.items, 0..) |*pf, i| {
+            const func_count_before = shared_builder.funcs.items.len;
+
             var lower_err = errors_mod.ErrorReporter.init(&pf.source, null);
             var lowerer = lower_mod.Lowerer.initWithBuilder(self.allocator, &pf.tree, &type_reg, &lower_err, &checkers.items[i], shared_builder, self.target);
             lowerer.lowered_generics = shared_lowered_generics;
@@ -612,6 +633,13 @@ pub const Driver = struct {
             shared_shape_stencils = lowerer.shape_stencils;
             shared_dict_arg_names = lowerer.dict_arg_names;
             shared_generated_dict_helpers = lowerer.generated_dict_helpers;
+
+            // Track func→file mapping: all functions added by this file's lowering
+            const func_count_after = shared_builder.funcs.items.len;
+            for (func_count_before..func_count_after) |_| {
+                try func_file_idx_list.append(self.allocator, @intCast(i));
+            }
+
             lowerer.deinitWithoutBuilder();
         }
 
@@ -713,6 +741,11 @@ pub const Driver = struct {
 
         // Shape stenciling: pass aliases and dict arg names to code generator for call resolution
         self.dict_arg_names = &shared_dict_arg_names;
+
+        // Multi-file source map: store per-file data for pctab encoder
+        self.parsed_file_paths = file_paths_list.items;
+        self.parsed_file_texts = file_texts_list.items;
+        self.func_file_indices = func_file_idx_list.items;
 
         const main_file = if (parsed_files.items.len > 0) parsed_files.items[parsed_files.items.len - 1] else ParsedFile{
             .path = path,
@@ -1985,12 +2018,19 @@ pub const Driver = struct {
                     const func_code_offset = module.getFuncCodeOffset(func_ids[func_idx]);
                     const func_code_size: u32 = @intCast(cf.buffer.data.items.len);
 
+                    // Multi-file: resolve correct source text for this function
+                    const dwarf_file_idx: u16 = if (func_idx < self.func_file_indices.len) self.func_file_indices[func_idx] else 0;
+                    const dwarf_source_text = if (dwarf_file_idx < self.parsed_file_texts.len)
+                        self.parsed_file_texts[dwarf_file_idx]
+                    else
+                        self.debug_source_text;
+
                     // Find declaration line from first srcloc
                     var decl_line: u32 = 0;
                     if (cf.buffer.srclocs.items.len > 0) {
                         const first_src = cf.buffer.srclocs.items[0].loc.offset;
                         if (first_src > 0) {
-                            decl_line = lineFromByteOffset(self.debug_source_text, first_src);
+                            decl_line = lineFromByteOffset(dwarf_source_text, first_src);
                         }
                     }
 
@@ -2052,10 +2092,18 @@ pub const Driver = struct {
             defer functab_data.deinit(self.allocator);
             var functab_count: u32 = 0;
 
-            if (self.debug_source_text.len > 0) {
+            if (self.debug_source_text.len > 0 or self.parsed_file_texts.len > 0) {
                 for (compiled_funcs, 0..) |*cf, func_idx| {
                     if (func_idx >= func_names.len) continue;
                     const func_code_offset = module.getFuncCodeOffset(func_ids[func_idx]);
+
+                    // Multi-file source map: resolve source text for this function's file.
+                    // Reference: Go runtime/symtab.go:funcfile() — per-CU file tables.
+                    const file_idx: u16 = if (func_idx < self.func_file_indices.len) self.func_file_indices[func_idx] else 0;
+                    const source_text_for_func = if (file_idx < self.parsed_file_texts.len)
+                        self.parsed_file_texts[file_idx]
+                    else
+                        self.debug_source_text;
 
                     // Collect (pc_offset, line) pairs sorted by pc_offset for this function.
                     // Also emit DWARF line entries.
@@ -2066,7 +2114,7 @@ pub const Driver = struct {
                     for (cf.buffer.srclocs.items) |srcloc| {
                         const src_byte_offset = srcloc.loc.offset;
                         if (src_byte_offset == 0) continue;
-                        const line = lineFromByteOffset(self.debug_source_text, src_byte_offset);
+                        const line = lineFromByteOffset(source_text_for_func, src_byte_offset);
                         if (line == 0) continue;
 
                         // DWARF: absolute code offset in text section
@@ -2131,7 +2179,6 @@ pub const Driver = struct {
                     const name_hash = fnvHash(name);
                     try functab_data.appendSlice(self.allocator, std.mem.asBytes(&name_hash));
                     try functab_data.appendSlice(self.allocator, std.mem.asBytes(&pctab_off));
-                    const file_idx: u16 = 0;
                     try functab_data.appendSlice(self.allocator, std.mem.asBytes(&file_idx));
                     const pad: u16 = 0;
                     try functab_data.appendSlice(self.allocator, std.mem.asBytes(&pad));
@@ -2165,9 +2212,21 @@ pub const Driver = struct {
                 const ftcount_id = try module.declareData("_cot_functab_count", .Local, false);
                 try module.defineData(ftcount_id, std.mem.asBytes(&functab_count));
 
-                // _cot_filetab: source file name (null-terminated)
+                // _cot_filetab: concatenated null-terminated file paths.
+                // Multi-file: each file path is null-terminated, concatenated.
+                // file_idx in functab indexes by ordinal (0th path, 1st path, ...).
+                // Reference: Go runtime/symtab.go:funcfile() — per-CU file tables via cutab.
                 const filetab_id = try module.declareData("_cot_filetab", .Local, false);
-                if (self.debug_source_file.len > 0) {
+                if (self.parsed_file_paths.len > 0) {
+                    var file_data = std.ArrayListUnmanaged(u8){};
+                    defer file_data.deinit(self.allocator);
+                    for (self.parsed_file_paths) |fpath| {
+                        try file_data.appendSlice(self.allocator, fpath);
+                        try file_data.append(self.allocator, 0);
+                    }
+                    while (file_data.items.len % 8 != 0) try file_data.append(self.allocator, 0);
+                    try module.defineData(filetab_id, file_data.items);
+                } else if (self.debug_source_file.len > 0) {
                     var file_data = std.ArrayListUnmanaged(u8){};
                     defer file_data.deinit(self.allocator);
                     try file_data.appendSlice(self.allocator, self.debug_source_file);
