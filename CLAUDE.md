@@ -101,8 +101,8 @@ The self-hosted compiler lives in `self/` and is written in Cot. It compiles `.c
 # 1. Build the Zig compiler first (if not already done)
 zig build
 
-# 2. Build selfcot as a native binary using the Zig compiler
-cot build self/main.cot -o /tmp/selfcot
+# 2. Build selfcot as a native binary using the dev compiler (full path!)
+./zig-out/bin/cot build self/main.cot -o /tmp/selfcot
 ```
 
 **How to test selfcot:**
@@ -110,8 +110,8 @@ cot build self/main.cot -o /tmp/selfcot
 # Use selfcot to compile a file and measure memory
 /usr/bin/time -l /tmp/selfcot build self/parse/scanner.cot -o /tmp/out.wasm
 
-# Compare with Zig compiler for the same file (baseline)
-/usr/bin/time -l cot build self/parse/scanner.cot --target=wasm32 -o /tmp/out_zig.wasm
+# Compare with dev compiler for the same file (baseline)
+/usr/bin/time -l ./zig-out/bin/cot build self/parse/scanner.cot --target=wasm32 -o /tmp/out_zig.wasm
 ```
 
 **Key facts:**
@@ -126,6 +126,12 @@ cot build self/main.cot -o /tmp/selfcot
 
 **Stdlib** is a separate repo (`cotlang/std`) included as a git submodule at `stdlib/`. After cloning: `git submodule update --init stdlib`. When modifying stdlib files, changes must be committed in the submodule first (`cd stdlib && git add . && git commit && git push`), then the updated submodule ref committed in the parent repo.
 
+**🚨 TWO `cot` BINARIES — KNOW WHICH ONE YOU'RE USING:**
+- **`cot`** on PATH → `/opt/homebrew/bin/cot` → **Homebrew release binary** (stable, for testing). Do NOT use this for development.
+- **`./zig-out/bin/cot`** → **Local dev build** from `zig build`. Always use the full path `./zig-out/bin/cot` when developing the compiler.
+- After `zig build`, the dev binary is at `./zig-out/bin/cot` — it is NOT on PATH. This is intentional.
+- **NEVER** assume `cot` refers to the dev build. Always use the full path for compiler development.
+
 **🚨 SUBMODULE COMMIT RULE:** When committing changes in the parent repo, **NEVER include `stdlib` in `git add`** unless you are intentionally updating the submodule reference. The `stdlib` directory will frequently show as "modified" in `git status`/`git diff` because the local checkout may be ahead of the tracked ref. **Always stage files by explicit name** (e.g., `git add compiler/foo.zig compiler/bar.zig`). **NEVER use `git add .` or `git add -A`**. If you accidentally commit a stdlib ref change pointing to a commit that doesn't exist on the remote, CI will break for ALL jobs because `actions/checkout` can't fetch the submodule.
 
 ---
@@ -135,6 +141,7 @@ cot build self/main.cot -o /tmp/selfcot
 ```
 cot <file.cot>                  # Implicit build (shorthand for cot build)
 cot build <file.cot> [-o name]  # Compile to executable (or .wasm)
+cot build <file.cot> --debug    # Compile with full DWARF debug info (also: -g)
 cot run <file.cot> [-- args]    # Compile, run in /tmp, clean up, forward exit code
 cot test <file.cot>             # Compile + run in test mode
 cot bench <file.cot>            # Run benchmarks
@@ -245,11 +252,11 @@ Two categories:
 `zig build test` validates the Zig compiler internals. Run it once after changes to confirm the compiler builds correctly. After that, **use `cot test` as the primary verification tool** — it exercises the full pipeline (parse → check → SSA → native/Wasm → execute) and catches real-world regressions that unit tests miss.
 
 ```bash
-zig build test                                    # Compiler internals (run once)
-cot test test/e2e/features.cot                    # Primary: 350 feature tests, native
-cot test test/e2e/features.cot --target=wasm32    # Primary: same tests, wasm via wasmtime
-cot test test/cases/<category>.cot                # Targeted: specific category
-./test/run_all.sh                                 # Full suite (~1,670 tests across 70 files)
+zig build test                                                        # Compiler internals (run once)
+./zig-out/bin/cot test test/e2e/features.cot                          # Primary: 350 feature tests, native
+./zig-out/bin/cot test test/e2e/features.cot --target=wasm32          # Primary: same tests, wasm via wasmtime
+./zig-out/bin/cot test test/cases/<category>.cot                      # Targeted: specific category
+./test/run_all.sh                                                     # Full suite (~1,670 tests across 70 files)
 ```
 
 **`cot test --target=wasm32`** runs Wasm binaries via `wasmtime` (must be installed). Use this to verify Wasm codegen — bugs often manifest on one target but not the other.
@@ -298,8 +305,8 @@ try list.append(allocator, 42);
 ## Behavioral Guidelines
 
 **DO:**
-- Run `zig build test` once after compiler changes, then use `cot test` for ongoing verification
-- Use `cot test test/e2e/features.cot` (native) and `cot test test/e2e/features.cot --target=wasm32` (wasm) as the primary check — these catch real regressions faster than unit tests
+- Run `zig build test` once after compiler changes, then use `./zig-out/bin/cot test` for ongoing verification
+- Use `./zig-out/bin/cot test test/e2e/features.cot` (native) and `./zig-out/bin/cot test test/e2e/features.cot --target=wasm32` (wasm) as the primary check — these catch real regressions faster than unit tests
 - After changing `compiler/lsp/`: run `zig build` to update the LSP binary
 - After changing `editors/vscode/`: rebuild + reinstall extension (see Editor Extensions & LSP section)
 - After changing either: do BOTH — `zig build` AND reinstall extension

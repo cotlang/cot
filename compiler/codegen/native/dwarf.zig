@@ -395,7 +395,7 @@ pub const DwarfBuilder = struct {
         try buf.append(alloc, 0);
 
         // DW_AT_producer (DW_FORM_string)
-        try buf.appendSlice(alloc, "Cot 0.3.6");
+        try buf.appendSlice(alloc, "Cot 0.3.7");
         try buf.append(alloc, 0);
 
         // Emit base type DIEs BEFORE subprogram DIEs so type references are valid.

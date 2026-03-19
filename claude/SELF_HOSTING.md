@@ -120,3 +120,4 @@ The Zig compiler's `lowerOrElseExpr` uses `emitSelect` for pointer-like optional
 | `self/build/lower.cot` | IR lowering (~9,200 lines, most complex) |
 | `compiler/frontend/lower.zig` | Zig compiler's lowerer (ARC dispatch, opt_make integration) |
 | `compiler/frontend/ssa_builder.zig` | SSA builder (opt_make/opt_tag/opt_data decomposition) |
+| `compiler/codegen/native/dwarf.zig` | DWARF debug info (subprograms, variables, types, frame) |

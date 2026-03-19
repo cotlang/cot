@@ -2,7 +2,7 @@
 
 ## Current: 0.3 (Mar 2026)
 
-The language works. Both native and Wasm targets produce correct binaries. ARC memory management at Swift SILGen parity. 34 stdlib modules. LSP, formatter, linter, test runner, benchmarks, doc generator — all built in. Self-hosted compiler at 44,700 lines across 42 files, covering the full pipeline: parse, check, build, optimize, emit.
+The language works. Both native and Wasm targets produce correct binaries. ARC memory management at Swift SILGen parity. Full DWARF debug info — lldb breakpoints, source display, variable inspection, struct types, stack unwinding (macOS + Linux). 34 stdlib modules. LSP, formatter, linter, test runner, benchmarks, doc generator — all built in. Self-hosted compiler at 44,700 lines across 42 files, covering the full pipeline: parse, check, build, optimize, emit.
 
 ---
 
