@@ -42,6 +42,7 @@ pub const DW_FORM_data8: u8 = 0x07;
 pub const DW_FORM_string: u8 = 0x08;
 pub const DW_FORM_block1: u8 = 0x0a;
 pub const DW_FORM_flag: u8 = 0x0c;
+pub const DW_FORM_udata: u8 = 0x0f;
 pub const DW_FORM_sec_offset: u8 = 0x17;
 
 pub const DW_OP_call_frame_cfa: u8 = 0x9c;
@@ -142,6 +143,7 @@ pub const DwarfBuilder = struct {
     comp_dir: []const u8 = "",
     text_size: u64 = 0,
     func_infos: []const DebugFuncInfo = &.{},
+    type_reg: ?*const @import("../../frontend/types.zig").TypeRegistry = null,
 
     pub fn init(allocator: std.mem.Allocator) DwarfBuilder {
         return .{ .allocator = allocator };
@@ -167,6 +169,10 @@ pub const DwarfBuilder = struct {
 
     pub fn setFuncInfos(self: *DwarfBuilder, infos: []const DebugFuncInfo) void {
         self.func_infos = infos;
+    }
+
+    pub fn setTypeRegistry(self: *DwarfBuilder, reg: *const @import("../../frontend/types.zig").TypeRegistry) void {
+        self.type_reg = reg;
     }
 
     fn sourceOffsetToLine(self: *DwarfBuilder, offset: u32) u32 {
@@ -296,6 +302,37 @@ pub const DwarfBuilder = struct {
         try appendUleb128(buf, alloc, 0);
         try appendUleb128(buf, alloc, 0);
 
+        // Abbreviation 7: DW_TAG_structure_type (DW_CHILDREN_yes — has member children)
+        try appendUleb128(buf, alloc, 7);
+        try appendUleb128(buf, alloc, DW_TAG_structure_type);
+        try buf.append(alloc, DW_CHILDREN_yes);
+        const struct_attrs = [_][2]u8{
+            .{ DW_AT_name, DW_FORM_string },
+            .{ DW_AT_byte_size, DW_FORM_udata },
+        };
+        for (struct_attrs) |attr| {
+            try appendUleb128(buf, alloc, attr[0]);
+            try appendUleb128(buf, alloc, attr[1]);
+        }
+        try appendUleb128(buf, alloc, 0);
+        try appendUleb128(buf, alloc, 0);
+
+        // Abbreviation 8: DW_TAG_member (DW_CHILDREN_no)
+        try appendUleb128(buf, alloc, 8);
+        try appendUleb128(buf, alloc, @as(u8, 0x0d)); // DW_TAG_member
+        try buf.append(alloc, DW_CHILDREN_no);
+        const member_attrs = [_][2]u8{
+            .{ DW_AT_name, DW_FORM_string },
+            .{ DW_AT_data_member_location, DW_FORM_udata },
+            .{ DW_AT_type, DW_FORM_ref4 },
+        };
+        for (member_attrs) |attr| {
+            try appendUleb128(buf, alloc, attr[0]);
+            try appendUleb128(buf, alloc, attr[1]);
+        }
+        try appendUleb128(buf, alloc, 0);
+        try appendUleb128(buf, alloc, 0);
+
         try appendUleb128(buf, alloc, 0); // End abbreviations table
     }
 
@@ -385,6 +422,44 @@ pub const DwarfBuilder = struct {
         // DW_AT_type: reference to i64 type DIE
         const i64_offset = type_offsets.get("i64") orelse 0;
         try buf.appendSlice(alloc, &std.mem.toBytes(i64_offset));
+
+        // Emit struct type DIEs from the type registry
+        if (self.type_reg) |reg| {
+            const types_mod = @import("../../frontend/types.zig");
+            for (reg.types.items) |t| {
+                if (t != .struct_type) continue;
+                const st = t.struct_type;
+                if (st.name.len == 0) continue; // skip anonymous
+
+                // Record this struct's DIE offset for type references
+                const struct_die_offset: u32 = @intCast(buf.items.len);
+                try type_offsets.put(alloc, st.name, struct_die_offset);
+
+                // Emit DW_TAG_structure_type (abbrev 7)
+                try appendUleb128(buf, alloc, 7);
+                try buf.appendSlice(alloc, st.name);
+                try buf.append(alloc, 0); // null terminator
+                try appendUleb128(buf, alloc, st.size); // byte_size
+
+                // Emit DW_TAG_member for each field (abbrev 8)
+                for (st.fields) |field| {
+                    try appendUleb128(buf, alloc, 8);
+                    try buf.appendSlice(alloc, field.name);
+                    try buf.append(alloc, 0); // null terminator
+                    try appendUleb128(buf, alloc, field.offset); // member location
+
+                    // Resolve field type to DIE offset
+                    const field_type_name = resolveTypeNameForDwarf(reg, field.type_idx);
+                    const field_type_offset = type_offsets.get(field_type_name) orelse
+                        type_offsets.get("i64") orelse 0;
+                    try buf.appendSlice(alloc, &std.mem.toBytes(field_type_offset));
+                }
+
+                // Null terminator to close struct's children list
+                try buf.append(alloc, 0);
+            }
+            _ = types_mod;
+        }
 
         // Emit DW_TAG_subprogram DIEs as children of compile_unit
         for (self.func_infos) |func_info| {
@@ -584,6 +659,17 @@ pub const DwarfBuilder = struct {
         try buf.append(alloc, @intCast(@as(u8, @truncate(@as(u64, @bitCast(opcode))))));
     }
 };
+
+/// Resolve a type index to a DWARF type name for struct field references.
+fn resolveTypeNameForDwarf(reg: *const @import("../../frontend/types.zig").TypeRegistry, type_idx: anytype) []const u8 {
+    const t = reg.get(type_idx);
+    return switch (t) {
+        .basic => |bk| bk.name(),
+        .struct_type => |st| st.name,
+        .pointer => "pointer",
+        else => "i64",
+    };
+}
 
 // Tests
 

@@ -199,6 +199,7 @@ pub const ObjectModule = struct {
     debug_source_text: []const u8 = "",
     debug_line_entries: std.ArrayListUnmanaged(macho.LineEntry) = .{},
     debug_func_infos: std.ArrayListUnmanaged(dwarf_mod.DebugFuncInfo) = .{},
+    debug_type_reg: ?*const @import("../../frontend/types.zig").TypeRegistry = null,
     /// Owned debug local slices — freed in deinit after DWARF generation completes.
     owned_debug_locals: std.ArrayListUnmanaged([]const dwarf_mod.DebugLocalInfo) = .{},
 
@@ -393,6 +394,11 @@ pub const ObjectModule = struct {
         try self.debug_func_infos.appendSlice(self.allocator, infos);
     }
 
+    /// Set type registry for DWARF struct type DIEs.
+    pub fn setTypeRegistry(self: *Self, reg: *const @import("../../frontend/types.zig").TypeRegistry) void {
+        self.debug_type_reg = reg;
+    }
+
     /// Register owned debug locals so they are freed in deinit.
     pub fn addOwnedDebugLocals(self: *Self, locals: []const dwarf_mod.DebugLocalInfo) !void {
         try self.owned_debug_locals.append(self.allocator, locals);
@@ -568,6 +574,7 @@ pub const ObjectModule = struct {
         if (self.debug_line_entries.items.len > 0) {
             macho_writer.setDebugInfo(self.debug_source_file, self.debug_source_text);
             macho_writer.setFuncInfos(self.debug_func_infos.items);
+            if (self.debug_type_reg) |reg| macho_writer.setTypeRegistry(reg);
             try macho_writer.addLineEntries(self.debug_line_entries.items);
             try macho_writer.generateDebugSections();
         }

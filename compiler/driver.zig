@@ -2026,6 +2026,7 @@ pub const Driver = struct {
                 }
 
                 try module.setFuncInfos(debug_func_infos.items);
+                if (self.debug_type_reg) |tr| module.setTypeRegistry(tr);
             }
 
             // Build source map entries: (func_name_hash, code_offset_in_func, line_number)
@@ -3151,6 +3152,7 @@ pub const Driver = struct {
             }
 
             try module.setFuncInfos(debug_func_infos.items);
+            if (self.debug_type_reg) |tr| module.setTypeRegistry(tr);
         }
 
         // Write to memory buffer
