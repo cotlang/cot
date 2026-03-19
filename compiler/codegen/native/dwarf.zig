@@ -204,6 +204,21 @@ pub const DwarfBuilder = struct {
         return line;
     }
 
+    /// Convert a source byte offset to a 1-based column number within its line.
+    /// Column 0 means "unknown" in DWARF, so we return 1+ for valid offsets.
+    fn sourceOffsetToColumn(self: *DwarfBuilder, offset: u32) u32 {
+        if (offset >= self.source_text.len) return 0;
+        // Find the start of the current line by scanning backwards for '\n'
+        var col: u32 = 1;
+        var i = offset;
+        while (i > 0) {
+            i -= 1;
+            if (self.source_text[i] == '\n') break;
+            col += 1;
+        }
+        return col;
+    }
+
     pub fn generate(self: *DwarfBuilder, line_entries: []const LineEntry, text_symbol_idx: u32) !void {
         try self.generateDebugAbbrev();
         try self.generateDebugInfo(text_symbol_idx);
@@ -618,9 +633,19 @@ pub const DwarfBuilder = struct {
 
         var pc: u64 = 0;
         var line: i64 = 1;
+        var column: u32 = 0;
 
         for (line_entries) |entry| {
             const new_line = self.sourceOffsetToLine(entry.source_offset);
+            const new_column = self.sourceOffsetToColumn(entry.source_offset);
+
+            // Emit DW_LNS_set_column when the column changes
+            if (new_column != column) {
+                try buf.append(alloc, DW_LNS_set_column);
+                try appendUleb128(buf, alloc, new_column);
+                column = new_column;
+            }
+
             const delta_pc = entry.code_offset - pc;
             const delta_line: i64 = @as(i64, new_line) - line;
             try self.putPcLcDelta(delta_pc, delta_line);
@@ -867,4 +892,22 @@ test "sourceOffsetToLine" {
     try std.testing.expectEqual(@as(u32, 1), builder.sourceOffsetToLine(0));
     try std.testing.expectEqual(@as(u32, 2), builder.sourceOffsetToLine(6));
     try std.testing.expectEqual(@as(u32, 3), builder.sourceOffsetToLine(12));
+}
+
+test "sourceOffsetToColumn" {
+    const alloc = std.testing.allocator;
+    var builder = DwarfBuilder.init(alloc);
+    defer builder.deinit();
+
+    builder.source_text = "line1\nline2\nline3";
+    // "line1" — offset 0 = col 1, offset 4 = col 5
+    try std.testing.expectEqual(@as(u32, 1), builder.sourceOffsetToColumn(0));
+    try std.testing.expectEqual(@as(u32, 5), builder.sourceOffsetToColumn(4));
+    // "line2" — offset 6 = col 1, offset 10 = col 5
+    try std.testing.expectEqual(@as(u32, 1), builder.sourceOffsetToColumn(6));
+    try std.testing.expectEqual(@as(u32, 5), builder.sourceOffsetToColumn(10));
+    // "line3" — offset 12 = col 1
+    try std.testing.expectEqual(@as(u32, 1), builder.sourceOffsetToColumn(12));
+    // Past end returns 0
+    try std.testing.expectEqual(@as(u32, 0), builder.sourceOffsetToColumn(100));
 }
