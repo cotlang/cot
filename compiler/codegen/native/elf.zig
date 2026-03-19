@@ -2,6 +2,7 @@
 // Reference: System V ABI AMD64 Architecture Processor Supplement
 
 const std = @import("std");
+const dwarf = @import("dwarf.zig");
 
 // ELF Constants
 pub const ELF_MAGIC = [4]u8{ 0x7F, 'E', 'L', 'F' };
@@ -165,6 +166,26 @@ pub const ElfWriter = struct {
     shstrtab_strtab: u32 = 0,
     shstrtab_shstrtab: u32 = 0,
     shstrtab_rela_text: u32 = 0,
+    shstrtab_debug_abbrev: u32 = 0,
+    shstrtab_debug_info: u32 = 0,
+    shstrtab_debug_line: u32 = 0,
+    shstrtab_debug_frame: u32 = 0,
+
+    // DWARF Debug Info
+    debug_abbrev_data: std.ArrayListUnmanaged(u8) = .{},
+    debug_info_data: std.ArrayListUnmanaged(u8) = .{},
+    debug_line_data: std.ArrayListUnmanaged(u8) = .{},
+    debug_frame_data: std.ArrayListUnmanaged(u8) = .{},
+    line_entries: std.ArrayListUnmanaged(LineEntry) = .{},
+    source_file: ?[]const u8 = null,
+    source_text: ?[]const u8 = null,
+    debug_func_infos: []const dwarf.DebugFuncInfo = &.{},
+    debug_type_reg: ?*const @import("../../frontend/types.zig").TypeRegistry = null,
+
+    pub const LineEntry = struct {
+        code_offset: u32,
+        source_offset: u32,
+    };
 
     pub fn init(allocator: std.mem.Allocator) ElfWriter {
         var writer = ElfWriter{ .allocator = allocator };
@@ -178,6 +199,10 @@ pub const ElfWriter = struct {
         writer.shstrtab_strtab = writer.addShstrtab(".strtab") catch 0;
         writer.shstrtab_shstrtab = writer.addShstrtab(".shstrtab") catch 0;
         writer.shstrtab_rela_text = writer.addShstrtab(".rela.text") catch 0;
+        writer.shstrtab_debug_abbrev = writer.addShstrtab(".debug_abbrev") catch 0;
+        writer.shstrtab_debug_info = writer.addShstrtab(".debug_info") catch 0;
+        writer.shstrtab_debug_line = writer.addShstrtab(".debug_line") catch 0;
+        writer.shstrtab_debug_frame = writer.addShstrtab(".debug_frame") catch 0;
         return writer;
     }
 
@@ -193,6 +218,75 @@ pub const ElfWriter = struct {
             self.allocator.free(lit.symbol);
         }
         self.string_literals.deinit(self.allocator);
+        self.debug_abbrev_data.deinit(self.allocator);
+        self.debug_info_data.deinit(self.allocator);
+        self.debug_line_data.deinit(self.allocator);
+        self.debug_frame_data.deinit(self.allocator);
+        self.line_entries.deinit(self.allocator);
+    }
+
+    pub fn setDebugInfo(self: *ElfWriter, source_file: []const u8, source_text: []const u8) void {
+        self.source_file = source_file;
+        self.source_text = source_text;
+    }
+
+    pub fn setFuncInfos(self: *ElfWriter, infos: []const dwarf.DebugFuncInfo) void {
+        self.debug_func_infos = infos;
+    }
+
+    pub fn setTypeRegistry(self: *ElfWriter, reg: *const @import("../../frontend/types.zig").TypeRegistry) void {
+        self.debug_type_reg = reg;
+    }
+
+    pub fn addLineEntries(self: *ElfWriter, entries: []const LineEntry) !void {
+        try self.line_entries.appendSlice(self.allocator, entries);
+    }
+
+    /// Generate DWARF debug sections using DwarfBuilder.
+    /// Mirrors MachOWriter.generateDebugSections.
+    pub fn generateDebugSections(self: *ElfWriter) !void {
+        if (self.line_entries.items.len == 0) return;
+
+        var builder = dwarf.DwarfBuilder.init(self.allocator);
+        defer builder.deinit();
+
+        builder.setSourceInfo(self.source_file orelse "unknown.cot", self.source_text orelse "");
+        builder.setTextSize(self.text_data.items.len);
+        builder.setFuncInfos(self.debug_func_infos);
+        if (self.debug_type_reg) |reg| builder.setTypeRegistry(reg);
+
+        // Find first text section symbol (lowest address)
+        var text_symbol_idx: u32 = 0;
+        var lowest_addr: u64 = std.math.maxInt(u64);
+        for (self.symbols.items, 0..) |sym, i| {
+            if (sym.section == SHIDX_TEXT and sym.value < lowest_addr) {
+                lowest_addr = sym.value;
+                text_symbol_idx = @intCast(i);
+            }
+        }
+
+        // Convert line entries to DwarfBuilder format
+        var dwarf_entries = std.ArrayListUnmanaged(dwarf.LineEntry){};
+        defer dwarf_entries.deinit(self.allocator);
+        for (self.line_entries.items) |entry| {
+            try dwarf_entries.append(self.allocator, .{ .code_offset = entry.code_offset, .source_offset = entry.source_offset });
+        }
+
+        try builder.generate(dwarf_entries.items, text_symbol_idx);
+
+        // Copy results
+        try self.debug_abbrev_data.appendSlice(self.allocator, builder.debug_abbrev.items);
+        try self.debug_info_data.appendSlice(self.allocator, builder.debug_info.items);
+        try self.debug_line_data.appendSlice(self.allocator, builder.debug_line.items);
+        try self.debug_frame_data.appendSlice(self.allocator, builder.debug_frame.items);
+    }
+
+    /// Set pre-built debug section data directly.
+    pub fn setDebugSections(self: *ElfWriter, abbrev: []const u8, info: []const u8, line: []const u8, frame: []const u8) !void {
+        try self.debug_abbrev_data.appendSlice(self.allocator, abbrev);
+        try self.debug_info_data.appendSlice(self.allocator, info);
+        try self.debug_line_data.appendSlice(self.allocator, line);
+        try self.debug_frame_data.appendSlice(self.allocator, frame);
     }
 
     fn addStrtab(self: *ElfWriter, s: []const u8) !u32 {
@@ -328,7 +422,9 @@ pub const ElfWriter = struct {
         const has_relocs = self.relocations.items.len > 0;
         const has_data = self.data.items.len > 0;
         const has_bss = self.bss_size > 0;
-        const num_sections: u16 = (if (has_relocs) @as(u16, 7) else @as(u16, 6)) + (if (has_bss) @as(u16, 1) else @as(u16, 0));
+        const has_debug = self.debug_abbrev_data.items.len > 0;
+        const debug_section_count: u16 = if (has_debug) 4 else 0; // abbrev, info, line, frame
+        const num_sections: u16 = (if (has_relocs) @as(u16, 7) else @as(u16, 6)) + (if (has_bss) @as(u16, 1) else @as(u16, 0)) + debug_section_count;
         const ehdr_size: u64 = @sizeOf(Elf64_Ehdr);
 
         var offset: u64 = ehdr_size;
@@ -359,6 +455,34 @@ pub const ElfWriter = struct {
             rela_text_offset = offset;
             rela_text_size = self.relocations.items.len * @sizeOf(Elf64_Rela);
             offset = alignTo(offset + rela_text_size, 8);
+        }
+
+        // Debug section layout
+        var debug_abbrev_offset: u64 = 0;
+        var debug_info_offset: u64 = 0;
+        var debug_line_offset: u64 = 0;
+        var debug_frame_offset: u64 = 0;
+        const debug_abbrev_size: u64 = self.debug_abbrev_data.items.len;
+        const debug_info_size: u64 = self.debug_info_data.items.len;
+        const debug_line_size: u64 = self.debug_line_data.items.len;
+        const debug_frame_size: u64 = self.debug_frame_data.items.len;
+
+        if (has_debug) {
+            debug_abbrev_offset = offset;
+            offset += debug_abbrev_size;
+            offset = alignTo(offset, 4);
+
+            debug_info_offset = offset;
+            offset += debug_info_size;
+            offset = alignTo(offset, 4);
+
+            debug_line_offset = offset;
+            offset += debug_line_size;
+            offset = alignTo(offset, 4);
+
+            debug_frame_offset = offset;
+            offset += debug_frame_size;
+            offset = alignTo(offset, 8);
         }
 
         const shdr_offset = offset;
@@ -426,6 +550,21 @@ pub const ElfWriter = struct {
                 }));
             }
             try writePadding(writer, alignTo(rela_text_offset + rela_text_size, 8) - (rela_text_offset + rela_text_size));
+        }
+
+        // Write debug section data
+        if (has_debug) {
+            try writer.writeAll(self.debug_abbrev_data.items);
+            try writePadding(writer, alignTo(debug_abbrev_offset + debug_abbrev_size, 4) - (debug_abbrev_offset + debug_abbrev_size));
+
+            try writer.writeAll(self.debug_info_data.items);
+            try writePadding(writer, alignTo(debug_info_offset + debug_info_size, 4) - (debug_info_offset + debug_info_size));
+
+            try writer.writeAll(self.debug_line_data.items);
+            try writePadding(writer, alignTo(debug_line_offset + debug_line_size, 4) - (debug_line_offset + debug_line_size));
+
+            try writer.writeAll(self.debug_frame_data.items);
+            try writePadding(writer, alignTo(debug_frame_offset + debug_frame_size, 8) - (debug_frame_offset + debug_frame_size));
         }
 
         // Write section headers
@@ -499,6 +638,49 @@ pub const ElfWriter = struct {
                 .sh_offset = 0, // SHT_NOBITS has no file data
                 .sh_size = self.bss_size,
                 .sh_addralign = 4096, // page alignment
+            }));
+        }
+
+        // DWARF debug sections (not allocated, not loaded into memory)
+        if (has_debug) {
+            // .debug_abbrev
+            try writer.writeAll(std.mem.asBytes(&Elf64_Shdr{
+                .sh_name = self.shstrtab_debug_abbrev,
+                .sh_type = SHT_PROGBITS,
+                .sh_flags = 0,
+                .sh_offset = debug_abbrev_offset,
+                .sh_size = debug_abbrev_size,
+                .sh_addralign = 1,
+            }));
+
+            // .debug_info
+            try writer.writeAll(std.mem.asBytes(&Elf64_Shdr{
+                .sh_name = self.shstrtab_debug_info,
+                .sh_type = SHT_PROGBITS,
+                .sh_flags = 0,
+                .sh_offset = debug_info_offset,
+                .sh_size = debug_info_size,
+                .sh_addralign = 1,
+            }));
+
+            // .debug_line
+            try writer.writeAll(std.mem.asBytes(&Elf64_Shdr{
+                .sh_name = self.shstrtab_debug_line,
+                .sh_type = SHT_PROGBITS,
+                .sh_flags = 0,
+                .sh_offset = debug_line_offset,
+                .sh_size = debug_line_size,
+                .sh_addralign = 1,
+            }));
+
+            // .debug_frame
+            try writer.writeAll(std.mem.asBytes(&Elf64_Shdr{
+                .sh_name = self.shstrtab_debug_frame,
+                .sh_type = SHT_PROGBITS,
+                .sh_flags = 0,
+                .sh_offset = debug_frame_offset,
+                .sh_size = debug_frame_size,
+                .sh_addralign = 8,
             }));
         }
     }

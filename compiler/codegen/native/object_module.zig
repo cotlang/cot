@@ -631,6 +631,22 @@ pub const ObjectModule = struct {
             try elf_writer.addRelocationWithType(reloc.offset, target_name, elf_rel_type, reloc.addend);
         }
 
+        // Generate DWARF debug sections if line entries are present
+        if (self.debug_line_entries.items.len > 0) {
+            elf_writer.setDebugInfo(self.debug_source_file, self.debug_source_text);
+            elf_writer.setFuncInfos(self.debug_func_infos.items);
+            if (self.debug_type_reg) |reg| elf_writer.setTypeRegistry(reg);
+
+            // Convert line entries to ELF LineEntry format
+            for (self.debug_line_entries.items) |entry| {
+                try elf_writer.line_entries.append(self.allocator, .{
+                    .code_offset = entry.code_offset,
+                    .source_offset = entry.source_offset,
+                });
+            }
+            try elf_writer.generateDebugSections();
+        }
+
         try elf_writer.write(writer);
     }
 };
