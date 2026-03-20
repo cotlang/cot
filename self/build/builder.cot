@@ -1513,6 +1513,12 @@ struct SSABuilder {
         const field_type = self.type_reg.get(type_idx)
         if (field_type.tag == TAG_STRUCT or field_type.tag == TAG_ARRAY) { return off_val }
 
+        // String/slice compound load: decompose into ptr@0, len@8, create string_make/slice_make
+        // Must match convertFieldValue behavior for compound types.
+        if (self.isStringOrSlice(type_idx)) {
+            return self.emitStringSliceLoad(off_val, type_idx)
+        }
+
         return self.emitNewValueWithArg(self.getLoadOp(type_idx), type_idx, off_val)
     }
 

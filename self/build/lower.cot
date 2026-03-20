@@ -3916,10 +3916,11 @@ struct Lowerer {
 
     fn lowerStringInterp(si: StringInterpExpr, idx: int) int {
         const fb = self.builder.func() orelse return null_node
-        // Each segment is either a text literal or an expression
+        // Each segment is either a text literal or an expression.
         // Text → addStringLiteral → emitConstSlice
-        // Expr → if int, int_to_string; if string, use directly
-        // Chain with string_concat calls
+        // Expr → if int, int_to_string + string_header; if bool, select; if string, use directly
+        // Chain all segments inline with string_concat.
+        // Reference: Zig compiler lower.zig lowerStringInterp (lines 2903-2993)
 
         var result = null_node
         for i in 0..si.segments.count {
@@ -3932,8 +3933,10 @@ struct Lowerer {
             switch (seg_node) { Node.expr |e| => switch (e) {
                 Expr.literal |l| => {
                     if (l.kind == LiteralKind.@"string") {
-                        const str_idx = fb.addStringLiteral(l.value)
-                        seg_val = fb.emitConstSlice(str_idx, si.span)
+                        if (l.value.len > 0) {
+                            const str_idx = fb.addStringLiteral(l.value)
+                            seg_val = fb.emitConstSlice(str_idx, si.span)
+                        }
                         is_text_segment = true
                     }
                 },
@@ -3951,20 +3954,43 @@ struct Lowerer {
 
                 if (is_int) {
                     const int_val = self.lowerExprNode(seg_idx)
-                    // Allocate buffer for conversion
+                    // Allocate buffer for conversion (matches Zig compiler)
                     const buf_size = 24
                     const buf_type = self.types.makeArray(U8, buf_size)
-                    const buf_local = fb.addLocalWithSize("__itoa_buf", buf_type, true, buf_size)
+                    const buf_local = fb.addLocalWithSize("__interp_buf", buf_type, true, buf_size)
                     const buf_addr = fb.emitAddrLocal(buf_local, I64, si.span)
                     var conv_args: List(int) = .{}
                     conv_args.append(int_val)
                     conv_args.append(buf_addr)
-                    seg_val = fb.emitCall("int_to_string", conv_args, false, STRING, si.span)
+                    // int_to_string returns I64 (length), NOT a string
+                    const str_len = fb.emitCall("int_to_string", conv_args, false, I64, si.span)
+                    // String starts at buf_addr + 21 - str_len (right-aligned in buffer)
+                    const twenty_one = fb.emitConstInt(21, I64, si.span)
+                    const str_offset = fb.emitBinary(BinaryOp.sub, twenty_one, str_len, I64, si.span)
+                    const str_ptr = fb.emitBinary(BinaryOp.add, buf_addr, str_offset, I64, si.span)
+                    // Store ptr+len into a string local
+                    const str_local = fb.addLocalWithSize("__its_str", STRING, false, 16)
+                    fb.emitStoreLocalField(str_local, 0, 0, str_ptr, si.span)
+                    fb.emitStoreLocalField(str_local, 1, 8, str_len, si.span)
+                    seg_val = fb.emitLoadLocal(str_local, STRING, si.span)
                 } else if (seg_type == BOOL) {
+                    // Bool: select between "true" and "false" literals (matches Zig compiler)
                     const bool_val = self.lowerExprNode(seg_idx)
-                    var conv_args: List(int) = .{}
-                    conv_args.append(bool_val)
-                    seg_val = fb.emitCall("bool_to_string", conv_args, false, STRING, si.span)
+                    const true_idx = fb.addStringLiteral("true")
+                    const true_str = fb.emitConstSlice(true_idx, si.span)
+                    const false_idx = fb.addStringLiteral("false")
+                    const false_str = fb.emitConstSlice(false_idx, si.span)
+                    const true_ptr = fb.emitSlicePtr(true_str, I64, si.span)
+                    const true_len = fb.emitConstInt(4, I64, si.span)
+                    const false_ptr = fb.emitSlicePtr(false_str, I64, si.span)
+                    const false_len = fb.emitConstInt(5, I64, si.span)
+                    const sel_ptr = fb.emitSelect(bool_val, true_ptr, false_ptr, I64, si.span)
+                    const sel_len = fb.emitSelect(bool_val, true_len, false_len, I64, si.span)
+                    // Store ptr+len into a string local
+                    const bool_local = fb.addLocalWithSize("__bts_str", STRING, false, 16)
+                    fb.emitStoreLocalField(bool_local, 0, 0, sel_ptr, si.span)
+                    fb.emitStoreLocalField(bool_local, 1, 8, sel_len, si.span)
+                    seg_val = fb.emitLoadLocal(bool_local, STRING, si.span)
                 } else {
                     seg_val = self.lowerExprNode(seg_idx)
                 }
@@ -3975,23 +4001,34 @@ struct Lowerer {
             if (result == null_node) {
                 result = seg_val
             } else {
-                // Concatenate result and seg_val
+                // Decompose result into ptr/len
                 const left_local = fb.addLocalWithSize("__interp_l", STRING, false, 16)
                 fb.emitStoreLocal(left_local, result, si.span)
                 const left_ptr = fb.emitFieldLocal(left_local, 0, 0, I64, si.span)
                 const left_len = fb.emitFieldLocal(left_local, 1, 8, I64, si.span)
 
+                // Decompose seg_val into ptr/len
                 const right_local = fb.addLocalWithSize("__interp_r", STRING, false, 16)
                 fb.emitStoreLocal(right_local, seg_val, si.span)
                 const right_ptr = fb.emitFieldLocal(right_local, 0, 0, I64, si.span)
                 const right_len = fb.emitFieldLocal(right_local, 1, 8, I64, si.span)
 
+                // string_concat returns I64 (new pointer), NOT a string
                 var concat_args: List(int) = .{}
                 concat_args.append(left_ptr)
                 concat_args.append(left_len)
                 concat_args.append(right_ptr)
                 concat_args.append(right_len)
-                result = fb.emitCall("string_concat", concat_args, false, STRING, si.span)
+                const new_ptr = fb.emitCall("string_concat", concat_args, false, I64, si.span)
+
+                // Compute new_len = left_len + right_len
+                const new_len = fb.emitBinary(BinaryOp.add, left_len, right_len, I64, si.span)
+
+                // Store ptr+len into a string local
+                const cat_local = fb.addLocalWithSize("__cat_str", STRING, false, 16)
+                fb.emitStoreLocalField(cat_local, 0, 0, new_ptr, si.span)
+                fb.emitStoreLocalField(cat_local, 1, 8, new_len, si.span)
+                result = fb.emitLoadLocal(cat_local, STRING, si.span)
             }
         }
         if (result == null_node) {
