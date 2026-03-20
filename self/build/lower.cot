@@ -520,7 +520,6 @@ struct Lowerer {
     // ========================================================================
 
     fn lowerFnDecl(fn_decl: FnDecl) void {
-        const fb = self.builder.func() orelse return null_node
         if (fn_decl.is_extern) { return }
         if (fn_decl.type_params.count > 0) { return }  // Generic — lowered on demand
         if ((self.test_mode or self.bench_mode) and fn_decl.name == "main") { return }
@@ -2959,6 +2958,18 @@ struct Lowerer {
         const fb = self.builder.func() orelse return null_node
         // Dispatch call types following lower.zig:6545-6965
 
+        // 0. Distinct type constructor: RawPtr(expr) — zero-cost, just lower the argument
+        // Zig reference: lower.zig line 8046-8053
+        if (self.extractIdentName(c.callee)) |ident_name| {
+            const type_idx = self.types.lookupByName(ident_name)
+            if (type_idx >= 0) {
+                const type_info = self.types.get(type_idx)
+                if (type_info.tag == TAG_DISTINCT and c.args.count == 1) {
+                    return self.lowerExprNode(c.args.get(0))
+                }
+            }
+        }
+
         // 1. Method call: callee is field_access (Type.method or value.method)
         var fa: FieldAccessExpr = undefined
         var is_field_access = false
@@ -3239,7 +3250,14 @@ struct Lowerer {
             else => "",
         }
         if (m_type_name == "" and base_type_idx == STRING) { m_type_name = "string" }
-        const resolved_method = self.resolveMethodName(m_type_name, method_info.func_name, method_info.source_tree)
+        // Go LinkFuncName: qualify method call target (skip for generic instances).
+        // Generic instances use bare name (TypeIndex makes it unique).
+        // Zig reference: lower.zig line 9510-9513.
+        const resolved_method = if (self.lookupGenericInst(method_info.func_name) != null) {
+            method_info.func_name
+        } else {
+            self.resolveMethodName(m_type_name, method_info.func_name, method_info.source_tree)
+        }
 
         // Dict dispatch: if inside a dict-stenciled body and receiver is a type param,
         // emit indirect call through the dictionary fn-ptr param.
@@ -6098,12 +6116,51 @@ struct Lowerer {
             const ch = self.lowerExprNode(sc.channel)
             if (ch == null_node) { return null_node }
 
-            // For recv, call tryRecv as method on channel
-            // Simplified: emit as direct call with channel as arg
+            // Resolve tryRecv method via type registry (same as lowerMethodCall)
+            // Zig reference: lower.zig:6600-6631
+            const ch_type_idx = self.inferExprType(sc.channel)
+            const ch_info = self.types.get(ch_type_idx)
+            var method_name = "tryRecv"
+            var opt_type = self.types.makeOptional(I64)
+            // Find struct type name for method lookup
+            var struct_name = ""
+            if (ch_info.tag == TAG_POINTER) {
+                switch (ch_info) { Type.pointer |p| => {
+                    const pointee = self.types.get(p.elem)
+                    if (pointee.tag == TAG_STRUCT) {
+                        switch (pointee) { Type.struct_type |st| => { struct_name = st.name }, else => {} }
+                    }
+                }, else => {} }
+            } else if (ch_info.tag == TAG_STRUCT) {
+                switch (ch_info) { Type.struct_type |st| => { struct_name = st.name }, else => {} }
+            }
+            if (struct_name != "") {
+                const m_idx = self.types.lookupMethod(struct_name, "tryRecv")
+                if (m_idx >= 0) {
+                    const m = self.types.getMethodInfo(m_idx)
+                    // Qualify name (skip for generic instances)
+                    method_name = if (self.lookupGenericInst(m.func_name) != null) {
+                        m.func_name
+                    } else {
+                        self.resolveMethodName(struct_name, m.func_name, m.source_tree)
+                    }
+                    // Get return type from method signature
+                    const func_info = self.types.get(m.func_type)
+                    if (func_info.tag == TAG_FUNC) {
+                        switch (func_info) { Type.func |ft| => {
+                            opt_type = ft.return_type
+                        }, else => {} }
+                    }
+                    // Queue generic instance if needed
+                    if (self.lookupGenericInst(m.func_name)) |inst| {
+                        self.ensureGenericFnQueued(inst)
+                    }
+                }
+            }
+
             var args: List(int) = .{}
             args.append(ch)
-            const opt_type = self.types.makeOptional(I64)
-            const result = fb.emitCall("tryRecv", args, false, opt_type, span)
+            const result = fb.emitCall(method_name, args, false, opt_type, span)
 
             const temp_name = "__select_recv_" ++ intToString(self.temp_counter)
             self.temp_counter = self.temp_counter + 1

@@ -25,6 +25,18 @@ const MEMCPY_NAME: string = "memcpy"
 const MEMSET_ZERO_NAME: string = "memset_zero"
 const STRING_EQ_NAME: string = "string_eq"
 const STRING_CONCAT_NAME: string = "string_concat"
+const ALLOC_RAW_NAME: string = "alloc_raw"
+const REALLOC_RAW_NAME: string = "realloc_raw"
+const DEALLOC_RAW_NAME: string = "dealloc_raw"
+const RETAIN_NAME: string = "retain"
+const RELEASE_NAME: string = "release"
+
+// ARC header layout constants (match arc.zig)
+const METADATA_OFFSET: int = 4
+const REFCOUNT_OFFSET: int = 8
+const USER_DATA_OFFSET: int = 16
+const IMMORTAL_REFCOUNT: int = 0x7FFFFFFFFFFFFFFF
+const DESTRUCTOR_OFFSET: int = 8
 
 struct MemFunctions {
     alloc_idx: int,
@@ -34,6 +46,12 @@ struct MemFunctions {
     memset_zero_idx: int,
     string_eq_idx: int,
     string_concat_idx: int,
+    alloc_raw_idx: int,
+    realloc_raw_idx: int,
+    dealloc_raw_idx: int,
+    retain_idx: int,
+    release_idx: int,
+    destructor_type: int,
 }
 
 /// Add all memory runtime functions to the linker.
@@ -91,6 +109,36 @@ fn addMemRuntime(linker: *Linker, heap_ptr_global: int) MemFunctions {
     const string_concat_body = generateStringConcatBody(heap_ptr_global)
     const string_concat_idx = linker.addFunc(WasmFunc.init(STRING_CONCAT_NAME, i64_4i64_type, string_concat_body, false))
 
+    // alloc_raw(size: i64) -> i64  (no ARC header, for List/Map backing buffers)
+    // Zig reference: arc.zig line 331-337
+    const alloc_raw_type = linker.addType(params_1i64, results_i64)
+    const alloc_raw_body = generateAllocRawBody(heap_ptr_global)
+    const alloc_raw_idx = linker.addFunc(WasmFunc.init(ALLOC_RAW_NAME, alloc_raw_type, alloc_raw_body, false))
+
+    // realloc_raw(ptr: i64, old_size: i64, new_size: i64) -> i64
+    // Zig reference: arc.zig line 340-346
+    const realloc_raw_type = linker.addType(params_3i64, results_i64)
+    const realloc_raw_body = generateReallocRawBody(heap_ptr_global, memcpy_idx)
+    const realloc_raw_idx = linker.addFunc(WasmFunc.init(REALLOC_RAW_NAME, realloc_raw_type, realloc_raw_body, false))
+
+    // dealloc_raw(ptr: i64) -> void  (no-op on Wasm bump allocator)
+    // Zig reference: arc.zig line 349-355
+    const dealloc_raw_body = generateVoidStubBody()
+    const dealloc_raw_idx = linker.addFunc(WasmFunc.init(DEALLOC_RAW_NAME, void_1i64_type, dealloc_raw_body, false))
+
+    // retain(obj: i64) -> i64  (increment refcount)
+    // Zig reference: arc.zig line 221-230
+    const retain_body = generateRetainBody()
+    const retain_idx = linker.addFunc(WasmFunc.init(RETAIN_NAME, alloc_raw_type, retain_body, false))
+
+    // Destructor type: (i64) -> void  (for call_indirect in release)
+    const destructor_type = linker.addType(params_1i64, results_void)
+
+    // release(obj: i64) -> void  (decrement refcount, call destructor+dealloc if zero)
+    // Zig reference: arc.zig line 248-256
+    const release_body = generateReleaseBody(linker.funcTypeIndex(destructor_type), dealloc_idx)
+    const release_idx = linker.addFunc(WasmFunc.init(RELEASE_NAME, void_1i64_type, release_body, false))
+
     return MemFunctions {
         alloc_idx: alloc_idx,
         dealloc_idx: dealloc_idx,
@@ -99,6 +147,12 @@ fn addMemRuntime(linker: *Linker, heap_ptr_global: int) MemFunctions {
         memset_zero_idx: memset_zero_idx,
         string_eq_idx: string_eq_idx,
         string_concat_idx: string_concat_idx,
+        alloc_raw_idx: alloc_raw_idx,
+        realloc_raw_idx: realloc_raw_idx,
+        dealloc_raw_idx: dealloc_raw_idx,
+        retain_idx: retain_idx,
+        release_idx: release_idx,
+        destructor_type: destructor_type,
     }
 }
 
@@ -488,6 +542,237 @@ fn generateStringConcatBody(heap_ptr_global: int) List(int) {
 
     // Return new_ptr
     code.emitLocalGet(5)
+
+    return code.finish()
+}
+
+// ============================================================================
+// alloc_raw(size: i64) -> i64
+// Simple bump allocator without ARC header. Used for List/Map backing buffers.
+// Zig reference: arc.zig generateAllocRawBody()
+// ============================================================================
+
+fn generateAllocRawBody(heap_ptr_global: int) List(int) {
+    var code = CodeBuilder.init()
+
+    // local 0: size (i64)
+    // local 1: result_ptr (i64)
+    var locals: List(int) = .{}
+    locals.append(VT_I64)
+    code.declareLocals(locals)
+
+    // result_ptr = heap_ptr (as i64)
+    code.emitGlobalGet(heap_ptr_global)
+    code.emitI64ExtendI32U()
+    code.emitLocalSet(1)
+
+    // heap_ptr += size
+    code.emitGlobalGet(heap_ptr_global)
+    code.emitLocalGet(0)
+    code.emitI32WrapI64()
+    code.emitI32Add()
+    code.emitGlobalSet(heap_ptr_global)
+
+    // return result_ptr
+    code.emitLocalGet(1)
+
+    return code.finish()
+}
+
+// ============================================================================
+// realloc_raw(ptr: i64, old_size: i64, new_size: i64) -> i64
+// Bump allocator: allocate new block and copy old data.
+// Zig reference: arc.zig generateReallocRawBody()
+// ============================================================================
+
+fn generateReallocRawBody(heap_ptr_global: int, memcpy_idx: int) List(int) {
+    var code = CodeBuilder.init()
+
+    // local 0: ptr (i64), local 1: old_size (i64), local 2: new_size (i64)
+    // local 3: new_ptr (i64)
+    var locals: List(int) = .{}
+    locals.append(VT_I64)
+    code.declareLocals(locals)
+
+    // new_ptr = heap_ptr (as i64)
+    code.emitGlobalGet(heap_ptr_global)
+    code.emitI64ExtendI32U()
+    code.emitLocalSet(3)
+
+    // heap_ptr += new_size
+    code.emitGlobalGet(heap_ptr_global)
+    code.emitLocalGet(2)
+    code.emitI32WrapI64()
+    code.emitI32Add()
+    code.emitGlobalSet(heap_ptr_global)
+
+    // memcpy(new_ptr, ptr, old_size)
+    code.emitLocalGet(3)
+    code.emitLocalGet(0)
+    code.emitLocalGet(1)
+    code.emitCall(memcpy_idx)
+
+    // return new_ptr
+    code.emitLocalGet(3)
+
+    return code.finish()
+}
+
+// ============================================================================
+// retain(obj: i64) -> i64
+// Increment ARC refcount. Returns obj. No-op for null/immortal.
+// Zig reference: arc.zig generateRetainBody()
+// ============================================================================
+
+fn generateRetainBody() List(int) {
+    var code = CodeBuilder.init()
+
+    // local 0: obj (i64)
+    // local 1: header_ptr (i64)
+    // local 2: old_count (i64)
+    var locals: List(int) = .{}
+    locals.append(VT_I64)
+    locals.append(VT_I64)
+    code.declareLocals(locals)
+
+    // if (obj == 0) return 0
+    code.emitLocalGet(0)
+    code.emitI64Eqz()
+    code.emitIf(BLOCK_VOID)
+    code.emitI64Const(0)
+    code.emitReturn()
+    code.emitEnd()
+
+    // header_ptr = obj - USER_DATA_OFFSET
+    code.emitLocalGet(0)
+    code.emitI64Const(USER_DATA_OFFSET)
+    code.emitI64Sub()
+    code.emitLocalSet(1)
+
+    // old_count = i64.load(header_ptr + REFCOUNT_OFFSET)
+    code.emitLocalGet(1)
+    code.emitI32WrapI64()
+    code.emitI64Load(3, REFCOUNT_OFFSET)
+    code.emitLocalSet(2)
+
+    // if (old_count >= IMMORTAL_REFCOUNT) return obj
+    code.emitLocalGet(2)
+    code.emitI64Const(IMMORTAL_REFCOUNT)
+    code.emitI64GeS()
+    code.emitIf(BLOCK_VOID)
+    code.emitLocalGet(0)
+    code.emitReturn()
+    code.emitEnd()
+
+    // i64.store(header_ptr + REFCOUNT_OFFSET, old_count + 1)
+    code.emitLocalGet(1)
+    code.emitI32WrapI64()
+    code.emitLocalGet(2)
+    code.emitI64Const(1)
+    code.emitI64Add()
+    code.emitI64Store(3, REFCOUNT_OFFSET)
+
+    // return obj
+    code.emitLocalGet(0)
+
+    return code.finish()
+}
+
+// ============================================================================
+// release(obj: i64) -> void
+// Decrement ARC refcount. Call destructor+dealloc if count reaches zero.
+// Zig reference: arc.zig generateReleaseBody()
+// ============================================================================
+
+fn generateReleaseBody(destructor_type_idx: int, dealloc_idx: int) List(int) {
+    var code = CodeBuilder.init()
+
+    // local 0: obj (i64)
+    // local 1: header_ptr (i64)
+    // local 2: old_count (i64)
+    // local 3: new_count (i64)
+    // local 4: metadata_ptr (i32)
+    // local 5: destructor_ptr (i32)
+    var locals: List(int) = .{}
+    locals.append(VT_I64)
+    locals.append(VT_I64)
+    locals.append(VT_I64)
+    locals.append(VT_I32)
+    locals.append(VT_I32)
+    code.declareLocals(locals)
+
+    // if (obj == 0) return
+    code.emitLocalGet(0)
+    code.emitI64Eqz()
+    code.emitIf(BLOCK_VOID)
+    code.emitReturn()
+    code.emitEnd()
+
+    // header_ptr = obj - USER_DATA_OFFSET
+    code.emitLocalGet(0)
+    code.emitI64Const(USER_DATA_OFFSET)
+    code.emitI64Sub()
+    code.emitLocalSet(1)
+
+    // old_count = i64.load(header_ptr + REFCOUNT_OFFSET)
+    code.emitLocalGet(1)
+    code.emitI32WrapI64()
+    code.emitI64Load(3, REFCOUNT_OFFSET)
+    code.emitLocalSet(2)
+
+    // if (old_count >= IMMORTAL_REFCOUNT) return
+    code.emitLocalGet(2)
+    code.emitI64Const(IMMORTAL_REFCOUNT)
+    code.emitI64GeS()
+    code.emitIf(BLOCK_VOID)
+    code.emitReturn()
+    code.emitEnd()
+
+    // new_count = old_count - 1
+    code.emitLocalGet(2)
+    code.emitI64Const(1)
+    code.emitI64Sub()
+    code.emitLocalSet(3)
+
+    // i64.store(header_ptr + REFCOUNT_OFFSET, new_count)
+    code.emitLocalGet(1)
+    code.emitI32WrapI64()
+    code.emitLocalGet(3)
+    code.emitI64Store(3, REFCOUNT_OFFSET)
+
+    // if (new_count == 0) { load metadata, check destructor, call dealloc }
+    code.emitLocalGet(3)
+    code.emitI64Eqz()
+    code.emitIf(BLOCK_VOID)
+
+    // Load metadata_ptr from header
+    code.emitLocalGet(1)
+    code.emitI32WrapI64()
+    code.emitI32Load(2, METADATA_OFFSET)
+    code.emitLocalTee(4)
+
+    // if (metadata_ptr != 0) — only look up destructor if metadata exists
+    code.emitIf(BLOCK_VOID)
+
+    // Load destructor_ptr from metadata at offset 8
+    code.emitLocalGet(4)
+    code.emitI32Load(2, DESTRUCTOR_OFFSET)
+    code.emitLocalTee(5)
+
+    // if (destructor_ptr != 0) { call_indirect }
+    code.emitIf(BLOCK_VOID)
+    code.emitLocalGet(0)    // Push object ptr as argument
+    code.emitLocalGet(5)    // Push destructor table index
+    code.emitCallIndirect(destructor_type_idx, 0)
+    code.emitEnd()
+
+    code.emitEnd()  // end metadata_ptr != 0
+
+    // Dealloc: return memory to freelist
+    code.emitLocalGet(0)
+    code.emitCall(dealloc_idx)
+
+    code.emitEnd()  // end new_count == 0
 
     return code.finish()
 }

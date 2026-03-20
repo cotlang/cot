@@ -1892,6 +1892,7 @@ struct GenState {
             if (@lenOf(name) > 0 and fi.contains(name)) {
                 return fi.get(name)
             }
+            // Fallback to aux_int if name not in func_indices
         }
         return v.aux_int
     }

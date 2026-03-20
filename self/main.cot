@@ -448,6 +448,15 @@ fn compileWithImports(path: string, project_safe: bool, lower_opts: LowerOptions
     }
 
     // Build module name map (Zig driver.zig lines 461-509)
+    // Register main file first (Zig driver.zig lines 476-482)
+    if (parsed_files.count > 0) {
+        const main_pf = parsed_files.get(parsed_files.count - 1)
+        const main_base = basename(main_pf.path)
+        const main_module = if (endsWith(main_base, ".cot")) {
+            substring(main_base, 0, main_base.len - 4)
+        } else { main_base }
+        lower_shared.module_names.set(main_pf.path, main_module)
+    }
     for fi in 0..parsed_files.count {
         const pf = parsed_files.get(fi)
         var imports = pf.ast.getImports()

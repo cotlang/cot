@@ -171,6 +171,11 @@ fn populateMemIndices(m: *Map(string, int), f: *MemFunctions) void {
     m.set(MEMSET_ZERO_NAME, f.memset_zero_idx)
     m.set(STRING_EQ_NAME, f.string_eq_idx)
     m.set(STRING_CONCAT_NAME, f.string_concat_idx)
+    m.set(ALLOC_RAW_NAME, f.alloc_raw_idx)
+    m.set(REALLOC_RAW_NAME, f.realloc_raw_idx)
+    m.set(DEALLOC_RAW_NAME, f.dealloc_raw_idx)
+    m.set(RETAIN_NAME, f.retain_idx)
+    m.set(RELEASE_NAME, f.release_idx)
 }
 
 fn populateSliceIndices(m: *Map(string, int), f: *SliceFunctions) void {
@@ -545,6 +550,12 @@ test "populateMemIndices sets function names" {
         memset_zero_idx: 4,
         string_eq_idx: 5,
         string_concat_idx: 6,
+        alloc_raw_idx: 7,
+        realloc_raw_idx: 8,
+        dealloc_raw_idx: 9,
+        retain_idx: 10,
+        release_idx: 11,
+        destructor_type: 0,
     }
     populateMemIndices(&m, &f)
     @assert(m.contains("alloc"))
@@ -554,8 +565,15 @@ test "populateMemIndices sets function names" {
     @assert(m.contains("memset_zero"))
     @assert(m.contains("string_eq"))
     @assert(m.contains("string_concat"))
+    @assert(m.contains("alloc_raw"))
+    @assert(m.contains("realloc_raw"))
+    @assert(m.contains("dealloc_raw"))
+    @assert(m.contains("retain"))
+    @assert(m.contains("release"))
     @assertEq(m.get("alloc"), 0)
     @assertEq(m.get("string_concat"), 6)
+    @assertEq(m.get("retain"), 10)
+    @assertEq(m.get("release"), 11)
 }
 
 /// Helper: create a minimal Func for testing.
