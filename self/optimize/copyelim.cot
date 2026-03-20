@@ -47,8 +47,8 @@ fn phielimValue(func: *SsaFunc, val_idx: int) bool {
     // Find the single non-self argument
     var w: int = -1
     var ai = 0
-    while (ai < val.args_len) {
-        const arg = val.getArg(ai)
+    while (ai < val.args.count) {
+        const arg = val.args.get(ai)
         if (arg == val_idx) { ai += 1; continue }  // skip self-references
         if (arg == w) { ai += 1; continue }          // skip duplicates of w
         if (w != -1) { return false }                 // two distinct args — not redundant
@@ -60,7 +60,7 @@ fn phielimValue(func: *SsaFunc, val_idx: int) bool {
 
     // Convert phi to copy(w)
     val.op = SsaOp.copy
-    val.args_len = 0
+    val.args.count = 0
     val.addArg(w)
     func.setValue(val_idx, val)
     return true
@@ -90,8 +90,8 @@ test "phielim redundant phi" {
 
     const result = func.getValue(v1)
     @assertEq(result.op == SsaOp.copy, true)
-    @assertEq(result.args_len, 1)
-    @assertEq(result.getArg(0), v0)
+    @assertEq(result.args.count, 1)
+    @assertEq(result.args.get(0), v0)
 }
 
 test "phielim non-redundant phi" {
@@ -136,5 +136,5 @@ test "phielim self-referencing phi" {
 
     const result = func.getValue(v1)
     @assertEq(result.op == SsaOp.copy, true)
-    @assertEq(result.getArg(0), v0)
+    @assertEq(result.args.get(0), v0)
 }

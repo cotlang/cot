@@ -63,10 +63,10 @@ fn cse(func: *SsaFunc) void {
         var val = func.getValue(vi)
         var changed = false
         var ai = 0
-        while (ai < val.args_len) {
-            const arg = val.getArg(ai)
+        while (ai < val.args.count) {
+            const arg = val.args.get(ai)
             if (rewrite.contains(arg)) {
-                val.setArg(ai, rewrite.get(arg))
+                val.args.set(ai, rewrite.get(arg))
                 changed = true
             }
             ai += 1
@@ -164,8 +164,8 @@ fn hashValue(val: SsaValue) int {
     h = h ^ (val.type_idx * 17)
     h = h ^ (val.aux_int * 13)
     var ai = 0
-    while (ai < val.args_len) {
-        h = h ^ (val.getArg(ai) * (7 + ai))
+    while (ai < val.args.count) {
+        h = h ^ (val.args.get(ai) * (7 + ai))
         ai += 1
     }
     // Make hash positive
@@ -178,10 +178,10 @@ fn valuesEqual(a: SsaValue, b: SsaValue, a_idx: int, b_idx: int) bool {
     if (a.op != b.op) { return false }
     if (a.type_idx != b.type_idx) { return false }
     if (a.aux_int != b.aux_int) { return false }
-    if (a.args_len != b.args_len) { return false }
+    if (a.args.count != b.args.count) { return false }
     var ai = 0
-    while (ai < a.args_len) {
-        if (a.getArg(ai) != b.getArg(ai)) { return false }
+    while (ai < a.args.count) {
+        if (a.args.get(ai) != b.args.get(ai)) { return false }
         ai += 1
     }
     return true
@@ -221,8 +221,8 @@ test "cse eliminates duplicate constants" {
 
     // After CSE, v2's second arg should point to v0 (v1 rewritten to v0)
     const result = func.getValue(v2)
-    @assertEq(result.getArg(0), v0)
-    @assertEq(result.getArg(1), v0)
+    @assertEq(result.args.get(0), v0)
+    @assertEq(result.args.get(1), v0)
 }
 
 test "cse keeps different constants" {
@@ -255,8 +255,8 @@ test "cse keeps different constants" {
 
     // No rewrites — args unchanged
     const result = func.getValue(v2)
-    @assertEq(result.getArg(0), v0)
-    @assertEq(result.getArg(1), v1)
+    @assertEq(result.args.get(0), v0)
+    @assertEq(result.args.get(1), v1)
 }
 
 test "cse eliminates duplicate arithmetic" {
@@ -295,6 +295,6 @@ test "cse eliminates duplicate arithmetic" {
     cse(&func)
 
     const result = func.getValue(v4)
-    @assertEq(result.getArg(0), v2)
-    @assertEq(result.getArg(1), v2)  // v3 rewritten to v2
+    @assertEq(result.args.get(0), v2)
+    @assertEq(result.args.get(1), v2)  // v3 rewritten to v2
 }

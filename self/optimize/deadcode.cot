@@ -71,8 +71,8 @@ fn recomputeUses(func: *SsaFunc) void {
     while (vi < total) {
         const val = func.getValue(vi)
         var ai = 0
-        while (ai < val.args_len) {
-            const arg_idx = val.getArg(ai)
+        while (ai < val.args.count) {
+            const arg_idx = val.args.get(ai)
             if (arg_idx >= 0 and arg_idx < total) {
                 var arg_val = func.getValue(arg_idx)
                 arg_val.uses += 1
