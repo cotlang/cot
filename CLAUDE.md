@@ -22,17 +22,17 @@ This is by design so Cot looks like TypeScript to users. **NEVER change `Type` t
 
 ---
 
-## 🚨🚨🚨 GIT: ONLY COMMIT AND PUSH — ALL OTHER GIT COMMANDS ARE PROHIBITED 🚨🚨🚨
+## 🚨🚨🚨 GIT: NO DESTRUCTIVE OPERATIONS WITHOUT ASKING 🚨🚨🚨
 
-**Claude is PROHIBITED from using ANY git commands other than `git add`, `git commit`, `git push`, `git status`, `git log`, and `git diff`.** No exceptions. No stash, no checkout, no restore, no reset, no rebase, no cherry-pick, no worktree. Claude ALWAYS breaks code when using these commands.
+**Standard git workflow is fine:** `git add`, `git commit`, `git push`, `git pull`, `git rebase`, `git status`, `git log`, `git diff`, `git fetch` are all allowed.
 
-- **NEVER** `git stash` — causes merge conflicts that corrupt files
-- **NEVER** `git checkout` — destroys uncommitted work
-- **NEVER** `git restore` — destroys uncommitted work
-- **NEVER** `git reset` — destroys history
-- **NEVER** `git rebase` — corrupts history
-- **NEVER** `git worktree` — leaves orphaned state
-- **To undo changes:** Edit the file manually with the Edit tool
+**NEVER use destructive operations without asking the user first:**
+- **NEVER** `git checkout -- <file>` or `git restore` — destroys uncommitted work
+- **NEVER** `git reset --hard` — destroys history and uncommitted work
+- **NEVER** `git push --force` — destroys remote history
+- **NEVER** `git stash drop` or `git stash clear` — destroys stashed work
+- **NEVER** `git clean -f` — deletes untracked files permanently
+- **To undo changes:** Edit the file manually with the Edit tool, or ask the user
 - **To compare with old code:** Use `git diff` or `git show` to READ, never to modify
 - **To compare with clean state:** `git stash && <test> && git stash pop`
 - **To abandon changes:** ASK THE USER FIRST — never decide unilaterally

@@ -64,6 +64,9 @@ pub fn build(b: *std.Build) void {
         }),
     });
     tests.root_module.addOptions("build_options", options);
+    tests.root_module.addAnonymousImport("dwarf_reader_native_o", .{
+        .root_source_file = dwarf_obj.getEmittedBin(),
+    });
     const run_tests = b.addRunArtifact(tests);
     if (b.args) |args| run_tests.addArgs(args);
     b.step("test", "Run unit tests").dependOn(&run_tests.step);
