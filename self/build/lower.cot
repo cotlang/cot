@@ -4783,7 +4783,13 @@ struct Lowerer {
             if (!found) { continue }
 
             const case_block = fb.newBlock("switch.case")
-            const next_block = fb.newBlock("switch.next")
+            // Match Zig compiler: last case reuses merge_block (or else_block) instead of creating extra block
+            var next_block = merge_block
+            if (i + 1 < se.cases.count) {
+                next_block = fb.newBlock("switch.next")
+            } else if (se.else_body != null_node) {
+                next_block = fb.newBlock("switch.else")
+            }
 
             // Build condition: OR of all pattern matches
             var case_cond = null_node
@@ -4886,7 +4892,13 @@ struct Lowerer {
             if (!found) { continue }
 
             const case_block = fb.newBlock("union.case")
-            const next_block = fb.newBlock("union.next")
+            // Match Zig compiler: last case reuses merge_block (or else_block) instead of creating extra block
+            var next_block = merge_block
+            if (i + 1 < se.cases.count) {
+                next_block = fb.newBlock("union.next")
+            } else if (se.else_body != null_node) {
+                next_block = fb.newBlock("union.else")
+            }
 
             // Match on tag value — find variant index from pattern
             var case_cond = null_node
@@ -4997,7 +5009,13 @@ struct Lowerer {
             if (!found) { continue }
 
             const case_block = fb.newBlock("union.gc.case")
-            const next_block = fb.newBlock("union.gc.next")
+            // Match Zig compiler: last case reuses merge_block (or else_block) instead of creating extra block
+            var next_block = merge_block
+            if (i + 1 < se.cases.count) {
+                next_block = fb.newBlock("union.gc.next")
+            } else if (se.else_body != null_node) {
+                next_block = fb.newBlock("union.gc.else")
+            }
 
             // Match using ref.test for each pattern
             var case_cond = null_node
@@ -5115,7 +5133,13 @@ struct Lowerer {
             if (!found) { continue }
 
             const case_block = fb.newBlock("switch.case")
-            const next_block = fb.newBlock("switch.next")
+            // Match Zig compiler: last case reuses merge_block (or else_block) instead of creating extra block
+            var next_block = merge_block
+            if (i + 1 < se.cases.count) {
+                next_block = fb.newBlock("switch.next")
+            } else if (se.else_body != null_node) {
+                next_block = fb.newBlock("switch.else")
+            }
 
             var case_cond = null_node
             for p in 0..sc.patterns.count {
