@@ -1103,6 +1103,17 @@ struct Lowerer {
 
     fn lowerAssign(a: AssignStmt) void {
         if (self.builder.func()) |fb| {
+            // Discard pattern: `_ = expr;` — evaluate expr for side effects, discard result.
+            // Same semantics as Zig's `_ = foo();` (Zig ref: lower.zig:3028-3032)
+            var is_discard = false
+            switch (self.tree.getNode(a.target)) { Node.expr |e| => switch (e) { Expr.ident |id| => {
+                if (id.name == "_") { is_discard = true }
+            }, else => {} }, else => {} }
+            if (is_discard) {
+                _ = self.lowerExprNode(a.value)
+                return
+            }
+
             // Handle compound operators: +=, -=, etc.
             const is_compound = (a.op != Token.assign)
 

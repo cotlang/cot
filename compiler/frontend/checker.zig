@@ -3403,9 +3403,16 @@ pub const Checker = struct {
     }
 
     fn checkAssign(self: *Checker, as_stmt: ast.AssignStmt) CheckError!void {
+        // Discard pattern: `_ = expr;` — evaluate expr for side effects, discard result.
+        // Same semantics as Zig's `_ = foo();` (ignore return value).
+        const target = (self.tree.getNode(as_stmt.target) orelse return).asExpr() orelse return;
+        if (target == .ident and std.mem.eql(u8, target.ident.name, "_")) {
+            _ = try self.checkExpr(as_stmt.value);
+            return;
+        }
+
         const target_type = try self.checkExpr(as_stmt.target);
         const value_type = try self.checkExpr(as_stmt.value);
-        const target = (self.tree.getNode(as_stmt.target) orelse return).asExpr() orelse return;
         switch (target) {
             .ident => |id| if (self.scope.lookup(id.name)) |sym| if (!sym.mutable) { self.err.errorWithCode(as_stmt.span.start, .e300, "cannot assign to constant"); return; },
             .index, .field_access, .deref => {},

@@ -1249,8 +1249,20 @@ struct Checker {
     fn checkAssign(idx: int) void {
         const node = self.ast.getNode(idx)
         switch (node) { Node.stmt |s| => switch (s) { Stmt.assign_stmt |asgn| => {
-            // Validate assignment target (Zig ref: checker.zig:2988-2998)
+            // Discard pattern: `_ = expr;` — evaluate expr for side effects, discard result.
+            // Same semantics as Zig's `_ = foo();` (Zig ref: checker.zig:3408-3412)
             const target_tag = nodeTag(self.ast, asgn.target)
+            if (target_tag == "ident") {
+                const t_node = self.ast.getNode(asgn.target)
+                switch (t_node) { Node.expr |e| => switch (e) { Expr.ident |id| => {
+                    if (id.name == "_") {
+                        _ = self.checkExpr(asgn.value)
+                        return
+                    }
+                }, else => {} }, else => {} }
+            }
+
+            // Validate assignment target (Zig ref: checker.zig:2988-2998)
             if (target_tag != "ident" and target_tag != "index_expr" and
                 target_tag != "field_access" and target_tag != "deref") {
                 self.reportError(idx, ErrorCode.e303, "invalid assignment target")
