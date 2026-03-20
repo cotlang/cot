@@ -7555,10 +7555,17 @@ struct Lowerer {
             // Use Phase 2 expr_types directly — no re-checking needed
             self.chk.expr_types = @intToPtr(*Map(int, int), inst.expr_types_ptr).*
         } else {
-            // Fallback: fresh expr_types with re-check (for impl method generics)
+            // Fallback: fresh expr_types with re-check (for impl method generics).
+            // Zig/Go pattern: use a temporary ErrorReporter for the defining file's
+            // source to prevent corrupt byte offset → source text mapping.
+            // The defining file's AST is in self.tree (swapped above).
             var fresh_types: Map(int, int) = .{}
             self.chk.expr_types = fresh_types
+            const saved_err = self.chk.err
+            var temp_err = ErrorReporter.init()
+            self.chk.err = &temp_err
             self.chk.checkFnDeclBody(inst.generic_node, concrete_name)
+            self.chk.err = saved_err
         }
 
         // Lower the concrete function body

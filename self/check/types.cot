@@ -520,6 +520,14 @@ struct TypeRegistry {
         return idx
     }
 
+    /// Update a type entry in-place (for placeholder pattern).
+    /// Zig reference: checker.zig:456 — update placeholder with real struct type.
+    fn updateAt(idx: int, t: Type) void {
+        if (idx >= 0 and idx < self.types.count) {
+            @intToPtr(*Type, self.types.items + idx * @sizeOf(Type)).* = t
+        }
+    }
+
     /// Register a named type mapping.
     fn registerNamed(n: string, idx: int) void {
         self.name_map.set(n, idx)

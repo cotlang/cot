@@ -492,9 +492,21 @@ struct Checker {
                 return
             }
 
+            // Two-pass placeholder pattern for self-referencing structs.
+            // Zig reference: checker.zig:451-456
+            // Pass 1: Register placeholder (empty struct) so self-references resolve.
+            const placeholder = self.types.add(Type.struct_type(StructType {
+                name: name, field_count: 0, fields: 0, size: 0, alignment: 8, layout: 0,
+            }))
+            self.defineSymbol(makeTypeSymbol(name, placeholder, idx))
+            self.types.registerNamed(name, placeholder)
+
+            // Pass 2: Build real struct type (field type resolution can now find 'name').
             const struct_type = self.buildStructType(idx, name)
-            self.defineSymbol(makeTypeSymbol(name, struct_type, idx))
-            self.types.registerNamed(name, struct_type)
+
+            // Update placeholder in-place with the real struct data.
+            // Zig reference: checker.zig:456
+            self.types.updateAt(placeholder, self.types.get(struct_type))
 
             // Register nested declarations with qualified names (Parent_Child)
             for ni in 0..sd.nested_decls.count {
@@ -519,9 +531,14 @@ struct Checker {
             },
             Decl.struct_decl |sd| => {
                 const qualified = "${parent_name}_${sd.name}"
+                // Placeholder pattern (same as collectStructDecl)
+                const ph = self.types.add(Type.struct_type(StructType {
+                    name: qualified, field_count: 0, fields: 0, size: 0, alignment: 8, layout: 0,
+                }))
+                self.defineSymbol(makeTypeSymbol(qualified, ph, nested_idx))
+                self.types.registerNamed(qualified, ph)
                 const ns_type = self.buildStructType(nested_idx, qualified)
-                self.defineSymbol(makeTypeSymbol(qualified, ns_type, nested_idx))
-                self.types.registerNamed(qualified, ns_type)
+                self.types.updateAt(ph, self.types.get(ns_type))
             },
             Decl.type_alias |ta| => {
                 const qualified = "${parent_name}_${ta.name}"
