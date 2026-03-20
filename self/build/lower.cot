@@ -2229,13 +2229,9 @@ struct Lowerer {
         const fb = self.builder.func() orelse return null_node
         const tok = bin.op
 
-        // Short-circuit logical and
-        if (tok == Token.land or tok == Token.kw_and) {
-            return self.lowerShortCircuitAnd(bin)
-        }
-        // Short-circuit logical or
-        if (tok == Token.lor or tok == Token.kw_or) {
-            return self.lowerShortCircuitOr(bin)
+        // Short-circuit logical and/or
+        if (tok == Token.land or tok == Token.kw_and or tok == Token.lor or tok == Token.kw_or) {
+            return self.lowerShortCircuit(bin)
         }
 
         // String concatenation (++ or + on strings)
@@ -2289,44 +2285,46 @@ struct Lowerer {
         return fb.emitBinary(op, left, right, result_type, bin.span)
     }
 
-    /// Short-circuit AND: left && right → if left then right else false
-    fn lowerShortCircuitAnd(bin: Binary) int {
+    /// Short-circuit and/or at IR level: defer right-side lowering until inside the branch.
+    /// Go reference: ssagen/ssa.go:3398-3442 (OANDAND/OOROR expr path).
+    /// Pattern: result_local + store + load (matches Zig compiler lower.zig:301-334).
+    fn lowerShortCircuit(bin: Binary) int {
         const fb = self.builder.func() orelse return null_node
         const left = self.lowerExprNode(bin.left)
         if (left == null_node) { return null_node }
 
-        const rhs_block = fb.newBlock("and.rhs")
-        const merge_block = fb.newBlock("and.end")
-        const false_val = fb.emitConstBool(false, bin.span)
+        const is_and = (bin.op == Token.land or bin.op == Token.kw_and)
 
-        fb.emitBranch(left, rhs_block, merge_block, bin.span)
+        const result_local = fb.addLocalWithSize("__sc_result", BOOL, false, 8)
+        const eval_right_block = fb.newBlock("sc.eval_right")
+        const short_circuit_block = fb.newBlock("sc.short")
+        const merge_block = fb.newBlock("sc.merge")
 
-        fb.setBlock(rhs_block)
-        const right = self.lowerExprNode(bin.right)
+        if (is_and) {
+            // and: left true → eval right; left false → short circuit (result = false)
+            fb.emitBranch(left, eval_right_block, short_circuit_block, bin.span)
+        } else {
+            // or: left true → short circuit (result = true); left false → eval right
+            fb.emitBranch(left, short_circuit_block, eval_right_block, bin.span)
+        }
+
+        // Short circuit block: result = false (for and) or true (for or)
+        fb.setBlock(short_circuit_block)
+        const short_val = fb.emitConstBool(!is_and, bin.span)
+        fb.emitStoreLocal(result_local, short_val, bin.span)
         fb.emitJump(merge_block, bin.span)
 
-        fb.setBlock(merge_block)
-        return fb.emitSelect(left, right, false_val, BOOL, bin.span)
-    }
-
-    /// Short-circuit OR: left || right → if left then true else right
-    fn lowerShortCircuitOr(bin: Binary) int {
-        const fb = self.builder.func() orelse return null_node
-        const left = self.lowerExprNode(bin.left)
-        if (left == null_node) { return null_node }
-
-        const rhs_block = fb.newBlock("or.rhs")
-        const merge_block = fb.newBlock("or.end")
-        const true_val = fb.emitConstBool(true, bin.span)
-
-        fb.emitBranch(left, merge_block, rhs_block, bin.span)
-
-        fb.setBlock(rhs_block)
+        // Eval right block: lower right operand HERE (deferred, after branch)
+        fb.setBlock(eval_right_block)
         const right = self.lowerExprNode(bin.right)
+        if (right != null_node) {
+            fb.emitStoreLocal(result_local, right, bin.span)
+        }
         fb.emitJump(merge_block, bin.span)
 
+        // Merge: load result
         fb.setBlock(merge_block)
-        return fb.emitSelect(left, true_val, right, BOOL, bin.span)
+        return fb.emitLoadLocal(result_local, BOOL, bin.span)
     }
 
     /// String concatenation: decompose strings, call string_concat runtime

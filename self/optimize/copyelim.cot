@@ -14,6 +14,21 @@ import "../build/ssa"
 /// Zig reference: compiler/ssa/passes/copyelim.zig copyelim()
 fn copyelim(func: *SsaFunc) void {
     phielim(func)
+
+    // Update block control values — replace copy controls with their sources.
+    // Zig reference: copyelim.zig:24-36
+    for bi in 0..func.blocks.count {
+        var blk = func.getBlock(bi)
+        for ci in 0..blk.controls.count {
+            const ctrl = blk.controls.get(ci)
+            const ctrl_v = func.getValue(ctrl)
+            if (ctrl_v.op == SsaOp.copy and ctrl_v.args.count > 0) {
+                const src = followCopyChain(func, ctrl)
+                blk.controls.set(ci, src)
+            }
+        }
+        func.setBlock(bi, blk)
+    }
 }
 
 /// Follow a copy chain to its ultimate source.
@@ -80,6 +95,9 @@ fn phielim(func: *SsaFunc) void {
             var vi = 0
             while (vi < blk.values.count) {
                 const val_idx = blk.values.get(vi)
+                // Eliminate copy args first (matching Go's combined pass).
+                // Zig reference: copyelim.zig:97 — copyelimValue(v) for EVERY value.
+                replaceCopyArgs(func, val_idx)
                 if (phielimValue(func, val_idx)) {
                     changed = true
                 }

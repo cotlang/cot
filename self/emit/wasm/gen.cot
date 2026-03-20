@@ -222,6 +222,7 @@ struct GenState {
                     const len_local = self.compound_len_locals.get(ret_val_idx)
                     self.builder.appendFrom(As.local_get, constAddr(len_local))
                 } else {
+                    // Non-compound scalar return
                     self.getValue64(ret_val_idx)
                 }
             }
@@ -1981,9 +1982,14 @@ struct GenState {
         if (v.op == SsaOp.string_make or v.op == SsaOp.slice_make) { return }
 
         // Skip copy of compound ops — copyelim may leave copies whose source is
-        // string_make/slice_make. These produce no Wasm code (no local allocated).
+        // string_make/slice_make. Follow copy chains to detect transitive copies.
         if (v.op == SsaOp.copy and v.args.count > 0) {
-            const src = self.ssa_func.getValue(v.args.get(0))
+            var src = self.ssa_func.getValue(v.args.get(0))
+            var depth = 0
+            while (src.op == SsaOp.copy and src.args.count > 0 and depth < 10) {
+                src = self.ssa_func.getValue(src.args.get(0))
+                depth += 1
+            }
             if (src.op == SsaOp.string_make or src.op == SsaOp.slice_make) { return }
         }
 
@@ -2082,9 +2088,15 @@ struct GenState {
                     v.op == SsaOp.wasm_lowered_move or v.op == SsaOp.wasm_lowered_zero or
                     v.op == SsaOp.wasm_return_call) { continue }
                 // Skip copy of compound ops (no local needed — source has no local)
+                // Follow copy chains: copy → copy → string_make should also be skipped.
                 if (v.op == SsaOp.copy and v.args.count > 0) {
-                    const copy_src = self.ssa_func.getValue(v.args.get(0))
-                    if (copy_src.op == SsaOp.string_make or copy_src.op == SsaOp.slice_make) { continue }
+                    var src = self.ssa_func.getValue(v.args.get(0))
+                    var depth = 0
+                    while (src.op == SsaOp.copy and src.args.count > 0 and depth < 10) {
+                        src = self.ssa_func.getValue(src.args.get(0))
+                        depth += 1
+                    }
+                    if (src.op == SsaOp.string_make or src.op == SsaOp.slice_make) { continue }
                 }
                 // Skip store ops
                 if (v.op == SsaOp.wasm_i64_store or v.op == SsaOp.wasm_i64_store8 or
