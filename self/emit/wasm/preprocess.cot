@@ -248,17 +248,21 @@ fn pass4AdjustOffsets(sym: *Symbol) void {
 fn pass5DispatchLoop(sym: *Symbol, numResumePoints: int, tableIdxs: *List(int), entryPointLoopBranches: *List(int)) int {
     var entryPointLoopIdx: ?int = null
     var insert_point = 0
+    var num_inserted = 0
 
     if (entryPointLoopBranches.count > 0) {
         insert_point = insertAfter(&sym.text, insert_point, Prog.init(As.loop))
         entryPointLoopIdx = insert_point
+        num_inserted += 1
     }
 
     if (numResumePoints > 0) {
         for k in 0..numResumePoints + 1 {
             insert_point = insertAfter(&sym.text, insert_point, Prog.init(As.block))
+            num_inserted += 1
         }
         insert_point = insertAfter(&sym.text, insert_point, Prog.initFrom(As.get, regAddr(Reg.pc_b)))
+        num_inserted += 1
 
         // br_table with indices — store directly in Prog's AddrVal union
         // (Zig reference: preprocess.zig line 336-340)
@@ -269,7 +273,21 @@ fn pass5DispatchLoop(sym: *Symbol, numResumePoints: int, tableIdxs: *List(int), 
         var bt_addr = Addr.init()
         bt_addr.val = AddrVal.br_table(bt_indices)
         insert_point = insertAfter(&sym.text, insert_point, Prog.initTo(As.br_table, bt_addr))
+        num_inserted += 1
         insert_point = insertAfter(&sym.text, insert_point, Prog.init(As.end))
+        num_inserted += 1
+    }
+
+    // Adjust entryPointLoopBranches indices: pass3 recorded indices before
+    // pass5 insertions. Since all insertions happen at the front (position 0+),
+    // every recorded branch index shifts by num_inserted.
+    // Zig uses *Prog pointers (unaffected by list insertions); selfcot uses
+    // List indices which become stale after insertAfter shifts elements.
+    if (num_inserted > 0) {
+        for b in 0..entryPointLoopBranches.count {
+            const old_idx = entryPointLoopBranches.get(b)
+            entryPointLoopBranches.set(b, old_idx + num_inserted)
+        }
     }
 
     if (entryPointLoopBranches.count > 0) {
