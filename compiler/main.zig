@@ -1480,10 +1480,7 @@ fn compileAndLinkFull(
     // Zig reference: std.debug reads DWARF from own binary at crash time.
     // The .o is pre-compiled at `zig build` time and embedded in the compiler.
     if (debug_mode and !compile_target.isWasm()) {
-        const dwarf_obj_bytes: []const u8 = if (compile_target.arch == .arm64)
-            @embedFile("dwarf_reader_arm64_o")
-        else
-            @embedFile("dwarf_reader_x64_o");
+        const dwarf_obj_bytes: []const u8 = @embedFile("dwarf_reader_native_o");
 
         const dwarf_obj_path = std.fs.path.join(allocator, &.{ std.fs.path.dirname(obj_path) orelse "/tmp", "dwarf_reader.o" }) catch "/tmp/dwarf_reader.o";
         if (std.fs.cwd().createFile(dwarf_obj_path, .{})) |file| {
