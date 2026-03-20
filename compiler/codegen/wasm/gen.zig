@@ -899,6 +899,14 @@ pub const GenState = struct {
             // Copy
             .copy => {
                 try self.getValue64(v.args[0]);
+                // If source is float but copy is not, reinterpret f64 bits to i64
+                const src = v.args[0];
+                if (isFloatType(src.type_idx) and !isFloatType(v.type_idx)) {
+                    _ = try self.builder.append(.i64_reinterpret_f64);
+                }
+                if (!isFloatType(src.type_idx) and isFloatType(v.type_idx)) {
+                    _ = try self.builder.append(.f64_reinterpret_i64);
+                }
             },
 
             // Phi - load from local (populated by emitPhiMoves in predecessor blocks)

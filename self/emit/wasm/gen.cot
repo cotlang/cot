@@ -1786,6 +1786,15 @@ struct GenState {
             // Copy
             SsaOp.copy => {
                 self.getValue64(v.args.get(0))
+                // If source is float but copy is not, reinterpret f64 bits to i64
+                const src = self.ssa_func.getValue(v.args.get(0))
+                if (isFloatType(src.type_idx) and !isFloatType(v.type_idx)) {
+                    self.builder.append(As.i64_reinterpret_f64)
+                }
+                // If source is not float but copy is, reinterpret i64 to f64
+                if (!isFloatType(src.type_idx) and isFloatType(v.type_idx)) {
+                    self.builder.append(As.f64_reinterpret_i64)
+                }
             },
 
             // Phi — load from local (populated by emitPhiMoves)
