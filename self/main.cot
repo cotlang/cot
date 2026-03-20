@@ -744,7 +744,7 @@ fn computeWasmOutputPath(path: string) string {
 
 /// Write a List(int) of byte values to a file.
 fn writeByteList(path: string, bytes: List(int)) void {
-    const fd = fd_open(@ptrOf(path), @lenOf(path), 577)  // O_WRONLY | O_CREAT | O_TRUNC
+    const fd = fd_open(@ptrOf(path), @lenOf(path), 1537)  // O_WRONLY(1) | O_CREAT(512) | O_TRUNC(1024) — macOS values
     if (fd < 0) {
         eprintln("error: cannot open file for writing: ${path}")
         exit(1)
