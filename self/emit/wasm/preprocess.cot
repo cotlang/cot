@@ -429,7 +429,7 @@ fn expandMov(sym: *Symbol, idx: int, framesize: int) void {
 
     if (to.addr_type == AddrType.mem) {
         insert = insertAfter(&sym.text, insert, Prog.initFrom(As.get, regAddr(to.reg)))
-        if (to.reg != Reg.sp) {
+        if (to.reg != Reg.sp and to.reg != Reg.pc_b) {
             insert = insertAfter(&sym.text, insert, Prog.init(As.i32_wrap_i64))
         }
     }
@@ -438,18 +438,18 @@ fn expandMov(sym: *Symbol, idx: int, framesize: int) void {
         insert = insertAfter(&sym.text, insert, Prog.initFrom(As.i64_const, constAddr(from.offset)))
     } else if (from.addr_type == AddrType.reg) {
         insert = insertAfter(&sym.text, insert, Prog.initFrom(As.get, from))
-        if (from.reg == Reg.sp) {
+        if (from.reg == Reg.sp or from.reg == Reg.pc_b) {
             insert = insertAfter(&sym.text, insert, Prog.init(As.i64_extend_i32_u))
         }
     } else if (from.addr_type == AddrType.mem) {
         insert = insertAfter(&sym.text, insert, Prog.initFrom(As.get, regAddr(from.reg)))
-        if (from.reg != Reg.sp) {
+        if (from.reg != Reg.sp and from.reg != Reg.pc_b) {
             insert = insertAfter(&sym.text, insert, Prog.init(As.i32_wrap_i64))
         }
         insert = insertAfter(&sym.text, insert, Prog.initFrom(load_as, constAddr(from.offset)))
     } else if (from.addr_type == AddrType.addr) {
         insert = insertAfter(&sym.text, insert, Prog.initFrom(As.get, regAddr(from.reg)))
-        if (from.reg == Reg.sp) {
+        if (from.reg == Reg.sp or from.reg == Reg.pc_b) {
             insert = insertAfter(&sym.text, insert, Prog.init(As.i64_extend_i32_u))
         }
         if (from.offset != 0) {
@@ -459,7 +459,7 @@ fn expandMov(sym: *Symbol, idx: int, framesize: int) void {
     }
 
     if (to.addr_type == AddrType.reg) {
-        if (to.reg == Reg.sp) {
+        if (to.reg == Reg.sp or to.reg == Reg.pc_b) {
             insert = insertAfter(&sym.text, insert, Prog.init(As.i32_wrap_i64))
         }
         insert = insertAfter(&sym.text, insert, Prog.initTo(As.set, to))

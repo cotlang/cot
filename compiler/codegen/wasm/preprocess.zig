@@ -485,7 +485,7 @@ fn expandMov(allocator: std.mem.Allocator, p: *Prog, framesize: i32) !void {
     if (to.type == .mem) {
         // Store: push address, push value, store
         current = try appendAfter(allocator, current, .get, prog.regAddr(to.reg), .{});
-        if (to.reg != .sp) {
+        if (to.reg != .sp and to.reg != .pc_b) {
             current = try appendAfter(allocator, current, .i32_wrap_i64, .{}, .{});
         }
     }
@@ -497,20 +497,20 @@ fn expandMov(allocator: std.mem.Allocator, p: *Prog, framesize: i32) !void {
         },
         .reg => {
             current = try appendAfter(allocator, current, .get, from, .{});
-            if (from.reg == .sp) {
+            if (from.reg == .sp or from.reg == .pc_b) {
                 current = try appendAfter(allocator, current, .i64_extend_i32_u, .{}, .{});
             }
         },
         .mem => {
             current = try appendAfter(allocator, current, .get, prog.regAddr(from.reg), .{});
-            if (from.reg != .sp) {
+            if (from.reg != .sp and from.reg != .pc_b) {
                 current = try appendAfter(allocator, current, .i32_wrap_i64, .{}, .{});
             }
             current = try appendAfter(allocator, current, load_as, prog.constAddr(from.offset), .{});
         },
         .addr => {
             current = try appendAfter(allocator, current, .get, prog.regAddr(from.reg), .{});
-            if (from.reg == .sp) {
+            if (from.reg == .sp or from.reg == .pc_b) {
                 current = try appendAfter(allocator, current, .i64_extend_i32_u, .{}, .{});
             }
             if (from.offset != 0) {
@@ -524,7 +524,7 @@ fn expandMov(allocator: std.mem.Allocator, p: *Prog, framesize: i32) !void {
     // Handle destination
     switch (to.type) {
         .reg => {
-            if (to.reg == .sp) {
+            if (to.reg == .sp or to.reg == .pc_b) {
                 current = try appendAfter(allocator, current, .i32_wrap_i64, .{}, .{});
             }
             current = try appendAfter(allocator, current, .set, .{}, to);
