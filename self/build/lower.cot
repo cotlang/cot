@@ -644,7 +644,8 @@ struct Lowerer {
                         self.builder.addStruct(StructDef { name: qualified, type_idx: ns_type_idx, span: ns.span })
                     },
                     Decl.fn_decl |fd| => {
-                        const synth_name = struct_decl.name ++ "_" ++ fd.name
+                        const bare_name = struct_decl.name ++ "_" ++ fd.name
+                        const synth_name = self.qualifyName(bare_name)
                         eprintln("[lower] method: ${synth_name}")
                         self.lowerMethodWithName(fd, synth_name, fd.name == "deinit")
                         eprintln("[lower] method done: ${synth_name}")
@@ -664,7 +665,7 @@ struct Lowerer {
             switch (self.tree.getNode(nested_idx)) {
                 Node.decl |nd| => switch (nd) {
                     Decl.fn_decl |fd| => {
-                        const synth_name = ed.name ++ "_" ++ fd.name
+                        const synth_name = self.qualifyName(ed.name ++ "_" ++ fd.name)
                         self.lowerMethodWithName(fd, synth_name, fd.name == "deinit")
                     },
                     else => {},
@@ -681,7 +682,7 @@ struct Lowerer {
             switch (self.tree.getNode(method_idx)) {
                 Node.decl |d| => switch (d) {
                     Decl.fn_decl |fd| => {
-                        const synth_name = impl_block.type_name ++ "_" ++ fd.name
+                        const synth_name = self.qualifyName(impl_block.type_name ++ "_" ++ fd.name)
                         self.lowerMethodWithName(fd, synth_name, fd.name == "deinit")
                     },
                     else => {},
@@ -697,7 +698,7 @@ struct Lowerer {
             switch (self.tree.getNode(method_idx)) {
                 Node.decl |d| => switch (d) {
                     Decl.fn_decl |fd| => {
-                        const synth_name = impl_trait.target_type ++ "_" ++ fd.name
+                        const synth_name = self.qualifyName(impl_trait.target_type ++ "_" ++ fd.name)
                         self.lowerMethodWithName(fd, synth_name, fd.name == "deinit")
                     },
                     else => {},
