@@ -923,6 +923,11 @@ pub const GenState = struct {
                 // Push arguments onto stack
                 for (v.args) |arg| {
                     try self.getValue64(arg);
+                    // Float args stored in f64 locals need reinterpret to i64 for Wasm call ABI
+                    // (all Cot runtime functions use i64 parameters, even for float values)
+                    if (isFloatType(arg.type_idx)) {
+                        _ = try self.builder.append(.i64_reinterpret_f64);
+                    }
                 }
                 // Emit call with function index from aux_int
                 const p = try self.builder.append(.call);
@@ -959,6 +964,9 @@ pub const GenState = struct {
                 // Push arguments onto stack
                 for (v.args) |arg| {
                     try self.getValue64(arg);
+                    if (isFloatType(arg.type_idx)) {
+                        _ = try self.builder.append(.i64_reinterpret_f64);
+                    }
                 }
                 // Get function index from name
                 const fn_name: ?[]const u8 = switch (v.aux) {

@@ -1307,21 +1307,34 @@ struct GenState {
         switch (v.op) {
             SsaOp.wasm_call => {
                 for ai in 0..v.args.count {
-                    self.getValue64(v.args.get(ai))
+                    const arg_idx = v.args.get(ai)
+                    self.getValue64(arg_idx)
+                    // Float args in f64 locals need reinterpret to i64 for call ABI
+                    if (isFloatType(self.ssa_func.getValue(arg_idx).type_idx)) {
+                        self.builder.append(As.i64_reinterpret_f64)
+                    }
                 }
                 const func_idx = self.resolveCallIndex(v)
                 self.builder.appendTo(As.call, constAddr(func_idx))
             },
             SsaOp.wasm_return_call => {
                 for ai in 0..v.args.count {
-                    self.getValue64(v.args.get(ai))
+                    const arg_idx = v.args.get(ai)
+                    self.getValue64(arg_idx)
+                    if (isFloatType(self.ssa_func.getValue(arg_idx).type_idx)) {
+                        self.builder.append(As.i64_reinterpret_f64)
+                    }
                 }
                 const rc_func_idx = self.resolveCallIndex(v)
                 self.builder.appendTo(As.return_call, constAddr(rc_func_idx))
             },
             SsaOp.wasm_lowered_static_call => {
                 for ai in 0..v.args.count {
-                    self.getValue64(v.args.get(ai))
+                    const arg_idx = v.args.get(ai)
+                    self.getValue64(arg_idx)
+                    if (isFloatType(self.ssa_func.getValue(arg_idx).type_idx)) {
+                        self.builder.append(As.i64_reinterpret_f64)
+                    }
                 }
                 const sc_func_idx = self.resolveCallIndex(v)
                 self.builder.appendTo(As.call, constAddr(sc_func_idx))
