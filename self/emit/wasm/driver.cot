@@ -436,12 +436,8 @@ fn addParamType(params: *List(int), param: Local, types: *TypeRegistry) void {
             k += 1
         }
     } else {
-        const is_float = param.type_idx == F64 or param.type_idx == F32
-        if (is_float) {
-            params.append(VT_F64)
-        } else {
-            params.append(VT_I64)
-        }
+        // All values stored as i64 (Go's all-i64 approach) — no f64 params
+        params.append(VT_I64)
     }
 }
 
@@ -456,12 +452,8 @@ fn buildFuncResults(results: *List(int), ir_func: Func, types: *TypeRegistry) vo
         results.append(VT_I64)
         results.append(VT_I64)
     } else {
-        const ret_is_float = ir_func.return_type == F64 or ir_func.return_type == F32
-        if (ret_is_float) {
-            results.append(VT_F64)
-        } else {
-            results.append(VT_I64)
-        }
+        // All values stored as i64 (Go's all-i64 approach) — no f64 returns
+        results.append(VT_I64)
     }
 }
 
