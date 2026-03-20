@@ -1286,19 +1286,21 @@ struct Lowerer {
             if (cond == null_node) { return false }
 
             const then_block = fb.newBlock("if.then")
-            var else_block = fb.newBlock("if.else")
             const merge_block = fb.newBlock("if.end")
 
-            fb.emitBranch(cond, then_block, else_block, i.span)
-
-            fb.setBlock(then_block)
-            const then_terminated = self.lowerBlockNode(i.then_branch)
-            if (!then_terminated) {
-                fb.emitJump(merge_block, i.span)
-            }
-
-            fb.setBlock(else_block)
+            // Only create else block if there's an else branch;
+            // otherwise branch directly to merge (matches Zig compiler)
             if (i.else_branch != null_node) {
+                const else_block = fb.newBlock("if.else")
+                fb.emitBranch(cond, then_block, else_block, i.span)
+
+                fb.setBlock(then_block)
+                const then_terminated = self.lowerBlockNode(i.then_branch)
+                if (!then_terminated) {
+                    fb.emitJump(merge_block, i.span)
+                }
+
+                fb.setBlock(else_block)
                 const else_terminated = self.lowerBlockNode(i.else_branch)
                 if (!else_terminated) {
                     fb.emitJump(merge_block, i.span)
@@ -1307,7 +1309,13 @@ struct Lowerer {
                     return true
                 }
             } else {
-                fb.emitJump(merge_block, i.span)
+                fb.emitBranch(cond, then_block, merge_block, i.span)
+
+                fb.setBlock(then_block)
+                const then_terminated = self.lowerBlockNode(i.then_branch)
+                if (!then_terminated) {
+                    fb.emitJump(merge_block, i.span)
+                }
             }
 
             fb.setBlock(merge_block)

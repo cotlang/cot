@@ -1,5 +1,16 @@
 # Claude AI Instructions
 
+## 🚨🚨🚨 CURRENT PROJECT FOCUS: `self/` MUST MATCH ZIG COMPILER 1:1 🚨🚨🚨
+
+**The self-hosted compiler (`self/`) must be a mechanical 1:1 translation of the Zig compiler (`compiler/`).** Every function, every variable, every enum, every logic pattern must be identical. Any divergence is a bug.
+
+- **If `self/` diverges from `compiler/`:** Fix `self/` to match the Zig compiler. No exceptions.
+- **If `self/` has a genuinely better approach:** Port the improvement to the Zig compiler FIRST, verify all 360 tests pass, THEN update `self/` to match. Never let `self/` lead — the Zig compiler is always the source of truth.
+- **When investigating bugs in `self/`:** Compare the generated output (SSA, Wasm) against the Zig compiler's output for the same input. The difference IS the bug.
+- **When adding features:** Implement in the Zig compiler first, test, then port to `self/`.
+
+---
+
 ## 🚨🚨🚨 `self/` IS `@safe` MODE — ALL STRUCT PARAMS ARE INFERRED POINTERS 🚨🚨🚨
 
 **ALL files in `self/` use `@safe` mode (set in `self/cot.json`).** In `@safe` mode:
