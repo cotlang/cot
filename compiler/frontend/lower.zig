@@ -3025,6 +3025,12 @@ pub const Lowerer = struct {
         const target_node = self.tree.getNode(assign.target) orelse return;
         const target_expr = target_node.asExpr() orelse return;
 
+        // Discard pattern: `_ = expr;` — evaluate expr for side effects, discard result.
+        if (target_expr == .ident and std.mem.eql(u8, target_expr.ident.name, "_")) {
+            _ = try self.lowerExprNode(assign.value);
+            return;
+        }
+
         // Handle compound assignment (+=, -=, etc.)
         // Go reference: walk/assign.go:50-52 - Rewrite x op= y into x = x op y
         const value_node = if (assign.op != .assign) blk: {
