@@ -269,10 +269,18 @@ struct GenState {
                     const local_idx = self.value_to_local.get(val_idx)
                     // Reinterpret float↔i64 at phi boundaries when types differ
                     const arg_v = self.ssa_func.getValue(arg_idx)
-                    if (isFloatType(arg_v.type_idx) and local_idx < self.first_float_local) {
+                    // Check: is the SOURCE in an f64 local?
+                    var src_is_float_local = false
+                    if (self.value_to_local.contains(arg_idx)) {
+                        const src_local = self.value_to_local.get(arg_idx)
+                        if (src_local >= self.first_float_local and self.float_local_count > 0) {
+                            src_is_float_local = true
+                        }
+                    }
+                    if ((isFloatType(arg_v.type_idx) or src_is_float_local) and local_idx < self.first_float_local) {
                         self.builder.append(As.i64_reinterpret_f64)
                     }
-                    if (!isFloatType(arg_v.type_idx) and local_idx >= self.first_float_local and self.float_local_count > 0) {
+                    if (!isFloatType(arg_v.type_idx) and !src_is_float_local and local_idx >= self.first_float_local and self.float_local_count > 0) {
                         self.builder.append(As.f64_reinterpret_i64)
                     }
                     self.builder.appendTo(As.local_set, constAddr(local_idx))
@@ -319,10 +327,6 @@ struct GenState {
         if (self.value_to_local.contains(val_idx)) {
             const local_idx = self.value_to_local.get(val_idx)
             self.builder.appendFrom(As.local_get, constAddr(local_idx))
-            // If the local is f64 but the value is used in i64 context, reinterpret
-            if (local_idx >= self.first_float_local and self.float_local_count > 0 and !isFloatType(v.type_idx)) {
-                self.builder.append(As.i64_reinterpret_f64)
-            }
             return
         }
         // Generate on stack (on-demand values like comparisons)
@@ -1279,13 +1283,19 @@ struct GenState {
             SsaOp.wasm_f64_load => {
                 self.getValue64(v.args.get(0))
                 self.builder.append(As.i32_wrap_i64)
-                self.builder.appendFrom(As.f64_load, constAddr(v.aux_int))
+                // Load as i64 (preserving bits) then reinterpret to f64.
+                // Using i64.load ensures the shadow stack save/restore
+                // (which always uses i64) doesn't cause type mismatches.
+                self.builder.appendFrom(As.i64_load, constAddr(v.aux_int))
+                self.builder.append(As.f64_reinterpret_i64)
             },
             SsaOp.wasm_f64_store => {
                 self.getValue64(v.args.get(0))
                 self.builder.append(As.i32_wrap_i64)
                 self.getValue64(v.args.get(1))
-                self.builder.appendTo(As.f64_store, constAddr(v.aux_int))
+                // Reinterpret f64→i64 then store as i64 (matching shadow stack type)
+                self.builder.append(As.i64_reinterpret_f64)
+                self.builder.appendTo(As.i64_store, constAddr(v.aux_int))
             },
             SsaOp.wasm_f32_load => {
                 self.getValue64(v.args.get(0))
