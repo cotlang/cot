@@ -387,8 +387,15 @@ fn expandGetAddr(sym: *Symbol, idx: int) void {
 
 fn expandLoadMem(sym: *Symbol, idx: int) void {
     var p = sym.text.get(idx)
-    const load_instr = p.instr
+    var load_instr = p.instr
     const from = p.from
+
+    // Shadow stack stores all values as i64 bit patterns (via expandMov's i64.store).
+    // Float loads from register-relative addresses must use i64.load, not f64.load,
+    // to match the stored type. The gen handles f64↔i64 reinterpretation at use sites.
+    // Zig reference: expandMov always uses i64_load for mov_d regardless of value type.
+    if (load_instr == As.f64_load) { load_instr = As.i64_load }
+    if (load_instr == As.f32_load) { load_instr = As.i64_load }
 
     p.instr = As.get
     p.from = regAddr(from.reg)

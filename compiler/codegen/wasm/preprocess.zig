@@ -435,8 +435,13 @@ fn expandGetAddr(allocator: std.mem.Allocator, p: *Prog, framesize: i32) !void {
 
 /// Expand Load with memory operand
 fn expandLoadMem(allocator: std.mem.Allocator, p: *Prog) !void {
-    const as = p.as;
+    var as = p.as;
     const from = p.from;
+
+    // Shadow stack stores all values as i64 bit patterns (via expandMov's i64.store).
+    // Float loads from register-relative addresses must use i64.load, not f64.load.
+    if (as == .f64_load) as = .i64_load;
+    if (as == .f32_load) as = .i64_load;
 
     // Replace with Get + wrap + load
     p.as = .get;

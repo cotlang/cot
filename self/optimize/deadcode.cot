@@ -12,6 +12,9 @@ import "../build/ssa"
 
 /// Remove dead values from all blocks.
 /// A value is dead if: uses == 0 AND not a side-effecting op AND not a block control.
+/// Zig reference: compiler/ssa/passes/deadcode.zig
+/// When removing dead values, decrement uses of their args (resetArgs pattern).
+/// Iterate until fixed point — removing dead values may make their args dead.
 fn deadcode(func: *SsaFunc) void {
     // Identify control values (must be kept alive)
     var is_control: Map(int, bool) = .{}
@@ -28,33 +31,60 @@ fn deadcode(func: *SsaFunc) void {
         bi += 1
     }
 
-    // Compute use counts (SSA passes may have invalidated them)
-    recomputeUses(func)
+    // Iterate until fixed point: removing dead values decrements uses of their
+    // args, which may make more values dead (transitive dead code elimination).
+    // Zig does this via resetArgs() which decrements arg uses inline.
+    var changed = true
+    var iterations = 0
+    while (changed and iterations < 10) {
+        changed = false
+        iterations += 1
 
-    // Remove dead values from each block
-    bi = 0
-    while (bi < func.blocks.count) {
-        var blk = func.getBlock(bi)
-        var new_values: List(int) = .{}
-        var vi = 0
-        while (vi < blk.values.count) {
-            const val_idx = blk.values.get(vi)
-            const val = func.getValue(val_idx)
-            if (isLive(val, val_idx, &is_control)) {
-                new_values.append(val_idx)
+        // Recompute use counts fresh each iteration
+        recomputeUses(func)
+
+        // Remove dead values from each block, decrementing arg uses
+        bi = 0
+        while (bi < func.blocks.count) {
+            var blk = func.getBlock(bi)
+            var new_values: List(int) = .{}
+            var vi = 0
+            while (vi < blk.values.count) {
+                const val_idx = blk.values.get(vi)
+                const val = func.getValue(val_idx)
+                if (isLive(val, val_idx, &is_control)) {
+                    new_values.append(val_idx)
+                } else {
+                    // Dead value — decrement uses of its args (resetArgs pattern)
+                    var ai = 0
+                    while (ai < val.args.count) {
+                        const arg_idx = val.args.get(ai)
+                        if (arg_idx >= 0 and arg_idx < func.next_value_id) {
+                            var arg_val = func.getValue(arg_idx)
+                            if (arg_val.uses > 0) {
+                                arg_val.uses -= 1
+                                func.setValue(arg_idx, arg_val)
+                            }
+                        }
+                        ai += 1
+                    }
+                    changed = true
+                }
+                vi += 1
             }
-            vi += 1
+            blk.values.free()
+            blk.values = new_values
+            func.setBlock(bi, blk)
+            bi += 1
         }
-        blk.values.free()
-        blk.values = new_values
-        func.setBlock(bi, blk)
-        bi += 1
     }
 
     is_control.free()
 }
 
 /// Recompute use counts for all values.
+/// Only counts uses from values that are IN blocks — removed values
+/// must not contribute to use counts.
 fn recomputeUses(func: *SsaFunc) void {
     // Zero all uses
     const total = func.next_value_id
@@ -66,27 +96,27 @@ fn recomputeUses(func: *SsaFunc) void {
         vi += 1
     }
 
-    // Count uses: for each value, increment uses of all its args
-    vi = 0
-    while (vi < total) {
-        const val = func.getValue(vi)
-        var ai = 0
-        while (ai < val.args.count) {
-            const arg_idx = val.args.get(ai)
-            if (arg_idx >= 0 and arg_idx < total) {
-                var arg_val = func.getValue(arg_idx)
-                arg_val.uses += 1
-                func.setValue(arg_idx, arg_val)
-            }
-            ai += 1
-        }
-        vi += 1
-    }
-
-    // Also count control value uses
+    // Count uses: only from values that are in blocks (not removed values)
     var bi = 0
     while (bi < func.blocks.count) {
         const blk = func.getBlock(bi)
+        var bvi = 0
+        while (bvi < blk.values.count) {
+            const val_idx = blk.values.get(bvi)
+            const val = func.getValue(val_idx)
+            var ai = 0
+            while (ai < val.args.count) {
+                const arg_idx = val.args.get(ai)
+                if (arg_idx >= 0 and arg_idx < total) {
+                    var arg_val = func.getValue(arg_idx)
+                    arg_val.uses += 1
+                    func.setValue(arg_idx, arg_val)
+                }
+                ai += 1
+            }
+            bvi += 1
+        }
+        // Also count control value uses
         var ci = 0
         while (ci < blk.controls.count) {
             const ctrl_idx = blk.controls.get(ci)

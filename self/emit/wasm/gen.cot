@@ -68,6 +68,9 @@ struct GenState {
     /// Number of f64 locals (contiguous after i64 locals)
     float_local_count: int,
 
+    /// Index of the first f64 local (set after allocateLocals completes)
+    first_float_local: int,
+
     /// GC ref locals: each entry is a GC struct type index
     gc_ref_locals: List(int),
 
@@ -117,6 +120,7 @@ struct GenState {
             on_wasm_stack_skipped: 0,
             frame_size: 0,
             float_local_count: 0,
+            first_float_local: 999999,
             gc_ref_locals: gc_ref_locals,
             func_indices: null,
             string_offsets: null,
@@ -263,6 +267,14 @@ struct GenState {
                 self.getValue64(arg_idx)
                 if (self.value_to_local.contains(val_idx)) {
                     const local_idx = self.value_to_local.get(val_idx)
+                    // Reinterpret float↔i64 at phi boundaries when types differ
+                    const arg_v = self.ssa_func.getValue(arg_idx)
+                    if (isFloatType(arg_v.type_idx) and local_idx < self.first_float_local) {
+                        self.builder.append(As.i64_reinterpret_f64)
+                    }
+                    if (!isFloatType(arg_v.type_idx) and local_idx >= self.first_float_local and self.float_local_count > 0) {
+                        self.builder.append(As.f64_reinterpret_i64)
+                    }
                     self.builder.appendTo(As.local_set, constAddr(local_idx))
                 }
             }
@@ -307,6 +319,10 @@ struct GenState {
         if (self.value_to_local.contains(val_idx)) {
             const local_idx = self.value_to_local.get(val_idx)
             self.builder.appendFrom(As.local_get, constAddr(local_idx))
+            // If the local is f64 but the value is used in i64 context, reinterpret
+            if (local_idx >= self.first_float_local and self.float_local_count > 0 and !isFloatType(v.type_idx)) {
+                self.builder.append(As.i64_reinterpret_f64)
+            }
             return
         }
         // Generate on stack (on-demand values like comparisons)
@@ -320,6 +336,16 @@ struct GenState {
     fn setReg(val_idx: int) void {
         if (self.value_to_local.contains(val_idx)) {
             const local_idx = self.value_to_local.get(val_idx)
+            // If the value is float-typed but allocated as an i64 local (e.g., phi/copy
+            // of a float value with i64 type), reinterpret f64→i64 before storing.
+            // The local type boundary is: locals < first_float_local are i64.
+            const v = self.ssa_func.getValue(val_idx)
+            if (isFloatType(v.type_idx) and local_idx < self.first_float_local) {
+                self.builder.append(As.i64_reinterpret_f64)
+            }
+            if (!isFloatType(v.type_idx) and local_idx >= self.first_float_local and self.float_local_count > 0) {
+                self.builder.append(As.f64_reinterpret_i64)
+            }
             self.builder.appendTo(As.local_set, constAddr(local_idx))
         }
     }
@@ -2001,19 +2027,8 @@ struct GenState {
         if (v.uses == 0 and !hasSideEffects(v)) { return }
 
         // Skip compound type ops — no code generated
+        // Go: no case for OpSliceMake/OpStringMake in wasm/ssa.go
         if (v.op == SsaOp.string_make or v.op == SsaOp.slice_make) { return }
-
-        // Skip copy of compound ops — copyelim may leave copies whose source is
-        // string_make/slice_make. Follow copy chains to detect transitive copies.
-        if (v.op == SsaOp.copy and v.args.count > 0) {
-            var src = self.ssa_func.getValue(v.args.get(0))
-            var depth = 0
-            while (src.op == SsaOp.copy and src.args.count > 0 and depth < 10) {
-                src = self.ssa_func.getValue(src.args.get(0))
-                depth += 1
-            }
-            if (src.op == SsaOp.string_make or src.op == SsaOp.slice_make) { return }
-        }
 
         // Skip rematerializable values (generate on demand)
         if (isRematerializable(v)) { return }
@@ -2109,17 +2124,6 @@ struct GenState {
                 if (v.op == SsaOp.slice_make or v.op == SsaOp.string_make or
                     v.op == SsaOp.wasm_lowered_move or v.op == SsaOp.wasm_lowered_zero or
                     v.op == SsaOp.wasm_return_call) { continue }
-                // Skip copy of compound ops (no local needed — source has no local)
-                // Follow copy chains: copy → copy → string_make should also be skipped.
-                if (v.op == SsaOp.copy and v.args.count > 0) {
-                    var src = self.ssa_func.getValue(v.args.get(0))
-                    var depth = 0
-                    while (src.op == SsaOp.copy and src.args.count > 0 and depth < 10) {
-                        src = self.ssa_func.getValue(src.args.get(0))
-                        depth += 1
-                    }
-                    if (src.op == SsaOp.string_make or src.op == SsaOp.slice_make) { continue }
-                }
                 // Skip store ops
                 if (v.op == SsaOp.wasm_i64_store or v.op == SsaOp.wasm_i64_store8 or
                     v.op == SsaOp.wasm_i64_store16 or v.op == SsaOp.wasm_i64_store32 or
@@ -2129,6 +2133,9 @@ struct GenState {
                     v.op == SsaOp.wasm_gc_struct_set or
                     v.op == SsaOp.wasm_gc_array_set or v.op == SsaOp.wasm_gc_array_copy) { continue }
                 if (isFloatType(v.type_idx)) { continue }
+                // Also skip float ops by opcode — safety net for cases where
+                // type_idx may not match after optimization passes.
+                if (v.op == SsaOp.wasm_f64_load or v.op == SsaOp.wasm_f32_load) { continue }
                 if (v.op == SsaOp.wasm_gc_struct_new or
                     v.op == SsaOp.wasm_gc_array_new or v.op == SsaOp.wasm_gc_array_new_default or
                     v.op == SsaOp.wasm_gc_array_new_fixed or v.op == SsaOp.wasm_gc_array_new_data) { continue }
@@ -2167,6 +2174,7 @@ struct GenState {
             }
         }
         self.float_local_count = float_count
+        self.first_float_local = self.next_local - float_count
 
         // Pass 3: Allocate GC ref locals
         for bi in 0..self.ssa_func.blocks.count {
@@ -2224,10 +2232,22 @@ struct GenState {
     // ========================================================================
 
     fn computeUses() void {
+        // Zero all uses first (Zig reference: deadcode.zig recomputeUses)
+        // Without this, uses accumulate across passes, double-counting and
+        // preventing dead loads from being identified (uses artificially > 0).
+        var vi = 0
+        while (vi < self.ssa_func.next_value_id) {
+            var v = self.ssa_func.getValue(vi)
+            v.uses = 0
+            self.ssa_func.setValue(vi, v)
+            vi += 1
+        }
+
+        // Count uses from block values and controls
         for bi in 0..self.ssa_func.blocks.count {
             const blk = self.ssa_func.getBlock(bi)
-            for vi in 0..blk.values.count {
-                const val_idx = blk.values.get(vi)
+            for vii in 0..blk.values.count {
+                const val_idx = blk.values.get(vii)
                 const val = self.ssa_func.getValue(val_idx)
                 for ai in 0..val.args.count {
                     const arg_idx = val.args.get(ai)
