@@ -202,6 +202,18 @@ pub const CleanupStack = struct {
         return false;
     }
 
+    /// Find the cleanup handle for a local variable with an active scope_destroy or release cleanup.
+    /// Swift reference: CleanupManager traverses stack to find cleanup for forwarding.
+    /// Used by managedFromLowered to detect idents that own resources.
+    pub fn findCleanupForLocal(self: *const CleanupStack, local_idx: ir.LocalIdx) ?CleanupHandle {
+        for (self.items.items, 0..) |cleanup, i| {
+            if (cleanup.isActive() and cleanup.local_idx != null and cleanup.local_idx.? == local_idx) {
+                return .{ .index = @intCast(i) };
+            }
+        }
+        return null;
+    }
+
     /// Get number of active cleanups (for defer depth tracking).
     pub fn activeCount(self: *const CleanupStack) usize {
         var count: usize = 0;

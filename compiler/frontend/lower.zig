@@ -4393,12 +4393,31 @@ pub const Lowerer = struct {
     fn managedFromLowered(self: *Lowerer, value: ir.NodeIndex, ast_idx: NodeIndex, type_idx: TypeIndex) !arc.ManagedValue {
         const node = self.tree.getNode(ast_idx);
         const expr = if (node) |n| n.asExpr() else null;
-        const is_owned = if (expr) |e| (e == .new_expr or e == .call) else false;
-        if (is_owned and self.type_reg.couldBeARC(type_idx) and !self.target.isWasm()) {
-            const cleanup = arc.Cleanup.init(.release, value, type_idx);
-            const handle = try self.cleanup_stack.push(cleanup);
-            return arc.ManagedValue.forOwned(value, type_idx, handle);
+
+        if (self.type_reg.couldBeARC(type_idx) and !self.target.isWasm()) {
+            // +1 expressions: new_expr, call — caller owns the result
+            const is_owned = if (expr) |e| (e == .new_expr or e == .call) else false;
+            if (is_owned) {
+                const cleanup = arc.Cleanup.init(.release, value, type_idx);
+                const handle = try self.cleanup_stack.push(cleanup);
+                return arc.ManagedValue.forOwned(value, type_idx, handle);
+            }
+
+            // Ident referencing a local with active cleanup — forward ownership.
+            // Swift reference: SILGenLValue.cpp:3738-3763 (maybeEmitValueOfLocalVarDecl)
+            // ManagedValue.cpp:161-165 (forward deactivates cleanup before store)
+            if (expr) |e| {
+                if (e == .ident) {
+                    const fb = self.current_func orelse return arc.ManagedValue.forTrivial(value, type_idx);
+                    if (fb.lookupLocal(e.ident.name)) |local_idx| {
+                        if (self.cleanup_stack.findCleanupForLocal(local_idx)) |handle| {
+                            return arc.ManagedValue.forOwned(value, type_idx, handle);
+                        }
+                    }
+                }
+            }
         }
+
         return arc.ManagedValue.forTrivial(value, type_idx);
     }
 
@@ -4633,13 +4652,23 @@ pub const Lowerer = struct {
         const value = try self.lowerExprNode(idx);
         const type_idx = self.inferExprType(idx);
 
-        // +1 expressions: caller owns the result
-        if (expr == .new_expr or expr == .call) {
-            if (self.type_reg.couldBeARC(type_idx) and !self.target.isWasm()) {
-                // Register cleanup so scope exit releases it
+        if (self.type_reg.couldBeARC(type_idx) and !self.target.isWasm()) {
+            // +1 expressions: caller owns the result
+            if (expr == .new_expr or expr == .call) {
                 const cleanup = arc.Cleanup.init(.release, value, type_idx);
                 const handle = try self.cleanup_stack.push(cleanup);
                 return arc.ManagedValue.forOwned(value, type_idx, handle);
+            }
+
+            // Ident referencing a local with active cleanup — forward ownership.
+            // Swift reference: SILGenLValue.cpp:3738-3763 (maybeEmitValueOfLocalVarDecl)
+            if (expr == .ident) {
+                const fb = self.current_func orelse return arc.ManagedValue.forTrivial(value, type_idx);
+                if (fb.lookupLocal(expr.ident.name)) |local_idx| {
+                    if (self.cleanup_stack.findCleanupForLocal(local_idx)) |handle| {
+                        return arc.ManagedValue.forOwned(value, type_idx, handle);
+                    }
+                }
             }
         }
 
