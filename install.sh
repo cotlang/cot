@@ -62,7 +62,7 @@ else
     esac
     ZIG_ARCH="$ARCH_NAME"
 
-    ZIG_TARBALL="zig-${ZIG_OS}-${ZIG_ARCH}-${ZIG_VERSION}.tar.xz"
+    ZIG_TARBALL="zig-${ZIG_ARCH}-${ZIG_OS}-${ZIG_VERSION}.tar.xz"
     ZIG_URL="https://ziglang.org/download/${ZIG_VERSION}/${ZIG_TARBALL}"
     ZIG_DIR="$COT_DIR/zig"
 

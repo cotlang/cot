@@ -1,8 +1,9 @@
-// ELF64 Object File Writer for Linux AMD64
-// Reference: System V ABI AMD64 Architecture Processor Supplement
+// ELF64 Object File Writer for Linux
+// Reference: System V ABI AMD64/AArch64 Architecture Processor Supplement
 
 const std = @import("std");
 const dwarf = @import("dwarf.zig");
+const object_module = @import("object_module.zig");
 
 // ELF Constants
 pub const ELF_MAGIC = [4]u8{ 0x7F, 'E', 'L', 'F' };
@@ -14,6 +15,21 @@ pub const ELFOSABI_SYSV: u8 = 0;
 pub const ET_REL: u16 = 1;
 pub const ET_EXEC: u16 = 2;
 pub const EM_X86_64: u16 = 62;
+pub const EM_AARCH64: u16 = 183;
+
+// ARM64 ELF relocation types
+pub const R_AARCH64_CALL26: u32 = 283;
+pub const R_AARCH64_JUMP26: u32 = 282;
+pub const R_AARCH64_ADR_PREL_PG_HI21: u32 = 275;
+pub const R_AARCH64_ADD_ABS_LO12_NC: u32 = 277;
+pub const R_AARCH64_LDST64_ABS_LO12_NC: u32 = 286;
+pub const R_AARCH64_LDST32_ABS_LO12_NC: u32 = 285;
+pub const R_AARCH64_LDST16_ABS_LO12_NC: u32 = 284;
+pub const R_AARCH64_LDST8_ABS_LO12_NC: u32 = 278;
+pub const R_AARCH64_LDST128_ABS_LO12_NC: u32 = 299;
+pub const R_AARCH64_ADR_GOT_PAGE: u32 = 311;
+pub const R_AARCH64_LD64_GOT_LO12_NC: u32 = 312;
+pub const R_AARCH64_ABS64: u32 = 257;
 
 pub const SHT_NULL: u32 = 0;
 pub const SHT_PROGBITS: u32 = 1;
@@ -149,6 +165,7 @@ pub const StringLiteral = struct {
 
 pub const ElfWriter = struct {
     allocator: std.mem.Allocator,
+    target_arch: object_module.TargetArch = .x86_64,
     text_data: std.ArrayListUnmanaged(u8) = .{},
     data: std.ArrayListUnmanaged(u8) = .{},
     bss_size: u64 = 0, // Zero-fill section size (SHT_NOBITS, no disk space)
@@ -488,7 +505,12 @@ pub const ElfWriter = struct {
         const shdr_offset = offset;
 
         // Write ELF header
-        var ehdr = Elf64_Ehdr{ .e_shoff = shdr_offset, .e_shnum = num_sections, .e_shstrndx = SHIDX_SHSTRTAB };
+        var ehdr = Elf64_Ehdr{
+            .e_machine = if (self.target_arch == .aarch64) EM_AARCH64 else EM_X86_64,
+            .e_shoff = shdr_offset,
+            .e_shnum = num_sections,
+            .e_shstrndx = SHIDX_SHSTRTAB,
+        };
         try writer.writeAll(std.mem.asBytes(&ehdr));
 
         // Write sections

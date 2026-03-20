@@ -585,6 +585,7 @@ pub const ObjectModule = struct {
     /// Write ELF format object file.
     fn writeELF(self: *Self, writer: anytype) !void {
         var elf_writer = elf.ElfWriter.init(self.allocator);
+        elf_writer.target_arch = self.target_arch;
         defer elf_writer.deinit();
 
         // Add code section
@@ -701,7 +702,20 @@ fn elfRelocType(reloc: Reloc, arch: TargetArch) u32 {
             .X86CallPCRel4, .X86CallPLTRel4 => elf.R_X86_64_PLT32,
             else => elf.R_X86_64_PC32,
         },
-        .aarch64 => elf.R_X86_64_PC32, // ARM64 ELF uses different constants
+        .aarch64 => switch (reloc) {
+            .Arm64Call => elf.R_AARCH64_CALL26,
+            .Aarch64AdrPrelPgHi21, .Aarch64AdrPrel21 => elf.R_AARCH64_ADR_PREL_PG_HI21,
+            .Aarch64AddAbsLo12Nc => elf.R_AARCH64_ADD_ABS_LO12_NC,
+            .Aarch64Ldst64AbsLo12Nc => elf.R_AARCH64_LDST64_ABS_LO12_NC,
+            .Aarch64Ldst32AbsLo12Nc => elf.R_AARCH64_LDST32_ABS_LO12_NC,
+            .Aarch64Ldst16AbsLo12Nc => elf.R_AARCH64_LDST16_ABS_LO12_NC,
+            .Aarch64Ldst8AbsLo12Nc => elf.R_AARCH64_LDST8_ABS_LO12_NC,
+            .Aarch64Ldst128AbsLo12Nc => elf.R_AARCH64_LDST128_ABS_LO12_NC,
+            .Arm64AdrGotPage21 => elf.R_AARCH64_ADR_GOT_PAGE,
+            .Arm64Ld64GotLo12Nc => elf.R_AARCH64_LD64_GOT_LO12_NC,
+            .Abs8 => elf.R_AARCH64_ABS64,
+            else => elf.R_AARCH64_ABS64,
+        },
     };
 }
 

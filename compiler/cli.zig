@@ -481,7 +481,7 @@ fn parseTarget(arg: []const u8, args: *std.process.ArgIterator) ?Target {
     if (std.mem.startsWith(u8, arg, "--target=")) {
         const val = arg[9..];
         return Target.parse(val) orelse {
-            std.debug.print("Error: Unknown target '{s}'. Use: wasm32, wasm32-wasi, arm64-macos, amd64-linux\n", .{val});
+            std.debug.print("Error: Unknown target '{s}'. Use: wasm32, wasm32-wasi, arm64-macos, arm64-linux, amd64-linux\n", .{val});
             return null;
         };
     }
@@ -491,7 +491,7 @@ fn parseTarget(arg: []const u8, args: *std.process.ArgIterator) ?Target {
             return null;
         };
         return Target.parse(val) orelse {
-            std.debug.print("Error: Unknown target '{s}'. Use: wasm32, wasm32-wasi, arm64-macos, amd64-linux\n", .{val});
+            std.debug.print("Error: Unknown target '{s}'. Use: wasm32, wasm32-wasi, arm64-macos, arm64-linux, amd64-linux\n", .{val});
             return null;
         };
     }
@@ -584,7 +584,7 @@ fn printUsage() void {
         \\
         \\Flags:
         \\  -o <name>       Output name (default: input filename without .cot)
-        \\  --target=<t>    Target: native, wasm32, wasm32-wasi, arm64-macos, amd64-linux
+        \\  --target=<t>    Target: native, wasm32, wasm32-wasi, arm64-macos, arm64-linux, amd64-linux
         \\
     , .{version_short});
 }
@@ -597,7 +597,7 @@ fn printBuildHelp() void {
         \\
         \\Flags:
         \\  -o <name>       Output name (default: input filename without .cot)
-        \\  --target=<t>    Target: wasm32, wasm32-wasi, arm64-macos, amd64-linux
+        \\  --target=<t>    Target: wasm32, wasm32-wasi, arm64-macos, arm64-linux, amd64-linux
         \\  --watch, -w     Recompile on file changes
         \\
         \\Examples:
@@ -617,7 +617,7 @@ fn printRunHelp() void {
         \\temporary directory and cleaned up after execution.
         \\
         \\Flags:
-        \\  --target=<t>    Target: arm64-macos, amd64-linux, wasm32 (via wasmtime)
+        \\  --target=<t>    Target: arm64-macos, arm64-linux, amd64-linux, wasm32 (via wasmtime)
         \\  --watch, -w     Recompile and rerun on file changes
         \\  -- args...      Arguments passed to the program
         \\
@@ -637,7 +637,7 @@ fn printTestHelp() void {
         \\Compile and run a Cot source file in test mode.
         \\
         \\Flags:
-        \\  --target=<t>    Target: arm64-macos, amd64-linux, wasm32
+        \\  --target=<t>    Target: arm64-macos, arm64-linux, amd64-linux, wasm32
         \\  --filter=<str>  Only run tests whose name contains <str>
         \\  --fail-fast, -x Stop after first test failure
         \\  --verbose, -v   Show detailed test output
@@ -660,7 +660,7 @@ fn printBenchHelp() void {
         \\Uses Go-style adaptive calibration to target ~1s per benchmark.
         \\
         \\Flags:
-        \\  --target=<t>    Target: arm64-macos, amd64-linux
+        \\  --target=<t>    Target: arm64-macos, arm64-linux, amd64-linux
         \\  --filter=<str>  Only run benchmarks whose name contains <str>
         \\  --n=<count>     Fixed iteration count (skip auto-calibration)
         \\
@@ -680,7 +680,7 @@ fn printCheckHelp() void {
         \\for catching type errors during development.
         \\
         \\Flags:
-        \\  --target=<t>    Target: wasm32, arm64-macos, amd64-linux
+        \\  --target=<t>    Target: wasm32, arm64-macos, arm64-linux, amd64-linux
         \\
         \\Examples:
         \\  cot check app.cot                   Type-check app.cot
@@ -696,7 +696,7 @@ fn printLintHelp() void {
         \\Check a Cot source file for common issues.
         \\
         \\Flags:
-        \\  --target=<t>    Target: wasm32, arm64-macos, amd64-linux
+        \\  --target=<t>    Target: wasm32, arm64-macos, arm64-linux, amd64-linux
         \\
         \\Rules:
         \\  W001  Unused variable        Local variable defined but never used
