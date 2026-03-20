@@ -1437,6 +1437,12 @@ struct SSABuilder {
         const value = self.convertNode(p.value)
         if (ptr_val == null_value or value == null_value) { return null_value }
         const value_type_idx = self.func.getValue(value).type_idx
+
+        // String/slice compound store: decompose into ptr@0, len@8
+        if (self.isStringOrSlice(value_type_idx)) {
+            return self.emitStringSliceStore(ptr_val, value)
+        }
+
         return self.emitStoreOp(ptr_val, value)
     }
 
@@ -1527,6 +1533,21 @@ struct SSABuilder {
         const value = self.convertNode(p.value)
         if (ptr_val == null_value or value == null_value) { return null_value }
         const off_val = self.emitOffPtr(ptr_val, p.offset)
+
+        // String/slice compound store: decompose into ptr@0, len@8
+        // Zig ref: ssa_builder.zig convertStoreField lines 1639-1672
+        const value_type_idx = self.func.getValue(value).type_idx
+        if (self.isStringOrSlice(value_type_idx)) {
+            return self.emitStringSliceStore(off_val, value)
+        }
+
+        // Large struct/tuple/union: use bulk move
+        const type_size = self.type_reg.sizeOf(value_type_idx)
+        const value_type = self.type_reg.get(value_type_idx)
+        if (((value_type.tag == TAG_STRUCT or value_type.tag == TAG_TUPLE or value_type.tag == TAG_UNION) and type_size > 8) or self.isCompoundOptional(value_type_idx)) {
+            return self.emitMove(off_val, value, type_size, p.value)
+        }
+
         return self.emitStoreOp(off_val, value)
     }
 
