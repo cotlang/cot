@@ -360,7 +360,10 @@ fn generateAllFunctions(linker: *Linker, ir: IR, types: *TypeRegistry, func_indi
 fn generateAndAddFunc(linker: *Linker, ir_func: Func, ir: IR, types: *TypeRegistry, func_indices: *Map(string, int), string_offsets: *Map(string, int), func_table_indices: *Map(string, int)) void {
     // Build SSA from IR
     var builder = SSABuilder.init(ir_func, ir.globals, types)
-    const ssa_func = builder.build()
+    var ssa_func = builder.build()
+
+    // Record the function's return type so gen can use it for compound returns
+    ssa_func.type_idx = ir_func.return_type
 
     // Run Wasm-specific SSA passes (Go pass order)
     // Zig reference: driver.zig lines 6158-6167

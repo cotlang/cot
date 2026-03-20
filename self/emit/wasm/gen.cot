@@ -243,6 +243,12 @@ struct GenState {
                         self.getValue64(ret_val_idx)
                         self.builder.appendFrom(As.i64_const, constAddr(0))
                     }
+                } else if (self.ssa_func.type_idx == STRING) {
+                    // Function returns STRING but control is not string_make/copy.
+                    // This can happen when passes (copyelim/CSE) replace the control.
+                    // Push the value as ptr, then push i64.const 0 as len fallback.
+                    self.getValue64(ret_val_idx)
+                    self.builder.appendFrom(As.i64_const, constAddr(0))
                 } else {
                     // Non-compound scalar return
                     self.getValue64(ret_val_idx)
@@ -2135,6 +2141,7 @@ struct GenState {
         // Compute use counts (self-hosted SSA doesn't auto-track)
         self.computeUses()
 
+
         // Allocate locals for values (3-pass: i64, f64, GC ref)
         self.allocateLocals()
 
@@ -2225,26 +2232,49 @@ struct GenState {
         // return_call is a terminator — doesn't leave value on stack
         if (v.op == SsaOp.wasm_return_call) { return }
 
-        // Store ops consume values and produce nothing — don't setReg
+        // Store ops and bulk memory ops consume values and produce nothing — don't setReg
         if (v.op == SsaOp.wasm_i64_store or v.op == SsaOp.wasm_i64_store8 or
             v.op == SsaOp.wasm_i64_store16 or v.op == SsaOp.wasm_i64_store32 or
             v.op == SsaOp.wasm_i32_store or v.op == SsaOp.wasm_i32_store8 or
             v.op == SsaOp.wasm_i32_store16 or
             v.op == SsaOp.wasm_f64_store or v.op == SsaOp.wasm_f32_store or
             v.op == SsaOp.wasm_gc_struct_set or
-            v.op == SsaOp.wasm_gc_array_set or v.op == SsaOp.wasm_gc_array_copy) { return }
+            v.op == SsaOp.wasm_gc_array_set or v.op == SsaOp.wasm_gc_array_copy or
+            v.op == SsaOp.wasm_lowered_move or v.op == SsaOp.wasm_lowered_zero) { return }
+
+        // Nil check and bounds check produce no value — don't setReg
+        if (v.op == SsaOp.wasm_lowered_nil_check or v.op == SsaOp.bounds_check) { return }
+
+        // Retain/release are side-effect only — don't setReg
+        if (v.op == SsaOp.wasm_lowered_retain or v.op == SsaOp.wasm_lowered_release) { return }
+
+        // wasm_global_set, wasm_nop, wasm_drop, wasm_return — no value produced
+        if (v.op == SsaOp.wasm_global_set or v.op == SsaOp.wasm_nop) { return }
+
+        // init_mem, fwd_ref — no value produced
+        if (v.op == SsaOp.init_mem or v.op == SsaOp.fwd_ref) { return }
 
         // Compound return handling: calls returning string push 2 values
         const is_call = v.op == SsaOp.wasm_call or v.op == SsaOp.wasm_lowered_static_call
         const is_compound_ret = is_call and v.type_idx == STRING
         if (is_compound_ret) {
             // Stack: [ptr, len] — store len first (top of stack), then ptr
+            // Len local is pre-allocated in allocateLocals Pass 1.
+            // Fallback: allocate on the fly (shouldn't happen if allocateLocals ran).
             if (self.compound_len_locals.contains(val_idx)) {
                 const len_local = self.compound_len_locals.get(val_idx)
                 self.builder.appendTo(As.local_set, constAddr(len_local))
+            } else {
+                const fallback_len = self.next_local
+                self.next_local += 1
+                self.compound_len_locals.set(val_idx, fallback_len)
+                self.builder.appendTo(As.local_set, constAddr(fallback_len))
             }
             if (v.uses > 0) {
                 self.setReg(val_idx)
+            } else {
+                // uses == 0: drop the ptr still on stack
+                self.builder.append(As.drop)
             }
         } else if (v.uses > 0) {
             self.setReg(val_idx)
@@ -2421,6 +2451,29 @@ struct GenState {
                 var ctrl_val = self.ssa_func.getValue(ctrl_idx)
                 ctrl_val.uses += 1
                 self.ssa_func.setValue(ctrl_idx, ctrl_val)
+                // Also count uses from control value's args — control values
+                // may not be in block.values (e.g. string_make used as return control
+                // but removed from block.values by deadcode after copyelim).
+                for cai in 0..ctrl_val.args.count {
+                    const ctrl_arg = ctrl_val.args.get(cai)
+                    if (ctrl_arg < 0 or ctrl_arg >= self.ssa_func.values.count) { continue }
+                    var ca_val = self.ssa_func.getValue(ctrl_arg)
+                    ca_val.uses += 1
+                    self.ssa_func.setValue(ctrl_arg, ca_val)
+                }
+                // Transitively also count control args' args' uses (2 levels)
+                for cai in 0..ctrl_val.args.count {
+                    const ctrl_arg = ctrl_val.args.get(cai)
+                    if (ctrl_arg < 0 or ctrl_arg >= self.ssa_func.values.count) { continue }
+                    const ca_val2 = self.ssa_func.getValue(ctrl_arg)
+                    for cai2 in 0..ca_val2.args.count {
+                        const ca2 = ca_val2.args.get(cai2)
+                        if (ca2 < 0 or ca2 >= self.ssa_func.values.count) { continue }
+                        var ca2_val = self.ssa_func.getValue(ca2)
+                        ca2_val.uses += 1
+                        self.ssa_func.setValue(ca2, ca2_val)
+                    }
+                }
             }
         }
     }

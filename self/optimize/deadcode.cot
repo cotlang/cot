@@ -116,7 +116,10 @@ fn recomputeUses(func: *SsaFunc) void {
             }
             bvi += 1
         }
-        // Also count control value uses
+        // Also count control value uses AND their args' uses.
+        // Control values (e.g. string_make as return control) may not be in
+        // block.values but their args still need uses counted so they aren't
+        // wrongly removed as dead.
         var ci = 0
         while (ci < blk.controls.count) {
             const ctrl_idx = blk.controls.get(ci)
@@ -124,6 +127,17 @@ fn recomputeUses(func: *SsaFunc) void {
                 var ctrl_val = func.getValue(ctrl_idx)
                 ctrl_val.uses += 1
                 func.setValue(ctrl_idx, ctrl_val)
+                // Count uses from control value's args
+                var cai = 0
+                while (cai < ctrl_val.args.count) {
+                    const ctrl_arg = ctrl_val.args.get(cai)
+                    if (ctrl_arg >= 0 and ctrl_arg < total) {
+                        var ca_val = func.getValue(ctrl_arg)
+                        ca_val.uses += 1
+                        func.setValue(ctrl_arg, ca_val)
+                    }
+                    cai += 1
+                }
             }
             ci += 1
         }
