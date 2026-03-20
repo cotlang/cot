@@ -15,7 +15,10 @@ import "../../build/ir"
 import "../../check/types"
 import "../../build/ssa"
 import "../../build/builder"
+import "../../optimize/copyelim"
 import "../../optimize/decompose"
+import "../../optimize/cse"
+import "../../optimize/deadcode"
 import "../../optimize/schedule"
 import "../../optimize/layout"
 import "lower"
@@ -360,9 +363,14 @@ fn generateAndAddFunc(linker: *Linker, ir_func: Func, ir: IR, types: *TypeRegist
     const ssa_func = builder.build()
 
     // Run Wasm-specific SSA passes (Go pass order)
+    // Zig reference: driver.zig lines 6158-6167
+    copyelim(ssa_func)
     passRewriteGeneric(ssa_func, string_offsets)
     decompose(ssa_func)
     passRewriteDec(ssa_func)
+    copyelim(ssa_func)
+    // cse(ssa_func)
+    // deadcode(ssa_func)
     schedule(ssa_func)
     layout(ssa_func)
     lower(ssa_func)

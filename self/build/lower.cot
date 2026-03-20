@@ -2348,13 +2348,20 @@ struct Lowerer {
         const right_ptr = fb.emitFieldLocal(right_local, 0, 0, I64, bin.span)
         const right_len = fb.emitFieldLocal(right_local, 1, 8, I64, bin.span)
 
-        // Call string_concat(left_ptr, left_len, right_ptr, right_len)
+        // Call string_concat(left_ptr, left_len, right_ptr, right_len) → new_ptr (I64)
+        // Zig reference: lower.zig lines 4893-4900 — returns I64, wraps with string_header
         var args: List(int) = .{}
         args.append(left_ptr)
         args.append(left_len)
         args.append(right_ptr)
         args.append(right_len)
-        return fb.emitCall("string_concat", args, false, STRING, bin.span)
+        const new_ptr = fb.emitCall("string_concat", args, false, I64, bin.span)
+
+        // Compute new_len = left_len + right_len
+        const new_len = fb.emitBinary(BinaryOp.add, left_len, right_len, I64, bin.span)
+
+        // Create string_header(new_ptr, new_len) — produces string_make in SSA
+        return fb.emit(Node.init(Data.string_header(StringHeader { ptr: new_ptr, len: new_len }), STRING, bin.span))
     }
 
     /// String comparison: decompose strings, call string_eq runtime

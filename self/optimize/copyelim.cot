@@ -11,8 +11,60 @@ import "std/list"
 import "../build/ssa"
 
 /// Combined copy + phi elimination pass.
+/// Zig reference: compiler/ssa/passes/copyelim.zig copyelim()
 fn copyelim(func: *SsaFunc) void {
     phielim(func)
+}
+
+/// Follow a copy chain to its ultimate source.
+/// Simple approach without path compression — avoids ARC issues with in-place
+/// arg mutation. Uses a step limit to prevent infinite loops in unreachable code.
+fn followCopyChain(func: *SsaFunc, val_idx: int) int {
+    var cur = val_idx
+    var steps = 0
+    while (steps < 1000) {
+        const v = func.getValue(cur)
+        if (v.op != SsaOp.copy or v.args.count == 0) { return cur }
+        cur = v.args.get(0)
+        steps += 1
+    }
+    return cur
+}
+
+/// Replace copy args in a value with their ultimate sources.
+/// Rebuilds args list to avoid in-place mutation of shared List backing arrays.
+fn replaceCopyArgs(func: *SsaFunc, val_idx: int) void {
+    var val = func.getValue(val_idx)
+    if (val.args.count == 0) { return }
+
+    var any_changed = false
+    var ai = 0
+    while (ai < val.args.count) {
+        const arg = val.args.get(ai)
+        const arg_val = func.getValue(arg)
+        if (arg_val.op == SsaOp.copy) {
+            any_changed = true
+            break
+        }
+        ai += 1
+    }
+    if (!any_changed) { return }
+
+    // Build new args list with copies resolved
+    var new_args: List(int) = .{}
+    ai = 0
+    while (ai < val.args.count) {
+        const arg = val.args.get(ai)
+        const arg_val = func.getValue(arg)
+        if (arg_val.op == SsaOp.copy) {
+            new_args.append(followCopyChain(func, arg))
+        } else {
+            new_args.append(arg)
+        }
+        ai += 1
+    }
+    val.args = new_args
+    func.setValue(val_idx, val)
 }
 
 /// Phi elimination: convert redundant phis to copies.

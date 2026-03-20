@@ -1980,6 +1980,13 @@ struct GenState {
         // Skip compound type ops — no code generated
         if (v.op == SsaOp.string_make or v.op == SsaOp.slice_make) { return }
 
+        // Skip copy of compound ops — copyelim may leave copies whose source is
+        // string_make/slice_make. These produce no Wasm code (no local allocated).
+        if (v.op == SsaOp.copy and v.args.count > 0) {
+            const src = self.ssa_func.getValue(v.args.get(0))
+            if (src.op == SsaOp.string_make or src.op == SsaOp.slice_make) { return }
+        }
+
         // Skip rematerializable values (generate on demand)
         if (isRematerializable(v)) { return }
 
@@ -2074,6 +2081,11 @@ struct GenState {
                 if (v.op == SsaOp.slice_make or v.op == SsaOp.string_make or
                     v.op == SsaOp.wasm_lowered_move or v.op == SsaOp.wasm_lowered_zero or
                     v.op == SsaOp.wasm_return_call) { continue }
+                // Skip copy of compound ops (no local needed — source has no local)
+                if (v.op == SsaOp.copy and v.args.count > 0) {
+                    const copy_src = self.ssa_func.getValue(v.args.get(0))
+                    if (copy_src.op == SsaOp.string_make or copy_src.op == SsaOp.slice_make) { continue }
+                }
                 // Skip store ops
                 if (v.op == SsaOp.wasm_i64_store or v.op == SsaOp.wasm_i64_store8 or
                     v.op == SsaOp.wasm_i64_store16 or v.op == SsaOp.wasm_i64_store32 or
