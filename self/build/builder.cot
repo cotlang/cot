@@ -1422,6 +1422,13 @@ struct SSABuilder {
     fn convertPtrLoad(ptr_local: int, type_idx: int) int {
         const ptr_val = self.variable(ptr_local, type_idx)
         if (ptr_val == null_value) { return null_value }
+
+        // String/slice compound load: load ptr@0 and len@8, create string_make/slice_make
+        // Must match convertPtrLoadValue behavior for compound types.
+        if (self.isStringOrSlice(type_idx)) {
+            return self.emitStringSliceLoad(ptr_val, type_idx)
+        }
+
         return self.emitNewValueWithArg(self.getLoadOp(type_idx), type_idx, ptr_val)
     }
 
