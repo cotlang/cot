@@ -119,6 +119,10 @@ fn generateWasmCode(ir: IR, types: *TypeRegistry, opts: CompileOptions) List(int
     // Generate code for each function
     generateAllFunctions(&linker, ir, types, &func_indices, &string_offsets, &func_table_indices, rt.runtime_func_count)
 
+    // Add _start wrapper for WASI compatibility (wasmtime expects _start, not main).
+    // Zig reference: driver.zig lines 6381-6408
+    addStartWrapper(&linker, &func_indices, ir, types)
+
     return linker.emit()
 }
 
@@ -134,7 +138,11 @@ fn addAllRuntimeFunctions(linker: *Linker, heap_ptr_global: int, opts: CompileOp
     const ws = addWasiRuntime(linker, opts.is_wasi)
     const mem = addMemRuntime(linker, heap_ptr_global)
     const sl = addSliceRuntime(linker, heap_ptr_global)
-    const pr = addPrintRuntime(linker)
+    var wasi_write_override: int = -1
+    if (opts.is_wasi) {
+        wasi_write_override = ws.fd_write_simple_idx
+    }
+    const pr = addPrintRuntime(linker, wasi_write_override)
     const tf = addTestRuntime(linker, pr.write_idx, pr.eprint_int_idx, ws.time_idx)
     const bf = addBenchRuntime(linker, pr.write_idx, pr.eprint_int_idx, ws.time_idx, opts.bench_n)
 
@@ -458,6 +466,55 @@ fn buildFuncResults(results: *List(int), ir_func: Func, types: *TypeRegistry) vo
         // All values stored as i64 (Go's all-i64 approach) — no f64 returns
         results.append(VT_I64)
     }
+}
+
+// ============================================================================
+// _start wrapper — WASI compatibility
+// Zig reference: driver.zig lines 6381-6408
+// ============================================================================
+
+/// Add _start function that calls main and drops its return value (if any).
+/// WASI requires _start as the entry point; wasmtime won't run main directly.
+fn addStartWrapper(linker: *Linker, func_indices: *Map(string, int), ir: IR, types: *TypeRegistry) void {
+    // Find main function — may be qualified as "module.main"
+    var main_name: string = ""
+    var main_returns_value = false
+    var i = 0
+    while (i < ir.funcs.count) {
+        const f = ir.funcs.get(i)
+        if (f.name == "main" or endsWith(f.name, ".main")) {
+            main_name = f.name
+            if (f.return_type != VOID) {
+                main_returns_value = true
+            }
+        }
+        i += 1
+    }
+    if (main_name == "") { return }
+    const main_idx = func_indices.get(main_name)
+
+    // _start: () -> void
+    var params: List(int) = .{}
+    var results: List(int) = .{}
+    const start_type = linker.addType(params, results)
+
+    // Build body manually: [0x00 (no locals), call opcode, ULEB128(main_idx), maybe drop, end]
+    var body: List(int) = .{}
+    body.append(0x00) // 0 local declarations
+    body.append(0x10) // call opcode
+    // Encode main_idx as unsigned LEB128
+    var idx = main_idx
+    while (idx >= 128) {
+        body.append((idx & 0x7F) | 0x80)
+        idx = idx >> 7
+    }
+    body.append(idx & 0x7F)
+    if (main_returns_value) {
+        body.append(0x1A) // drop opcode
+    }
+    body.append(0x0B) // end opcode
+
+    linker.addFunc(WasmFunc.init("_start", start_type, body, true))
 }
 
 // ============================================================================

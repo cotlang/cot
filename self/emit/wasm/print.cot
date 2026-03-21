@@ -4,7 +4,7 @@
 /// Go reference: runtime/print.go
 ///
 /// Seven functions:
-///   write(fd, ptr, len) -> i64              — write syscall stub
+///   write(fd, ptr, len) -> i64              — forwards to fd_write_simple (WASI) or stub (native)
 ///   print_int(value) -> void                — format i64 to decimal, stdout
 ///   eprint_int(value) -> void               — format i64 to decimal, stderr
 ///   int_to_string(value, buf_ptr) -> i64    — format i64 to caller buffer
@@ -43,7 +43,8 @@ struct PrintFunctions {
 
 /// Add all print runtime functions to linker.
 /// Zig reference: print_runtime.addToLinker()
-fn addPrintRuntime(linker: *Linker) PrintFunctions {
+/// wasi_write_idx: index of fd_write_simple (WASI shim), or -1 for stub mode.
+fn addPrintRuntime(linker: *Linker, wasi_write_idx: int) PrintFunctions {
     // write: (fd: i64, ptr: i64, len: i64) -> i64
     var params_3i64: List(int) = .{}
     params_3i64.append(VT_I64)
@@ -52,7 +53,12 @@ fn addPrintRuntime(linker: *Linker) PrintFunctions {
     var results_i64: List(int) = .{}
     results_i64.append(VT_I64)
     const write_type = linker.addType(params_3i64, results_i64)
-    const write_body = generateWriteStubBody()
+    var write_body: List(int) = .{}
+    if (wasi_write_idx >= 0) {
+        write_body = generateWriteForwardBody(wasi_write_idx)
+    } else {
+        write_body = generateWriteStubBody()
+    }
     const write_idx = linker.addFunc(WasmFunc.init(WRITE_NAME, write_type, write_body, true))
 
     // print_int: (value: i64) -> void
@@ -106,6 +112,20 @@ fn addPrintRuntime(linker: *Linker) PrintFunctions {
 fn generateWriteStubBody() List(int) {
     var code = CodeBuilder.init()
     code.emitI64Const(0)
+    return code.finish()
+}
+
+// ============================================================================
+// write forward — forwards (fd, ptr, len) to WASI fd_write_simple
+// Zig reference: print_runtime.generateWriteForwardBody()
+// ============================================================================
+
+fn generateWriteForwardBody(wasi_write_idx: int) List(int) {
+    var code = CodeBuilder.init()
+    code.emitLocalGet(0)  // fd
+    code.emitLocalGet(1)  // ptr
+    code.emitLocalGet(2)  // len
+    code.emitCall(wasi_write_idx)
     return code.finish()
 }
 
@@ -430,6 +450,51 @@ fn generatePrintFloatBody(write_func_idx: int, fd: int) List(int) {
     code.emitLocalSet(3)
     code.emitEnd()
 
+    // Check infinity: f_val == +inf
+    // Zig reference: print_runtime.generatePrintFloatBody() — infinity check
+    code.emitLocalGet(3)
+    code.emitF64ConstBits(0x7FF0000000000000) // +infinity
+    code.emitF64Eq()
+    code.emitIf(BLOCK_VOID)
+    // Store "Infinity" byte-by-byte: I=73, n=110, f=102, i=105, n=110, i=105, t=116, y=121
+    code.emitLocalGet(1)
+    code.emitI64Const(73)
+    code.emitI64Store8(0, 0)
+    code.emitLocalGet(1)
+    code.emitI64Const(110)
+    code.emitI64Store8(0, 1)
+    code.emitLocalGet(1)
+    code.emitI64Const(102)
+    code.emitI64Store8(0, 2)
+    code.emitLocalGet(1)
+    code.emitI64Const(105)
+    code.emitI64Store8(0, 3)
+    code.emitLocalGet(1)
+    code.emitI64Const(110)
+    code.emitI64Store8(0, 4)
+    code.emitLocalGet(1)
+    code.emitI64Const(105)
+    code.emitI64Store8(0, 5)
+    code.emitLocalGet(1)
+    code.emitI64Const(116)
+    code.emitI64Store8(0, 6)
+    code.emitLocalGet(1)
+    code.emitI64Const(121)
+    code.emitI64Store8(0, 7)
+    // write(fd, buf, 8)
+    code.emitI64Const(fd)
+    code.emitLocalGet(1)
+    code.emitI64ExtendI32U()
+    code.emitI64Const(8)
+    code.emitCall(write_func_idx)
+    code.emitDrop()
+    code.emitLocalGet(1)
+    code.emitI32Const(32)
+    code.emitI32Add()
+    code.emitGlobalSet(0)
+    code.emitReturn()
+    code.emitEnd()
+
     // Integer part: int_part = i64.trunc_f64_s(f_val)
     code.emitLocalGet(3)
     code.emitF64Trunc()
@@ -673,6 +738,66 @@ fn generateFloatToStringBody() List(int) {
     code.emitLocalSet(3)
     code.emitEnd()
 
+    // Check infinity: f_val == +inf
+    // Zig reference: print_runtime.generateFloatToStringBody() — infinity check
+    code.emitLocalGet(3)
+    code.emitF64ConstBits(0x7FF0000000000000) // +infinity
+    code.emitF64Eq()
+    code.emitIf(BLOCK_VOID)
+    // Store "Infinity" byte-by-byte at buf[pos..pos+8]
+    code.emitLocalGet(2)
+    code.emitLocalGet(6)
+    code.emitI32Add()
+    code.emitI64Const(73) // 'I'
+    code.emitI64Store8(0, 0)
+    code.emitLocalGet(2)
+    code.emitLocalGet(6)
+    code.emitI32Add()
+    code.emitI64Const(110) // 'n'
+    code.emitI64Store8(0, 1)
+    code.emitLocalGet(2)
+    code.emitLocalGet(6)
+    code.emitI32Add()
+    code.emitI64Const(102) // 'f'
+    code.emitI64Store8(0, 2)
+    code.emitLocalGet(2)
+    code.emitLocalGet(6)
+    code.emitI32Add()
+    code.emitI64Const(105) // 'i'
+    code.emitI64Store8(0, 3)
+    code.emitLocalGet(2)
+    code.emitLocalGet(6)
+    code.emitI32Add()
+    code.emitI64Const(110) // 'n'
+    code.emitI64Store8(0, 4)
+    code.emitLocalGet(2)
+    code.emitLocalGet(6)
+    code.emitI32Add()
+    code.emitI64Const(105) // 'i'
+    code.emitI64Store8(0, 5)
+    code.emitLocalGet(2)
+    code.emitLocalGet(6)
+    code.emitI32Add()
+    code.emitI64Const(116) // 't'
+    code.emitI64Store8(0, 6)
+    code.emitLocalGet(2)
+    code.emitLocalGet(6)
+    code.emitI32Add()
+    code.emitI64Const(121) // 'y'
+    code.emitI64Store8(0, 7)
+    // Restore scratch SP
+    code.emitLocalGet(7)
+    code.emitI32Const(24)
+    code.emitI32Add()
+    code.emitGlobalSet(0)
+    // Return pos + 8
+    code.emitLocalGet(6)
+    code.emitI32Const(8)
+    code.emitI32Add()
+    code.emitI64ExtendI32U()
+    code.emitReturn()
+    code.emitEnd()
+
     // Integer part
     code.emitLocalGet(3)
     code.emitF64Trunc()
@@ -896,9 +1021,15 @@ test "generateFloatToStringBody produces valid bytecode" {
     @assertEq(body.get(body.count - 1), 0x0B)
 }
 
+test "generateWriteForwardBody produces valid bytecode" {
+    const body = generateWriteForwardBody(42)
+    @assert(body.count >= 2)
+    @assertEq(body.get(body.count - 1), 0x0B)
+}
+
 test "addPrintRuntime registers all 7 functions" {
     var linker = Linker.init()
-    const funcs = addPrintRuntime(&linker)
+    const funcs = addPrintRuntime(&linker, -1)
     @assert(funcs.write_idx >= 0)
     @assert(funcs.print_int_idx >= 0)
     @assert(funcs.eprint_int_idx >= 0)
