@@ -168,17 +168,17 @@ struct GenState {
 
         if (blk.kind == SsaBlockKind.plain or blk.kind == SsaBlockKind.first or blk.kind == SsaBlockKind.defer_) {
             // Go: BlockPlain, BlockDefer (lines 171-174)
-            // Always emit explicit branch. Fall-through optimization is disabled
-            // because the dispatch loop's br_table resume_point structure doesn't
-            // support it with index-based block references. The Zig compiler can
-            // use fall-through because it uses *Block pointers that survive reorder.
+            // Zig ref: gen.zig lines 187-193
             if (blk.succs.count > 0) {
                 const succ_edge = blk.succs.get(0)
                 const succ_bi = succ_edge.block
-                self.br(succ_bi)
+                if (!has_next or next_bi != succ_bi) {
+                    self.br(succ_bi)
+                }
             }
         } else if (blk.kind == SsaBlockKind.if_) {
             // Go: BlockIf (lines 176-198)
+            // Zig ref: gen.zig lines 197-224
             if (blk.succs.count < 2) { return }
 
             const succ0_bi = blk.succs.get(0).block  // true branch
@@ -188,12 +188,24 @@ struct GenState {
                 self.getValue32(blk.controls.get(0))
             }
 
-            // Always emit both branches explicitly (no fall-through).
-            // See plain block comment above for rationale.
-            self.builder.append(As.@"if")
-            self.br(succ0_bi)
-            self.builder.append(As.end)
-            self.br(succ1_bi)
+            if (has_next and next_bi == succ0_bi) {
+                // if false, jump to succ1 (Go: lines 178-184)
+                self.builder.append(As.i32_eqz)
+                self.builder.append(As.@"if")
+                self.br(succ1_bi)
+                self.builder.append(As.end)
+            } else if (has_next and next_bi == succ1_bi) {
+                // if true, jump to succ0 (Go: lines 185-190)
+                self.builder.append(As.@"if")
+                self.br(succ0_bi)
+                self.builder.append(As.end)
+            } else {
+                // neither is next (Go: lines 191-197)
+                self.builder.append(As.@"if")
+                self.br(succ0_bi)
+                self.builder.append(As.end)
+                self.br(succ1_bi)
+            }
         } else if (blk.kind == SsaBlockKind.ret) {
             // Go: BlockRet (lines 200-201)
             // Zig ref: gen.zig lines 228-252
