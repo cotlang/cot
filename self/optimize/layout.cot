@@ -143,17 +143,15 @@ fn layout(func: *SsaFunc) void {
         if (!found) { break }
     }
 
-    // Replace func.blocks with new order
-    var new_blocks: List(SsaBlock) = .{}
-    for oi in 0..order.count {
-        new_blocks.append(func.getBlock(order.get(oi)))
-    }
-    func.blocks = new_blocks
+    // Store layout order without physically reordering blocks.
+    // Zig physically reorders + uses *Block pointers in edges (stable).
+    // Cot uses indices in edges — physical reorder invalidates them.
+    // Instead, gen iterates block_order to emit in layout order.
+    func.block_order = order
 
     // Free per-function temporaries
     scheduled.free()
     indegree.free()
-    order.free()
     zerodegree.free()
     succs_list.free()
     is_exit.free()

@@ -377,6 +377,9 @@ struct SsaFunc {
     string_literals: List(string),
     is_export: bool,
     constants: Map(int, int),    // constant value → value index (dedup)
+    block_order: List(int),      // layout order: block indices to iterate in gen
+                                 // Zig uses *Block pointers; we use indices + separate order list
+                                 // because Cot indices are invalidated by physical reordering.
 
     static fn init(name: string) SsaFunc {
         var blocks: List(SsaBlock) = .{}
@@ -385,6 +388,7 @@ struct SsaFunc {
         var local_offsets: List(int) = .{}
         var string_literals: List(string) = .{}
         var constants: Map(int, int) = .{}
+        var block_order: List(int) = .{}
         return SsaFunc {
             name: name,
             type_idx: 0,
@@ -398,6 +402,7 @@ struct SsaFunc {
             string_literals: string_literals,
             is_export: false,
             constants: constants,
+            block_order: block_order,
         }
     }
 
@@ -490,6 +495,7 @@ struct SsaFunc {
         self.local_offsets.free()
         self.string_literals.free()
         self.constants.free()
+        self.block_order.free()
     }
 }
 

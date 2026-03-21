@@ -18,7 +18,7 @@ const VT_I64: int = 0x7E
 // WASI scratch memory addresses
 const SCRATCH_BASE: int = 0xE0000
 const SCRATCH_NWRITTEN: int = 0xE0008
-const SCRATCH_RESULT: int = 0xE000C
+const SCRATCH_RESULT: int = 0xE0010  // Must match Zig compiler's wasi_runtime.zig: 8-byte aligned for i64 stores
 const SCRATCH_ARGV: int = 0xE1000
 const SCRATCH_ARGV_BUF: int = 0xE2000
 const SCRATCH_ENVIRON: int = 0xE4000
