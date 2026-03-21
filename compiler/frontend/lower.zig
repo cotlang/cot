@@ -1837,10 +1837,19 @@ pub const Lowerer = struct {
                 const sret_idx = fb.lookupLocal("__sret").?;
                 const sret_ptr = try fb.emitLoadLocal(sret_idx, TypeRegistry.I64, ret.span);
 
+                // Swift ensurePlusOne for SRET: retain ARC fields before copy.
+                // The SRET copy creates aliases of managed pointers in the caller's buffer.
+                // Without retain, the source local's cleanup releases the fields, leaving
+                // the caller with dangling pointers.
                 const ret_expr = if (ret_node) |n| n.asExpr() else null;
                 if (ret_expr != null and ret_expr.? == .ident) {
                     // Direct local reference → copy fields from local to SRET
                     if (fb.lookupLocal(ret_expr.?.ident.name)) |src_local| {
+                        // Retain ARC fields before copy (Swift ensurePlusOne)
+                        if (!self.target.isWasm() and self.type_reg.couldBeARC(sret_type)) {
+                            const src_val = try fb.emitLoadLocal(src_local, sret_type, ret.span);
+                            _ = try self.emitCopyValue(fb, src_val, sret_type, ret.span);
+                        }
                         for (0..num_words) |i| {
                             const offset: i64 = @intCast(i * 8);
                             const field = try fb.emitFieldLocal(src_local, @intCast(i), offset, TypeRegistry.I64, ret.span);
@@ -3337,7 +3346,7 @@ pub const Lowerer = struct {
                         const fld_info = self.type_reg.get(field.type_idx);
                         if (fld_info == .optional and !self.isPtrLikeOptional(field.type_idx)) {
                             try self.storeCompoundOptField(fb, local_idx, field_idx, field_offset, value_node, rhs_ast, span);
-                        } else if (self.type_reg.get(field.type_idx) == .pointer and self.type_reg.get(field.type_idx).pointer.managed and !self.target.isWasm() and self.cleanup_stack.hasCleanupForLocal(local_idx)) {
+                        } else if (self.type_reg.get(field.type_idx) == .pointer and self.type_reg.get(field.type_idx).pointer.managed and !self.target.isWasm()) {
                             // Swift store [assign]: copy +0 → store → destroy old. +1 forwarded.
                             const old_val = try fb.emitFieldLocal(local_idx, field_idx, field_offset, field.type_idx, span);
                             var managed = try self.managedFromLowered(value_node, rhs_ast, field.type_idx);
