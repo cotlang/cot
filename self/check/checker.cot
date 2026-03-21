@@ -12,6 +12,7 @@ import "std/sys"
 import "../parse/ast"
 import "errors"
 import "types"
+import "comptime"
 import "../parse/token"
 import "../parse/scanner"
 import "../parse/parser"
@@ -4894,6 +4895,208 @@ struct Checker {
         if (tag == "comptime_block") { return self.evalConstComptimeBlock(idx) }
         if (tag == "block_expr") { return self.evalConstBlockExpr(idx) }
         return (0, 0)
+    }
+
+    /// Rich comptime value evaluation — returns ?ComptimeValue (all types, not just int).
+    /// Port of Zig checker.zig:859-1141 (evalComptimeValue).
+    /// Handles: literal, unary, binary, paren, ident, builtin_call, if_expr,
+    /// block_expr, comptime_block, field_access, index.
+    fn evalComptimeValue(idx: int) ?ComptimeValue {
+        if (idx == null_node) { return null }
+        const tag = nodeTag(self.ast, idx)
+
+        // Literal: int, float, string, bool, undefined
+        if (tag == "literal") {
+            var kind = 0
+            var val_str = ""
+            switch (self.ast.getNode(idx)) { Node.expr |e| => switch (e) { Expr.literal |lit| => { kind = lit.kind; val_str = lit.value }, else => {} }, else => {} }
+            if (kind == LiteralKind.@"int") { return ComptimeValue.makeInt(parseInt(val_str)) }
+            if (kind == LiteralKind.true_lit) { return ComptimeValue.makeBool(true) }
+            if (kind == LiteralKind.false_lit) { return ComptimeValue.makeBool(false) }
+            if (kind == LiteralKind.@"string") {
+                // Strip quotes: "foo" → foo (matches Zig checker.zig:866-868)
+                if (@lenOf(val_str) >= 2 and charAt(val_str, 0) == 34 and charAt(val_str, @lenOf(val_str) - 1) == 34) {
+                    return ComptimeValue.makeString(substring(val_str, 1, @lenOf(val_str) - 1))
+                }
+                return ComptimeValue.makeString(val_str)
+            }
+            if (kind == LiteralKind.undefined_lit) { return ComptimeValue.makeUndefined() }
+            return null
+        }
+
+        // Unary: negation, bitwise-not, logical-not
+        if (tag == "unary") {
+            var op = 0
+            var operand_idx = null_node
+            switch (self.ast.getNode(idx)) { Node.expr |e| => switch (e) { Expr.unary |u| => { op = u.op; operand_idx = u.operand }, else => {} }, else => {} }
+            const inner = self.evalComptimeValue(operand_idx) orelse return null
+            if (inner.asInt()) |v| {
+                if (op == Token.sub) { return ComptimeValue.makeInt(0 - v) }
+                if (op == Token.@"not") { return ComptimeValue.makeInt(~v) }
+                if (op == Token.lnot) { return ComptimeValue.makeInt(if (v == 0) { 1 } else { 0 }) }
+            }
+            if (inner.tag == CV_BOOL) {
+                if (op == Token.lnot) { return ComptimeValue.makeBool(!inner.bool_val) }
+            }
+            return null
+        }
+
+        // Binary: int arithmetic/comparison, string equality
+        if (tag == "binary") {
+            var op = 0
+            var left_n = null_node
+            var right_n = null_node
+            switch (self.ast.getNode(idx)) { Node.expr |e| => switch (e) { Expr.binary |b| => { op = b.op; left_n = b.left; right_n = b.right }, else => {} }, else => {} }
+            const l = self.evalComptimeValue(left_n) orelse return null
+            const r = self.evalComptimeValue(right_n) orelse return null
+            // Int-int binary
+            if (l.asInt()) |li| {
+                if (r.asInt()) |ri| {
+                    if (op == Token.add) { return ComptimeValue.makeInt(li + ri) }
+                    if (op == Token.sub) { return ComptimeValue.makeInt(li - ri) }
+                    if (op == Token.mul) { return ComptimeValue.makeInt(li * ri) }
+                    if (op == Token.quo and ri != 0) { return ComptimeValue.makeInt(li / ri) }
+                    if (op == Token.rem and ri != 0) { return ComptimeValue.makeInt(li % ri) }
+                    if (op == Token.@"and") { return ComptimeValue.makeInt(li & ri) }
+                    if (op == Token.@"or") { return ComptimeValue.makeInt(li | ri) }
+                    if (op == Token.xor) { return ComptimeValue.makeInt(li ^ ri) }
+                    if (op == Token.shl) { return ComptimeValue.makeInt(li << ri) }
+                    if (op == Token.shr) { return ComptimeValue.makeInt(li >> ri) }
+                    if (op == Token.eql) { return ComptimeValue.makeInt(if (li == ri) { 1 } else { 0 }) }
+                    if (op == Token.neq) { return ComptimeValue.makeInt(if (li != ri) { 1 } else { 0 }) }
+                    if (op == Token.lss) { return ComptimeValue.makeInt(if (li < ri) { 1 } else { 0 }) }
+                    if (op == Token.leq) { return ComptimeValue.makeInt(if (li <= ri) { 1 } else { 0 }) }
+                    if (op == Token.gtr) { return ComptimeValue.makeInt(if (li > ri) { 1 } else { 0 }) }
+                    if (op == Token.geq) { return ComptimeValue.makeInt(if (li >= ri) { 1 } else { 0 }) }
+                }
+            }
+            // String-string equality
+            if (l.asString()) |ls| {
+                if (r.asString()) |rs| {
+                    if (op == Token.eql) { return ComptimeValue.makeInt(if (ls == rs) { 1 } else { 0 }) }
+                    if (op == Token.neq) { return ComptimeValue.makeInt(if (ls != rs) { 1 } else { 0 }) }
+                }
+            }
+            return null
+        }
+
+        // Paren: delegate to inner
+        if (tag == "paren") {
+            var inner_n = null_node
+            switch (self.ast.getNode(idx)) { Node.expr |e| => switch (e) { Expr.paren |p| => { inner_n = p.inner }, else => {} }, else => {} }
+            return self.evalComptimeValue(inner_n)
+        }
+
+        // Ident: check comptime_vars, then const symbols
+        if (tag == "ident") {
+            var name = ""
+            switch (self.ast.getNode(idx)) { Node.expr |e| => switch (e) { Expr.ident |id| => { name = id.name }, else => {} }, else => {} }
+            // Check comptime mutable vars first (Phase 2: inline for bindings)
+            if (self.in_comptime and self.comptime_vars.contains(name)) {
+                return ComptimeValue.makeInt(self.comptime_vars.get(name))
+            }
+            // Fall back to const symbol lookup
+            if (self.scope.lookup(name)) |sym| {
+                if (sym.is_const_val) { return ComptimeValue.makeInt(sym.const_value) }
+                // float_const_value stores f64 bits as int — reinterpret
+                if (sym.float_const_value != 0) { return ComptimeValue.makeFloat(@bitCast(f64, sym.float_const_value)) }
+            }
+            return null
+        }
+
+        // Builtin call: @sizeOf, @enumLen, etc.
+        if (tag == "builtin_call") {
+            var bk = 0
+            var type_arg_n = null_node
+            var bc_args: List(int) = .{}
+            switch (self.ast.getNode(idx)) { Node.expr |e| => switch (e) { Expr.builtin_call |bc| => { bk = bc.kind; type_arg_n = bc.type_arg; bc_args = bc.args }, else => {} }, else => {} }
+            if (bk == BuiltinKind.size_of and type_arg_n != null_node) {
+                const type_idx = self.resolveTypeExpr(type_arg_n)
+                if (type_idx != invalid_type) { return ComptimeValue.makeInt(self.types.sizeOf(type_idx)) }
+            }
+            if (bk == BuiltinKind.enum_len and type_arg_n != null_node) {
+                const type_idx = self.resolveTypeExpr(type_arg_n)
+                if (type_idx != invalid_type) {
+                    const t = self.types.get(type_idx)
+                    if (t.tag == TAG_ENUM) {
+                        const et = switch (t) { Type.enum_type |e| => e, else => EnumType { name: "", variant_count: 0, variants: 0, backing_type: 0 } }
+                        return ComptimeValue.makeInt(et.variant_count)
+                    }
+                }
+            }
+            if (bk == BuiltinKind.int_from_enum and bc_args.count > 0) {
+                const cv = self.evalConstExpr(bc_args.get(0))
+                if (cv.0 != 0) { return ComptimeValue.makeInt(cv.1) }
+            }
+            return null
+        }
+
+        // If expression: comptime condition evaluation
+        if (tag == "if_expr") {
+            var cond_n = null_node
+            var then_n = null_node
+            var else_n = null_node
+            switch (self.ast.getNode(idx)) { Node.expr |e| => switch (e) { Expr.if_expr |ie| => { cond_n = ie.condition; then_n = ie.then_branch; else_n = ie.else_branch }, else => {} }, else => {} }
+            const cond_val = (self.evalComptimeValue(cond_n) orelse return null).asInt() orelse return null
+            if (cond_val != 0) { return self.evalComptimeValue(then_n) }
+            if (else_n != null_node) { return self.evalComptimeValue(else_n) }
+            return null
+        }
+
+        // Block expression: delegate or evalComptimeBlock for multi-statement blocks
+        if (tag == "block_expr") {
+            var blk_stmts: List(int) = .{}
+            var result_expr = null_node
+            switch (self.ast.getNode(idx)) { Node.expr |e| => switch (e) { Expr.block_expr |blk| => { blk_stmts = blk.stmts; result_expr = blk.result_expr }, else => {} }, else => {} }
+            if (blk_stmts.count == 0) { return self.evalComptimeValue(result_expr) }
+            return null
+        }
+
+        // Comptime block: push context, evaluate body
+        if (tag == "comptime_block") {
+            var body_n = null_node
+            switch (self.ast.getNode(idx)) { Node.expr |e| => switch (e) { Expr.comptime_block |cb| => { body_n = cb.body }, else => {} }, else => {} }
+            return self.evalComptimeValue(body_n)
+        }
+
+        // Field access: resolve on comptime values
+        if (tag == "field_access") {
+            var base_n = null_node
+            var field_name = ""
+            switch (self.ast.getNode(idx)) { Node.expr |e| => switch (e) { Expr.field_access |fa| => { base_n = fa.base; field_name = fa.field }, else => {} }, else => {} }
+            const base_val = self.evalComptimeValue(base_n) orelse return null
+            if (base_val.tag == CV_TYPE_INFO) {
+                if (field_name == "fields") {
+                    return ComptimeValue.makeArray(base_val.type_info.fields, "EnumField")
+                }
+                if (field_name == "name") { return ComptimeValue.makeString(base_val.type_info.name) }
+            }
+            if (base_val.tag == CV_ENUM_FIELD) {
+                if (field_name == "name") { return ComptimeValue.makeString(base_val.enum_field.name) }
+                if (field_name == "value") { return ComptimeValue.makeInt(base_val.enum_field.value) }
+            }
+            if (base_val.tag == CV_ARRAY) {
+                if (field_name == "len") { return ComptimeValue.makeInt(base_val.array.elements.count) }
+            }
+            return null
+        }
+
+        // Index: comptime array element access
+        if (tag == "index_expr") {
+            var base_n = null_node
+            var idx_n = null_node
+            switch (self.ast.getNode(idx)) { Node.expr |e| => switch (e) { Expr.index_expr |ix| => { base_n = ix.base; idx_n = ix.idx }, else => {} }, else => {} }
+            const base_val = self.evalComptimeValue(base_n) orelse return null
+            const idx_val = (self.evalComptimeValue(idx_n) orelse return null).asInt() orelse return null
+            if (base_val.tag == CV_ARRAY) {
+                if (idx_val >= 0 and idx_val < base_val.array.elements.count) {
+                    return base_val.array.elements.get(idx_val)
+                }
+            }
+            return null
+        }
+
+        return null
     }
 
     /// Evaluate a comptime float expression. Returns (ok, value).

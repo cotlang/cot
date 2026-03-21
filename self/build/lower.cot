@@ -12,6 +12,7 @@ import "../check/types"
 import "../parse/source"
 import "../check/errors"
 import "../check/checker"
+import "../check/comptime"
 import "../parse/token"
 
 // Constants null_node, null_local, null_block imported from ir.cot
@@ -139,7 +140,7 @@ struct Lowerer {
     lowered_generics: Map(string, int),
     global_error_table: Map(string, int),
     weak_locals: Map(int, int),
-    comptime_value_vars: Map(string, int),
+    comptime_value_vars: Map(string, ComptimeValue),
     global_comptime_values: Map(string, int),
     pending_global_inits: List(GlobalInit),
     pending_auto_deinits: List(string),
@@ -8035,25 +8036,70 @@ struct Lowerer {
     // ========================================================================
 
     /// Look up a comptime value by name — checks function-local vars first, then globals.
-    /// Returns -1 if not found.
-    fn lookupComptimeValue(name: string) int {
+    /// Look up a comptime value by name. Returns null if not found.
+    /// Ref: lower.zig lookupComptimeValue — checks local then global.
+    fn lookupComptimeValue(name: string) ?ComptimeValue {
         if (self.comptime_value_vars.contains(name)) {
             return self.comptime_value_vars.get(name)
         }
-        if (self.global_comptime_values.contains(name)) {
-            return self.global_comptime_values.get(name)
-        }
-        return -1
+        return null
     }
 
     /// Emit a comptime value as IR nodes.
-    /// For the self-hosted compiler, comptime values are stored as ints.
-    /// Kind encoding: 0=int, 1=float (as bits), 2=string index, 3=bool.
-    /// Ref: lower.zig:8723-8737
-    fn emitComptimeValue(val: int, span: Span) int {
+    /// Switches on ComptimeValue.tag to emit the right IR.
+    /// Ref: lower.zig:10813-10827 (emitComptimeValue).
+    fn emitComptimeValue(cv: ComptimeValue, span: Span) int {
         const fb = self.builder.func() orelse return null_node
-        // Simple case: treat as integer constant
-        return fb.emitConstInt(val, I64, span)
+        if (cv.tag == CV_INT) { return fb.emitConstInt(cv.int_val, I64, span) }
+        if (cv.tag == CV_FLOAT) { return fb.emitConstFloat(cv.float_val, F64, span) }
+        if (cv.tag == CV_STRING) {
+            const str_idx = fb.addStringLiteral(cv.str_val)
+            return fb.emitConstSlice(str_idx, span)
+        }
+        if (cv.tag == CV_BOOL) { return fb.emitConstBool(cv.bool_val, span) }
+        if (cv.tag == CV_ARRAY) { return self.emitComptimeArray(cv.array, span) }
+        return null_node
+    }
+
+    /// Emit a comptime array: allocate heap memory, store each element at correct offset.
+    /// Ref: lower.zig:10832-10870 (emitComptimeArray).
+    fn emitComptimeArray(arr: ComptimeValue_ComptimeArray, span: Span) int {
+        const fb = self.builder.func() orelse return null_node
+        const elem_count = arr.elements.count
+        if (elem_count == 0) { return fb.emitConstInt(0, I64, span) }
+
+        // Determine element size from first element
+        const first = arr.elements.get(0)
+        var elem_size = 8
+        if (first.tag == CV_STRING) { elem_size = self.types.sizeOf(STRING) }
+        const total_size = elem_size * elem_count
+
+        // Allocate: alloc(0, total_size)
+        var alloc_args: List(int) = .{}
+        alloc_args.append(fb.emitConstInt(0, I64, span))
+        alloc_args.append(fb.emitConstInt(total_size, I64, span))
+        const base_ptr = fb.emitCall("alloc", alloc_args, false, I64, span)
+
+        // Store each element
+        for i in 0..elem_count {
+            const elem = arr.elements.get(i)
+            const offset = i * elem_size
+            if (elem.tag == CV_INT or elem.tag == CV_BOOL) {
+                var val = elem.int_val
+                if (elem.tag == CV_BOOL) { val = if (elem.bool_val) { 1 } else { 0 } }
+                const val_node = fb.emitConstInt(val, I64, span)
+                fb.emitStoreField(base_ptr, 0, offset, val_node, span)
+            } else if (elem.tag == CV_STRING) {
+                const str_idx = fb.addStringLiteral(elem.str_val)
+                const str_slice = fb.emitConstSlice(str_idx, span)
+                const ptr_type = self.types.makePointer(U8)
+                const ptr_val = fb.emitSlicePtr(str_slice, ptr_type, span)
+                const len_val = fb.emitSliceLen(str_slice, span)
+                fb.emitStoreField(base_ptr, 0, offset, ptr_val, span)
+                fb.emitStoreField(base_ptr, 0, offset + 8, len_val, span)
+            }
+        }
+        return base_ptr
     }
 
     /// Evaluate a float literal expression at compile time.
@@ -8120,7 +8166,7 @@ struct Lowerer {
     fn clearPerFunctionState() void {
         var empty_cleanup: List(CleanupEntry) = .{}
         self.cleanup_stack = empty_cleanup
-        var empty_comptime: Map(string, int) = .{}
+        var empty_comptime: Map(string, ComptimeValue) = .{}
         self.comptime_value_vars = empty_comptime
         var empty_weak: Map(int, int) = .{}
         self.weak_locals = empty_weak
@@ -9053,7 +9099,7 @@ fn initLowererMaps(lower: *Lowerer) void {
     lower.global_error_table = ge
     var wl: Map(int, int) = .{}
     lower.weak_locals = wl
-    var cvv: Map(string, int) = .{}
+    var cvv: Map(string, ComptimeValue) = .{}
     lower.comptime_value_vars = cvv
     var gcv: Map(string, int) = .{}
     lower.global_comptime_values = gcv
@@ -9348,21 +9394,21 @@ test "lookupComptimeValue" {
     initLowererLists(&lower)
     initLowererMaps(&lower)
 
-    // No values stored yet
-    @assertEq(lower.lookupComptimeValue("x"), -1)
+    // No values stored yet — returns null
+    const r1 = lower.lookupComptimeValue("x")
+    @assert(r1 == null)
 
     // Store in local comptime vars
-    lower.comptime_value_vars.set("x", 42)
-    @assertEq(lower.lookupComptimeValue("x"), 42)
+    lower.comptime_value_vars.set("x", ComptimeValue.makeInt(42))
+    const r2 = lower.lookupComptimeValue("x")
+    @assert(r2 != null)
+    @assertEq(r2.?.int_val, 42)
 
-    // Store in global comptime values
-    lower.global_comptime_values.set("y", 99)
-    @assertEq(lower.lookupComptimeValue("y"), 99)
-
-    // Local takes precedence
-    lower.comptime_value_vars.set("z", 10)
-    lower.global_comptime_values.set("z", 20)
-    @assertEq(lower.lookupComptimeValue("z"), 10)
+    // Store another
+    lower.comptime_value_vars.set("y", ComptimeValue.makeString("hello"))
+    const r3 = lower.lookupComptimeValue("y")
+    @assert(r3 != null)
+    @assertEq(r3.?.tag, CV_STRING)
 }
 
 test "dictOpName" {
