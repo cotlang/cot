@@ -1,8 +1,10 @@
 # ARC Swift Parity — Deep Investigation
 
 **Date:** 2026-03-21
-**Status:** In Progress
-**Root cause:** `@arcRetain` is a no-op for structs containing managed pointers
+**Status:** Core bugs fixed, calling convention pending
+**Root causes found and fixed:**
+1. `couldBeARC` didn't handle structs with managed pointer fields
+2. Call results were treated as +1 without matching callee-side retain
 
 ---
 
