@@ -4667,11 +4667,11 @@ pub const Lowerer = struct {
         const value = try self.lowerExprNode(idx);
         const type_idx = self.inferExprType(idx);
 
-        // +1 expressions: only `new` creates a new owned reference.
-        // Regular function calls returning *T are +0 (borrowed) — the callee
-        // doesn't transfer ownership. Swift convention: only init/alloc/copy are +1.
-        // Previously `.call` was included here, causing spurious release() on
-        // pointers returned by cast functions like getWorkspacePtr(@intToPtr).
+        // +1 expressions: only new_expr. Call results are +0 (unretained).
+        // Swift convention is +1 for all non-trivial returns, but Swift callees
+        // emit retain before return (symmetric). Cot callees DON'T retain before
+        // return, so the caller must NOT release. When Cot adds the full Swift
+        // calling convention (callee retains → caller releases), add .call here.
         if (expr == .new_expr) {
             if (self.type_reg.couldBeARC(type_idx) and !self.target.isWasm()) {
                 const cleanup = arc.Cleanup.init(.release, value, type_idx);
