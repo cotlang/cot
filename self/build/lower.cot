@@ -3123,7 +3123,18 @@ struct Lowerer {
             } else if (self.isLargeCompound(param_type_idx)) {
                 self.decomposeCompoundArg(&args, arg_node, param_type_idx, c.span)
             } else {
-                args.append(arg_node)
+                // Fallback: if param type unknown (VOID), check arg type
+                // Zig ref: lower.zig:8440 — decomposes large struct/union args at call site
+                if (param_type_idx == VOID) {
+                    const arg_type_idx = self.inferExprType(arg_idx)
+                    if (self.isLargeCompound(arg_type_idx)) {
+                        self.decomposeCompoundArg(&args, arg_node, arg_type_idx, c.span)
+                    } else {
+                        args.append(arg_node)
+                    }
+                } else {
+                    args.append(arg_node)
+                }
             }
         }
 
@@ -3275,7 +3286,16 @@ struct Lowerer {
             } else if (self.isLargeCompound(param_type_idx)) {
                 self.decomposeCompoundArg(&args, arg_node, param_type_idx, call.span)
             } else {
-                args.append(arg_node)
+                if (param_type_idx == VOID) {
+                    const arg_type_idx = self.inferExprType(arg_idx)
+                    if (self.isLargeCompound(arg_type_idx)) {
+                        self.decomposeCompoundArg(&args, arg_node, arg_type_idx, call.span)
+                    } else {
+                        args.append(arg_node)
+                    }
+                } else {
+                    args.append(arg_node)
+                }
             }
         }
 
@@ -7653,63 +7673,9 @@ struct Lowerer {
         const param_names = inst.type_param_names
         self.parseAndPushTypeSubs(type_args, param_names)
 
-        // Shape stenciling: check if this instantiation can share code
-        // Parse type args as integers for shape analysis
-        const parsed_type_args = self.parseTypeArgsStr(inst.type_args_str)
-        var stencil_result = STENCIL_NOT_STENCILABLE
-        if (parsed_type_args.count > 0) {
-            // Check shape analysis cache, or compute and cache
-            if (self.shape_analysis_cache.getOrNull(inst.generic_node)) |cached| {
-                stencil_result = cached
-            } else {
-                stencil_result = self.analyzeStencilability(fn_d.body, parsed_type_args)
-                self.shape_analysis_cache.set(inst.generic_node, stencil_result)
-            }
-
-            if (stencil_result != STENCIL_NOT_STENCILABLE) {
-                // Build shape key: "List_append$s8in" (base name + shape suffix)
-                const paren_pos = indexOf(concrete_name, "(")
-                const base_part = if (paren_pos >= 0) { substring(concrete_name, 0, paren_pos) } else { concrete_name }
-                var method_suffix = ""
-                if (paren_pos >= 0) {
-                    const close_pos = indexOf(concrete_name, ")")
-                    if (close_pos >= 0 and close_pos + 1 < concrete_name.len) {
-                        method_suffix = substring(concrete_name, close_pos + 1, concrete_name.len)
-                    }
-                }
-                var shape_key = base_part ++ method_suffix ++ "$"
-                for ti in 0..parsed_type_args.count {
-                    if (ti > 0) { shape_key = shape_key ++ "_" }
-                    const shape = self.types.shapeOf(parsed_type_args.get(ti))
-                    shape_key = shape_key ++ shape.key()
-                }
-
-                if (self.shape_stencils.getOrNull(shape_key)) |existing_stencil| {
-                    // Already stenciled for this shape — alias, skip lowering
-                    self.shape_aliases.set(concrete_name, existing_stencil)
-                    if (stencil_result == STENCIL_DICT) {
-                        self.generateDictHelpers(parsed_type_args, self.stencil_dict_entries)
-                        self.buildDictArgNames(inst, self.stencil_dict_entries)
-                    }
-                    // Restore and return — skip lowering entirely
-                    self.chk.type_sub_keys.count = saved_sub_count
-                    self.chk.type_sub_vals.count = saved_sub_count
-                    self.tree = saved_tree
-                    return
-                }
-
-                // First instance for this shape — record as the stencil
-                self.shape_stencils.set(shape_key, concrete_name)
-                if (stencil_result == STENCIL_DICT) {
-                    self.buildDictArgNames(inst, self.stencil_dict_entries)
-                }
-            }
-        }
-
-        // Generate dict helper functions BEFORE starting the function body
-        if (stencil_result == STENCIL_DICT) {
-            self.generateDictHelpers(parsed_type_args, self.stencil_dict_entries)
-        }
+        // Shape stenciling DISABLED — selfcot's Wasm linker doesn't support
+        // shape aliases yet. Every generic instance is lowered fully.
+        // TODO: Re-enable when func_indices resolves aliases at link time.
 
         // Go pattern: use expr_types preserved from Phase 2 instead of re-checking.
         // This eliminates checkFnDeclBody during lowering, avoiding stack overflow.
@@ -7747,18 +7713,7 @@ struct Lowerer {
                 fb.addParam("__sret", I64, 8)
             }
 
-            // Dict-stenciled functions: add extra fn-ptr params BEFORE regular params
-            if (stencil_result == STENCIL_DICT) {
-                self.current_dict_entries.count = 0
-                self.current_dict_params.count = 0
-                for di in 0..self.stencil_dict_entries.count {
-                    const param_name = "__dict_" ++ intToString(di)
-                    const dict_local = fb.addParam(param_name, I64, 8)
-                    self.current_dict_entries.append(self.stencil_dict_entries.get(di))
-                    self.current_dict_params.append(dict_local)
-                }
-                self.has_dict_context = true
-            }
+            // Dict-stenciled functions disabled (shape stenciling off)
 
             // Add params
             for pi in 0..fn_d.params.count {
