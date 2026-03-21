@@ -601,7 +601,6 @@ struct Lowerer {
             }
 
             if (fn_decl.body != null_node) {
-                eprintln("[lower] lmwn: lowerBlockNode")
                 self.lowerBlockNode(fn_decl.body)
 
                 if (is_destructor) {
@@ -7772,18 +7771,10 @@ struct Lowerer {
                     else => {},
                 }, else => {} }
                 var param_type = self.resolveTypeNode(ptype_expr)
-                // Skip safeWrapType for substituted type parameters
-                var is_substituted = false
-                if (self.chk.hasTypeSubstitution() and ptype_expr != null_node) {
-                    switch (self.tree.getNode(ptype_expr)) { Node.expr |e| => switch (e) {
-                        Expr.ident |id| => {
-                            if (self.chk.lookupTypeSub(id.name) >= 0) {
-                                is_substituted = true
-                            }
-                        },
-                        else => {},
-                    }, else => {} }
-                }
+                // Skip safeWrapType for substituted type parameters.
+                // Mirror checker isSubstitutedTypeParam: check both Expr.ident
+                // and Expr.type_expr with TYPE_NAMED kind (Zig ref: lower.zig:9179-9182).
+                const is_substituted = self.chk.isSubstitutedTypeParam(ptype_expr)
                 if (!is_substituted) { param_type = self.chk.safeWrapType(param_type) }
                 fb.addParam(pname, param_type, self.types.sizeOf(param_type))
             }
