@@ -10,6 +10,8 @@
 
 **Timeouts:** Nothing in this project takes more than a few seconds. If a command doesn't return in 3-5 seconds, it's an infinite loop — kill it immediately. Use `perl -e 'alarm 3; exec @ARGV'` or `timeout 3` wrappers. Never set timeouts above 15s for test runs.
 
+**ALWAYS rebuild before testing.** After ANY edit to `self/`, run `./zig-out/bin/cot build self/main.cot -o /tmp/selfcot` and WAIT for it to finish BEFORE running `/tmp/selfcot`. Never test with a stale binary — this has wasted hours of debugging non-existent bugs. Chain commands: `./zig-out/bin/cot build self/main.cot -o /tmp/selfcot && /tmp/selfcot test ...`
+
 ---
 
 ## 🚨🚨🚨 `self/` MUST MATCH ZIG COMPILER 1:1 🚨🚨🚨
