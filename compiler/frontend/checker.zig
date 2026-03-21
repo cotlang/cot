@@ -2934,7 +2934,8 @@ pub const Checker = struct {
         const then_type = try self.checkExpr(ie.then_branch);
         if (ie.else_branch != null_node) {
             const else_type = try self.checkExpr(ie.else_branch);
-            if (!self.types.equal(then_type, else_type)) self.err.errorWithCode(ie.span.start, .e300, "if branches have different types");
+            if (!self.types.equal(then_type, else_type) and !self.types.isAssignable(else_type, then_type) and !self.types.isAssignable(then_type, else_type))
+                self.err.errorWithCode(ie.span.start, .e300, "if branches have different types");
             return then_type;
         }
         return TypeRegistry.VOID;
