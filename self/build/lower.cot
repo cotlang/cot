@@ -2489,6 +2489,29 @@ struct Lowerer {
             }
         }
 
+        // Union: .tag pseudo-field, payload extraction, or variant tag
+        // Zig reference: lower.zig lines 5368-5403
+        if (type_info.tag == TAG_UNION) {
+            // .tag pseudo-field returns the tag value (offset 0)
+            if (fa.field == "tag") {
+                // Try to access from local if base is an ident
+                if (self.extractIdentName(fa.base)) |base_name| {
+                    if (fb.lookupLocal(base_name)) |local_idx| {
+                        return fb.emitFieldLocal(local_idx, 0, 0, I64, fa.span)
+                    }
+                }
+                const base = self.lowerExprNode(fa.base)
+                if (base == null_node) { return null_node }
+                // Store to temp, extract tag at offset 0
+                const union_size = self.types.sizeOf(base_type)
+                const tmp = fb.addLocalWithSize("__union_tag", base_type, false, union_size)
+                fb.emitStoreLocal(tmp, base, fa.span)
+                return fb.emitFieldLocal(tmp, 0, 0, I64, fa.span)
+            }
+            // Variant payload extraction and variant tag creation handled by
+            // switch-case lowering, not field access. Fall through to fallback.
+        }
+
         // Enum variant constant (Color.Red → integer value)
         if (type_info.tag == TAG_ENUM) {
             const variant_val = self.findEnumVariant(base_type, fa.field)

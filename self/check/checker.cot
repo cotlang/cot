@@ -3851,7 +3851,6 @@ struct Checker {
         }
         const type_idx = self.types.lookupByName(name)
 
-
         if (type_idx >= 0) { return type_idx }
         const type_suggestion = self.findSimilarType(name)
         if (type_suggestion) |ts| {
@@ -4102,36 +4101,39 @@ struct Checker {
 
     /// Build cache key for generic deduplication: "List(5)" or "Pair(5;17)"
     fn buildGenericCacheKey(name: string, type_args: List(int)) string {
-        var result = "${name}("
+        var result = name ++ "("
         for i in 0..type_args.count {
             if (i > 0) {
-                result = "${result};${type_args.get(i)}"
+                result = result ++ ";" ++ intToString(type_args.get(i))
             } else {
-                result = "${result}${type_args.get(i)}"
+                result = result ++ intToString(type_args.get(i))
             }
         }
-        return "${result})"
+        return result ++ ")"
     }
 
     /// Register a generic instance so the lowerer can find it by concrete name.
     /// Zig: self.generics.generic_inst_by_name.put(name, inst)
     fn registerGenericInst(concrete_name: string, generic_node: int, type_args: List(int), type_param_names: List(string), ast_ptr: int, expr_types_ptr: int) void {
         // Serialize type args: "5" or "5;17"
+        // NOTE: Use explicit ++ instead of string interpolation to avoid
+        // a Zig compiler codegen bug where "${str};${int}" truncates str.
         var ta_str = ""
         for i in 0..type_args.count {
+            const ta_val_str = intToString(type_args.get(i))
             if (i > 0) {
-                ta_str = "${ta_str};${type_args.get(i)}"
+                ta_str = ta_str ++ ";" ++ ta_val_str
             } else {
-                ta_str = "${type_args.get(i)}"
+                ta_str = ta_val_str
             }
         }
         // Serialize type param names: "T" or "K;V"
         var tp_str = ""
         for i in 0..type_param_names.count {
             if (i > 0) {
-                tp_str = "${tp_str};${type_param_names.get(i)}"
+                tp_str = tp_str ++ ";" ++ type_param_names.get(i)
             } else {
-                tp_str = "${type_param_names.get(i)}"
+                tp_str = type_param_names.get(i)
             }
         }
         // Manually copy strings to fresh heap buffers to avoid ARC use-after-free
