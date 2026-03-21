@@ -591,6 +591,7 @@ struct SSABuilder {
         const cur = self.cur_block
         const base = self.convertNode(ai.base)
         const idx = self.convertNode(ai.index)
+        if (base == null_value or idx == null_value) { return null_value }
         const elem_size = self.func.newValue(SsaOp.const_int, I64, cur, self.cur_pos_line, self.cur_pos_col)
         var es = self.func.getValue(elem_size)
         es.aux_int = ai.elem_size
@@ -1326,9 +1327,23 @@ struct SSABuilder {
 
     fn emitIndexedLoad(base: int, index: int, elem_size: int, type_idx: int) int {
         const cur = self.cur_block
+        // If base is a compound value (string_make/slice_make), extract the ptr component.
+        // Compound values represent (ptr, len[, cap]) but add_ptr needs the raw ptr.
+        // Zig reference: ssa_builder.zig emitIndexedLoad — base from convertFieldValue
+        // is string_make for strings; Zig gen resolves this via register mapping.
+        var resolved_base = base
+        if (base != null_value) {
+            const bv = self.func.getValue(base)
+            if (bv.op == SsaOp.string_make or bv.op == SsaOp.slice_make) {
+                // Extract ptr (first arg of string_make/slice_make)
+                if (bv.argsLen() > 0) {
+                    resolved_base = bv.args.get(0)
+                }
+            }
+        }
         const size_val = self.emitConst(SsaOp.const_int, I64, elem_size)
         const offset = self.emitBinOp(SsaOp.mul, I64, index, size_val)
-        const ptr = self.emitBinOp(SsaOp.add_ptr, VOID, base, offset)
+        const ptr = self.emitBinOp(SsaOp.add_ptr, VOID, resolved_base, offset)
 
         if (self.isStringOrSlice(type_idx)) {
             return self.emitStringSliceLoad(ptr, type_idx)

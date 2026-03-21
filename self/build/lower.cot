@@ -2507,8 +2507,38 @@ struct Lowerer {
                 fb.emitStoreLocal(tmp, base, fa.span)
                 return fb.emitFieldLocal(tmp, 0, 0, I64, fa.span)
             }
-            // Variant payload extraction and variant tag creation handled by
-            // switch-case lowering, not field access. Fall through to fallback.
+            // Union variant field access: payload extraction or unit variant construction
+            // Zig reference: lower.zig lines 5553-5573
+            switch (type_info) {
+                Type.union_type |ut| => {
+                    for i in 0..ut.variant_count {
+                        const v = ut.getVariant(i)
+                        if (v.name == fa.field) {
+                            if (v.payload_type != VOID and v.payload_type > 0) {
+                                // Payload extraction: load from union at offset 8
+                                if (self.extractIdentName(fa.base)) |vbase_name| {
+                                    if (fb.lookupLocal(vbase_name)) |vlocal_idx| {
+                                        return fb.emitFieldLocal(vlocal_idx, 1, 8, v.payload_type, fa.span)
+                                    }
+                                }
+                                const vbase = self.lowerExprNode(fa.base)
+                                if (vbase == null_node) { return null_node }
+                                return fb.emitFieldValue(vbase, 1, 8, v.payload_type, fa.span)
+                            }
+                            // Unit variant: create temp local with tag stored
+                            const usize = self.types.sizeOf(base_type)
+                            if (usize > 8) {
+                                const utmp = fb.addLocalWithSize("__union_tmp", base_type, false, usize)
+                                const utag = fb.emitConstInt(i, I64, fa.span)
+                                fb.emitStoreLocalField(utmp, 0, 0, utag, fa.span)
+                                return fb.emitLoadLocal(utmp, base_type, fa.span)
+                            }
+                            return fb.emitConstInt(i, base_type, fa.span)
+                        }
+                    }
+                },
+                else => {},
+            }
         }
 
         // Enum variant constant (Color.Red → integer value)
@@ -3040,6 +3070,26 @@ struct Lowerer {
                 else => "",
             }
             if (type_name == "" and base_type_idx == STRING) { type_name = "string" }
+
+            // Fallback: if base type not resolved from expr_types, try resolving base ident
+            // as a type name directly. This handles cross-file static method calls like
+            // Node.init(...) where the checker may not have stored the base type in expr_types.
+            // Zig reference: lower.zig lines 8266-8289
+            if (type_name == "") {
+                if (self.extractIdentName(fa.base)) |base_ident| {
+                    const resolved_type = self.types.lookupByName(base_ident)
+                    if (resolved_type >= 0) {
+                        const resolved_info = self.types.get(resolved_type)
+                        if (resolved_info.tag == TAG_STRUCT) {
+                            type_name = switch (resolved_info) { Type.struct_type |st| => st.name, else => "" }
+                        } else if (resolved_info.tag == TAG_ENUM) {
+                            type_name = switch (resolved_info) { Type.enum_type |et| => et.name, else => "" }
+                        } else if (resolved_info.tag == TAG_UNION) {
+                            return self.lowerUnionConstructor(c, fa, resolved_type)
+                        }
+                    }
+                }
+            }
 
             // Try method lookup
             if (type_name != "") {
