@@ -1332,7 +1332,7 @@ pub const Driver = struct {
             // Network runtime
             "net_socket",    "net_bind",       "net_listen",
             "net_accept",    "net_connect",    "net_set_reuse_addr",
-            "set_nonblocking",
+            "set_nonblocking", "poll_read",
             // Event loop runtime (kqueue on macOS)
             "kqueue_create", "kevent_add",     "kevent_del",    "kevent_wait",
             // Epoll stubs (return -1 on macOS)
@@ -1392,7 +1392,7 @@ pub const Driver = struct {
             "usleep",
             // dladdr — used by signal handler for source map lookup
             "dladdr",
-            // poll — used by poll_read runtime for non-blocking IO drain
+            // poll — used by poll_read to wait on non-blocking fd
             "poll",
         };
         const runtime_start_idx: u32 = @intCast(funcs.len);

@@ -1845,8 +1845,11 @@ fn generateSetNonblocking(
     var sig = clif.Signature.init(.system_v);
     try sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64)); // fd
     try sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64)); // cmd
-    const is_aarch64 = isa == .aarch64;
-    if (is_aarch64) {
+    // Apple ARM64 variadic ABI: variadic args go on the stack, so pad X2-X7
+    // to push the actual arg past the register window. Linux ARM64: variadic
+    // args use the same registers as fixed args, no padding needed.
+    const is_apple_aarch64 = isa == .aarch64 and target_os == .macos;
+    if (is_apple_aarch64) {
         for (0..6) |_| try sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
     }
     try sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64)); // flags
@@ -1859,7 +1862,7 @@ fn generateSetNonblocking(
     });
     const f_setfl = try ins.iconst(clif.Type.I64, 4);
     const o_nonblock = try ins.iconst(clif.Type.I64, if (target_os == .macos) 0x0004 else 0x800);
-    const call_result = if (is_aarch64) blk: {
+    const call_result = if (is_apple_aarch64) blk: {
         const pad = try ins.iconst(clif.Type.I64, 0);
         break :blk try ins.call(func_ref, &[_]clif.Value{ fd, f_setfl, pad, pad, pad, pad, pad, pad, o_nonblock });
     } else try ins.call(func_ref, &[_]clif.Value{ fd, f_setfl, o_nonblock });
@@ -1889,6 +1892,7 @@ fn generatePollRead(
     defer func_ctx.deinit();
     var builder = FunctionBuilder.init(&clif_func, &func_ctx);
 
+    // Signature: (fd: i64, timeout_ms: i64) -> i64
     try clif_func.signature.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
     try clif_func.signature.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
     try clif_func.signature.addReturn(allocator, clif.AbiParam.init(clif.Type.I64));
