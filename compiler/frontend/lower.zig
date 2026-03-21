@@ -3205,6 +3205,22 @@ pub const Lowerer = struct {
                         }
                     }
                 }
+                // Raw pointer store: forward cleanup for ident with scope_destroy.
+                // Swift: UnsafeMutablePointer.pointee = value still transfers ownership.
+                // Without this, the local's auto-deinit fires and corrupts the heap copy.
+                if (!self.target.isWasm()) {
+                    const assign_node = self.tree.getNode(assign.value);
+                    const assign_expr = if (assign_node) |n| n.asExpr() else null;
+                    if (assign_expr) |ae| {
+                        if (ae == .ident) {
+                            if (fb.lookupLocal(ae.ident.name)) |local_idx| {
+                                if (self.cleanup_stack.findCleanupForLocal(local_idx)) |handle| {
+                                    self.cleanup_stack.disable(handle);
+                                }
+                            }
+                        }
+                    }
+                }
                 _ = try fb.emitPtrStoreValue(ptr_node, store_value, assign.span);
             },
             else => {},

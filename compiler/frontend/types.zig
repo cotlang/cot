@@ -480,14 +480,23 @@ pub const TypeRegistry = struct {
         return !self.isTrivial(idx);
     }
 
-    /// Returns true if type could be an ARC-managed heap pointer.
+    /// Returns true if type could be an ARC-managed heap pointer, or is a
+    /// struct/tuple containing ARC-managed fields.
     /// `new T` creates ARC-managed *T for struct, enum, or union types.
     /// Also handles ?*T (optional pointer wrapping an ARC type).
-    /// Reference: Swift TypeLowering — class types (heap) are non-trivial.
+    /// Reference: Swift TypeLowering — aggregate types containing class references
+    /// are non-trivial. initializeWithCopy retains each class field memberwise.
     pub fn couldBeARC(self: *const TypeRegistry, idx: TypeIndex) bool {
         const t = self.get(idx);
         if (t == .pointer) return t.pointer.managed;
         if (t == .optional) return self.couldBeARC(t.optional.elem);
+        // Struct types: check if any field is ARC-managed (recursive).
+        // Swift: aggregate types with class reference fields are non-trivial.
+        if (t == .struct_type) {
+            for (t.struct_type.fields) |field| {
+                if (self.couldBeARC(field.type_idx)) return true;
+            }
+        }
         return false;
     }
 
