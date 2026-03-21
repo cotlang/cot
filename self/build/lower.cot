@@ -4387,23 +4387,14 @@ struct Lowerer {
 
         // ARC management
         if (kind == BuiltinKind.arc_retain) {
+            // Wasm uses bump allocator, no ARC — return arg directly (matches Zig line 10635)
             if (bc.args.count > 0) {
-                const ptr = self.lowerExprNode(bc.args.get(0))
-                if (ptr == null_node) { return null_node }
-                var retain_args: List(int) = .{}
-                retain_args.append(ptr)
-                return fb.emitCall("retain", retain_args, false, VOID, bc.span)
+                return self.lowerExprNode(bc.args.get(0))
             }
             return null_node
         }
         if (kind == BuiltinKind.arc_release) {
-            if (bc.args.count > 0) {
-                const ptr = self.lowerExprNode(bc.args.get(0))
-                if (ptr == null_node) { return null_node }
-                var release_args: List(int) = .{}
-                release_args.append(ptr)
-                return fb.emitCall("release", release_args, false, VOID, bc.span)
-            }
+            // Wasm uses bump allocator, no ARC — no-op (matches Zig line 10645)
             return null_node
         }
 
