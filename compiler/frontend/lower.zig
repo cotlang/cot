@@ -2691,7 +2691,7 @@ pub const Lowerer = struct {
                         if (!self.target.isWasm() and !self.type_reg.isTrivial(struct_field.type_idx)) {
                             const fi_node = self.tree.getNode(field_init.value);
                             const fi_expr = if (fi_node) |n| n.asExpr() else null;
-                            const fi_owned = if (fi_expr) |e| (e == .new_expr or e == .call) else false;
+                            const fi_owned = if (fi_expr) |e| (e == .new_expr) else false;
                             if (!fi_owned) {
                                 _ = try self.emitCopyValue(fb, actual_value, struct_field.type_idx, span);
                             }
@@ -2729,7 +2729,7 @@ pub const Lowerer = struct {
                 if (!self.target.isWasm() and !self.type_reg.isTrivial(struct_field.type_idx)) {
                     const def_node = self.tree.getNode(struct_field.default_value);
                     const def_expr = if (def_node) |n| n.asExpr() else null;
-                    const def_owned = if (def_expr) |e| (e == .new_expr or e == .call) else false;
+                    const def_owned = if (def_expr) |e| (e == .new_expr) else false;
                     if (!def_owned) {
                         _ = try self.emitCopyValue(fb, value_node_ir, struct_field.type_idx, span);
                     }
@@ -4427,7 +4427,7 @@ pub const Lowerer = struct {
     fn managedFromLowered(self: *Lowerer, value: ir.NodeIndex, ast_idx: NodeIndex, type_idx: TypeIndex) !arc.ManagedValue {
         const node = self.tree.getNode(ast_idx);
         const expr = if (node) |n| n.asExpr() else null;
-        const is_owned = if (expr) |e| (e == .new_expr or e == .call) else false;
+        const is_owned = if (expr) |e| (e == .new_expr) else false;
         if (is_owned and self.type_reg.couldBeARC(type_idx) and !self.target.isWasm()) {
             const cleanup = arc.Cleanup.init(.release, value, type_idx);
             const handle = try self.cleanup_stack.push(cleanup);
@@ -4667,10 +4667,13 @@ pub const Lowerer = struct {
         const value = try self.lowerExprNode(idx);
         const type_idx = self.inferExprType(idx);
 
-        // +1 expressions: caller owns the result
-        if (expr == .new_expr or expr == .call) {
+        // +1 expressions: only `new` creates a new owned reference.
+        // Regular function calls returning *T are +0 (borrowed) — the callee
+        // doesn't transfer ownership. Swift convention: only init/alloc/copy are +1.
+        // Previously `.call` was included here, causing spurious release() on
+        // pointers returned by cast functions like getWorkspacePtr(@intToPtr).
+        if (expr == .new_expr) {
             if (self.type_reg.couldBeARC(type_idx) and !self.target.isWasm()) {
-                // Register cleanup so scope exit releases it
                 const cleanup = arc.Cleanup.init(.release, value, type_idx);
                 const handle = try self.cleanup_stack.push(cleanup);
                 return arc.ManagedValue.forOwned(value, type_idx, handle);
@@ -5985,7 +5988,7 @@ pub const Lowerer = struct {
                         if (!self.target.isWasm() and !self.type_reg.isTrivial(struct_field.type_idx)) {
                             const fi_node = self.tree.getNode(field_init.value);
                             const fi_expr = if (fi_node) |n| n.asExpr() else null;
-                            const fi_owned = if (fi_expr) |e| (e == .new_expr or e == .call) else false;
+                            const fi_owned = if (fi_expr) |e| (e == .new_expr) else false;
                             if (!fi_owned) {
                                 _ = try self.emitCopyValue(fb, actual_value, struct_field.type_idx, si.span);
                             }
@@ -6024,7 +6027,7 @@ pub const Lowerer = struct {
                 if (!self.target.isWasm() and !self.type_reg.isTrivial(struct_field.type_idx)) {
                     const def_node = self.tree.getNode(struct_field.default_value);
                     const def_expr = if (def_node) |n| n.asExpr() else null;
-                    const def_owned = if (def_expr) |e| (e == .new_expr or e == .call) else false;
+                    const def_owned = if (def_expr) |e| (e == .new_expr) else false;
                     if (!def_owned) {
                         _ = try self.emitCopyValue(fb, value_node, struct_field.type_idx, si.span);
                     }
@@ -6338,7 +6341,7 @@ pub const Lowerer = struct {
                                 // Conditionally retain if +0 and non-null
                                 const fi_node = self.tree.getNode(field_init.value);
                                 const fi_expr = if (fi_node) |n| n.asExpr() else null;
-                                const fi_owned = if (fi_expr) |e| (e == .new_expr or e == .call) else false;
+                                const fi_owned = if (fi_expr) |e| (e == .new_expr) else false;
                                 if (!fi_owned) {
                                     const zero = try fb.emitConstInt(0, TypeRegistry.I64, ne.span);
                                     const is_non_null = try fb.emitBinary(.ne, tag_val, zero, TypeRegistry.BOOL, ne.span);
@@ -6366,7 +6369,7 @@ pub const Lowerer = struct {
                             if (!self.target.isWasm() and fld_ti == .pointer and fld_ti.pointer.managed) {
                                 const fi_node = self.tree.getNode(field_init.value);
                                 const fi_expr = if (fi_node) |n| n.asExpr() else null;
-                                const fi_owned = if (fi_expr) |e| (e == .new_expr or e == .call) else false;
+                                const fi_owned = if (fi_expr) |e| (e == .new_expr) else false;
                                 if (!fi_owned) {
                                     var retain_args = [_]ir.NodeIndex{value_node};
                                     _ = try fb.emitCall("retain", &retain_args, false, struct_field.type_idx, ne.span);
@@ -6409,7 +6412,7 @@ pub const Lowerer = struct {
                 if (!self.target.isWasm() and !self.type_reg.isTrivial(struct_field.type_idx)) {
                     const def_node = self.tree.getNode(struct_field.default_value);
                     const def_expr = if (def_node) |n| n.asExpr() else null;
-                    const def_owned = if (def_expr) |e| (e == .new_expr or e == .call) else false;
+                    const def_owned = if (def_expr) |e| (e == .new_expr) else false;
                     if (!def_owned) {
                         _ = try self.emitCopyValue(fb, value_node, struct_field.type_idx, ne.span);
                     }
