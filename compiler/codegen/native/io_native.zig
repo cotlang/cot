@@ -225,6 +225,12 @@ pub fn generate(
         .compiled = try generateSetNonblocking(allocator, isa, ctrl_plane, func_index_map, target_os),
     });
 
+    // poll_read(fd, timeout_ms) → i64  (calls libc poll)
+    try result.append(allocator, .{
+        .name = "poll_read",
+        .compiled = try generatePollRead(allocator, isa, ctrl_plane, func_index_map),
+    });
+
     // --- Event loop runtime (kqueue on macOS, stubs on Linux) ---
     if (target_os == .macos) {
         // kqueue_create() → i64  (calls libc kqueue)
@@ -1857,6 +1863,70 @@ fn generateSetNonblocking(
         const pad = try ins.iconst(clif.Type.I64, 0);
         break :blk try ins.call(func_ref, &[_]clif.Value{ fd, f_setfl, pad, pad, pad, pad, pad, pad, o_nonblock });
     } else try ins.call(func_ref, &[_]clif.Value{ fd, f_setfl, o_nonblock });
+    _ = try ins.return_(&[_]clif.Value{call_result.results[0]});
+
+    try builder.sealAllBlocks();
+    builder.finalize();
+    return native_compile.compile(allocator, &clif_func, isa, ctrl_plane);
+}
+
+// ============================================================================
+// poll_read(fd, timeout_ms) → i64: poll(&pfd, 1, timeout_ms)
+// Builds struct pollfd on stack: { fd: i32, events: i16, revents: i16 } = 8 bytes
+// Returns >0 if ready, 0 if timeout, -1 on error.
+// Reference: Ghostty Exec.zig:1285-1330 (poll-based IO loop)
+// ============================================================================
+
+fn generatePollRead(
+    allocator: Allocator,
+    isa: native_compile.TargetIsa,
+    ctrl_plane: *native_compile.ControlPlane,
+    func_index_map: *const std.StringHashMapUnmanaged(u32),
+) !native_compile.CompiledCode {
+    var clif_func = clif.Function.init(allocator);
+    defer clif_func.deinit();
+    var func_ctx = FunctionBuilderContext.init(allocator);
+    defer func_ctx.deinit();
+    var builder = FunctionBuilder.init(&clif_func, &func_ctx);
+
+    try clif_func.signature.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+    try clif_func.signature.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+    try clif_func.signature.addReturn(allocator, clif.AbiParam.init(clif.Type.I64));
+
+    const block_entry = try builder.createBlock();
+    builder.switchToBlock(block_entry);
+    try builder.appendBlockParamsForFunctionParams(block_entry);
+    try builder.ensureInsertedBlock();
+
+    const ins = builder.ins();
+    const params = builder.blockParams(block_entry);
+    const fd = params[0];
+    const timeout_ms = params[1];
+
+    // Build struct pollfd on stack: { fd: i32, events: i16 = POLLIN, revents: i16 = 0 }
+    // Pack as single i64: lower 32 bits = fd, bits 32-47 = POLLIN (1)
+    const pfd_slot = try builder.createSizedStackSlot(clif.StackSlotData.explicit(8, 3));
+    const fd_masked = try ins.band(fd, try ins.iconst(clif.Type.I64, 0xFFFFFFFF));
+    const pollin_shifted = try ins.iconst(clif.Type.I64, @as(i64, 1) << 32);
+    const packed_pfd = try ins.bor(fd_masked, pollin_shifted);
+    _ = try ins.stackStore(packed_pfd, pfd_slot, 0);
+    const pfd_addr = try ins.stackAddr(clif.Type.I64, pfd_slot, 0);
+
+    // Call poll(fds, nfds, timeout): int poll(struct pollfd *fds, nfds_t nfds, int timeout)
+    const poll_idx = func_index_map.get("poll") orelse 0;
+    var sig = clif.Signature.init(.system_v);
+    try sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+    try sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+    try sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+    try sig.addReturn(allocator, clif.AbiParam.init(clif.Type.I64));
+    const sig_ref = try builder.importSignature(sig);
+    const func_ref = try builder.importFunction(.{
+        .name = .{ .user = .{ .namespace = 0, .index = poll_idx } },
+        .signature = sig_ref,
+        .colocated = false,
+    });
+    const v_one = try ins.iconst(clif.Type.I64, 1);
+    const call_result = try ins.call(func_ref, &[_]clif.Value{ pfd_addr, v_one, timeout_ms });
     _ = try ins.return_(&[_]clif.Value{call_result.results[0]});
 
     try builder.sealAllBlocks();

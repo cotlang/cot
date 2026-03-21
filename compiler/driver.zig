@@ -1392,6 +1392,8 @@ pub const Driver = struct {
             "usleep",
             // dladdr — used by signal handler for source map lookup
             "dladdr",
+            // poll — used by poll_read runtime for non-blocking IO drain
+            "poll",
         };
         const runtime_start_idx: u32 = @intCast(funcs.len);
         for (runtime_func_names, 0..) |name, i| {
