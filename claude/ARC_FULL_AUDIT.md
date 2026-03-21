@@ -2,7 +2,7 @@
 
 **Date:** 2026-03-21
 **Audited by:** Line-by-line comparison against Swift SILGen
-**Status:** Phases 1-4 complete. 10 of 12 gaps fixed.
+**Status:** Complete. 10 gaps fixed, 2 documented (convention + WasmGC by design).
 
 ---
 
@@ -75,10 +75,11 @@ Cot's ARC implementation has the right architecture (ManagedValue, CleanupStack,
 - Swift equivalent: `ResultConvention::Owned` on function types
 - Status: Invariant documented
 
-**Gap 11: Wasm skips all ARC**
-- Known limitation — requires Wasm ARC runtime
-- All `emitCopyValue`/`emitDestroyValue`/cleanup emission skipped on Wasm
-- Status: DEFERRED — separate project (Wasm ARC runtime)
+**Gap 11: Wasm skips all ARC — BY DESIGN (not a gap)**
+- Wasm target uses WasmGC (garbage collected by runtime), not ARC
+- Reference: Kotlin/Wasm compiler (`references/kotlin/wasm/`)
+- All `if (self.target.isWasm()) return;` guards are correct
+- Status: NOT APPLICABLE
 
 ---
 
