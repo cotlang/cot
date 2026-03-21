@@ -2684,62 +2684,144 @@ struct Lowerer {
         return null_node
     }
 
+    /// Port of Zig lower.zig:5740-5856 (lowerIndex).
     fn lowerIndex(ie: IndexExpr, idx: int) int {
         const fb = self.builder.func() orelse return null_node
-        const base_type = self.inferExprType(ie.base)
-        const type_info = self.types.get(base_type)
 
-        // Get element type and size
-        var elem_type = I64
-        if (type_info.tag == TAG_ARRAY) {
-            switch (type_info) { Type.array |a| => { elem_type = a.elem }, else => {} }
-        } else if (type_info.tag == TAG_SLICE) {
-            switch (type_info) { Type.slice |s| => { elem_type = s.elem }, else => {} }
-        } else if (base_type == STRING) {
-            // String indexing via charAt
-            const base = self.lowerExprNode(ie.base)
-            const index = self.lowerExprNode(ie.idx)
-            if (base == null_node or index == null_node) { return null_node }
-            var args: List(int) = .{}
-            args.append(base)
-            args.append(index)
-            return fb.emitCall("charAt", args, false, I64, ie.span)
-        }
-        const elem_size = self.types.sizeOf(elem_type)
-
-        // Lower index expression
-        const index = self.lowerExprNode(ie.idx)
-        if (index == null_node) { return null_node }
-
-        // Bounds check (debug mode only)
-        if (!self.release_mode) {
-            if (type_info.tag == TAG_ARRAY) {
-                var arr_len = 0
-                switch (type_info) { Type.array |a| => { arr_len = a.length }, else => {} }
-                const len_node = fb.emitConstInt(arr_len, I64, ie.span)
-                self.emitBoundsCheck(index, len_node, ie.span)
-            } else if (type_info.tag == TAG_SLICE) {
-                // Need to get the slice value to extract length
-                if (self.extractIdentName(ie.base)) |sl_name| {
-                    if (fb.lookupLocal(sl_name)) |sl_local| {
-                        const sl_val = fb.emitLoadLocal(sl_local, base_type, ie.span)
-                        const len_node = fb.emitSliceLen(sl_val, ie.span)
-                        self.emitBoundsCheck(index, len_node, ie.span)
+        // Comptime array indexing: resolve from lowerer's comptime_value_vars map.
+        // If base is a known comptime array and index is comptime-known, emit element directly.
+        // If index is runtime, materialize the array and emit indexed load.
+        // Ref: lower.zig:5743-5773
+        if (self.extractIdentName(ie.base)) |base_name| {
+            if (self.lookupComptimeValue(base_name)) |base_cv| {
+                if (base_cv.tag == CV_ARRAY) {
+                    // Try comptime index first (direct element emission)
+                    if (self.chk.evalComptimeValue(ie.idx)) |iv| {
+                        if (iv.asInt()) |i_val| {
+                            if (i_val >= 0 and i_val < base_cv.array.elements.count) {
+                                const elem = base_cv.array.elements.get(i_val)
+                                return self.emitComptimeValue(elem, ie.span)
+                            }
+                        }
                     }
+                    // Dynamic index: materialize array, then emit indexed load.
+                    const base_ptr = self.emitComptimeArray(base_cv.array, ie.span)
+                    const index_node = self.lowerExprNode(ie.idx)
+                    var ct_elem_size = 8
+                    var ct_elem_type = I64
+                    if (base_cv.array.elements.count > 0) {
+                        const first = base_cv.array.elements.get(0)
+                        if (first.tag == CV_STRING) {
+                            ct_elem_size = self.types.sizeOf(STRING)
+                            ct_elem_type = STRING
+                        }
+                    }
+                    return fb.emitIndexValue(base_ptr, index_node, ct_elem_size, ct_elem_type, ie.span)
                 }
             }
         }
 
-        if (self.extractIdentName(ie.base)) |base_name| {
-            if (fb.lookupLocal(base_name)) |local_idx| {
-                return fb.emitIndexLocal(local_idx, index, elem_size, elem_type, ie.span)
+        // Resolve base type, unwrapping pointers
+        // Ref: lower.zig:5775-5777
+        var base_type_idx = self.inferExprType(ie.base)
+        var base_type_info = self.types.get(base_type_idx)
+        while (base_type_info.tag == TAG_POINTER) {
+            switch (base_type_info) { Type.pointer |p| => { base_type_idx = p.elem }, else => {} }
+            base_type_info = self.types.get(base_type_idx)
+        }
+
+        // Determine element type
+        // Ref: lower.zig:5778-5783
+        var elem_type = I64
+        if (base_type_idx == STRING) {
+            elem_type = U8
+        } else if (base_type_info.tag == TAG_ARRAY) {
+            switch (base_type_info) { Type.array |a| => { elem_type = a.elem }, else => {} }
+        } else if (base_type_info.tag == TAG_SLICE) {
+            switch (base_type_info) { Type.slice |s| => { elem_type = s.elem }, else => {} }
+        } else {
+            return null_node
+        }
+        const elem_size = self.types.sizeOf(elem_type)
+
+        // String indexing: extract slice ptr, then index into it
+        // Ref: lower.zig:5785-5811
+        if (base_type_idx == STRING) {
+            const index_node = self.lowerExprNode(ie.idx)
+            if (self.extractIdentName(ie.base)) |str_name| {
+                if (fb.lookupLocal(str_name)) |local_idx| {
+                    const str_val = fb.emitLoadLocal(local_idx, STRING, ie.span)
+                    if (!self.release_mode) {
+                        const len_node = fb.emitSliceLen(str_val, ie.span)
+                        self.emitBoundsCheck(index_node, len_node, ie.span)
+                    }
+                    const ptr_type = self.types.makePointer(U8)
+                    const ptr_val = fb.emitSlicePtr(str_val, ptr_type, ie.span)
+                    return fb.emitIndexValue(ptr_val, index_node, elem_size, elem_type, ie.span)
+                }
+            }
+            const base_val = self.lowerExprNode(ie.base)
+            if (!self.release_mode) {
+                const len_node = fb.emitSliceLen(base_val, ie.span)
+                self.emitBoundsCheck(index_node, len_node, ie.span)
+            }
+            const ptr_type = self.types.makePointer(U8)
+            const ptr_val = fb.emitSlicePtr(base_val, ptr_type, ie.span)
+            return fb.emitIndexValue(ptr_val, index_node, elem_size, elem_type, ie.span)
+        }
+
+        // Lower index expression
+        // Ref: lower.zig:5813
+        const index_node = self.lowerExprNode(ie.idx)
+
+        // Bounds check for arrays (debug mode only)
+        // Ref: lower.zig:5816-5821
+        if (!self.release_mode) {
+            if (base_type_info.tag == TAG_ARRAY) {
+                var arr_len = 0
+                switch (base_type_info) { Type.array |a| => { arr_len = a.length }, else => {} }
+                const len_node = fb.emitConstInt(arr_len, I64, ie.span)
+                self.emitBoundsCheck(index_node, len_node, ie.span)
             }
         }
 
-        // Expression base
-        const base = self.lowerExprNode(ie.base)
-        if (base == null_node) { return null_node }
-        return fb.emitIndexValue(base, index, elem_size, elem_type, ie.span)
+        // Identifier base: check local type for slice/array/param handling
+        // Ref: lower.zig:5823-5851
+        if (self.extractIdentName(ie.base)) |base_name| {
+            if (fb.lookupLocal(base_name)) |local_idx| {
+                const local = fb.locals.get(local_idx)
+                const local_type = self.types.get(local.type_idx)
+                // Slice: load slice, extract ptr, index into ptr
+                if (local_type.tag == TAG_SLICE) {
+                    const slice_val = fb.emitLoadLocal(local_idx, local.type_idx, ie.span)
+                    if (!self.release_mode) {
+                        const len_node = fb.emitSliceLen(slice_val, ie.span)
+                        self.emitBoundsCheck(index_node, len_node, ie.span)
+                    }
+                    const ptr_type = self.types.makePointer(elem_type)
+                    const ptr_val = fb.emitSlicePtr(slice_val, ptr_type, ie.span)
+                    return fb.emitIndexValue(ptr_val, index_node, elem_size, elem_type, ie.span)
+                }
+                // Array param: load as pointer, index into it
+                if (local.is_param and self.types.isArray(local.type_idx)) {
+                    const ptr_val = fb.emitLoadLocal(local_idx, local.type_idx, ie.span)
+                    return fb.emitIndexValue(ptr_val, index_node, elem_size, elem_type, ie.span)
+                }
+                // Regular array local: direct indexed access
+                return fb.emitIndexLocal(local_idx, index_node, elem_size, elem_type, ie.span)
+            }
+            // Global: take address, index into it
+            if (self.builder.lookupGlobal(base_name)) |g| {
+                const ptr_type = self.types.makePointer(g.global.type_idx)
+                const global_addr = fb.emitAddrGlobal(g.idx, base_name, ptr_type, ie.span)
+                return fb.emitIndexValue(global_addr, index_node, elem_size, elem_type, ie.span)
+            }
+        }
+
+        // Expression base: lower and index
+        // Ref: lower.zig:5854-5855
+        const base_val = self.lowerExprNode(ie.base)
+        return fb.emitIndexValue(base_val, index_node, elem_size, elem_type, ie.span)
     }
 
     fn lowerStructInit(si: StructInitExpr, idx: int) int {
