@@ -2420,6 +2420,13 @@ pub const Lowerer = struct {
                         }
                     }
                 }
+                // Register ARC cleanup for compound optionals with managed payloads.
+                // Swift: Optional<ClassRef> gets destroy_value cleanup at scope exit.
+                if (!self.target.isWasm() and self.type_reg.couldBeARC(type_idx)) {
+                    const loaded = try fb.emitLoadLocal(local_idx, type_idx, var_stmt.span);
+                    const cleanup = arc.Cleanup.initForLocal(.release, loaded, type_idx, local_idx);
+                    _ = try self.cleanup_stack.push(cleanup);
+                }
             } else {
                 {
                     // Use lowerExprManaged as the SINGLE expression evaluation.
@@ -2530,6 +2537,14 @@ pub const Lowerer = struct {
                 } else {
                     const elem_val = try fb.emitFieldLocal(temp_idx, @intCast(i), offset, elem_type, ds.span);
                     _ = try fb.emitStoreLocal(local_idx, elem_val, ds.span);
+                }
+                // Register ARC cleanup for destructured elements with managed types.
+                // Swift: destructuring copies each element and registers cleanups.
+                if (!self.target.isWasm() and self.type_reg.couldBeARC(elem_type)) {
+                    const loaded = try fb.emitLoadLocal(local_idx, elem_type, ds.span);
+                    _ = try self.emitCopyValue(fb, loaded, elem_type, ds.span);
+                    const cleanup = arc.Cleanup.initForLocal(.release, loaded, elem_type, local_idx);
+                    _ = try self.cleanup_stack.push(cleanup);
                 }
             }
         }
