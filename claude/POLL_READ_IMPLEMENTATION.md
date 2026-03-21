@@ -179,7 +179,27 @@ If it crashes on both targets, the bug is in the shared `machinst/` or `ir/clif/
 
 ## Recommended Investigation
 
-### ROOT CAUSE IDENTIFIED (Partial)
+### ROOT CAUSE IDENTIFIED: stackStore codegen drops the store instruction
+
+**Disassembly of `poll_read` shows the `stackStore` value (x10) is computed but NEVER written to the stack:**
+
+```asm
+sub sp, sp, #0x10        ; allocate stack slot
+and x10, x0, x9          ; mask fd
+orr x10, x10, x11        ; OR with POLLIN << 32
+mov x0, sp               ; x0 = &pollfd (UNINITIALIZED!)
+mov x2, x1               ; x2 = timeout
+mov x1, #1               ; x1 = nfds
+bl poll@plt               ; poll gets garbage struct
+```
+
+**Missing instruction:** `str x10, [sp]` should appear between the `orr` and `mov x0, sp`. The CLIF `stack_store` instruction is lowered by `lowerStackStore` (lower.zig:2990) which calls `ctx.emit(Inst.genStore(...))` — but the store is silently dropped.
+
+This means `poll()` receives an uninitialized `struct pollfd` on the stack, which has random values for `fd` and `events`, causing it to either timeout immediately or monitor the wrong fd.
+
+**This is the same bug that would affect ALL kevent_* functions on Linux** — they're currently macOS-only so the bug was never exposed.
+
+### Previous (stale) root cause analysis
 
 The crash is NOT in the CLIF IR lowering. The binary compiles successfully (`Success: /tmp/test_trivial`). The crash is at **runtime** during `__cot_init_globals` → `sched_select`:
 
