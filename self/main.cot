@@ -566,40 +566,26 @@ fn compileSingleFile(path: string, content: string, ast: *Ast, types: TypeRegist
 /// Lower a checked AST to IR. Separated into own function to keep Lowerer
 /// off the caller's stack frame (avoids stack overflow).
 fn lowerChecked(ast: *Ast, types: TypeRegistry, errs: ErrorReporter, checker: Checker, lower_opts: LowerOptions) CompileResult {
-    eprintln("[cot] lowerChecked: start")
     var lower_inst: Lowerer = undefined
-    eprintln("[cot] lowerChecked: a")
     lower_inst.tree = ast
-    eprintln("[cot] lowerChecked: b")
     lower_inst.types = types
-    eprintln("[cot] lowerChecked: c")
     lower_inst.err = errs
-    eprintln("[cot] lowerChecked: d")
     lower_inst.chk = checker
-    eprintln("[cot] lowerChecked: e")
     lower_inst.module_name = ""
-    eprintln("[cot] lowerChecked: f")
     initLowererScalars(lower_inst)
-    eprintln("[cot] lowerChecked: g")
     initLowererLists(lower_inst)
-    eprintln("[cot] lowerChecked: h")
     initLowererMaps(lower_inst)
-    eprintln("[cot] lowerChecked: i")
 
     // Set modes before lowering
-    eprintln("[cot] lowerChecked: setting modes")
     lower_inst.setTestMode(lower_opts.test_mode)
     lower_inst.setBenchMode(lower_opts.bench_mode)
     lower_inst.setFailFast(lower_opts.fail_fast)
 
     // Lower all declarations
-    eprintln("[cot] lowerChecked: lowerToBuilder start")
     lower_inst.lowerToBuilder()
-    eprintln("[cot] lowerChecked: lowerToBuilder done")
 
     // Generate global init function (Go init pattern)
     lower_inst.generateGlobalInits()
-    eprintln("[cot] lowerChecked: generateGlobalInits done")
 
     // Generate test runner if in test mode
     if (lower_opts.test_mode and lower_inst.test_names.count > 0) {

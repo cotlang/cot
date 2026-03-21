@@ -737,7 +737,8 @@ struct Parser {
             self.collectDocComment()
             const tok = @enumFromInt(self.tok) as Token
             if (tok == Token.kw_const or tok == Token.kw_enum or tok == Token.kw_type or
-                tok == Token.kw_fn or tok == Token.kw_static) {
+                tok == Token.kw_fn or tok == Token.kw_static or
+                (tok == Token.kw_struct and self.peekToken() == Token.ident as int)) {
                 const nested_decl = self.parseDecl()
                 if (nested_decl != null_node) {
                     nested.append(nested_decl)
@@ -769,7 +770,8 @@ struct Parser {
             self.collectDocComment()
             const tok = @enumFromInt(self.tok) as Token
             if (tok == Token.kw_const or tok == Token.kw_enum or tok == Token.kw_type or
-                tok == Token.kw_fn or tok == Token.kw_static) {
+                tok == Token.kw_fn or tok == Token.kw_static or
+                (tok == Token.kw_struct and self.peekToken() == Token.ident as int)) {
                 const nested_decl = self.parseDecl()
                 if (nested_decl != null_node) {
                     nested.append(nested_decl)

@@ -267,7 +267,6 @@ struct Lowerer {
     fn lowerToBuilder() void {
         for i in 0..self.tree.file_decls.count {
             const decl_idx = self.tree.file_decls.get(i)
-            eprintln("[lower] decl ${i}/${self.tree.file_decls.count}")
             self.lowerDecl(decl_idx)
         }
         self.lowerQueuedGenericFunctions()
@@ -278,20 +277,22 @@ struct Lowerer {
     fn generateTestRunner() void {
         if (self.test_names.count == 0) { return }
         const span = Span.zero()
-        const err_void_type = self.types.makeErrorUnion(VOID)
         self.builder.startFunc("main", VOID, I64, span)
         if (self.builder.func()) |fb| {
             self.clearPerFunctionState()
             const ptr_type = self.types.makePointer(U8)
+            const err_void_type = self.types.makeErrorUnion(VOID)
 
-            // Initialize globals
+            // Initialize globals before any test code runs
             var init_args: List(int) = .{}
             fb.emitCall("__cot_init_globals", init_args, false, VOID, span)
 
-            // Counters
+            // fail_count local — counts test failures, returned as exit code
             const fail_count = fb.addLocalWithSize("__fail_count", I64, true, 8)
             const zero_init = fb.emitConstInt(0, I64, span)
             fb.emitStoreLocal(fail_count, zero_init, span)
+
+            // pass_count local — counts test passes, for summary output
             const pass_count = fb.addLocalWithSize("__pass_count", I64, true, 8)
             fb.emitStoreLocal(pass_count, zero_init, span)
 
@@ -299,7 +300,7 @@ struct Lowerer {
                 const test_name = self.test_names.get(i)
                 const display_name = self.test_display_names.get(i)
 
-                // Print test name
+                // Print test name (also records per-test start time internally)
                 const str_idx = fb.addStringLiteral(display_name)
                 const str_slice = fb.emitConstSlice(str_idx, span)
                 const name_ptr = fb.emitSlicePtr(str_slice, ptr_type, span)
@@ -309,21 +310,22 @@ struct Lowerer {
                 pn_args.append(name_len)
                 fb.emitCall("__test_print_name", pn_args, false, VOID, span)
 
-                // Call test function — returns EU ptr
+                // Call test function — returns pointer to error union (!void)
                 var no_args: List(int) = .{}
                 const eu_ptr = fb.emitCall(test_name, no_args, false, err_void_type, span)
 
-                // Check EU tag
+                // Read error union tag at [eu_ptr + 0]
                 const tag_val = fb.emitPtrLoadValue(eu_ptr, I64, span)
                 const zero = fb.emitConstInt(0, I64, span)
                 const is_error = fb.emitBinary(BinaryOp.ne, tag_val, zero, BOOL, span)
 
+                // Branch: error → fail, ok → pass
                 const fail_block = fb.newBlock("test.fail")
                 const pass_block = fb.newBlock("test.pass")
                 const merge_block = fb.newBlock("test.merge")
                 fb.emitBranch(is_error, fail_block, pass_block, span)
 
-                // Fail block
+                // Fail block: __test_fail() computes timing internally
                 fb.setBlock(fail_block)
                 var fail_args: List(int) = .{}
                 fb.emitCall("__test_fail", fail_args, false, VOID, span)
@@ -331,6 +333,7 @@ struct Lowerer {
                 const one_f = fb.emitConstInt(1, I64, span)
                 const new_fail = fb.emitBinary(BinaryOp.add, cur_fail, one_f, I64, span)
                 fb.emitStoreLocal(fail_count, new_fail, span)
+
                 if (self.fail_fast) {
                     const ff_pass = fb.emitLoadLocal(pass_count, I64, span)
                     const ff_fail = fb.emitLoadLocal(fail_count, I64, span)
@@ -344,7 +347,7 @@ struct Lowerer {
                     fb.emitJump(merge_block, span)
                 }
 
-                // Pass block
+                // Pass block: __test_pass() computes timing internally
                 fb.setBlock(pass_block)
                 var pass_args: List(int) = .{}
                 fb.emitCall("__test_pass", pass_args, false, VOID, span)
@@ -354,10 +357,11 @@ struct Lowerer {
                 fb.emitStoreLocal(pass_count, new_pass, span)
                 fb.emitJump(merge_block, span)
 
+                // Merge block: continue to next test
                 fb.setBlock(merge_block)
             }
 
-            // Print summary
+            // Print summary: __test_summary(pass_count, fail_count)
             const final_pass = fb.emitLoadLocal(pass_count, I64, span)
             const final_fail = fb.emitLoadLocal(fail_count, I64, span)
             var summary_args: List(int) = .{}
@@ -365,7 +369,7 @@ struct Lowerer {
             summary_args.append(final_fail)
             fb.emitCall("__test_summary", summary_args, false, VOID, span)
 
-            // Return fail count as exit code
+            // Return fail_count as exit code (0 = all pass)
             const final_count = fb.emitLoadLocal(fail_count, I64, span)
             fb.emitRet(final_count, span)
         }
@@ -574,7 +578,6 @@ struct Lowerer {
     }
 
     fn lowerMethodWithName(fn_decl: FnDecl, synth_name: string, is_destructor: bool) void {
-        eprintln("[lower] lmwn: resolve return type")
         const return_type = if (fn_decl.return_type != null_node) {
             self.resolveTypeNode(fn_decl.return_type)
         } else { VOID }
@@ -582,19 +585,15 @@ struct Lowerer {
         const uses_sret = self.needsSret(return_type)
         const wasm_return_type = if (uses_sret) { VOID } else { return_type }
 
-        eprintln("[lower] lmwn: startFunc")
         self.builder.startFunc(synth_name, VOID, wasm_return_type, fn_decl.span)
         if (self.builder.func()) |fb| {
             fb.is_destructor = is_destructor
             if (uses_sret) { fb.sret_return_type = return_type }
-            eprintln("[lower] lmwn: clearPerFunctionState")
             self.clearPerFunctionState()
 
             if (uses_sret) {
                 fb.addParam("__sret", I64, 8)
             }
-
-            eprintln("[lower] lmwn: adding ${fn_decl.params.count} params")
             for i in 0..fn_decl.params.count {
                 const param_idx = fn_decl.params.get(i)
                 self.addParamFromNode(param_idx)
@@ -644,9 +643,7 @@ struct Lowerer {
                     Decl.fn_decl |fd| => {
                         const bare_name = struct_decl.name ++ "_" ++ fd.name
                         const synth_name = self.qualifyName(bare_name)
-                        eprintln("[lower] method: ${synth_name}")
                         self.lowerMethodWithName(fd, synth_name, fd.name == "deinit")
-                        eprintln("[lower] method done: ${synth_name}")
                     },
                     else => {},
                 },
@@ -2220,6 +2217,10 @@ struct Lowerer {
             LiteralKind.null_lit => {
                 const type_idx = self.inferExprType(idx)
                 return fb.emitConstNull(type_idx, span)
+            },
+            LiteralKind.char => {
+                const val = parseCharLiteral(lit.value)
+                return fb.emitConstInt(val, I64, span)
             },
             else => {
                 return null_node

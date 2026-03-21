@@ -1,0 +1,142 @@
+/// Comptime value system — rich structured values for compile-time evaluation.
+///
+/// Port of compiler/frontend/comptime.zig
+/// Reference: Zig's InternPool.MutableValue holds comptime state during analysis.
+
+import "std/list"
+
+// ComptimeValue tag constants
+const CV_INT: int = 0
+const CV_FLOAT: int = 1
+const CV_STRING: int = 2
+const CV_BOOL: int = 3
+const CV_ARRAY: int = 4
+const CV_ENUM_FIELD: int = 5
+const CV_TYPE_INFO: int = 6
+const CV_UNDEFINED: int = 7
+
+// TypeInfo kind constants
+const TI_ENUM_INFO: int = 0
+
+struct ComptimeValue {
+    // Nested types — matches Zig comptime.zig pub const inside ComptimeValue
+    struct ComptimeArray {
+        elements: List(ComptimeValue),
+        elem_type_name: string,
+    }
+
+    struct EnumFieldInfo {
+        name: string,
+        value: int,
+    }
+
+    struct ComptimeTypeInfo {
+        kind: int,
+        name: string,
+        fields: List(ComptimeValue),
+    }
+
+    // Fields
+    tag: int,
+    int_val: int,
+    float_val: float,
+    str_val: string,
+    bool_val: bool,
+    array: ComptimeValue_ComptimeArray,
+    enum_field: ComptimeValue_EnumFieldInfo,
+    type_info: ComptimeValue_ComptimeTypeInfo,
+
+    static fn makeInt(v: int) ComptimeValue {
+        return ComptimeValue {
+            tag: CV_INT, int_val: v, float_val: 0.0, str_val: "", bool_val: false,
+            array: ComptimeValue_ComptimeArray { elements: .{}, elem_type_name: "" },
+            enum_field: ComptimeValue_EnumFieldInfo { name: "", value: 0 },
+            type_info: ComptimeValue_ComptimeTypeInfo { kind: 0, name: "", fields: .{} },
+        }
+    }
+
+    static fn makeFloat(v: float) ComptimeValue {
+        return ComptimeValue {
+            tag: CV_FLOAT, int_val: 0, float_val: v, str_val: "", bool_val: false,
+            array: ComptimeValue_ComptimeArray { elements: .{}, elem_type_name: "" },
+            enum_field: ComptimeValue_EnumFieldInfo { name: "", value: 0 },
+            type_info: ComptimeValue_ComptimeTypeInfo { kind: 0, name: "", fields: .{} },
+        }
+    }
+
+    static fn makeString(v: string) ComptimeValue {
+        return ComptimeValue {
+            tag: CV_STRING, int_val: 0, float_val: 0.0, str_val: v, bool_val: false,
+            array: ComptimeValue_ComptimeArray { elements: .{}, elem_type_name: "" },
+            enum_field: ComptimeValue_EnumFieldInfo { name: "", value: 0 },
+            type_info: ComptimeValue_ComptimeTypeInfo { kind: 0, name: "", fields: .{} },
+        }
+    }
+
+    static fn makeBool(v: bool) ComptimeValue {
+        return ComptimeValue {
+            tag: CV_BOOL, int_val: 0, float_val: 0.0, str_val: "", bool_val: v,
+            array: ComptimeValue_ComptimeArray { elements: .{}, elem_type_name: "" },
+            enum_field: ComptimeValue_EnumFieldInfo { name: "", value: 0 },
+            type_info: ComptimeValue_ComptimeTypeInfo { kind: 0, name: "", fields: .{} },
+        }
+    }
+
+    static fn makeArray(elems: List(ComptimeValue), elem_name: string) ComptimeValue {
+        return ComptimeValue {
+            tag: CV_ARRAY, int_val: 0, float_val: 0.0, str_val: "", bool_val: false,
+            array: ComptimeValue_ComptimeArray { elements: elems, elem_type_name: elem_name },
+            enum_field: ComptimeValue_EnumFieldInfo { name: "", value: 0 },
+            type_info: ComptimeValue_ComptimeTypeInfo { kind: 0, name: "", fields: .{} },
+        }
+    }
+
+    static fn makeEnumField(name: string, value: int) ComptimeValue {
+        return ComptimeValue {
+            tag: CV_ENUM_FIELD, int_val: 0, float_val: 0.0, str_val: "", bool_val: false,
+            array: ComptimeValue_ComptimeArray { elements: .{}, elem_type_name: "" },
+            enum_field: ComptimeValue_EnumFieldInfo { name: name, value: value },
+            type_info: ComptimeValue_ComptimeTypeInfo { kind: 0, name: "", fields: .{} },
+        }
+    }
+
+    static fn makeTypeInfo(kind: int, name: string, fields: List(ComptimeValue)) ComptimeValue {
+        return ComptimeValue {
+            tag: CV_TYPE_INFO, int_val: 0, float_val: 0.0, str_val: "", bool_val: false,
+            array: ComptimeValue_ComptimeArray { elements: .{}, elem_type_name: "" },
+            enum_field: ComptimeValue_EnumFieldInfo { name: "", value: 0 },
+            type_info: ComptimeValue_ComptimeTypeInfo { kind: kind, name: name, fields: fields },
+        }
+    }
+
+    static fn makeUndefined() ComptimeValue {
+        return ComptimeValue {
+            tag: CV_UNDEFINED, int_val: 0, float_val: 0.0, str_val: "", bool_val: false,
+            array: ComptimeValue_ComptimeArray { elements: .{}, elem_type_name: "" },
+            enum_field: ComptimeValue_EnumFieldInfo { name: "", value: 0 },
+            type_info: ComptimeValue_ComptimeTypeInfo { kind: 0, name: "", fields: .{} },
+        }
+    }
+
+    /// Extract integer value (backward compat with evalConstExpr).
+    /// Returns null if not int or bool. Matches Zig comptime.zig:41-47.
+    fn asInt() ?int {
+        if (self.tag == CV_INT) { return self.int_val }
+        if (self.tag == CV_BOOL) { return if (self.bool_val) { 1 } else { 0 } }
+        return null
+    }
+
+    /// Extract string value. Returns null if not string.
+    /// Matches Zig comptime.zig:50-54.
+    fn asString() ?string {
+        if (self.tag == CV_STRING) { return self.str_val }
+        return null
+    }
+
+    /// Extract float value. Returns null if not float.
+    /// Matches Zig comptime.zig:57-62.
+    fn asFloat() ?float {
+        if (self.tag == CV_FLOAT) { return self.float_val }
+        return null
+    }
+}

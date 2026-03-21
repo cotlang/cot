@@ -1,6 +1,18 @@
 # Claude AI Instructions
 
-## 🚨🚨🚨 CURRENT PROJECT FOCUS: `self/` MUST MATCH ZIG COMPILER 1:1 🚨🚨🚨
+## 🚨🚨🚨 CURRENT 0.4 FOCUS: FIX ALL SELFCOT WASM CODEGEN TO MATCH ZIG 🚨🚨🚨
+
+**Goal:** selfcot must produce identical Wasm output to the Zig compiler. Run `selfcot test test/cases/*.cot` — every test that passes with `./zig-out/bin/cot test --target=wasm` must also pass with selfcot. Currently 6 of 21 test files have runtime failures (arrays, chars, loops, optional, strings, structs). Fix each by porting the exact Zig code to `self/`. Once all tests pass, selfcot2.wasm must compile selfcot3.wasm identically — that's full self-hosting and the 0.4 release gate.
+
+**Method:** For every failing test, diff the Zig compiler code against selfcot. The divergence IS the bug. Port the Zig code exactly — no simplification, no invention. This has resolved every issue so far without exception.
+
+**This is a long process and the user knows it.** Do not cut corners. Do not propose "quick fixes." Do not simplify or workaround. Every function in `self/` is production code that will permanently replace the Zig compiler. Port each function completely and correctly, matching the Zig implementation line-by-line. If a fix requires rewriting a large function, rewrite the entire function.
+
+**Timeouts:** Nothing in this project takes more than a few seconds. If a command doesn't return in 3-5 seconds, it's an infinite loop — kill it immediately. Use `perl -e 'alarm 3; exec @ARGV'` or `timeout 3` wrappers. Never set timeouts above 15s for test runs.
+
+---
+
+## 🚨🚨🚨 `self/` MUST MATCH ZIG COMPILER 1:1 🚨🚨🚨
 
 **The self-hosted compiler (`self/`) must be a mechanical 1:1 translation of the Zig compiler (`compiler/`).** Every function, every variable, every enum, every logic pattern must be identical. Any divergence is a bug.
 
@@ -131,9 +143,9 @@ zig build
 - selfcot is compiled to a native binary by the Zig `cot` compiler
 - The pipeline: `self/main.cot` → `self/parse/` → `self/check/` → `self/build/` → `self/optimize/` → `self/emit/wasm/`
 - `self/test_tiny.cot` is a minimal test file for smoke-testing selfcot
-- ~44,900 lines across 42 files — parse, check, build, optimize, emit all complete
+- ~44,900 lines across 41 files — parse, check, build, optimize, emit all complete
 
-**Current status (as of 2026-03-19):** selfcot compiles **9 of 13 parse/check/build files** to valid Wasm: token, source, errors, ast, arc, scanner, types, parser. Four remaining: ir/ssa/builder (SIGSEGV in codegen), checker/lower (check errors on imports). See `claude/SELF_HOSTING.md` for detailed status.
+**Current status (as of 2026-03-21):** selfcot compiles **all 41 files** individually to valid Wasm and builds itself to a valid 1.6MB Wasm binary (`selfcot2.wasm`). selfcot2.wasm validates clean and runs (`version`/`help` work). Next blocker: arg parsing bug with 3+ CLI args prevents selfcot2.wasm from compiling files. Expect more runtime codegen bugs once arg parsing is fixed — every pipeline stage is untested as Wasm-compiled code. See `claude/SELF_HOSTING.md` for detailed status.
 
 **`distinct` types:** Both the Zig compiler and selfcot support `type X = distinct T`. Used in stdlib: `alloc_raw` returns `RawPtr` (distinct i64), `dealloc_raw` takes `RawPtr` — mismatching alloc/dealloc is now a compile-time error.
 

@@ -249,6 +249,8 @@ struct Checker {
     trait_defs: *Map(string, int),
     current_return_type: int,
     in_loop: bool,
+    in_labeled_block: int,
+    labeled_block_result_type: int,
     safe_mode: bool,
     // Generic support — typed pointers matching Zig's SharedGenericContext
     generic_structs: *Map(string, *GenericInfo),
@@ -290,6 +292,8 @@ struct Checker {
             trait_defs: new Map(string, int) { keys: 0, values: 0, states: 0, count: 0, capacity: 0 },
             current_return_type: VOID,
             in_loop: false,
+            in_labeled_block: 0,
+            labeled_block_result_type: invalid_type,
             safe_mode: false,
             generic_structs: new Map(string, *GenericInfo) { keys: 0, values: 0, states: 0, count: 0, capacity: 0 },
             generic_functions: new Map(string, *GenericInfo) { keys: 0, values: 0, states: 0, count: 0, capacity: 0 },
@@ -501,18 +505,20 @@ struct Checker {
             self.defineSymbol(makeTypeSymbol(name, placeholder, idx))
             self.types.registerNamed(name, placeholder)
 
-            // Pass 2: Build real struct type (field type resolution can now find 'name').
+            // Register nested TYPE declarations BEFORE resolving fields, so parent struct
+            // fields can reference nested types (e.g. ComptimeValue_ComptimeArray).
+            // Matches Zig checker.zig: nested decls registered before buildStructTypeWithLayout.
+            for ni in 0..sd.nested_decls.count {
+                const nested_idx = sd.nested_decls.get(ni)
+                self.collectNestedDecl(name, nested_idx)
+            }
+
+            // Pass 2: Build real struct type (field type resolution can now find nested types).
             const struct_type = self.buildStructType(idx, name)
 
             // Update placeholder in-place with the real struct data.
             // Zig reference: checker.zig:456
             self.types.updateAt(placeholder, self.types.get(struct_type))
-
-            // Register nested declarations with qualified names (Parent_Child)
-            for ni in 0..sd.nested_decls.count {
-                const nested_idx = sd.nested_decls.get(ni)
-                self.collectNestedDecl(name, nested_idx)
-            }
         }, else => {} }, else => {} }
     }
 
@@ -1129,7 +1135,24 @@ struct Checker {
         else if (tag == "while_stmt") { self.checkWhileStmt(idx) }
         else if (tag == "for_stmt") { self.checkForStmt(idx) }
         else if (tag == "block_stmt") { self.checkBlockStmt(idx) }
-        else if (tag == "break_stmt") { if (!self.in_loop) { self.reportError(idx, ErrorCode.e400, "break outside loop") } }
+        else if (tag == "break_stmt") {
+            const node = self.ast.getNode(idx)
+            switch (node) { Node.stmt |s| => switch (s) { Stmt.break_stmt |bs| => {
+                if (@lenOf(bs.label) > 0) {
+                    if (self.in_labeled_block == 0 and !self.in_loop) {
+                        self.reportError(idx, ErrorCode.e400, "break label does not match any enclosing labeled block or loop")
+                    }
+                    if (bs.value != null_node) {
+                        const val_type = self.checkExpr(bs.value)
+                        if (self.labeled_block_result_type == invalid_type) {
+                            self.labeled_block_result_type = val_type
+                        }
+                    }
+                } else if (!self.in_loop) {
+                    self.reportError(idx, ErrorCode.e400, "break outside loop")
+                }
+            }, else => {} }, else => {} }
+        }
         else if (tag == "continue_stmt") { if (!self.in_loop) { self.reportError(idx, ErrorCode.e401, "continue outside loop") } }
         else if (tag == "defer_stmt") {
             const node = self.ast.getNode(idx)
@@ -1944,6 +1967,9 @@ struct Checker {
                     self.checkExpr(call_args.get(0))
                 }
                 return INT
+            }
+            if (name == "append") {
+                return self.checkBuiltinAppend(idx, call_args, args_count)
             }
             // Distinct type constructor: RawPtr(expr) — Go type conversion T(expr)
             if (self.types.lookupByName(name) >= 0) {
@@ -2811,8 +2837,14 @@ struct Checker {
     fn checkBlockExpr(idx: int) int {
         var blk_stmts: List(int) = .{}
         var result_expr = null_node
-        switch (self.ast.getNode(idx)) { Node.expr |e| => switch (e) { Expr.block_expr |blk| => { blk_stmts = blk.stmts; result_expr = blk.result_expr }, else => {} }, else => {} }
+        var label = ""
+        switch (self.ast.getNode(idx)) { Node.expr |e| => switch (e) { Expr.block_expr |blk| => { blk_stmts = blk.stmts; result_expr = blk.result_expr; label = blk.label }, else => {} }, else => {} }
         const stmts_count = blk_stmts.count
+
+        const has_label = @lenOf(label) > 0
+        if (has_label) { self.in_labeled_block = self.in_labeled_block + 1 }
+        const saved_label_result = self.labeled_block_result_type
+        if (has_label) { self.labeled_block_result_type = invalid_type }
 
         self.pushScope()
         for i in 0..stmts_count {
@@ -2822,8 +2854,42 @@ struct Checker {
         if (result_expr != null_node) {
             result = self.checkExpr(result_expr)
         }
+        // For labeled blocks, infer type from break values
+        if (has_label and self.labeled_block_result_type != invalid_type) {
+            result = self.labeled_block_result_type
+        }
         self.popScope()
+
+        if (has_label) {
+            self.in_labeled_block = self.in_labeled_block - 1
+            self.labeled_block_result_type = saved_label_result
+        }
         return result
+    }
+
+    /// Port of Zig checker.zig:2036-2049 — append(array_or_slice, elem) → slice
+    fn checkBuiltinAppend(idx: int, call_args: List(int), args_count: int) int {
+        if (args_count != 2) {
+            self.reportError(idx, ErrorCode.e300, "append() expects two arguments")
+            return invalid_type
+        }
+        const slice_type = self.checkExpr(call_args.get(0))
+        const elem_type = self.checkExpr(call_args.get(1))
+        const st = self.types.get(slice_type)
+        var expected_elem = invalid_type
+        if (st.tag == TAG_ARRAY) {
+            switch (st) { Type.array |a| => { expected_elem = a.elem }, else => {} }
+        } else if (st.tag == TAG_SLICE) {
+            switch (st) { Type.slice |s| => { expected_elem = s.elem }, else => {} }
+        }
+        if (expected_elem == invalid_type) {
+            self.reportError(idx, ErrorCode.e300, "append() first argument must be array or slice")
+            return invalid_type
+        }
+        if (!self.types.isAssignable(elem_type, expected_elem)) {
+            self.reportError(idx, ErrorCode.e300, "append() element type mismatch")
+        }
+        return self.types.makeSlice(expected_elem)
     }
 
     /// Port from Zig checker.zig:1830-2204 — per-builtin type validation.
