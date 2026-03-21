@@ -2463,72 +2463,36 @@ struct Lowerer {
     }
 
     /// String concatenation: decompose strings, call string_concat runtime
+    /// Port of Zig lower.zig:5087-5108 — string concatenation via string_concat runtime.
     fn lowerStringConcat(bin: Binary) int {
         const fb = self.builder.func() orelse return null_node
         const left = self.lowerExprNode(bin.left)
         const right = self.lowerExprNode(bin.right)
         if (left == null_node or right == null_node) { return null_node }
 
-        // Decompose left string into ptr/len
-        const left_local = fb.addLocalWithSize("__str_l", STRING, false, 16)
-        fb.emitStoreLocal(left_local, left, bin.span)
-        const left_ptr = fb.emitFieldLocal(left_local, 0, 0, I64, bin.span)
-        const left_len = fb.emitFieldLocal(left_local, 1, 8, I64, bin.span)
+        const ptr_type = self.types.makePointer(U8)
 
-        // Decompose right string into ptr/len
-        const right_local = fb.addLocalWithSize("__str_r", STRING, false, 16)
-        fb.emitStoreLocal(right_local, right, bin.span)
-        const right_ptr = fb.emitFieldLocal(right_local, 0, 0, I64, bin.span)
-        const right_len = fb.emitFieldLocal(right_local, 1, 8, I64, bin.span)
+        // Extract ptr/len from left string
+        const ptr1 = fb.emitSlicePtr(left, ptr_type, bin.span)
+        const len1 = fb.emitSliceLen(left, bin.span)
 
-        // Call string_concat(left_ptr, left_len, right_ptr, right_len) → new_ptr (I64)
-        // Zig reference: lower.zig lines 4893-4900 — returns I64, wraps with string_header
+        // Extract ptr/len from right string
+        const ptr2 = fb.emitSlicePtr(right, ptr_type, bin.span)
+        const len2 = fb.emitSliceLen(right, bin.span)
+
+        // Call string_concat(ptr1, len1, ptr2, len2) → new_ptr
         var args: List(int) = .{}
-        args.append(left_ptr)
-        args.append(left_len)
-        args.append(right_ptr)
-        args.append(right_len)
+        args.append(ptr1)
+        args.append(len1)
+        args.append(ptr2)
+        args.append(len2)
         const new_ptr = fb.emitCall("string_concat", args, false, I64, bin.span)
 
-        // Compute new_len = left_len + right_len
-        const new_len = fb.emitBinary(BinaryOp.add, left_len, right_len, I64, bin.span)
+        // Compute new_len = len1 + len2
+        const new_len = fb.emitBinary(BinaryOp.add, len1, len2, I64, bin.span)
 
         // Create string_header(new_ptr, new_len) — produces string_make in SSA
         return fb.emit(Node.init(Data.string_header(StringHeader { ptr: new_ptr, len: new_len }), STRING, bin.span))
-    }
-
-    /// String comparison: decompose strings, call string_eq runtime
-    fn lowerStringCompare(bin: Binary) int {
-        const fb = self.builder.func() orelse return null_node
-        const left = self.lowerExprNode(bin.left)
-        const right = self.lowerExprNode(bin.right)
-        if (left == null_node or right == null_node) { return null_node }
-
-        // Decompose left string
-        const left_local = fb.addLocalWithSize("__str_l", STRING, false, 16)
-        fb.emitStoreLocal(left_local, left, bin.span)
-        const left_ptr = fb.emitFieldLocal(left_local, 0, 0, I64, bin.span)
-        const left_len = fb.emitFieldLocal(left_local, 1, 8, I64, bin.span)
-
-        // Decompose right string
-        const right_local = fb.addLocalWithSize("__str_r", STRING, false, 16)
-        fb.emitStoreLocal(right_local, right, bin.span)
-        const right_ptr = fb.emitFieldLocal(right_local, 0, 0, I64, bin.span)
-        const right_len = fb.emitFieldLocal(right_local, 1, 8, I64, bin.span)
-
-        // Call string_eq(left_ptr, left_len, right_ptr, right_len)
-        var args: List(int) = .{}
-        args.append(left_ptr)
-        args.append(left_len)
-        args.append(right_ptr)
-        args.append(right_len)
-        const eq_result = fb.emitCall("string_eq", args, false, BOOL, bin.span)
-
-        // For != invert the result
-        if (bin.op == Token.neq) {
-            return fb.emitUnary(UnaryOp.@"not", eq_result, BOOL, bin.span)
-        }
-        return eq_result
     }
 
     fn lowerUnary(un: Unary, idx: int) int {
@@ -3826,10 +3790,12 @@ struct Lowerer {
         const arg_idx = call.args.get(0)
 
         // Check if arg is a string literal — compile-time length
+        // Ref: lower.zig:9749-9753 — parseStringLiteral strips quotes
         switch (self.tree.getNode(arg_idx)) { Node.expr |e| => switch (e) {
             Expr.literal |l| => {
                 if (l.kind == LiteralKind.@"string") {
-                    return fb.emitConstInt(@lenOf(l.value), I64, call.span)
+                    const unescaped = parseStringLiteral(l.value)
+                    return fb.emitConstInt(@lenOf(unescaped), I64, call.span)
                 }
             },
             else => {},
