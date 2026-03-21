@@ -4505,6 +4505,67 @@ pub const Lowerer = struct {
             return value;
         }
 
+        // Union types: tag-conditional retain for variants with ARC payloads.
+        // Swift LoadableEnumTypeLowering::emitLoweredCopyValue (TypeLowering.cpp:1577).
+        if (info == .union_type) {
+            const ut = info.union_type;
+            var has_arc_variant = false;
+            for (ut.variants) |v| {
+                if (v.payload_type != types.invalid_type and self.type_reg.couldBeARC(v.payload_type)) {
+                    has_arc_variant = true;
+                    break;
+                }
+            }
+            if (has_arc_variant) {
+                const union_size = self.type_reg.sizeOf(type_idx);
+                const tmp = try fb.addLocalWithSize("__copy_union", type_idx, false, union_size);
+                _ = try fb.emitStoreLocal(tmp, value, span);
+                const tag = try fb.emitFieldLocal(tmp, 0, 0, TypeRegistry.I64, span);
+                const after_blk = try fb.newBlock("copy_union.after");
+                for (ut.variants, 0..) |v, i| {
+                    if (v.payload_type != types.invalid_type and self.type_reg.couldBeARC(v.payload_type)) {
+                        const tag_val = try fb.emitConstInt(@intCast(i), TypeRegistry.I64, span);
+                        const is_this = try fb.emitBinary(.eq, tag, tag_val, TypeRegistry.BOOL, span);
+                        const copy_blk = try fb.newBlock("copy_union.case");
+                        const skip_blk = try fb.newBlock("copy_union.skip");
+                        _ = try fb.emitBranch(is_this, copy_blk, skip_blk, span);
+                        fb.setBlock(copy_blk);
+                        const payload = try fb.emitFieldLocal(tmp, 1, 8, v.payload_type, span);
+                        _ = try self.emitCopyValue(fb, payload, v.payload_type, span);
+                        _ = try fb.emitJump(after_blk, span);
+                        fb.setBlock(skip_blk);
+                    }
+                }
+                _ = try fb.emitJump(after_blk, span);
+                fb.setBlock(after_blk);
+            }
+            return value;
+        }
+
+        // Tuple types: element-wise copy for non-trivial elements.
+        // Swift LoadableTupleTypeLowering::emitLoweredCopyValue (TypeLowering.cpp:1455).
+        if (info == .tuple) {
+            const tup = info.tuple;
+            var has_arc_elem = false;
+            for (tup.element_types) |et| {
+                if (!self.type_reg.isTrivial(et)) { has_arc_elem = true; break; }
+            }
+            if (has_arc_elem) {
+                const tuple_size = self.type_reg.sizeOf(type_idx);
+                const tmp = try fb.addLocalWithSize("__copy_tuple", type_idx, false, tuple_size);
+                _ = try fb.emitStoreLocal(tmp, value, span);
+                var offset: u32 = 0;
+                for (tup.element_types, 0..) |et, i| {
+                    if (!self.type_reg.isTrivial(et)) {
+                        const elem_val = try fb.emitFieldLocal(tmp, @intCast(i), @intCast(offset), et, span);
+                        _ = try self.emitCopyValue(fb, elem_val, et, span);
+                    }
+                    offset += ((self.type_reg.sizeOf(et) + 7) / 8) * 8;
+                }
+            }
+            return value;
+        }
+
         // Error union: copy elem if success (tag=0)
         if (info == .error_union) {
             // Error unions have tag at offset 0, payload at offset 8
@@ -4600,6 +4661,72 @@ pub const Lowerer = struct {
                 if (!self.type_reg.isTrivial(field.type_idx)) {
                     const field_val = try fb.emitFieldLocal(tmp, @intCast(fi), @intCast(field.offset), field.type_idx, span);
                     try self.emitDestroyValue(fb, field_val, field.type_idx, span);
+                }
+            }
+            return;
+        }
+
+        // Union types: tag-conditional release for variants with ARC payloads.
+        // Swift LoadableEnumTypeLowering::emitLoweredDestroyValue.
+        if (info == .union_type) {
+            const ut = info.union_type;
+            var has_arc_variant = false;
+            for (ut.variants) |v| {
+                if (v.payload_type != types.invalid_type and self.type_reg.couldBeARC(v.payload_type)) {
+                    has_arc_variant = true;
+                    break;
+                }
+            }
+            if (has_arc_variant) {
+                const union_size = self.type_reg.sizeOf(type_idx);
+                const tmp = try fb.addLocalWithSize("__destroy_union", type_idx, false, union_size);
+                _ = try fb.emitStoreLocal(tmp, value, span);
+                const tag = try fb.emitFieldLocal(tmp, 0, 0, TypeRegistry.I64, span);
+                const after_blk = try fb.newBlock("destroy_union.after");
+                for (ut.variants, 0..) |v, i| {
+                    if (v.payload_type != types.invalid_type and self.type_reg.couldBeARC(v.payload_type)) {
+                        const tag_val = try fb.emitConstInt(@intCast(i), TypeRegistry.I64, span);
+                        const is_this = try fb.emitBinary(.eq, tag, tag_val, TypeRegistry.BOOL, span);
+                        const rel_blk = try fb.newBlock("destroy_union.case");
+                        const skip_blk = try fb.newBlock("destroy_union.skip");
+                        _ = try fb.emitBranch(is_this, rel_blk, skip_blk, span);
+                        fb.setBlock(rel_blk);
+                        const payload = try fb.emitFieldLocal(tmp, 1, 8, v.payload_type, span);
+                        try self.emitDestroyValue(fb, payload, v.payload_type, span);
+                        _ = try fb.emitJump(after_blk, span);
+                        fb.setBlock(skip_blk);
+                    }
+                }
+                _ = try fb.emitJump(after_blk, span);
+                fb.setBlock(after_blk);
+            }
+            return;
+        }
+
+        // Tuple types: element-wise destroy for non-trivial elements (reverse order).
+        // Swift LoadableTupleTypeLowering::emitLoweredDestroyValue.
+        if (info == .tuple) {
+            const tup = info.tuple;
+            var has_arc_elem = false;
+            for (tup.element_types) |et| {
+                if (!self.type_reg.isTrivial(et)) { has_arc_elem = true; break; }
+            }
+            if (has_arc_elem) {
+                const tuple_size = self.type_reg.sizeOf(type_idx);
+                const tmp = try fb.addLocalWithSize("__destroy_tuple", type_idx, false, tuple_size);
+                _ = try fb.emitStoreLocal(tmp, value, span);
+                // Destroy in reverse element order (LIFO, matching Swift)
+                var ei: usize = tup.element_types.len;
+                var offset: u32 = self.type_reg.sizeOf(type_idx);
+                while (ei > 0) {
+                    ei -= 1;
+                    const et = tup.element_types[ei];
+                    const elem_size = ((self.type_reg.sizeOf(et) + 7) / 8) * 8;
+                    offset -= elem_size;
+                    if (!self.type_reg.isTrivial(et)) {
+                        const elem_val = try fb.emitFieldLocal(tmp, @intCast(ei), @intCast(offset), et, span);
+                        try self.emitDestroyValue(fb, elem_val, et, span);
+                    }
                 }
             }
             return;
