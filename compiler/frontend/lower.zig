@@ -1888,17 +1888,19 @@ pub const Lowerer = struct {
                     var mv = managed;
                     value_node = mv.forward(&self.cleanup_stack);
                 } else if (managed.getValue() != ir.null_node) {
-                    // Swift SILGen: retain +0 values with managed pointer types.
-                    // Check BOTH the return type AND the value's IR type — in @safe mode
-                    // the return type may be a struct (Scope) while the IR value is *Scope.
-                    // Swift TypeLowering.cpp:1213: emitCopyValue retains based on value type.
-                    const val_type = if (managed.getValue() != ir.null_node)
-                        fb.nodes.items[managed.getValue()].type_idx
-                    else
-                        fb.return_type;
-                    // Swift SILGen: copy +0 return values to produce +1.
-                    // emitCopyValue handles all type categories (pointer, ?*T, struct, etc.)
-                    value_node = try self.emitCopyValue(fb, managed.getValue(), val_type, ret.span);
+                    // Swift SILGen ensurePlusOne (ManagedValue.cpp:289-299):
+                    // Retain +0 values to produce +1 for the caller.
+                    // Use the FUNCTION's declared return type (not the IR value's type)
+                    // so that @intToPtr raw pointers get retained when the function
+                    // signature declares a managed pointer return.
+                    // Swift TypeLowering: convention is determined by the function type,
+                    // not the internal representation of the value.
+                    const fn_ret_type = fb.return_type;
+                    if (self.type_reg.couldBeARC(fn_ret_type) and !self.target.isWasm()) {
+                        value_node = try self.emitCopyValue(fb, managed.getValue(), fn_ret_type, ret.span);
+                    } else {
+                        value_node = managed.getValue();
+                    }
                 }
             }
 
@@ -4428,17 +4430,10 @@ pub const Lowerer = struct {
         const node = self.tree.getNode(ast_idx);
         const expr = if (node) |n| n.asExpr() else null;
         const is_owned = if (expr) |e| (e == .new_expr or e == .call) else false;
-        if (is_owned and !self.target.isWasm()) {
-            // Use IR value's type for managed check (matches lowerExprManaged)
-            const ir_type = if (value != ir.null_node and self.current_func != null)
-                self.current_func.?.nodes.items[value].type_idx
-            else
-                type_idx;
-            if (self.type_reg.couldBeARC(ir_type)) {
-                const cleanup = arc.Cleanup.init(.release, value, ir_type);
-                const handle = try self.cleanup_stack.push(cleanup);
-                return arc.ManagedValue.forOwned(value, ir_type, handle);
-            }
+        if (is_owned and self.type_reg.couldBeARC(type_idx) and !self.target.isWasm()) {
+            const cleanup = arc.Cleanup.init(.release, value, type_idx);
+            const handle = try self.cleanup_stack.push(cleanup);
+            return arc.ManagedValue.forOwned(value, type_idx, handle);
         }
         return arc.ManagedValue.forTrivial(value, type_idx);
     }
@@ -4684,15 +4679,18 @@ pub const Lowerer = struct {
         // Example: getWorkspacePtr returns *Workspace (checker: managed=true), but
         // the IR value from @intToPtr is raw (managed=false). Using the IR type
         // prevents spurious release on raw pointers.
+        // +1 expressions: new_expr and call results with non-trivial types.
+        // Swift convention (SILFunctionType.cpp DefaultConventions): ALL non-trivial
+        // function returns are ResultConvention::Owned (+1). Caller must release.
+        // The callee retains +0 values in lowerReturn (ensurePlusOne pattern).
+        // Use the checker's type (not IR type) — this matches the function signature
+        // which determines the convention. The callee's lowerReturn uses the function's
+        // declared return type for retain, ensuring symmetry.
         if (expr == .new_expr or expr == .call) {
-            const ir_type = if (value != ir.null_node and self.current_func != null)
-                self.current_func.?.nodes.items[value].type_idx
-            else
-                type_idx;
-            if (self.type_reg.couldBeARC(ir_type) and !self.target.isWasm()) {
-                const cleanup = arc.Cleanup.init(.release, value, ir_type);
+            if (self.type_reg.couldBeARC(type_idx) and !self.target.isWasm()) {
+                const cleanup = arc.Cleanup.init(.release, value, type_idx);
                 const handle = try self.cleanup_stack.push(cleanup);
-                return arc.ManagedValue.forOwned(value, ir_type, handle);
+                return arc.ManagedValue.forOwned(value, type_idx, handle);
             }
         }
 

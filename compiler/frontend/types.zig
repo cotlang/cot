@@ -456,14 +456,26 @@ pub const TypeRegistry = struct {
             // Optionals of trivial types are trivial
             .optional => |o| self.isTrivial(o.elem),
             .error_union => |e| self.isTrivial(e.elem),
-            // Struct types: check if they have a heap flag
-            // For now, all structs are stack-allocated (trivial)
-            // When M18 adds heap allocation, this will check for heap objects
-            .struct_type => true,
+            // Struct types: trivial only if ALL fields are trivial.
+            // Swift TypeLowering.cpp: LoadableStructTypeLowering extends
+            // NonTrivialLoadableTypeLowering when any child is non-trivial.
+            .struct_type => |s| {
+                for (s.fields) |field| {
+                    if (!self.isTrivial(field.type_idx)) return false;
+                }
+                return true;
+            },
             // Collections and futures are non-trivial (heap-allocated)
             .map, .list, .future => false,
-            // Union types are trivial for now
-            .union_type => true,
+            // Union types: trivial only if ALL variant payloads are trivial.
+            // Swift TypeLowering.cpp: LoadableEnumTypeLowering for enums with
+            // non-trivial payloads.
+            .union_type => |u| {
+                for (u.variants) |v| {
+                    if (v.payload_type != invalid_type and !self.isTrivial(v.payload_type)) return false;
+                }
+                return true;
+            },
             // Tuples are trivial if all elements are trivial
             .tuple => |tup| {
                 for (tup.element_types) |et| if (!self.isTrivial(et)) return false;
@@ -486,17 +498,40 @@ pub const TypeRegistry = struct {
     /// Also handles ?*T (optional pointer wrapping an ARC type).
     /// Reference: Swift TypeLowering — aggregate types containing class references
     /// are non-trivial. initializeWithCopy retains each class field memberwise.
+    /// Returns true if type could be an ARC-managed value or contains ARC-managed fields.
+    /// Equivalent to Swift's `!isTrivial()` for ownership purposes.
+    /// Reference: Swift TypeLowering — recursive non-trivial check across all aggregate kinds.
     pub fn couldBeARC(self: *const TypeRegistry, idx: TypeIndex) bool {
         const t = self.get(idx);
         if (t == .pointer) return t.pointer.managed;
         if (t == .optional) return self.couldBeARC(t.optional.elem);
-        // Struct types: check if any field is ARC-managed (recursive).
-        // Swift: aggregate types with class reference fields are non-trivial.
+        // Struct: check if any field is ARC-managed (Swift LoadableStructTypeLowering)
         if (t == .struct_type) {
             for (t.struct_type.fields) |field| {
                 if (self.couldBeARC(field.type_idx)) return true;
             }
         }
+        // Union: check if any variant payload is ARC-managed (Swift LoadableEnumTypeLowering)
+        if (t == .union_type) {
+            for (t.union_type.variants) |v| {
+                if (v.payload_type != invalid_type and self.couldBeARC(v.payload_type)) return true;
+            }
+        }
+        // Tuple: check if any element is ARC-managed (Swift LoadableTupleTypeLowering)
+        if (t == .tuple) {
+            for (t.tuple.element_types) |et| {
+                if (self.couldBeARC(et)) return true;
+            }
+        }
+        // Error union: check payload (Swift: non-trivial if success type is non-trivial)
+        if (t == .error_union) return self.couldBeARC(t.error_union.elem);
+        // Collections and futures are heap-allocated ARC objects
+        if (t == .list or t == .map or t == .future) return true;
+        // Array/slice: check element type
+        if (t == .array) return self.couldBeARC(t.array.elem);
+        if (t == .slice) return self.couldBeARC(t.slice.elem);
+        // Distinct: check underlying
+        if (t == .distinct) return self.couldBeARC(t.distinct.underlying);
         return false;
     }
 
