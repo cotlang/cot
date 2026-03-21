@@ -223,3 +223,172 @@ Cot is positioned to be the **first language designed for both native performanc
 - [ ] Deployment (edge compilation)
 - [ ] Package registry
 - [ ] Plugin marketplace
+
+---
+
+## Full-Stack Cot: Browser + Server, One Language
+
+### Why Both Targets Matter
+
+**Browser (Wasm):** UI, client logic, offline capability, zero-install.
+**Server (native):** Database access, authentication, background jobs, heavy computation, secrets.
+
+An ERP, SaaS app, or any real business application needs both. You don't want database credentials in a Wasm binary the user can inspect. You don't want 10GB of data downloaded to the browser. You don't want long-running reports blocking the UI thread.
+
+The power of Cot: **same language, same stdlib, both sides.**
+
+```
+Browser (WasmGC)                    Server (native ARC)
+─────────────────                   ───────────────────
+std/ui (Canvas components)          std/http (server)
+std/http (fetch client)             std/sqlite (database)
+std/json (serialize)                std/json (serialize)
+std/crypto (client-side hash)       std/crypto (auth/tokens)
+                    │                       │
+                    └──── std/json ─────────┘
+                         same types
+                         same structs
+                         same validation
+```
+
+### Shared Code: The Killer Feature
+
+In a typical business app:
+
+```cot
+// shared/invoice.cot — used by BOTH client and server
+struct Invoice {
+    id: i64,
+    customer: string,
+    items: List(LineItem),
+    total: f64,
+    status: InvoiceStatus,
+
+    fn validate() ?string {
+        if (self.items.count == 0) { return "Invoice must have at least one item" }
+        if (self.total < 0) { return "Total cannot be negative" }
+        return null
+    }
+}
+```
+
+This struct, this validation, these types — compiled to Wasm for the browser, compiled to native for the server. No duplication. No TypeScript/Go mismatch. No "the client validates differently than the server" bugs.
+
+### What Runs Where
+
+| Component | Browser (Wasm) | Server (native) | Why |
+|-----------|---------------|-----------------|-----|
+| UI rendering | Yes | No | Canvas is browser-only |
+| Form validation | Yes | Yes | Same code both sides |
+| Type definitions | Yes | Yes | Shared structs |
+| API client | Yes | No | fetch from browser |
+| API server | No | Yes | listens on port |
+| Database queries | No | Yes | credentials stay server-side |
+| Auth/sessions | No | Yes | secrets never in browser |
+| Report generation | No | Yes | CPU-heavy, runs in background |
+| Offline cache | Yes | No | IndexedDB in browser |
+| Real-time updates | Yes (WebSocket client) | Yes (WebSocket server) | Both ends in Cot |
+| PDF generation | Either | Either | Pure computation, works both sides |
+| Full-text search | No | Yes (SQLite FTS) | Large index stays on server |
+
+### Project Structure
+
+```
+my-erp/
+  shared/           ← compiles to BOTH targets
+    invoice.cot
+    customer.cot
+    types.cot
+    validation.cot
+  client/            ← compiles to Wasm
+    app.cot
+    views/
+      dashboard.cot
+      invoice_list.cot
+      invoice_form.cot
+  server/            ← compiles to native
+    main.cot
+    routes/
+      invoices.cot
+      customers.cot
+      reports.cot
+    db/
+      migrations.cot
+      queries.cot
+```
+
+One `cot build` command. Two outputs: `client.wasm` (serve statically) and `server` (run on your box). Same language, same types, same validation logic, zero duplication.
+
+This is what every full-stack framework promises but none deliver cleanly — because they're all two different languages bolted together (TypeScript + Go, TypeScript + Python, Dart + Dart-but-different-on-server). Cot is genuinely one language with two compilation targets, designed from day one for both.
+
+---
+
+## Canvas UI: The shadcn of Wasm
+
+### Why Canvas Over DOM
+
+**DOM is a 1990s document renderer being abused as an app platform.** Every DOM element carries layout, accessibility, style inheritance, event propagation, reflow — hundreds of properties you don't need for an ERP grid showing 10,000 rows. That's why Google moved Docs and Sheets rendering to Canvas.
+
+### Performance Comparison: 10,000 Row ERP Grid
+
+| Approach | Render time | Memory | Scroll perf |
+|----------|------------|--------|-------------|
+| DOM (React table) | ~2s initial, jank on scroll | 500MB+ (10K DOM nodes) | Poor (reflow on every frame) |
+| Virtual DOM (TanStack) | ~200ms, better scroll | 50MB (windowed) | Good (only visible rows in DOM) |
+| Canvas (Cot) | ~16ms (one draw call) | 10MB (data only, no DOM) | 60fps (just redraw visible rect) |
+
+Canvas doesn't create DOM nodes for rows. It draws text directly to pixels. Scrolling is just changing the draw offset and redrawing — one frame, 16ms budget, done.
+
+### A Canvas UI Kit for Cot: `std/ui`
+
+**The gap in the market:** No Canvas-rendered, Wasm-native component library exists with a shadcn-level developer experience. Flutter Web is closest but it's Dart-only and heavy.
+
+```cot
+import "std/ui"
+import "std/ui/components"
+
+fn main() {
+    var app = ui.App.init("Acme ERP")
+    var root = ui.Column.init()
+
+    // shadcn-style components — Canvas-rendered, not DOM
+    var nav = NavBar.init("Acme Corp")
+    nav.addItem("Dashboard", icon: "home")
+    nav.addItem("Invoices", icon: "file-text", badge: 3)
+    nav.addItem("Customers", icon: "users")
+
+    var table = DataTable.init()
+    table.columns(["Invoice", "Customer", "Amount", "Status", "Due"])
+    table.data(invoices)  // 10,000 rows — Canvas handles this instantly
+    table.sortable(true)
+    table.filterable(true)
+    table.onRowClick(fn(row: int) { openInvoice(row) })
+
+    var sidebar = Card.init()
+    sidebar.add(StatCard.init("Revenue", "$142,800", trend: +12.5))
+    sidebar.add(StatCard.init("Outstanding", "$23,400", trend: -3.2))
+
+    root.add(nav)
+    root.split(sidebar, table, ratio: 0.25)
+    app.setRoot(root)
+    app.run()
+}
+```
+
+Every component renders to Canvas. Text drawn with font atlases (same technique as game engines and Ghostty). Layout is flexbox-like but computed in Cot, not by the browser. Hit testing is coordinate-based, not DOM event bubbling.
+
+### Cross-Platform Rendering
+
+On native: `std/ui` renders with Metal (macOS), Vulkan (Linux), Direct3D (Windows).
+In browser: `std/ui` renders with WebGPU/Canvas2D.
+Same Cot code, same components, different rendering backends.
+
+This is what Ghostty does for terminals — GPU-accelerated rendering on every platform. Cotty already follows this pattern with Metal. The browser version would use WebGPU (shipping in all major browsers now).
+
+### The Opportunity
+
+**A shadcn-quality component library, Canvas-rendered, Wasm-native, cross-platform.** Beautiful defaults (rounded corners, subtle shadows, clean typography), instant performance (no DOM reflow), works everywhere Wasm runs.
+
+For business apps like ERP: forms, data tables, charts, dashboards, reports — ALL better on Canvas than DOM. An ERP doesn't need SEO. It doesn't need accessibility on every internal admin cell (though ARIA annotations via a thin DOM overlay handle compliance). It needs SPEED for large datasets and CONSISTENCY across platforms.
+
+**First mover advantage is real.** Nobody has built this. The market is wide open.
