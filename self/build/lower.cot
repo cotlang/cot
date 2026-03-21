@@ -8576,11 +8576,29 @@ struct Lowerer {
                 if (tid >= 0) { return tid }
                 return VOID
             },
+            // Generic type instances: Map(K, V), List(T), etc.
+            // Delegate to checker's resolveTypeExpr which handles generic_instance.
+            Expr.generic_instance |_gi| => {
+                return self.chk.resolveTypeExpr(idx)
+            },
             else => {},
         }, else => {} }
         if (kind < 0) { return VOID }
         // Resolve type_expr by kind (Zig lower.zig:10066-10136)
         if (kind == TYPE_NAMED) {
+            // For TYPE_NAMED, d1 is an ident node. Check type substitution directly
+            // before falling through to checker (which may use wrong AST for cross-file generics).
+            if (self.chk.hasTypeSubstitution()) {
+                var n = ""
+                switch (self.tree.getNode(d1)) { Node.expr |e| => switch (e) {
+                    Expr.ident |id| => { n = id.name },
+                    else => {},
+                }, else => {} }
+                if (@lenOf(n) > 0) {
+                    const sub = self.chk.lookupTypeSub(n)
+                    if (sub >= 0) { return sub }
+                }
+            }
             return self.chk.resolveTypeExpr(d1)
         }
         if (kind == TYPE_POINTER) {

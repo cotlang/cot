@@ -2254,8 +2254,12 @@ struct GenState {
         // init_mem, fwd_ref — no value produced
         if (v.op == SsaOp.init_mem or v.op == SsaOp.fwd_ref) { return }
 
-        // Compound return handling: calls returning string push 2 values
+        // Void/noreturn calls push nothing on the Wasm stack — skip setReg entirely.
+        // Zig ref: gen.zig — exit() has type_idx == VOID; noreturn also produces nothing.
         const is_call = v.op == SsaOp.wasm_call or v.op == SsaOp.wasm_lowered_static_call
+        if (is_call and (v.type_idx == VOID or v.type_idx == NORETURN)) { return }
+
+        // Compound return handling: calls returning string push 2 values
         const is_compound_ret = is_call and v.type_idx == STRING
         if (is_compound_ret) {
             // Stack: [ptr, len] — store len first (top of stack), then ptr
@@ -2278,7 +2282,7 @@ struct GenState {
             }
         } else if (v.uses > 0) {
             self.setReg(val_idx)
-        } else if (is_call and v.type_idx != VOID) {
+        } else if (is_call and v.type_idx != VOID and v.type_idx != NORETURN) {
             // Side-effect call with discarded non-void return: drop
             self.builder.append(As.drop)
         } else if (v.op == SsaOp.wasm_gc_struct_new or
