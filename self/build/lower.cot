@@ -1099,6 +1099,9 @@ struct Lowerer {
         fb.emitRet(ret_ptr, span)
     }
 
+    /// Port of Zig lower.zig:2310-2439 (lowerVarStmt).
+    /// Dispatches by type: string/slice/array/struct/tuple/union/optional get
+    /// special init paths that store directly into the local's slots.
     fn lowerLocalVarDecl(v: VarStmt) void {
         if (self.builder.func()) |fb| {
             var type_idx = VOID
@@ -1111,9 +1114,65 @@ struct Lowerer {
             const local_idx = fb.addLocalWithSize(v.name, type_idx, !v.is_const, size)
 
             if (v.value != null_node) {
-                const val = self.lowerExprNode(v.value)
-                if (val != null_node) {
-                    fb.emitStoreLocal(local_idx, val, v.span)
+                // Type-specific init paths — store directly into local slots
+                // Ref: lower.zig:2382-2439
+                const is_array = self.types.isArray(type_idx)
+                const is_slice = self.types.isSlice(type_idx)
+                const type_info = self.types.get(type_idx)
+
+                var is_struct_literal = false
+                var is_tuple_literal = false
+                switch (self.tree.getNode(v.value)) { Node.expr |e| => switch (e) {
+                    Expr.struct_init => { is_struct_literal = true },
+                    Expr.tuple_literal => { is_tuple_literal = true },
+                    else => {},
+                }, else => {} }
+
+                if (type_idx == STRING) {
+                    self.lowerStringInit(local_idx, v.value, v.span)
+                } else if (is_slice) {
+                    self.lowerSliceInit(local_idx, v.value, type_idx, v.span)
+                } else if (is_array) {
+                    self.lowerArrayInit(local_idx, v.value, v.span)
+                } else if (is_struct_literal) {
+                    self.lowerStructInitLocal(local_idx, v.value, v.span)
+                    self.maybeRegisterScopeDestroy(local_idx, type_idx)
+                } else if (is_tuple_literal) {
+                    self.lowerTupleInit(local_idx, v.value, v.span)
+                } else if (type_info.tag == TAG_UNION) {
+                    self.lowerUnionInit(local_idx, v.value, type_idx, v.span)
+                } else if (type_info.tag == TAG_OPTIONAL and !self.isPtrLikeOptional(type_idx)) {
+                    // Compound optional init: T → ?T wrapping
+                    // Ref: lower.zig:2401-2431
+                    var is_null_init = false
+                    switch (self.tree.getNode(v.value)) { Node.expr |e| => switch (e) {
+                        Expr.literal |lit| => { if (lit.kind == LiteralKind.null_lit) { is_null_init = true } },
+                        else => {},
+                    }, else => {} }
+                    if (is_null_init) {
+                        const tag_zero = fb.emitConstInt(0, I64, v.span)
+                        fb.emitStoreLocalField(local_idx, 0, 0, tag_zero, v.span)
+                    } else {
+                        const value_node = self.lowerExprNode(v.value)
+                        if (value_node != null_node) {
+                            const value_type = self.inferExprType(v.value)
+                            const value_info = self.types.get(value_type)
+                            if (value_info.tag == TAG_OPTIONAL) {
+                                // Already ?T — compound copy
+                                fb.emitStoreLocal(local_idx, value_node, v.span)
+                            } else {
+                                // Plain T → wrap as tag=1, payload=value
+                                const tag_one = fb.emitConstInt(1, I64, v.span)
+                                fb.emitStoreLocalField(local_idx, 0, 0, tag_one, v.span)
+                                fb.emitStoreLocalField(local_idx, 1, 8, value_node, v.span)
+                            }
+                        }
+                    }
+                } else {
+                    const val = self.lowerExprNode(v.value)
+                    if (val != null_node) {
+                        fb.emitStoreLocal(local_idx, val, v.span)
+                    }
                 }
             }
 
@@ -2158,7 +2217,7 @@ struct Lowerer {
                 Expr.call |c| => { return self.lowerCall(c, idx) },
                 Expr.field_access |fa| => { return self.lowerFieldAccess(fa, idx) },
                 Expr.index_expr |ie| => { return self.lowerIndex(ie, idx) },
-                Expr.struct_init |si| => { return self.lowerStructInit(si, idx) },
+                Expr.struct_init |si| => { return self.lowerStructInitExpr(si, idx) },
                 Expr.if_expr |ie| => { return self.lowerIfExpr(ie, idx) },
                 Expr.block_expr |be| => { return self.lowerBlockExpr(be) },
                 Expr.addr_of |ao| => { return self.lowerAddrOf(ao, idx) },
@@ -2822,47 +2881,6 @@ struct Lowerer {
         // Ref: lower.zig:5854-5855
         const base_val = self.lowerExprNode(ie.base)
         return fb.emitIndexValue(base_val, index_node, elem_size, elem_type, ie.span)
-    }
-
-    fn lowerStructInit(si: StructInitExpr, idx: int) int {
-        const fb = self.builder.func() orelse return null_node
-        // Get struct type from checker or by name lookup
-        var struct_type = self.inferExprType(idx)
-        if (struct_type == VOID or struct_type == invalid_type) {
-            const looked_up = self.types.lookupByName(si.type_name)
-            if (looked_up >= 0) { struct_type = looked_up }
-        }
-        if (struct_type == VOID or struct_type == invalid_type) { return null_node }
-
-        const size = self.types.sizeOf(struct_type)
-        const tmp = fb.addLocalWithSize("__struct_init", struct_type, false, size)
-
-        // Store each field init
-        for i in 0..si.fields.count {
-            const field_init_idx = si.fields.get(i)
-            var fi_name = ""
-            var fi_value = null_node
-            var found = false
-            switch (self.tree.getNode(field_init_idx)) { Node.expr |e| => switch (e) {
-                Expr.field_init_node |fi| => { fi_name = fi.name; fi_value = fi.value; found = true },
-                else => {},
-            }, else => {} }
-
-            if (found) {
-                const field_idx = self.findStructFieldIdx(struct_type, fi_name)
-                if (field_idx >= 0) {
-                    if (self.getStructField(struct_type, field_idx)) |field| {
-                        const val = self.lowerExprNode(fi_value)
-                        if (val != null_node) {
-                            fb.emitStoreLocalField(tmp, field_idx, field.offset, val, si.span)
-                        }
-                    }
-                }
-            }
-        }
-
-        // Return address of the initialized struct
-        return fb.emitAddrLocal(tmp, struct_type, si.span)
     }
 
     // Recursively resolve address of nested struct fields (e.g. &obj.field.inner)
@@ -5673,6 +5691,99 @@ struct Lowerer {
         }, else => {} }
 
         return fb.emitLoadLocal(temp_idx, struct_type_idx, si.span)
+    }
+
+    /// Port of Zig lower.zig:2625-2764 (lowerStructInit).
+    /// Stores struct fields directly into the target local (no temp).
+    /// Used by lowerLocalVarDecl for `var s = Foo { x: 1, y: 2 }`.
+    fn lowerStructInitLocal(local_idx: int, value_idx: int, span: Span) void {
+        const fb = self.builder.func() orelse return
+        switch (self.tree.getNode(value_idx)) { Node.expr |e| => switch (e) {
+            Expr.struct_init |si| => {
+                // Resolve struct type
+                var struct_type_idx = self.inferExprType(value_idx)
+                if (struct_type_idx == VOID or struct_type_idx == invalid_type) {
+                    if (@lenOf(si.type_name) > 0) {
+                        const looked_up = self.types.lookupByName(si.type_name)
+                        if (looked_up >= 0) { struct_type_idx = looked_up }
+                    }
+                }
+                if (struct_type_idx == VOID or struct_type_idx == invalid_type) { return }
+                const type_info = self.types.get(struct_type_idx)
+                if (type_info.tag != TAG_STRUCT) { return }
+
+                switch (type_info) { Type.struct_type |st| => {
+                    // Store each explicitly provided field
+                    for fi in 0..si.fields.count {
+                        const field_init_idx = si.fields.get(fi)
+                        var fi_name = ""
+                        var fi_value = null_node
+                        var found = false
+                        switch (self.tree.getNode(field_init_idx)) { Node.expr |e2| => switch (e2) {
+                            Expr.field_init_node |fnode| => { fi_name = fnode.name; fi_value = fnode.value; found = true },
+                            else => {},
+                        }, else => {} }
+
+                        if (found) {
+                            for j in 0..st.field_count {
+                                const field = st.getField(j)
+                                if (field.name == fi_name) {
+                                    const value_node = self.lowerExprNode(fi_value)
+                                    const field_type_info = self.types.get(field.type_idx)
+                                    const is_string_field = (field.type_idx == STRING or field_type_info.tag == TAG_SLICE)
+                                    if (is_string_field) {
+                                        const ptr_type = self.types.makePointer(U8)
+                                        const ptr_ir = fb.emitSlicePtr(value_node, ptr_type, span)
+                                        const len_ir = fb.emitSliceLen(value_node, span)
+                                        fb.emitStoreLocalField(local_idx, j, field.offset, ptr_ir, span)
+                                        fb.emitStoreLocalField(local_idx, j + 1, field.offset + 8, len_ir, span)
+                                    } else if (field_type_info.tag == TAG_OPTIONAL and !self.isPtrLikeOptional(field.type_idx)) {
+                                        self.storeCompoundOptField(local_idx, j, field.offset, value_node, fi_value, span)
+                                    } else {
+                                        fb.emitStoreLocalField(local_idx, j, field.offset, value_node, span)
+                                    }
+                                    break
+                                }
+                            }
+                        }
+                    }
+
+                    // Emit default values for omitted fields
+                    for di in 0..st.field_count {
+                        const field = st.getField(di)
+                        if (field.default_value == null_node) { continue }
+                        var provided = false
+                        for fi in 0..si.fields.count {
+                            const field_init_idx = si.fields.get(fi)
+                            switch (self.tree.getNode(field_init_idx)) { Node.expr |e2| => switch (e2) {
+                                Expr.field_init_node |fnode| => { if (fnode.name == field.name) { provided = true } },
+                                else => {},
+                            }, else => {} }
+                        }
+                        if (provided) { continue }
+                        const value_node = self.lowerExprNode(field.default_value)
+                        const field_type_info = self.types.get(field.type_idx)
+                        const is_string_field = (field.type_idx == STRING or field_type_info.tag == TAG_SLICE)
+                        if (is_string_field) {
+                            const ptr_type = self.types.makePointer(U8)
+                            const ptr_ir = fb.emitSlicePtr(value_node, ptr_type, span)
+                            const len_ir = fb.emitSliceLen(value_node, span)
+                            fb.emitStoreLocalField(local_idx, di, field.offset, ptr_ir, span)
+                            fb.emitStoreLocalField(local_idx, di + 1, field.offset + 8, len_ir, span)
+                        } else if (field_type_info.tag == TAG_OPTIONAL and !self.isPtrLikeOptional(field.type_idx)) {
+                            self.storeCompoundOptField(local_idx, di, field.offset, value_node, field.default_value, span)
+                        } else {
+                            fb.emitStoreLocalField(local_idx, di, field.offset, value_node, span)
+                        }
+                    }
+                }, else => {} }
+            },
+            else => {
+                // Non struct-init expression — generic path
+                const val = self.lowerExprNode(value_idx)
+                if (val != null_node) { fb.emitStoreLocal(local_idx, val, span) }
+            },
+        }, else => {} }
     }
 
     // ========================================================================
