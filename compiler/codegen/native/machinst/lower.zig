@@ -1435,7 +1435,7 @@ pub fn Lower(comptime I: type) type {
 pub fn hasLoweringSideEffect(f: *const Function, inst: Inst) bool {
     const opcode = f.dfg.insts.items[inst.index].opcode();
     return switch (opcode) {
-        .load, .store => true,
+        .load, .store, .stack_store, .stack_load => true,
         .atomic_load, .atomic_store, .atomic_rmw_add, .atomic_rmw_xchg, .atomic_cas => true,
         .call, .call_indirect => true,
         .@"return" => true,

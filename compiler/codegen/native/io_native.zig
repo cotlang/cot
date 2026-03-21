@@ -2436,15 +2436,14 @@ fn generateIoctlWinsize(
     _ = try ins.store(.{}, cols_u16, ws_addr, 2);
 
     // ioctl(fd, TIOCSWINSZ, &ws) — variadic: int ioctl(int fd, unsigned long request, ...)
-    // Apple ARM64: variadic args must go on the stack, not in registers.
-    // Pad X2-X7 with dummy zeros to force the real variadic arg onto the stack.
-    // Port of rustc_codegen_cranelift adjust_call_for_c_variadic().
+    // Apple ARM64: variadic args go on stack, pad X2-X7.
+    // Linux ARM64: variadic args go in registers like fixed args, NO padding.
     const ioctl_idx = func_index_map.get("ioctl") orelse 0;
     var ioctl_sig = clif.Signature.init(.system_v);
     try ioctl_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64)); // fd
     try ioctl_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64)); // request
-    const is_aarch64 = isa == .aarch64;
-    if (is_aarch64) {
+    const is_apple_aarch64_ioctl = isa == .aarch64 and target_os == .macos;
+    if (is_apple_aarch64_ioctl) {
         for (0..6) |_| try ioctl_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
     }
     try ioctl_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64)); // argp
@@ -2456,7 +2455,7 @@ fn generateIoctlWinsize(
         .colocated = false,
     });
     const tiocswinsz = try ins.iconst(clif.Type.I64, if (target_os == .macos) 0x80087467 else 0x5414);
-    const call_result = if (is_aarch64) blk: {
+    const call_result = if (is_apple_aarch64_ioctl) blk: {
         const pad = try ins.iconst(clif.Type.I64, 0);
         break :blk try ins.call(ioctl_ref, &[_]clif.Value{ fd, tiocswinsz, pad, pad, pad, pad, pad, pad, ws_addr });
     } else try ins.call(ioctl_ref, &[_]clif.Value{ fd, tiocswinsz, ws_addr });
@@ -2504,8 +2503,8 @@ fn generateIoctlSetCtty(
     var ioctl_sig_b = clif.Signature.init(.system_v);
     try ioctl_sig_b.addParam(allocator, clif.AbiParam.init(clif.Type.I64)); // fd
     try ioctl_sig_b.addParam(allocator, clif.AbiParam.init(clif.Type.I64)); // request
-    const is_aarch64_b = isa == .aarch64;
-    if (is_aarch64_b) {
+    const is_apple_aarch64_b = isa == .aarch64 and target_os == .macos;
+    if (is_apple_aarch64_b) {
         for (0..6) |_| try ioctl_sig_b.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
     }
     try ioctl_sig_b.addParam(allocator, clif.AbiParam.init(clif.Type.I64)); // arg (0)
@@ -2518,7 +2517,7 @@ fn generateIoctlSetCtty(
     });
     const tiocsctty = try ins_b.iconst(clif.Type.I64, if (target_os == .macos) 0x20007461 else 0x540E);
     const v_zero_b = try ins_b.iconst(clif.Type.I64, 0);
-    const ioctl_result = if (is_aarch64_b) blk: {
+    const ioctl_result = if (is_apple_aarch64_b) blk: {
         const pad_b = try ins_b.iconst(clif.Type.I64, 0);
         break :blk try ins_b.call(ioctl_ref_b, &[_]clif.Value{ fd_val, tiocsctty, pad_b, pad_b, pad_b, pad_b, pad_b, pad_b, v_zero_b });
     } else try ins_b.call(ioctl_ref_b, &[_]clif.Value{ fd_val, tiocsctty, v_zero_b });
