@@ -2,7 +2,7 @@
 
 **Date:** 2026-03-21
 **Audited by:** Line-by-line comparison against Swift SILGen
-**Status:** Implementation plan ready
+**Status:** Phases 1-4 complete. 10 of 12 gaps fixed.
 
 ---
 
@@ -16,76 +16,69 @@ Cot's ARC implementation has the right architecture (ManagedValue, CleanupStack,
 
 ### P0 — Causes crashes/corruption in real code
 
-**Gap 2: `isTrivial` says all structs are trivial**
-- File: `types.zig:462` — `.struct_type => true`
-- Swift: `LoadableStructTypeLowering` extends `NonTrivialLoadableTypeLowering` — structs with class refs are non-trivial
-- Fix: Recursive field check, same as `couldBeARC`
-- Status: PENDING
+**Gap 2: `isTrivial` says all structs are trivial — FIXED**
+- Fix: Recursive field check for structs and unions
+- Commit: 4211427
 
-**Gap 1: `couldBeARC` missing tuple/union/error_union/list/map/slice**
-- File: `types.zig:489-501` — only checks `.pointer`, `.optional`, `.struct_type`
-- Swift: `isTrivial()` is recursive across ALL aggregate types
-- Fix: Add checks for all aggregate kinds
-- Status: PENDING
+**Gap 1: `couldBeARC` missing tuple/union/error_union/list/map/slice — FIXED**
+- Fix: Extended for all aggregate types (union, tuple, error_union, list, map, future, array, slice, distinct)
+- Commit: 4211427
+
+**Gap 13 (NEW): Callee-side retain used IR type instead of declared type — FIXED**
+- `lowerReturn` now uses `fb.return_type` for `emitCopyValue`, matching Swift's `ensurePlusOne`
+- Commit: 4211427
 
 ### P1 — Causes memory leaks or UAF in specific patterns
 
-**Gap 5: `emitCopyValue`/`emitDestroyValue` missing union types**
-- File: `lower.zig:4464-4535` — no `.union_type` case
-- Swift: `LoadableEnumTypeLowering` handles tag-conditional retain/release
-- Fix: Add tag-based conditional copy/destroy for union payloads
-- Status: PENDING
+**Gap 5: `emitCopyValue`/`emitDestroyValue` missing union types — FIXED**
+- Tag-conditional retain/release for variants with ARC payloads
+- Commit: cbe0627
 
-**Gap 6: `emitCopyValue`/`emitDestroyValue` missing tuple types**
-- File: `lower.zig:4464-4535` — no `.tuple` case
-- Swift: `LoadableTupleTypeLowering` does element-wise copy/destroy
-- Fix: Add element-wise copy/destroy for tuples
-- Status: PENDING
+**Gap 6: `emitCopyValue`/`emitDestroyValue` missing tuple types — FIXED**
+- Element-wise copy/destroy, destroy in reverse order (LIFO)
+- Commit: cbe0627
 
-**Gap 9: `?*T` local var init doesn't register ARC cleanup**
-- File: `lower.zig:2390-2420` — compound optional path skips cleanup
-- Swift: Optional values with non-trivial payloads get cleanups
-- Fix: Push cleanup after storing compound optional with ARC payload
-- Status: PENDING
+**Gap 9: `?*T` local var init doesn't register ARC cleanup — FIXED**
+- Compound optional locals with managed payloads now get cleanup
+- Commit: 735ef69
 
-**Gap 10: Destructured tuple bindings skip ARC**
-- File: `lower.zig:2469-2510` — no ARC in `lowerDestructureStmt`
-- Swift: Destructuring copies each element and registers cleanups
-- Fix: Check `couldBeARC` for each extracted element
-- Status: PENDING
+**Gap 10: Destructured tuple bindings skip ARC — FIXED**
+- Destructured elements get ARC copy + cleanup for managed types
+- Commit: 735ef69
 
-**Gap 4: SRET return path doesn't retain ARC fields**
-- File: `lower.zig:1833-1879` — word-by-word copy without field retain
-- Swift: `ensurePlusOne()` before forwarding to indirect result
-- Fix: Emit `emitCopyValue` for non-trivial fields in SRET path
-- Status: PENDING
+**Gap 4: SRET return path doesn't retain ARC fields — FIXED**
+- SRET copies now retain ARC fields before word-by-word copy
+- Commit: 0f0577f
 
 ### P2 — Latent / narrow trigger
 
-**Gap 7: Struct field assign missing ARC when struct has no cleanup**
-- File: `lower.zig:3318-3338` — guarded by `hasCleanupForLocal`
-- Swift: Field assign always does retain/release based on field type
-- Fix: Remove the cleanup guard, use field type only
-- Status: PENDING
+**Gap 7: Struct field assign missing ARC when struct has no cleanup — FIXED**
+- Removed `hasCleanupForLocal` guard, uses field type only
+- Commit: 0f0577f
 
-**Gap 12: Nested struct destroy skips inner structs**
+**Gap 12: Nested struct destroy skips inner structs — FIXED**
 - Fixed automatically by Gap 2 (`isTrivial` fix)
-- Status: BLOCKED on Gap 2
+- Commit: 4211427
 
 ### P3 — Design gaps / future
 
-**Gap 3: No ARC cleanup for function parameters**
-- Currently mitigated by field-assign workaround
-- Cot uses +0 parameter convention implicitly
-- Status: DEFERRED — document convention
+**Gap 3: No ARC cleanup for function parameters — DOCUMENTED**
+- Cot uses +0 (borrowed/guaranteed) parameter convention implicitly
+- All parameters are borrowed — callee does NOT release at scope exit
+- Swift equivalent: `@guaranteed` parameter convention
+- Field assignment on parameters correctly does retain/release (Gap 7 fix)
+- Status: Convention documented, no code change needed
 
-**Gap 8: `managedFromLowered`/`lowerExprManaged` only check new/call**
-- Future expressions producing +1 must be manually added
-- Status: DEFERRED — document invariant
+**Gap 8: `managedFromLowered`/`lowerExprManaged` only check new/call — DOCUMENTED**
+- +1 producers in Cot: `.new_expr` and `.call` returning non-trivial types
+- Future expression kinds that produce +1 must be added to both functions
+- Swift equivalent: `ResultConvention::Owned` on function types
+- Status: Invariant documented
 
 **Gap 11: Wasm skips all ARC**
 - Known limitation — requires Wasm ARC runtime
-- Status: DEFERRED — separate project
+- All `emitCopyValue`/`emitDestroyValue`/cleanup emission skipped on Wasm
+- Status: DEFERRED — separate project (Wasm ARC runtime)
 
 ---
 
