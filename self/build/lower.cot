@@ -2288,8 +2288,14 @@ struct Lowerer {
         }
     }
 
+    /// Port of Zig lower.zig:5031-5072 (lowerIdent).
     fn lowerIdent(id: Ident) int {
         const fb = self.builder.func() orelse return null_node
+        // Check comptime value vars first (inline for bindings, comptime blocks)
+        // Ref: lower.zig:5035-5036
+        if (self.lookupComptimeValue(id.name)) |cv| {
+            return self.emitComptimeValue(cv, id.span)
+        }
         // Check const_values first (compile-time known constants)
         if (self.const_values.contains(id.name)) {
             const val = self.const_values.get(id.name)
@@ -2331,6 +2337,7 @@ struct Lowerer {
         }
 
         // String concatenation (++ or + on strings)
+        // Ref: lower.zig:5087-5109
         if (tok == Token.concat or tok == Token.add) {
             const left_type = self.inferExprType(bin.left)
             if (left_type == STRING) {
@@ -2338,18 +2345,50 @@ struct Lowerer {
             }
         }
 
-        // String equality (== or != on strings)
-        if (tok == Token.eql or tok == Token.neq) {
-            const left_type = self.inferExprType(bin.left)
-            if (left_type == STRING) {
-                return self.lowerStringCompare(bin)
-            }
-        }
-
-        // Generic binary expression
+        // Lower both operands for remaining binary ops
         const left = self.lowerExprNode(bin.left)
         const right = self.lowerExprNode(bin.right)
         if (left == null_node or right == null_node) { return null_node }
+
+        // Array concat: [N]T ++ [M]T → [N+M]T (or + in @safe mode)
+        // Ref: lower.zig:5110-5125
+        if (tok == Token.concat or tok == Token.add) {
+            const left_type_idx = self.inferExprType(bin.left)
+            const right_type_idx = self.inferExprType(bin.right)
+            const left_info = self.types.get(left_type_idx)
+            const right_info = self.types.get(right_type_idx)
+            if (left_info.tag == TAG_ARRAY and right_info.tag == TAG_ARRAY) {
+                return self.lowerArrayConcat(left, right, left_type_idx, right_type_idx, bin.span)
+            }
+            if (left_info.tag == TAG_SLICE and right_info.tag == TAG_SLICE) {
+                return self.lowerSliceConcat(left, right, left_type_idx, bin.span)
+            }
+        }
+
+        // String equality: decompose to ptr/len and call string_eq
+        // Ref: lower.zig:5126-5141
+        if (tok == Token.eql or tok == Token.neq) {
+            const left_type = self.inferExprType(bin.left)
+            if (left_type == STRING) {
+                const ptr_type = self.types.makePointer(U8)
+                const l_ptr = fb.emitSlicePtr(left, ptr_type, bin.span)
+                const l_len = fb.emitSliceLen(left, bin.span)
+                const r_ptr = fb.emitSlicePtr(right, ptr_type, bin.span)
+                const r_len = fb.emitSliceLen(right, bin.span)
+                var eq_args: List(int) = .{}
+                eq_args.append(l_ptr)
+                eq_args.append(l_len)
+                eq_args.append(r_ptr)
+                eq_args.append(r_len)
+                const eq_result = fb.emitCall("string_eq", eq_args, false, I64, bin.span)
+                const zero = fb.emitConstInt(0, I64, bin.span)
+                if (tok == Token.eql) {
+                    return fb.emitBinary(BinaryOp.ne, eq_result, zero, BOOL, bin.span)
+                } else {
+                    return fb.emitBinary(BinaryOp.eq, eq_result, zero, BOOL, bin.span)
+                }
+            }
+        }
 
         const result_type = self.inferBinaryType(bin.op, bin.left, bin.right)
 
