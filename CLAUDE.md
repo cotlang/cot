@@ -10,7 +10,27 @@
 
 **Timeouts:** Nothing in this project takes more than a few seconds. If a command doesn't return in 3-5 seconds, it's an infinite loop — kill it immediately. Use `perl -e 'alarm 3; exec @ARGV'` or `timeout 3` wrappers. Never set timeouts above 15s for test runs.
 
-**ALWAYS rebuild before testing.** After ANY edit to `self/`, run `./zig-out/bin/cot build self/main.cot -o /tmp/selfcot` and WAIT for it to finish BEFORE running `/tmp/selfcot`. Never test with a stale binary — this has wasted hours of debugging non-existent bugs. Chain commands: `./zig-out/bin/cot build self/main.cot -o /tmp/selfcot && /tmp/selfcot test ...`
+**🚨🚨🚨 STALE BINARY PREVENTION — THIS HAS WASTED HOURS 🚨🚨🚨**
+
+The selfcot build takes ~8 seconds. The Bash tool often runs commands in background. This means if you run the build and then immediately run selfcot, YOU ARE RUNNING THE OLD BINARY. This has caused hours of debugging phantom crashes that don't exist.
+
+**THE ONLY SAFE PATTERN:**
+```bash
+# Step 1: Build selfcot (foreground, wait for Success output)
+./zig-out/bin/cot build self/main.cot -o /tmp/selfcot
+# Step 2: ONLY after seeing "Success: /tmp/selfcot", run tests
+/tmp/selfcot test test/cases/arithmetic.cot
+```
+
+**NEVER DO THIS** (background + sleep is unreliable):
+```bash
+./zig-out/bin/cot build self/main.cot -o /tmp/selfcot &  # WRONG: background
+sleep 8 && /tmp/selfcot test ...  # WRONG: sleep may not be enough
+```
+
+**NEVER chain build+test in one command** — the Bash tool may run it in background and you won't see the build output. Run them as TWO SEPARATE Bash calls. First call: build. Second call: test. Only make the second call after you SEE "Success: /tmp/selfcot" in the first call's output.
+
+**HOW TO VERIFY the binary is fresh:** Check `ls -la /tmp/selfcot` — the timestamp must be AFTER your last edit. If the timestamp is old, the binary is stale.
 
 ---
 
