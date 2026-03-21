@@ -8604,6 +8604,11 @@ struct Lowerer {
             Expr.generic_instance |_gi| => {
                 return self.chk.resolveTypeExpr(idx)
             },
+            // Tuple types: (T1, T2, ...) — parser stores as Expr.tuple_type, not type_expr.
+            // Must be handled here since resolveTypeNode only matches type_expr by default.
+            Expr.tuple_type |_tt| => {
+                return self.chk.resolveTupleType(idx)
+            },
             else => {},
         }, else => {} }
         if (kind < 0) { return VOID }
