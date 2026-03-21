@@ -168,6 +168,10 @@ struct GenState {
 
         if (blk.kind == SsaBlockKind.plain or blk.kind == SsaBlockKind.first or blk.kind == SsaBlockKind.defer_) {
             // Go: BlockPlain, BlockDefer (lines 171-174)
+            // Always emit explicit branch. Fall-through optimization is disabled
+            // because the dispatch loop's br_table resume_point structure doesn't
+            // support it with index-based block references. The Zig compiler can
+            // use fall-through because it uses *Block pointers that survive reorder.
             if (blk.succs.count > 0) {
                 const succ_edge = blk.succs.get(0)
                 const succ_bi = succ_edge.block
@@ -184,9 +188,8 @@ struct GenState {
                 self.getValue32(blk.controls.get(0))
             }
 
-            // Always emit explicit branches (no fall-through optimization).
-            // Fall-through in the dispatch loop requires block_order-aware
-            // resume_point alignment which isn't implemented yet.
+            // Always emit both branches explicitly (no fall-through).
+            // See plain block comment above for rationale.
             self.builder.append(As.@"if")
             self.br(succ0_bi)
             self.builder.append(As.end)

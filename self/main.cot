@@ -51,7 +51,7 @@ fn main() void {
     }
 
     if (cmd == "version" or cmd == "--version") {
-        println("cot 0.3.4 (self-hosted)")
+        println("cot 0.3.7 (self-hosted)")
         return
     }
 

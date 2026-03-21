@@ -1655,33 +1655,53 @@ struct Parser {
     fn parseStringInterp() int {
         const start = self.tok_start
         var segments: List(int) = .{}
-        // Start segment text (between " and ${)
+
+        // First token is string_interp_start: "text${
+        // Strip leading " and trailing ${ (Zig: text[1 .. len-2])
         const start_text = self.tok_text
-        if (@lenOf(start_text) > 0) {
-            segments.append(self.ast.addExpr(Expr.literal(Literal {
-                .kind = LiteralKind.@"string" as int, .value = start_text,
-                .span = self.spanSE(start, self.tok_end) })))
+        const start_len = @lenOf(start_text)
+        if (start_len >= 3) {
+            const text_part = substring(start_text, 1, start_len - 2)
+            if (@lenOf(text_part) > 0) {
+                segments.append(self.ast.addExpr(Expr.literal(Literal {
+                    .kind = LiteralKind.@"string" as int, .value = text_part,
+                    .span = self.spanSE(start, self.tok_end) })))
+            }
         }
         self.advance()  // consume string_interp_start
-        // Expression inside ${ }
+
+        // Parse the expression inside ${ }
         segments.append(self.parseExpr())
-        // Mid and end segments
+
+        // Loop: next token is either string_interp_mid or string_interp_end
         while (true) {
             if (self.tok == Token.string_interp_mid) {
+                // mid token: }text${
+                // Strip leading } and trailing ${ (Zig: text[1 .. len-2])
                 const mid_text = self.tok_text
-                if (@lenOf(mid_text) > 0) {
-                    segments.append(self.ast.addExpr(Expr.literal(Literal {
-                        .kind = LiteralKind.@"string" as int, .value = mid_text,
-                        .span = self.spanSE(self.tok_start, self.tok_end) })))
+                const mid_len = @lenOf(mid_text)
+                if (mid_len >= 3) {
+                    const text_part = substring(mid_text, 1, mid_len - 2)
+                    if (@lenOf(text_part) > 0) {
+                        segments.append(self.ast.addExpr(Expr.literal(Literal {
+                            .kind = LiteralKind.@"string" as int, .value = text_part,
+                            .span = self.spanSE(self.tok_start, self.tok_end) })))
+                    }
                 }
                 self.advance()  // consume mid
                 segments.append(self.parseExpr())
             } else if (self.tok == Token.string_interp_end) {
+                // end token: }text"
+                // Strip leading } and trailing " (Zig: text[1 .. len-1])
                 const end_text = self.tok_text
-                if (@lenOf(end_text) > 0) {
-                    segments.append(self.ast.addExpr(Expr.literal(Literal {
-                        .kind = LiteralKind.@"string" as int, .value = end_text,
-                        .span = self.spanSE(self.tok_start, self.tok_end) })))
+                const end_len = @lenOf(end_text)
+                if (end_len >= 2) {
+                    const text_part = substring(end_text, 1, end_len - 1)
+                    if (@lenOf(text_part) > 0) {
+                        segments.append(self.ast.addExpr(Expr.literal(Literal {
+                            .kind = LiteralKind.@"string" as int, .value = text_part,
+                            .span = self.spanSE(self.tok_start, self.tok_end) })))
+                    }
                 }
                 self.advance()  // consume end
                 break
