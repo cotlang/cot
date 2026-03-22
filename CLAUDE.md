@@ -66,11 +66,26 @@ This is by design so Cot looks like TypeScript to users. **NEVER change `Type` t
 - **NEVER** `git push --force` — destroys remote history
 - **NEVER** `git stash drop` or `git stash clear` — destroys stashed work
 - **NEVER** `git clean -f` — deletes untracked files permanently
+- **NEVER** `git submodule update`, `git submodule deinit`, or `git clone` inside the repo without asking — these can overwrite or duplicate submodule checkouts
 - **To undo changes:** Edit the file manually with the Edit tool, or ask the user
 - **To compare with old code:** Use `git diff` or `git show` to READ, never to modify
 - **To compare with clean state:** `git stash && <test> && git stash pop`
 - **To abandon changes:** ASK THE USER FIRST — never decide unilaterally
 - Uncommitted changes often contain hours of debugging, partial fixes, and diagnostic code
+
+---
+
+## 🚨🚨🚨 ABSOLUTE PATHS — NEVER USE RELATIVE PATHS FOR CRITICAL CHECKS 🚨🚨🚨
+
+**2026-03-23 INCIDENT:** Claude lost its working directory, ran `ls stdlib/` from inside `stdlib/`, concluded the standard library was deleted (it wasn't), told the user their code was destroyed, and ran `git clone` on top of the existing directory — creating a mess. **The stdlib was never deleted. The entire crisis was fabricated by using relative paths.**
+
+**RULES:**
+- **ALWAYS use absolute paths** when checking if directories/files exist: `ls /Users/johnc/cotlang/cot/stdlib/` NOT `ls stdlib/`
+- **NEVER conclude something is deleted** without verifying with an absolute path
+- **NEVER run `git clone` or `git submodule update --init`** as a "fix" without first confirming the directory is actually missing using an absolute path
+- **NEVER use `cd`, `pushd`, or `popd`** in Bash commands — the working directory state is unreliable between Bash tool calls
+- **NEVER make up explanations** for something you don't understand — say "I don't know" and investigate with absolute paths
+- **If a directory appears missing:** Check with `ls /absolute/path/` FIRST. If it exists, your working directory is wrong — not the directory
 
 ---
 
@@ -181,9 +196,13 @@ zig build
 
 **🚨 SUBMODULE WORKFLOW:** `stdlib/` is a git submodule (`cotlang/std`). It frequently shows as "modified" in `git status` because the local checkout may be ahead of the tracked ref. **The rule is simple: keep the submodule ref in sync across dev environments.**
 
+**stdlib/ is CRITICAL INFRASTRUCTURE.** It contains the entire standard library (sys, list, map, string, fs, os, etc.). Every file in `self/` imports from it. **NEVER run `git clone`, `rm -rf`, `git submodule deinit`, or any destructive operation on `stdlib/`.**
+
+**To check if stdlib exists:** `ls /Users/johnc/cotlang/cot/stdlib/sys.cot` — ALWAYS absolute path.
+
 **To update stdlib:**
-1. `cd stdlib && git add . && git commit -m "..." && git push` — commit and push inside the submodule first
-2. `cd .. && git add stdlib` — update the parent repo's ref to the pushed commit
+1. `git -C /Users/johnc/cotlang/cot/stdlib add . && git -C /Users/johnc/cotlang/cot/stdlib commit -m "..." && git -C /Users/johnc/cotlang/cot/stdlib push` — commit and push inside the submodule (use `-C` flag, NOT `cd`)
+2. `git -C /Users/johnc/cotlang/cot add stdlib` — update the parent repo's ref to the pushed commit
 3. Commit the parent repo normally
 
 **To commit parent repo changes WITHOUT updating stdlib:** Stage files by explicit name (e.g., `git add compiler/foo.zig self/build/lower.cot`). **NEVER use `git add .` or `git add -A`** — these will accidentally include the stdlib ref change. If the ref points to a commit that doesn't exist on the stdlib remote, CI breaks for ALL jobs because `actions/checkout` can't fetch the submodule.
