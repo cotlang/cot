@@ -307,20 +307,20 @@ schedule → layout → lower_wasm
   - Generate line-numbered source column
   - Cross-reference with Value.pos
 
-- [ ] **7.6** Test: Compare Zig vs selfcot HTML output
+- [x] **7.6** Test: Compare Zig vs selfcot HTML output
   - Build same function with both compilers using COT_SSA
   - HTML should show identical SSA at each pass
   - Any difference reveals a selfcot bug
 
 ### Selfcot-Specific Features
 
-- [ ] **7.7** Dual-compiler diff view
+- [ ] **7.7** Dual-compiler diff view (deferred — nice-to-have)
   - New mode: `COT_SSA_DIFF=funcname` runs BOTH compilers
   - Generates a single HTML with Zig output on left, selfcot on right
   - Values that differ are highlighted in red
   - This is the killer feature for self-hosting debugging
 
-- [ ] **7.8** Wasm bytecode column
+- [ ] **7.8** Wasm bytecode column (deferred — nice-to-have)
   - After all SSA passes, show the final Wasm bytecode
   - Disassembly format: `i64.const 42`, `i64.add`, `call $alloc`
   - Cross-reference Wasm instructions back to SSA values
@@ -329,10 +329,10 @@ schedule → layout → lower_wasm
 
 ## Phase 8: Documentation & Polish
 
-- [ ] **8.1** Add `COT_SSA` to CLAUDE.md debugging section
-- [ ] **8.2** Add `--ssa` flag to CLI help text
-- [ ] **8.3** Update `compiler/pipeline_debug.zig` to reference COT_SSA for visual debugging
-- [ ] **8.4** Add usage examples to TROUBLESHOOTING.md
+- [x] **8.1** Add `COT_SSA` to CLAUDE.md debugging section
+- [x] **8.2** Add `--ssa` flag to CLI help text
+- [x] **8.3** Update `compiler/pipeline_debug.zig` to reference COT_SSA for visual debugging
+- [x] **8.4** Add usage examples to TROUBLESHOOTING.md
 
 ---
 

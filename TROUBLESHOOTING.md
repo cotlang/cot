@@ -255,20 +255,52 @@ If you need to emit prologue/epilogue, use `I.genPrologue()` / `I.genEpilogue()`
 
 ## Debug Output
 
-Use `COT_DEBUG` environment variable:
+### Pipeline Logging (COT_DEBUG)
 
 ```bash
-# See what's happening at each stage
-COT_DEBUG=codegen zig build test
+# All phases — full pipeline visibility
+COT_DEBUG=all ./zig-out/bin/cot build file.cot --target=wasm
 
-# Multiple stages
-COT_DEBUG=parse,lower,codegen zig build test
+# Specific phases only
+COT_DEBUG=codegen ./zig-out/bin/cot build file.cot --target=wasm
+COT_DEBUG=deadcode,schedule ./zig-out/bin/cot build file.cot
+
+# Available phases: parse, check, lower, ssa, deadcode, copyelim,
+#   phielim, schedule, regalloc, codegen, strings, abi
 ```
 
 Add debug output using `pipeline_debug.zig`:
 ```zig
 const debug = @import("pipeline_debug.zig");
 debug.log(.codegen, "block {d} terminator: {s}", .{block.index, @tagName(terminator)});
+```
+
+### Interactive SSA Visualizer (COT_SSA)
+
+```bash
+# Generate interactive HTML for a specific function
+COT_SSA=myFunc ./zig-out/bin/cot build file.cot --target=wasm
+# Or via CLI flag:
+./zig-out/bin/cot build file.cot --ssa=myFunc --target=wasm
+# Dump ALL functions:
+./zig-out/bin/cot build file.cot --ssa='*' --target=wasm
+```
+
+Opens `myFunc.ssa.html` — shows SSA at every pass side by side. Click a value to highlight it across all passes. Dead code faded. Dark mode. Columns collapse/expand.
+
+### Selfcot Debugging
+
+Selfcot has the same pipeline logging:
+```bash
+COT_DEBUG=all /tmp/selfcot build file.cot
+COT_DEBUG=codegen /tmp/selfcot build file.cot
+```
+
+Compare Zig vs selfcot output to find divergences:
+```bash
+COT_DEBUG=all ./zig-out/bin/cot build file.cot --target=wasm 2>&1 | grep 'add' > /tmp/zig.txt
+COT_DEBUG=all /tmp/selfcot build file.cot 2>&1 | grep 'add' > /tmp/selfcot.txt
+diff /tmp/zig.txt /tmp/selfcot.txt
 ```
 
 **But remember:** Debug output helps you FIND where the bug is. It doesn't help you FIX the bug. The fix comes from the reference implementation.

@@ -356,10 +356,29 @@ zig build test                                                        # Compiler
 
 ## Debugging
 
-Use `compiler/pipeline_debug.zig`, NOT `std.debug.print`:
+**Pipeline debug logging** — use `compiler/pipeline_debug.zig`, NOT `std.debug.print`:
 ```zig
 const debug = @import("pipeline_debug.zig");
 debug.log(.codegen, "emitting {s}", .{op_name});
+```
+
+**Environment variables:**
+- `COT_DEBUG=all` — show all pipeline phases (check, lower, ssa, codegen, deadcode, etc.)
+- `COT_DEBUG=codegen,deadcode` — show specific phases only
+- `COT_TRACE=funcname` — trace one function through ALL passes
+
+**COT_SSA interactive HTML visualizer** (port of Go's GOSSAFUNC):
+```bash
+COT_SSA=myFunc cot build file.cot --target=wasm   # generates myFunc.ssa.html
+cot build file.cot --ssa=myFunc                    # same via CLI flag
+cot build file.cot --ssa='*'                       # dump ALL functions
+```
+Opens an interactive HTML page showing SSA at every compiler pass side by side. Click a value to highlight it across all passes. Dead code is faded. Dark mode supported. See `claude/COT_SSA_PLAN.md` for details.
+
+**Selfcot debugging** — selfcot has the same pipeline logging:
+```bash
+COT_DEBUG=all /tmp/selfcot build file.cot          # shows all passes
+COT_DEBUG=codegen /tmp/selfcot build file.cot      # codegen only
 ```
 
 ---

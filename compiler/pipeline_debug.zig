@@ -3,6 +3,11 @@
 //! Provides systematic debugging output for the compilation pipeline.
 //! Set COT_DEBUG=phase1,phase2 or COT_DEBUG=all to enable debug output.
 //! Set COT_TRACE=funcname to trace a specific function through ALL passes.
+//!
+//! For interactive HTML visualization, use COT_SSA=funcname or --ssa=funcname.
+//! See compiler/ssa/html.zig for the HTML writer (port of Go's GOSSAFUNC).
+//!
+//! Selfcot equivalent: self/debug.cot (same API, same output format).
 
 const std = @import("std");
 
