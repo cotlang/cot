@@ -13,8 +13,13 @@ const Op = @import("../op.zig").Op;
 const debug = @import("../../pipeline_debug.zig");
 
 /// Run CSE on a function.
+/// Reference: Go cse.go — hash-based value numbering, LogStat("CSE REWRITES", n).
 pub fn cse(f: *Func) !void {
-    debug.log(.codegen, "=== CSE pass for '{s}' ===", .{f.name});
+    var total_values: usize = 0;
+    for (f.blocks.items) |b| total_values += b.values.items.len;
+    debug.log(.codegen, "=== CSE pass for '{s}' ({d} blocks, {d} values) ===", .{
+        f.name, f.blocks.items.len, total_values,
+    });
 
     const allocator = f.allocator;
     var rewrites: usize = 0;
@@ -65,7 +70,8 @@ pub fn cse(f: *Func) !void {
         }
     }
 
-    debug.log(.codegen, "CSE: {d} rewrites", .{rewrites});
+    // Go LogStat: "CSE REWRITES" count
+    debug.log(.codegen, "=== CSE complete for '{s}': {d} rewrites ===", .{ f.name, rewrites });
 }
 
 fn canCSE(op: Op) bool {

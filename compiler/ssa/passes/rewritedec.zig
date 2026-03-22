@@ -30,7 +30,11 @@ const debug = @import("../../pipeline_debug.zig");
 /// Run the decomposition rewrite pass.
 /// Go reference: rewritedec.go main loop
 pub fn rewrite(allocator: std.mem.Allocator, f: *Func) !void {
-    debug.log(.codegen, "rewritedec: processing '{s}'", .{f.name});
+    var total_values: usize = 0;
+    for (f.blocks.items) |b| total_values += b.values.items.len;
+    debug.log(.codegen, "=== Rewritedec pass for '{s}' ({d} blocks, {d} values) ===", .{
+        f.name, f.blocks.items.len, total_values,
+    });
 
     var rewritten: usize = 0;
     var iterations: usize = 0;
@@ -55,7 +59,9 @@ pub fn rewrite(allocator: std.mem.Allocator, f: *Func) !void {
         if (!changed) break;
     }
 
-    debug.log(.codegen, "  rewritten {d} values in {d} iterations", .{ rewritten, iterations });
+    debug.log(.codegen, "=== Rewritedec complete for '{s}': {d} rewrites in {d} iterations ===", .{
+        f.name, rewritten, iterations,
+    });
 }
 
 /// Rewrite a single value if applicable.

@@ -23,13 +23,21 @@ pub const StringOffsetMap = std.StringHashMap(i32);
 /// Run the generic rewrite pass.
 /// Go reference: rewritegeneric.go main loop
 pub fn rewrite(allocator: std.mem.Allocator, f: *Func, string_offsets: ?*const StringOffsetMap) !void {
-    debug.log(.codegen, "rewritegeneric: processing '{s}'", .{f.name});
+    var total_values: usize = 0;
+    var const_strings: usize = 0;
+    for (f.blocks.items) |b| {
+        for (b.values.items) |v| {
+            total_values += 1;
+            if (v.op == .const_string) const_strings += 1;
+        }
+    }
+    debug.log(.codegen, "=== Rewritegeneric pass for '{s}' ({d} blocks, {d} values, {d} const_strings) ===", .{
+        f.name, f.blocks.items.len, total_values, const_strings,
+    });
 
     var rewritten: usize = 0;
 
     for (f.blocks.items) |block| {
-        // We need to iterate over values and potentially add new ones.
-        // To avoid issues with modifying while iterating, collect values to rewrite first.
         var to_rewrite = std.ArrayListUnmanaged(*Value){};
         defer to_rewrite.deinit(allocator);
 
@@ -39,7 +47,6 @@ pub fn rewrite(allocator: std.mem.Allocator, f: *Func, string_offsets: ?*const S
             }
         }
 
-        // Now rewrite each collected value
         for (to_rewrite.items) |v| {
             if (try rewriteConstString(allocator, f, block, v, string_offsets)) {
                 rewritten += 1;
@@ -47,7 +54,9 @@ pub fn rewrite(allocator: std.mem.Allocator, f: *Func, string_offsets: ?*const S
         }
     }
 
-    debug.log(.codegen, "  rewritten {d} values", .{rewritten});
+    debug.log(.codegen, "=== Rewritegeneric complete for '{s}': {d} const_strings rewritten ===", .{
+        f.name, rewritten,
+    });
 }
 
 /// Rewrite const_string to string_make(ptr_const, len_const).

@@ -25,22 +25,50 @@ const debug = @import("../../pipeline_debug.zig");
 /// Lower a function's generic ops to Wasm-specific ops.
 /// Decomposition should be done by rewritedec.zig BEFORE calling this.
 pub fn lower(f: *Func) !void {
-    debug.log(.codegen, "lower_wasm: processing '{s}'", .{f.name});
+    var total_values: usize = 0;
+    for (f.blocks.items) |b| total_values += b.values.items.len;
+    debug.log(.codegen, "=== lower_wasm pass for '{s}' ({d} blocks, {d} values) ===", .{
+        f.name, f.blocks.items.len, total_values,
+    });
 
     var lowered: usize = 0;
     var unchanged: usize = 0;
+    var unlowered_ops: [16]Op = undefined;
+    var unlowered_count: usize = 0;
 
     for (f.blocks.items) |block| {
         for (block.values.items) |v| {
+            const old_op = v.op;
             if (lowerValue(v)) {
                 lowered += 1;
+                // Log individual lowering at trace level
+                debug.log(.codegen, "  lower v{d}: {s} -> {s}", .{ v.id, @tagName(old_op), @tagName(v.op) });
             } else {
                 unchanged += 1;
+                // Track ops that weren't lowered (potential missing cases)
+                if (!isExpectedUnlowered(old_op) and unlowered_count < 16) {
+                    var found = false;
+                    for (unlowered_ops[0..unlowered_count]) |existing| {
+                        if (existing == old_op) { found = true; break; }
+                    }
+                    if (!found) {
+                        unlowered_ops[unlowered_count] = old_op;
+                        unlowered_count += 1;
+                    }
+                }
             }
         }
     }
 
-    debug.log(.codegen, "  lowered {d}, unchanged {d}", .{ lowered, unchanged });
+    debug.log(.codegen, "=== lower_wasm complete for '{s}': lowered {d}, unchanged {d} ===", .{
+        f.name, lowered, unchanged,
+    });
+    // Report unexpected unlowered ops (helps find missing lowering rules)
+    if (unlowered_count > 0) {
+        for (unlowered_ops[0..unlowered_count]) |op| {
+            debug.log(.codegen, "  WARNING: op '{s}' not lowered (expected?)", .{@tagName(op)});
+        }
+    }
 
     // Peephole: convert call+return patterns to return_call (Wasm 3.0 tail calls)
     optimizeTailCalls(f);
@@ -362,7 +390,6 @@ fn lowerValue(v: *Value) bool {
     };
 
     if (new_op) |op| {
-        debug.log(.codegen, "  lower v{d}: {s} -> {s}", .{ v.id, @tagName(v.op), @tagName(op) });
         v.op = op;
         return true;
     }
@@ -388,6 +415,42 @@ fn optimizeTailCalls(f: *Func) void {
 
 fn isFloatType(type_idx: TypeIndex) bool {
     return type_idx == TypeRegistry.F64 or type_idx == TypeRegistry.F32 or type_idx == TypeRegistry.UNTYPED_FLOAT;
+}
+
+/// Check if an op is expected to pass through without lowering.
+/// These are ops that are already target-specific, structural, or pass-through.
+fn isExpectedUnlowered(op: Op) bool {
+    return switch (op) {
+        // Already Wasm-specific
+        .wasm_i64_add, .wasm_i64_sub, .wasm_i64_mul, .wasm_i64_div_s, .wasm_i64_div_u,
+        .wasm_i64_rem_s, .wasm_i64_rem_u, .wasm_i64_and, .wasm_i64_or, .wasm_i64_xor,
+        .wasm_i64_shl, .wasm_i64_shr_s, .wasm_i64_shr_u, .wasm_i64_const,
+        .wasm_i64_eq, .wasm_i64_ne, .wasm_i64_lt_s, .wasm_i64_le_s,
+        .wasm_i64_gt_s, .wasm_i64_ge_s, .wasm_i64_lt_u, .wasm_i64_le_u,
+        .wasm_i64_gt_u, .wasm_i64_ge_u, .wasm_i64_eqz,
+        .wasm_i32_const, .wasm_i32_add, .wasm_i32_sub, .wasm_i32_mul,
+        .wasm_f64_add, .wasm_f64_sub, .wasm_f64_mul, .wasm_f64_div,
+        .wasm_f32_add, .wasm_f32_sub, .wasm_f32_mul, .wasm_f32_div,
+        .wasm_i64_load, .wasm_i64_store, .wasm_f64_load, .wasm_f64_store,
+        .wasm_lowered_static_call, .wasm_lowered_closure_call, .wasm_lowered_inter_call,
+        .wasm_lowered_move, .wasm_lowered_zero, .wasm_lowered_nil_check,
+        .wasm_call, .wasm_call_indirect, .wasm_return_call,
+        .wasm_nop, .wasm_unreachable, .wasm_return, .wasm_drop, .wasm_select,
+        // WasmGC
+        .wasm_gc_struct_new, .wasm_gc_struct_get, .wasm_gc_struct_set,
+        .wasm_gc_array_new, .wasm_gc_array_get, .wasm_gc_array_set,
+        .wasm_gc_ref_null, .wasm_gc_ref_is_null, .wasm_gc_ref_eq,
+        // Structural (pass-through by design)
+        .phi, .copy, .fwd_ref, .arg, .select0, .select1, .select_n,
+        .make_tuple, .cond_select, .init_mem, .invalid,
+        .const_bool, .const_nil, .const_string, .const_ptr,
+        .string_make, .slice_make, .opt_make,
+        .addr, .local_addr, .global_addr, .metadata_addr,
+        .off_ptr, .add_ptr, .sub_ptr,
+        .sp, .store_sp,
+        => true,
+        else => false,
+    };
 }
 
 // ============================================================================

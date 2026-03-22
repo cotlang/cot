@@ -15,13 +15,26 @@ const debug = @import("../../pipeline_debug.zig");
 /// copyelim removes all uses of OpCopy values.
 /// Combines copyelim and phielim into a single pass (matching Go).
 pub fn copyelim(f: *Func) !void {
-    debug.log(.copyelim, "=== Copyelim pass for '{s}' ===", .{f.name});
+    var total_values: usize = 0;
+    var total_copies: usize = 0;
+    var total_phis: usize = 0;
+    for (f.blocks.items) |b| {
+        for (b.values.items) |v| {
+            total_values += 1;
+            if (v.op == .copy) total_copies += 1;
+            if (v.op == .phi) total_phis += 1;
+        }
+    }
+    debug.log(.copyelim, "=== Copyelim pass for '{s}' ({d} values, {d} copies, {d} phis) ===", .{
+        f.name, total_values, total_copies, total_phis,
+    });
 
     // Run phielim first (converts redundant phis to copies), then
     // eliminate copy uses. Matches Go's copyelim() which calls phielim() first.
     try phielim(f);
 
     // Update block control values.
+    var ctrl_rewrites: usize = 0;
     for (f.blocks.items) |b| {
         for (&b.controls) |*ctrl| {
             if (ctrl.*) |v| {
@@ -30,12 +43,15 @@ pub fn copyelim(f: *Func) !void {
                     v.uses -= 1;
                     src.uses += 1;
                     ctrl.* = src;
+                    ctrl_rewrites += 1;
                 }
             }
         }
     }
 
-    debug.log(.copyelim, "=== Copyelim complete ===", .{});
+    debug.log(.copyelim, "=== Copyelim complete for '{s}': {d} control rewrites ===", .{
+        f.name, ctrl_rewrites,
+    });
 }
 
 /// copySource returns the (non-copy) op which is the ultimate source of v.

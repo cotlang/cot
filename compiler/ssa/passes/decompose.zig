@@ -31,12 +31,22 @@ const debug = @import("../../pipeline_debug.zig");
 /// Run the decomposition pass.
 /// Go reference: decompose.go decomposeBuiltin
 pub fn decompose(allocator: std.mem.Allocator, f: *Func, type_reg: ?*TypeRegistry) !void {
-    debug.log(.codegen, "decompose: processing '{s}'", .{f.name});
+    var total_phis: usize = 0;
+    var total_values: usize = 0;
+    for (f.blocks.items) |b| {
+        for (b.values.items) |v| {
+            total_values += 1;
+            if (v.op == .phi) total_phis += 1;
+        }
+    }
+    debug.log(.codegen, "=== Decompose pass for '{s}' ({d} blocks, {d} values, {d} phis) ===", .{
+        f.name, f.blocks.items.len, total_values, total_phis,
+    });
 
     var decomposed: usize = 0;
 
-    // Decompose phi nodes on compound types
-    // Go: lines 17-25
+    // Decompose phi nodes on compound types (string, slice, optional ptr)
+    // Go reference: decompose.go lines 17-25
     for (f.blocks.items) |block| {
         for (block.values.items) |v| {
             if (v.op != .phi) continue;
@@ -47,7 +57,9 @@ pub fn decompose(allocator: std.mem.Allocator, f: *Func, type_reg: ?*TypeRegistr
         }
     }
 
-    debug.log(.codegen, "  decomposed {d} phi nodes", .{decomposed});
+    debug.log(.codegen, "=== Decompose complete for '{s}': {d} phis decomposed ===", .{
+        f.name, decomposed,
+    });
 }
 
 /// Decompose a phi node if it's a compound builtin type.

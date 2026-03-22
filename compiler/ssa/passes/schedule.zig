@@ -36,13 +36,18 @@ fn getScore(v: *Value, is_control: bool) Score {
 
 /// Schedule all blocks in a function.
 pub fn schedule(f: *Func) !void {
-    debug.log(.schedule, "=== Schedule pass for '{s}' ===", .{f.name});
+    var total_values: usize = 0;
+    for (f.blocks.items) |b| total_values += b.values.items.len;
+    debug.log(.schedule, "=== Schedule pass for '{s}' ({d} blocks, {d} values) ===", .{
+        f.name, f.blocks.items.len, total_values,
+    });
 
     for (f.blocks.items) |block| {
         try scheduleBlock(f.allocator, block, f);
     }
+    f.scheduled = true;
 
-    debug.log(.schedule, "=== Schedule complete ===", .{});
+    debug.log(.schedule, "=== Schedule complete for '{s}' ===", .{f.name});
 }
 
 fn scheduleBlock(allocator: std.mem.Allocator, block: *Block, f: *Func) !void {

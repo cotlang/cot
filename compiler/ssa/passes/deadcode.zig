@@ -22,8 +22,14 @@ const copyelim_pass = @import("copyelim.zig");
 const debug = @import("../../pipeline_debug.zig");
 
 /// deadcode removes dead code from f.
+/// Reference: Go deadcode.go — remove unreachable blocks and dead values.
 pub fn deadcode(f: *Func) !void {
-    debug.log(.deadcode, "=== Deadcode pass for '{s}' ===", .{f.name});
+    // Go compile.go: f.Logf("  pass %s begin\n", p.name)
+    debug.log(.deadcode, "=== Deadcode pass for '{s}' ({d} blocks, {d} values) ===", .{
+        f.name,
+        f.blocks.items.len,
+        countValues(f),
+    });
 
     const allocator = f.allocator;
 
@@ -33,6 +39,23 @@ pub fn deadcode(f: *Func) !void {
     @memset(reachable, false);
 
     try reachableBlocks(f, reachable);
+
+    // Log reachability results (Go: f.Logf for debug > 0)
+    {
+        var n_reachable: usize = 0;
+        var n_unreachable: usize = 0;
+        for (f.blocks.items) |b| {
+            if (reachable[b.id]) {
+                n_reachable += 1;
+            } else {
+                n_unreachable += 1;
+                debug.log(.deadcode, "  block b{d} unreachable ({s})", .{ b.id, @tagName(b.kind) });
+            }
+        }
+        if (n_unreachable > 0) {
+            debug.log(.deadcode, "  reachable: {d}, unreachable: {d}", .{ n_reachable, n_unreachable });
+        }
+    }
 
     // 2. Remove edges from dead blocks to live blocks.
     // This is important for phi argument consistency.
@@ -120,7 +143,12 @@ pub fn deadcode(f: *Func) !void {
         f.invalidateCFG();
     }
 
-    debug.log(.deadcode, "=== Deadcode complete ===", .{});
+    // Go LogStat: "deadcode REMOVED <count>"
+    debug.log(.deadcode, "=== Deadcode complete for '{s}': {d} blocks, {d} values remaining ===", .{
+        f.name,
+        f.blocks.items.len,
+        countValues(f),
+    });
 }
 
 /// BFS from entry block to find all reachable blocks.
@@ -264,6 +292,15 @@ fn removePhiArg(v: *Value, j: usize) void {
         v.args[j] = v.args[last];
     }
     v.args = v.args[0..last];
+}
+
+/// Count total values across all blocks.
+fn countValues(f: *const Func) usize {
+    var n: usize = 0;
+    for (f.blocks.items) |b| {
+        n += b.values.items.len;
+    }
+    return n;
 }
 
 // ============================================================================

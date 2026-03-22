@@ -14,8 +14,9 @@ const debug = @import("../../pipeline_debug.zig");
 
 /// Reorder blocks to minimize jumps.
 pub fn layout(f: *Func) !void {
-    debug.log(.codegen, "layout: processing '{s}', entry=b{d}", .{
+    debug.log(.codegen, "=== Layout pass for '{s}' ({d} blocks, entry=b{d}) ===", .{
         f.name,
+        f.blocks.items.len,
         if (f.entry) |e| e.id else 0,
     });
 
