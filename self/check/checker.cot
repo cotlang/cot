@@ -2195,6 +2195,12 @@ struct Checker {
             return self.checkVariantShorthand(idx, field_name)
         }
 
+        // Zig checker.zig:2532-2555 — comptime field access before normal resolution
+        if (base_n != null_node) {
+            const cv_type = self.resolveComptimeFieldAccess(base_n, field_name)
+            if (cv_type != invalid_type) { return cv_type }
+        }
+
         return self.checkFieldAccessInner(idx, base_n, field_name)
     }
 
@@ -5061,6 +5067,70 @@ struct Checker {
             fields.append(ComptimeValue.makeEnumField(vn, vv))
         }
         return ComptimeValue.makeTypeInfo(TI_ENUM_INFO, name, fields)
+    }
+
+    /// Zig checker.zig:2532-2555 — resolve field access on comptime values.
+    fn resolveComptimeFieldAccess(base_n: int, field_name: string) int {
+        if (self.evalComptimeValue(base_n)) |cv| {
+            const is_ti = cv.tag == CV_TYPE_INFO
+            const is_ef = cv.tag == CV_ENUM_FIELD
+            const is_arr = cv.tag == CV_ARRAY
+            const is_fields = field_name == "fields"
+            const is_name = field_name == "name"
+            const is_value = field_name == "value"
+            const is_len = field_name == "len"
+            if (is_ti and is_fields) { return I64 }
+            if (is_ti and is_name) { return STRING }
+            if (is_ef and is_name) { return STRING }
+            if (is_ef and is_value) { return I64 }
+            if (is_arr and is_len) { return I64 }
+        }
+        return invalid_type
+    }
+
+    /// Return the tag of a comptime value, or -1 if not comptime.
+    fn evalComptimeValueTag(idx: int) int {
+        const cv = self.evalComptimeValue(idx) orelse return -1
+        return cv.tag
+    }
+
+    /// Comptime field access: split from evalComptimeValue to reduce frame size.
+    /// Zig checker.zig:1129 pattern — field access on comptime value.
+    fn evalComptimeFieldAccess(idx: int) ?ComptimeValue {
+        var base_n = null_node
+        var field_name = ""
+        switch (self.ast.getNode(idx)) { Node.expr |e| => switch (e) { Expr.field_access |fa| => { base_n = fa.base; field_name = fa.field }, else => {} }, else => {} }
+        const base_val = self.evalComptimeValue(base_n) orelse return null
+        if (base_val.tag == CV_TYPE_INFO) {
+            if (field_name == "fields") {
+                return ComptimeValue.makeArray(base_val.type_info.fields, "EnumField")
+            }
+            if (field_name == "name") { return ComptimeValue.makeString(base_val.type_info.name) }
+        }
+        if (base_val.tag == CV_ENUM_FIELD) {
+            if (field_name == "name") { return ComptimeValue.makeString(base_val.enum_field.name) }
+            if (field_name == "value") { return ComptimeValue.makeInt(base_val.enum_field.value) }
+        }
+        if (base_val.tag == CV_ARRAY) {
+            if (field_name == "len") { return ComptimeValue.makeInt(base_val.array.elements.count) }
+        }
+        return null
+    }
+
+    /// Comptime index: split from evalComptimeValue to reduce frame size.
+    /// Zig checker.zig:1129-1137 pattern — index on comptime array.
+    fn evalComptimeIndex(idx: int) ?ComptimeValue {
+        var base_n = null_node
+        var idx_n = null_node
+        switch (self.ast.getNode(idx)) { Node.expr |e| => switch (e) { Expr.index_expr |ix| => { base_n = ix.base; idx_n = ix.idx }, else => {} }, else => {} }
+        const base_val = self.evalComptimeValue(base_n) orelse return null
+        const idx_val = (self.evalComptimeValue(idx_n) orelse return null).asInt() orelse return null
+        if (base_val.tag == CV_ARRAY) {
+            if (idx_val >= 0 and idx_val < base_val.array.elements.count) {
+                return base_val.array.elements.get(idx_val)
+            }
+        }
+        return null
     }
 
     fn evalComptimeValue(idx: int) ?ComptimeValue {
