@@ -18,6 +18,8 @@ const Block = @import("block.zig").Block;
 const BlockKind = @import("block.zig").BlockKind;
 const Value = @import("value.zig").Value;
 const Op = @import("op.zig").Op;
+const types_mod = @import("../frontend/types.zig");
+const TypeRegistry = types_mod.TypeRegistry;
 
 /// HTMLWriter generates an interactive HTML page showing SSA at every pass.
 /// Reference: Go html.go lines 21-29
@@ -29,10 +31,11 @@ pub const HTMLWriter = struct {
     prev_hash: u32,
     pending_phases: std.ArrayListUnmanaged([]const u8),
     pending_titles: std.ArrayListUnmanaged([]const u8),
+    type_reg: ?*const TypeRegistry,
 
     /// Create a new HTMLWriter. Writes header immediately.
     /// Reference: Go html.go lines 31-53
-    pub fn init(allocator: Allocator, func_name: []const u8, path: []const u8) HTMLWriter {
+    pub fn init(allocator: Allocator, func_name: []const u8, path: []const u8, type_reg: ?*const TypeRegistry) HTMLWriter {
         var w = HTMLWriter{
             .allocator = allocator,
             .buf = .{},
@@ -41,6 +44,7 @@ pub const HTMLWriter = struct {
             .prev_hash = 0,
             .pending_phases = .{},
             .pending_titles = .{},
+            .type_reg = type_reg,
         };
         w.start();
         return w;
@@ -101,7 +105,7 @@ pub const HTMLWriter = struct {
         var func_html = std.ArrayListUnmanaged(u8){};
         defer func_html.deinit(self.allocator);
         func_html.appendSlice(self.allocator, "<code>") catch return;
-        renderFuncHTML(self.allocator, &func_html, f);
+        renderFuncHTML(self.allocator, &func_html, f, self.type_reg);
         func_html.appendSlice(self.allocator, "</code>") catch return;
 
         // Write the column
@@ -263,7 +267,7 @@ fn renderValueHTML(allocator: Allocator, out: *std.ArrayListUnmanaged(u8), v: *c
 
 /// Render a value with full details: op, type, args, aux.
 /// Reference: Go html.go lines 968-1010 (Value.LongHTML)
-fn renderValueLongHTML(allocator: Allocator, out: *std.ArrayListUnmanaged(u8), v: *const Value) void {
+fn renderValueLongHTML(allocator: Allocator, out: *std.ArrayListUnmanaged(u8), v: *const Value, type_reg: ?*const TypeRegistry) void {
     var buf: [128]u8 = undefined;
     const vid = std.fmt.bufPrint(&buf, "v{d}", .{v.id}) catch return;
 
@@ -288,23 +292,76 @@ fn renderValueLongHTML(allocator: Allocator, out: *std.ArrayListUnmanaged(u8), v
     const op_name = @tagName(v.op);
     out.appendSlice(allocator, op_name) catch {};
 
-    // <Type>
+    // <Type> — show real type name if TypeRegistry available (5.1)
     out.appendSlice(allocator, " &lt;") catch {};
-    const type_str = std.fmt.bufPrint(&buf, "type:{d}", .{v.type_idx}) catch "?";
-    out.appendSlice(allocator, type_str) catch {};
+    if (type_reg) |tr| {
+        const tname = tr.typeName(v.type_idx);
+        appendHTMLEscaped(allocator, out, tname);
+        // Also show size for structs/compounds
+        const size = tr.sizeOf(v.type_idx);
+        if (size > 8) {
+            const sz = std.fmt.bufPrint(&buf, " {d}B", .{size}) catch "";
+            out.appendSlice(allocator, sz) catch {};
+        }
+    } else {
+        const type_str = std.fmt.bufPrint(&buf, "type:{d}", .{v.type_idx}) catch "?";
+        out.appendSlice(allocator, type_str) catch {};
+    }
     out.appendSlice(allocator, "&gt;") catch {};
 
-    // Aux int (if non-zero)
-    if (v.aux_int != 0) {
-        const aux = std.fmt.bufPrint(&buf, " [{d}]", .{v.aux_int}) catch "";
-        out.appendSlice(allocator, aux) catch {};
-    }
-
-    // Aux string
+    // Aux data — context-sensitive display (5.3: Wasm-specific annotations)
     if (v.aux == .string) {
         out.appendSlice(allocator, " {\"") catch {};
         appendHTMLEscaped(allocator, out, v.aux.string);
         out.appendSlice(allocator, "\"}") catch {};
+    } else if (v.aux == .call) {
+        // Call target name
+        if (v.aux_call) |ac| {
+            if (ac.fn_name.len > 0) {
+                out.appendSlice(allocator, " call:") catch {};
+                appendHTMLEscaped(allocator, out, ac.fn_name);
+            }
+        }
+    }
+    // Aux int — show with context based on op
+    if (v.aux_int != 0) {
+        switch (v.op) {
+            .wasm_i64_load, .wasm_i64_store, .wasm_i64_load8_s, .wasm_i64_load8_u,
+            .wasm_i64_load16_s, .wasm_i64_load16_u, .wasm_i64_load32_s, .wasm_i64_load32_u,
+            .wasm_i64_store8, .wasm_i64_store16, .wasm_i64_store32,
+            .wasm_f64_load, .wasm_f64_store, .wasm_f32_load, .wasm_f32_store,
+            => {
+                // Memory ops: aux_int is offset
+                const aux = std.fmt.bufPrint(&buf, " offset={d}", .{v.aux_int}) catch "";
+                out.appendSlice(allocator, aux) catch {};
+            },
+            .wasm_i64_const, .wasm_i32_const, .const_int => {
+                // Constants: show value
+                const aux = std.fmt.bufPrint(&buf, " ={d}", .{v.aux_int}) catch "";
+                out.appendSlice(allocator, aux) catch {};
+            },
+            .arg => {
+                // Arg index
+                const aux = std.fmt.bufPrint(&buf, " arg#{d}", .{v.aux_int}) catch "";
+                out.appendSlice(allocator, aux) catch {};
+            },
+            .wasm_gc_struct_new, .wasm_gc_struct_get, .wasm_gc_struct_set => {
+                // WasmGC: show type index and field index
+                const type_idx = @as(u32, @truncate(@as(u64, @bitCast(v.aux_int))));
+                const field_idx = @as(u32, @truncate(@as(u64, @bitCast(v.aux_int)) >> 16));
+                if (field_idx > 0) {
+                    const aux = std.fmt.bufPrint(&buf, " gc_type={d} field={d}", .{ type_idx, field_idx }) catch "";
+                    out.appendSlice(allocator, aux) catch {};
+                } else {
+                    const aux = std.fmt.bufPrint(&buf, " gc_type={d}", .{type_idx}) catch "";
+                    out.appendSlice(allocator, aux) catch {};
+                }
+            },
+            else => {
+                const aux = std.fmt.bufPrint(&buf, " [{d}]", .{v.aux_int}) catch "";
+                out.appendSlice(allocator, aux) catch {};
+            },
+        }
     }
 
     // Args (as clickable value references)
@@ -385,7 +442,7 @@ fn renderBlockLongHTML(allocator: Allocator, out: *std.ArrayListUnmanaged(u8), b
 
 /// Render an entire function's SSA as HTML.
 /// Reference: Go html.go lines 1053-1065 (Func.HTML) + print.go lines 125-192 (fprintFunc)
-fn renderFuncHTML(allocator: Allocator, out: *std.ArrayListUnmanaged(u8), f: *const Func) void {
+fn renderFuncHTML(allocator: Allocator, out: *std.ArrayListUnmanaged(u8), f: *const Func, type_reg: ?*const TypeRegistry) void {
     // Compute liveness for dead code visualization
     // (simplified: mark all values with uses > 0 as live)
     for (f.blocks.items) |b| {
@@ -434,7 +491,7 @@ fn renderFuncHTML(allocator: Allocator, out: *std.ArrayListUnmanaged(u8), f: *co
                 } else {
                     out.appendSlice(allocator, "<li class=\"ssa-long-value\">") catch {};
                 }
-                renderValueLongHTML(allocator, out, v);
+                renderValueLongHTML(allocator, out, v, type_reg);
                 out.appendSlice(allocator, "</li>") catch {};
             }
 
@@ -975,7 +1032,7 @@ const js_template =
 
 test "HTMLWriter init and close produces valid HTML" {
     const allocator = std.testing.allocator;
-    var w = HTMLWriter.init(allocator, "testFunc", "/tmp/test.ssa.html");
+    var w = HTMLWriter.init(allocator, "testFunc", "/tmp/test.ssa.html", null);
     defer w.deinit();
     w.close();
     // Verify HTML structure

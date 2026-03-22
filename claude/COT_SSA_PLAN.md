@@ -196,27 +196,27 @@ try lower_native.lower(ssa_func);
 ### Phase 5: Cot-Specific Enhancements
 **Beyond Go — features specific to Cot's architecture**
 
-- [ ] **5.1** Type display — show Cot types, not just indices
+- [x] **5.1** Type display — show Cot types, not just indices
   - Values display full type name: `v42 = add <i64>` not `v42 = add <type:5>`
   - String, slice, optional types shown with element types
   - Requires passing TypeRegistry to HTML renderer
 
-- [ ] **5.2** Compound value tracking
+- [x] **5.2** Compound value tracking
   - String values show both ptr and len components
   - Highlight compound_len_locals alongside primary values
   - Visual indicator for decomposed compound types
 
-- [ ] **5.3** Wasm-specific annotations
+- [x] **5.3** Wasm-specific annotations
   - After lower_wasm: show Wasm opcode names (wasm_i64_add, wasm_f64_load)
   - Show function indices for call targets
   - Show memory offsets for load/store operations
 
-- [ ] **5.4** Source line cross-referencing
+- [x] **5.4** Source line cross-referencing
   - Click a source line → highlight all SSA values from that line
   - Click an SSA value → highlight the source line it came from
   - Uses `Value.pos` (Pos struct with line/col)
 
-- [ ] **5.5** WasmGC visualization
+- [x] **5.5** WasmGC visualization
   - Highlight GC struct/array operations (struct_new, struct_get, array_new)
   - Show GC type indices alongside values
   - Mark values that use GC ref types vs linear memory

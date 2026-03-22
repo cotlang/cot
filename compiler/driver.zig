@@ -6228,7 +6228,7 @@ pub const Driver = struct {
                     std.mem.eql(u8, target_name, "*"))
                 {
                     const html_path = std.fmt.allocPrint(self.allocator, "{s}.ssa.html", .{ir_func.name}) catch ir_func.name;
-                    html_writer = ssa_html.HTMLWriter.init(self.allocator, ir_func.name, html_path);
+                    html_writer = ssa_html.HTMLWriter.init(self.allocator, ir_func.name, html_path, type_reg);
 
                     // Write source code column (if source text available)
                     if (self.parsed_file_texts.len > 0) {
