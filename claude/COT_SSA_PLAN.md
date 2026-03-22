@@ -1,7 +1,7 @@
 # COT_SSA — Interactive SSA Visualizer Execution Plan
 
 **Date:** 2026-03-23
-**Status:** Planning
+**Status:** Phase 1-4 complete, Phase 5 in progress
 **Goal:** Port Go's GOSSAFUNC HTML visualizer to Cot, then to selfcot (self-hosted compiler)
 
 ---
@@ -74,39 +74,39 @@ try lower_native.lower(ssa_func);
 **Reference:** `references/go/src/cmd/compile/internal/ssa/html.go`
 **Estimated size:** ~800 lines of Zig
 
-- [ ] **1.1** Create `compiler/ssa/html.zig` with `HTMLWriter` struct
+- [x] **1.1** Create `compiler/ssa/html.zig` with `HTMLWriter` struct
   - Fields: file writer, func pointer, prev_hash, pending_phases, pending_titles
   - Reference: Go `html.go` lines 21-29
 
-- [ ] **1.2** Port `start()` — write HTML header, CSS, JavaScript
+- [x] **1.2** Port `start()` — write HTML header, CSS, JavaScript
   - Embed the complete CSS stylesheet (Go lines 73-364, ~290 lines)
   - Embed the complete JavaScript (Go lines 366-740, ~370 lines)
   - Dark mode support, column collapse/expand, history state
   - Reference: Go `html.go` lines 66-777
 
-- [ ] **1.3** Port `Close()` — close table, body, html tags, close file
+- [x] **1.3** Port `Close()` — close table, body, html tags, close file
   - Print "dumped SSA for {name} to {path}" message
   - Reference: Go `html.go` lines 779-791
 
-- [ ] **1.4** Port `WritePhase()` — hash-based phase capture
+- [x] **1.4** Port `WritePhase()` — hash-based phase capture
   - Compute CRC32 hash of current SSA state (Go `print.go` lines 20-25)
   - If hash unchanged, batch with pending phases (skip rendering identical columns)
   - If hash changed, call `flushPhases()` to emit column
   - Reference: Go `html.go` lines 793-821
 
-- [ ] **1.5** Port `flushPhases()` — emit HTML column
+- [x] **1.5** Port `flushPhases()` — emit HTML column
   - Combine batched phase names with " + "
   - Call `Func.HTML()` to render the SSA
   - Emit collapsed tab + expanded content
   - Reference: Go `html.go` lines 823-838
 
-- [ ] **1.6** Port `WriteMultiTitleColumn()` — column generation
+- [x] **1.6** Port `WriteMultiTitleColumn()` — column generation
   - Collapsed column (vertical text, click to expand)
   - Expanded column (h2 titles + SSA content)
   - Phase ID for CSS targeting
   - Reference: Go `html.go` lines 928-946
 
-- [ ] **1.7** Port `WriteSources()` — source code column
+- [x] **1.7** Port `WriteSources()` — source code column
   - Line numbers on left, source code on right
   - Line number CSS classes for cross-referencing (`l42` etc.)
   - Reference: Go `html.go` lines 840-881
@@ -114,28 +114,28 @@ try lower_native.lower(ssa_func);
 ### Phase 2: SSA Rendering (`compiler/ssa/html.zig` continued)
 **Reference:** `references/go/src/cmd/compile/internal/ssa/html.go:1012-1254`
 
-- [ ] **2.1** Port `Value.HTML()` — short value rendering
+- [x] **2.1** Port `Value.HTML()` — short value rendering
   - Format: `<span class="v42 ssa-value">v42</span>`
   - CSS class = value ID for cross-pass highlighting
   - Reference: Go `html.go` lines 1012-1016
 
-- [ ] **2.2** Port `Value.LongHTML()` — full value rendering
+- [x] **2.2** Port `Value.LongHTML()` — full value rendering
   - Format: `v42 (line:col) = add <i64> v10 v11 : R0`
   - Includes: op name, type, args (as clickable links), register allocation, aux data
   - Source position as line number
   - Reference: Go `html.go` lines 1018-1041
 
-- [ ] **2.3** Port `Block.HTML()` — short block rendering
+- [x] **2.3** Port `Block.HTML()` — short block rendering
   - Format: `<span class="b5 ssa-block">b5</span>`
   - CSS class = block ID for cross-pass highlighting
   - Reference: Go `html.go` lines 1043-1047
 
-- [ ] **2.4** Port `Block.LongHTML()` — full block rendering with successors
+- [x] **2.4** Port `Block.LongHTML()` — full block rendering with successors
   - Format: `b5 plain → b6` or `b5 if v42 → b6 b7`
   - Includes: block kind, control values, successor blocks (as clickable links)
   - Reference: Go `html.go` lines 1049-1051
 
-- [ ] **2.5** Port `htmlFuncPrinter` — full function HTML rendering
+- [x] **2.5** Port `htmlFuncPrinter` — full function HTML rendering
   - `startBlock()`: `<ul class="b5 ssa-print-func">` + predecessors + collapse button
   - `value()`: `<li class="ssa-long-value">` + `LongHTML()`
   - `endBlock()`: successor info + `</ul>`
@@ -143,7 +143,7 @@ try lower_native.lower(ssa_func);
   - Dead code marking: `dead-value` / `dead-block` CSS classes
   - Reference: Go `html.go` lines 1189-1254
 
-- [ ] **2.6** Port `Func.HTML()` — top-level function rendering
+- [x] **2.6** Port `Func.HTML()` — top-level function rendering
   - Wrap in `<code>` tags
   - Call htmlFuncPrinter to emit all blocks and values
   - Reference: Go `html.go` lines 1053-1065
@@ -151,12 +151,12 @@ try lower_native.lower(ssa_func);
 ### Phase 3: Hash Computation
 **Reference:** `references/go/src/cmd/compile/internal/ssa/print.go`
 
-- [ ] **3.1** Port `hashFunc()` — CRC32 of SSA text representation
+- [x] **3.1** Port `hashFunc()` — CRC32 of SSA text representation
   - Use `std.hash.CRC32` to hash the string output of the function
   - Must include dead values (for detecting deadcode pass changes)
   - Reference: Go `print.go` lines 20-25
 
-- [ ] **3.2** Port `fprintFunc()` — functional printer interface
+- [x] **3.2** Port `fprintFunc()` — functional printer interface
   - Abstract printer that can output to string, HTML, or hash
   - Called by both text dump and HTML rendering
   - Reference: Go `print.go` lines 28-89
@@ -164,28 +164,28 @@ try lower_native.lower(ssa_func);
 ### Phase 4: Driver Integration
 **Reference:** `references/go/src/cmd/compile/internal/ssagen/ssa.go:44-77`, `compile.go:58-145`
 
-- [ ] **4.1** Add `COT_SSA` env var parsing in `compiler/driver.zig`
+- [x] **4.1** Add `COT_SSA` env var parsing in `compiler/driver.zig`
   - Read `COT_SSA` env var (function name filter)
   - Support package-qualified names: `COT_SSA=mymod.myFunc`
   - Store on Driver struct: `ssa_html_func: ?[]const u8`
   - Reference: Go `ssagen/ssa.go` lines 44-77
 
-- [ ] **4.2** Create HTMLWriter when function name matches
+- [x] **4.2** Create HTMLWriter when function name matches
   - In compilation loop, check if current function matches `ssa_html_func`
   - If match: create HTMLWriter, write header, write source column
   - Output file: `{funcname}.ssa.html` in CWD (or `COT_SSA_DIR` if set)
   - Reference: Go `ssagen/ssa.go` lines 379-390
 
-- [ ] **4.3** Hook WritePhase after each SSA pass (Wasm path)
+- [x] **4.3** Hook WritePhase after each SSA pass (Wasm path)
   - After each pass in `driver.zig:6227-6236`, call `html_writer.writePhase(pass_name)`
   - Capture timing: `std.time.nanoTimestamp()` before/after each pass
   - Include timing in phase title: `"copyelim <span class='stats'>[1234 ns]</span>"`
   - Reference: Go `compile.go` lines 58-145
 
-- [ ] **4.4** Hook WritePhase after each SSA pass (Native path)
+- [x] **4.4** Hook WritePhase after each SSA pass (Native path)
   - Same as 4.3 but for `driver.zig:1549-1554`
 
-- [ ] **4.5** Close HTMLWriter after codegen
+- [x] **4.5** Close HTMLWriter after codegen
   - Call `html_writer.close()` after all passes complete
   - Print path to stderr: `"dumped SSA for {name} to {path}"`
 
@@ -216,10 +216,10 @@ try lower_native.lower(ssa_func);
   - Click an SSA value → highlight the source line it came from
   - Uses `Value.pos` (Pos struct with line/col)
 
-- [ ] **5.5** ARC visualization (native target only)
-  - Highlight retain/release pairs
-  - Show reference count flow
-  - Mark values that trigger ARC operations
+- [ ] **5.5** WasmGC visualization
+  - Highlight GC struct/array operations (struct_new, struct_get, array_new)
+  - Show GC type indices alongside values
+  - Mark values that use GC ref types vs linear memory
 
 ### Phase 6: Testing & Validation
 
