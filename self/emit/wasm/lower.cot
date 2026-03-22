@@ -23,6 +23,13 @@ fn lower(func: *SsaFunc) void {
             const val_idx = blk.values.get(vi)
             lowerValue(func, val_idx)
         }
+        // Also lower control values (may not be in values list)
+        for ci in 0..blk.controls.count {
+            const ctrl_idx = blk.controls.get(ci)
+            if (ctrl_idx >= 0 and ctrl_idx < func.next_value_id) {
+                lowerValue(func, ctrl_idx)
+            }
+        }
     }
 }
 
