@@ -1673,17 +1673,30 @@ pub fn emit(inst: *const Inst, sink: *MachBuffer, emit_info: *const EmitInfo, st
                 .sxtw => 0b110,
                 .sxtx => 0b111,
             };
-            const top11: u32 = switch (payload.alu_op) {
-                .add => 0b00001011_001,
-                .sub => 0b01001011_001,
-                .adds => 0b00101011_001,
-                .subs => 0b01101011_001,
+            // ARM64 extended register form: sf op S 01011 001 Rm option imm3 Rn Rd
+            // Register 31 in Rd/Rn = SP (not XZR like shifted form).
+            // Encode directly instead of using encArithRrr (which is for shifted form).
+            const sf: u32 = payload.size.sfBit();
+            const op_s: u32 = switch (payload.alu_op) {
+                .add => 0b00,
+                .sub => 0b10,
+                .adds => 0b01,
+                .subs => 0b11,
                 else => @panic("Unsupported ALU op for extended register"),
             };
-            const top11_sized = top11 | (@as(u32, payload.size.sfBit()) << 10);
-            // Extended register encoding: option(3) | imm3(3)
-            const bit15_10 = (ext_enc << 3) | 0; // imm3=0 (no additional shift)
-            try sink.put4(encArithRrr(top11_sized, bit15_10, payload.rd, payload.rn, payload.rm));
+            const rd_enc = machregToGpr(payload.rd.toReg());
+            const rn_enc = machregToGpr(payload.rn);
+            const rm_enc = machregToGpr(payload.rm);
+            try sink.put4(
+                (sf << 31) |
+                (op_s << 29) |
+                (0b01011_001 << 21) |
+                (rm_enc << 16) |
+                (ext_enc << 13) |
+                (0 << 10) | // imm3 = 0
+                (rn_enc << 5) |
+                rd_enc
+            );
         },
 
         // Conditional compare register

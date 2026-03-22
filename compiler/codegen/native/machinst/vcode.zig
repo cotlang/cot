@@ -1079,7 +1079,7 @@ pub fn VCode(comptime I: type) type {
                             if (hi > 0) {
                                 try buffer.put4(0xf2a00010 | (hi << 5)); // movk x16, #hi, lsl #16
                             }
-                            try buffer.put4(0xcb1003ff); // sub sp, sp, x16
+                            try buffer.put4(0xcb3063ff); // sub sp, sp, x16, uxtx (extended form: reg 31 = SP)
                         }
                     }
                 }
@@ -1216,7 +1216,7 @@ pub fn VCode(comptime I: type) type {
                                             if (hi > 0) {
                                                 try buffer.put4(0xf2a00010 | (hi << 5)); // movk x16, #hi, lsl #16
                                             }
-                                            try buffer.put4(0x8b1003ff); // add sp, sp, x16
+                                            try buffer.put4(0x8b3063ff); // add sp, sp, x16, uxtx (extended form: reg 31 = SP)
                                         }
                                     }
 
