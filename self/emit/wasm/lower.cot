@@ -215,10 +215,8 @@ fn lowerOp(op: SsaOp, type_idx: int, func: *SsaFunc, val_idx: int) SsaOp {
         .move => SsaOp.wasm_lowered_move,
         .zero => SsaOp.wasm_lowered_zero,
 
-        // ARC
-        // ARC retain/release not used on Wasm targets
-        .retain => SsaOp.invalid,
-        .release => SsaOp.invalid,
+        // ARC: no-op on Wasm (Wasm uses WasmGC, not ARC) — Zig lower_wasm.zig:213
+        .retain, .release => SsaOp.wasm_nop,
 
         // Everything else unchanged
         else => SsaOp.invalid,
