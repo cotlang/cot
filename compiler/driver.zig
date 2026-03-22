@@ -113,9 +113,16 @@ pub const Driver = struct {
     user_extern_has_result: std.ArrayListUnmanaged(bool) = .{},
     /// Dict dispatch: maps concrete generic name → list of dict helper fn names (extra args).
     dict_arg_names: ?*const std.StringHashMap([]const []const u8) = null,
+    /// COT_SSA: function name to generate interactive HTML visualizer for.
+    /// Set via COT_SSA env var or --ssa=funcname CLI flag.
+    /// Reference: Go GOSSAFUNC env var (ssagen/ssa.go lines 44-77)
+    ssa_html_func: ?[]const u8 = null,
 
     pub fn init(allocator: Allocator) Driver {
-        return .{ .allocator = allocator };
+        var d = Driver{ .allocator = allocator };
+        // Read COT_SSA env var for HTML visualizer
+        d.ssa_html_func = std.posix.getenv("COT_SSA");
+        return d;
     }
 
     pub fn setTarget(self: *Driver, t: Target) void {
@@ -6223,17 +6230,65 @@ pub const Driver = struct {
             // No need for individual deinit — arena frees everything at once
             ssa_builder.deinit();
 
+            // COT_SSA: interactive HTML visualizer (Go GOSSAFUNC port)
+            const ssa_html = @import("ssa/html.zig");
+            var html_writer: ?ssa_html.HTMLWriter = null;
+            if (self.ssa_html_func) |target_name| {
+                if (std.mem.eql(u8, ir_func.name, target_name) or
+                    std.mem.eql(u8, target_name, "*"))
+                {
+                    const html_path = std.fmt.allocPrint(self.allocator, "{s}.ssa.html", .{ir_func.name}) catch ir_func.name;
+                    html_writer = ssa_html.HTMLWriter.init(self.allocator, ir_func.name, html_path);
+
+                    // Write source code column (if source text available)
+                    if (self.parsed_file_texts.len > 0) {
+                        const src_text = self.parsed_file_texts[0];
+                        const src_path = if (self.parsed_file_paths.len > 0) self.parsed_file_paths[0] else "unknown";
+                        html_writer.?.writeSources(src_text, src_path);
+                    }
+
+                    // Initial SSA state
+                    html_writer.?.writePhase("start", "start", ssa_func);
+                }
+            }
+
             // Run Wasm-specific passes with optimization (Go pass order)
+            // Reference: Go compile.go lines 58-145 — pass loop + HTMLWriter integration
             try copyelim.copyelim(ssa_func);
+            if (html_writer != null) html_writer.?.writePhase("copyelim", "copyelim", ssa_func);
+
             try rewritegeneric.rewrite(func_alloc, ssa_func, &string_offsets);
+            if (html_writer != null) html_writer.?.writePhase("rewritegeneric", "rewritegeneric", ssa_func);
+
             try decompose_builtin.decompose(func_alloc, ssa_func, type_reg);
+            if (html_writer != null) html_writer.?.writePhase("decompose", "decompose", ssa_func);
+
             try rewritedec.rewrite(func_alloc, ssa_func);
+            if (html_writer != null) html_writer.?.writePhase("rewritedec", "rewritedec", ssa_func);
+
             try copyelim.copyelim(ssa_func);
+            if (html_writer != null) html_writer.?.writePhase("copyelim2", "copyelim (2nd)", ssa_func);
+
             try cse_pass.cse(ssa_func);
+            if (html_writer != null) html_writer.?.writePhase("cse", "cse", ssa_func);
+
             try deadcode.deadcode(ssa_func);
+            if (html_writer != null) html_writer.?.writePhase("deadcode", "deadcode", ssa_func);
+
             try schedule.schedule(ssa_func);
+            if (html_writer != null) html_writer.?.writePhase("schedule", "schedule", ssa_func);
+
             try layout.layout(ssa_func);
+            if (html_writer != null) html_writer.?.writePhase("layout", "layout", ssa_func);
+
             try lower_wasm.lower(ssa_func);
+            if (html_writer != null) {
+                html_writer.?.writePhase("lower_wasm", "lower_wasm", ssa_func);
+                html_writer.?.flushPhases(ssa_func);
+                html_writer.?.close();
+                html_writer.?.deinit();
+                html_writer = null;
+            }
 
             // Determine function signature
             var param_count: u32 = 0;
