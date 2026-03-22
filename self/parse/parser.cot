@@ -1103,6 +1103,7 @@ struct Parser {
         var is_distinct = false
         if (self.tok == Token.kw_distinct) { self.advance(); is_distinct = true }
         const target = self.parseType()
+        self.match(Token.semicolon as int)
         return self.ast.addDecl(Decl.type_alias(TypeAlias { .name = name, .target = target, .is_distinct = is_distinct, .doc_comment = doc, .span = self.spanSE(start, self.tok_end) }))
     }
 
@@ -2086,13 +2087,13 @@ struct Parser {
         switch (bk) {
             // 0 args
             .trap, .target, .target_os, .target_arch => {},
-            // 1 type arg only: @sizeOf(T), @alignOf(T), @enumLen(T), @typeName(T), @typeInfo(T), @enumName(T)
-            .size_of, .align_of, .enum_len, .type_name, .enum_name, .type_info => {
+            // 1 type arg only: @sizeOf(T), @alignOf(T), @enumLen(T), @typeName(T), @typeInfo(T)
+            .size_of, .align_of, .enum_len, .type_name, .type_info => {
                 type_arg = self.parseType()
             },
-            // 1 type + 1 value: @intCast(T, v), @ptrCast(T, v), @intToPtr(T, v), @as(T, v), etc.
+            // 1 type + 1 value: @intCast(T, v), @ptrCast(T, v), @intToPtr(T, v), @as(T, v), @enumName(T, v), etc.
             .int_cast, .float_cast, .float_from_int, .ptr_cast, .int_to_ptr, .has_field,
-            .bit_cast, .truncate, .@"as", .offset_of, .align_cast => {
+            .bit_cast, .truncate, .@"as", .offset_of, .align_cast, .enum_name => {
                 type_arg = self.parseType()
                 self.expect(Token.comma as int)
                 args.append(self.parseExpr())
@@ -2303,6 +2304,7 @@ struct Parser {
         }
         if (tok == Token.kw_packed) {
             if ((@enumFromInt(self.peekToken()) as Token) == Token.kw_struct) {
+                self.advance()  // consume 'packed', now current token is 'struct'
                 const decl_idx = self.parseStructDecl(1)
                 return self.ast.addStmt(Stmt.expr_stmt(ExprStmt { .expr = decl_idx, .span = self.ast.nodeSpan(decl_idx) }))
             }
@@ -2362,7 +2364,23 @@ struct Parser {
         }
         var value = null_node
         if (self.match(Token.assign as int)) {
-            value = self.parseExpr()
+            // Inline type declarations: const Color = enum { ... }
+            if (self.tok == Token.kw_enum) {
+                value = self.parseEnumDecl()
+            } else if (self.tok == Token.kw_struct) {
+                value = self.parseStructDecl(0)
+            } else if (self.tok == Token.kw_union) {
+                value = self.parseUnionDecl()
+            } else if (self.tok == Token.kw_packed) {
+                if ((@enumFromInt(self.peekToken()) as Token) == Token.kw_struct) {
+                    self.advance()  // consume 'packed'
+                    value = self.parseStructDecl(1)
+                } else {
+                    value = self.parseExpr()
+                }
+            } else {
+                value = self.parseExpr()
+            }
         }
         self.match(Token.semicolon as int)
         return self.ast.addStmt(Stmt.var_stmt(VarStmt { .name = name, .type_expr = type_expr, .value = value, .is_const = is_const == 1, .is_weak = false, .is_unowned = false, .span = self.spanSE(start, self.tok_end) }))
@@ -2580,7 +2598,14 @@ struct Parser {
         const start = self.tok_start
         self.advance()  // consume 'continue'
         var label = ""
-        if (self.tok == Token.ident) {
+        // Zig parser.zig:1962 — continue :label syntax (colon then ident)
+        if (self.tok == Token.colon) {
+            self.advance()  // consume ':'
+            if (self.tok == Token.ident) {
+                label = self.tok_text
+                self.advance()
+            }
+        } else if (self.tok == Token.ident) {
             label = self.tok_text
             self.advance()
         }
@@ -2784,7 +2809,8 @@ struct Parser {
         if (self.tok == Token.kw_fn) {
             return self.parseFnType(start)
         }
-        self.errors.report(start, ErrorCode.e202, "expected type")
+        // Zig parser pattern: parseType returns null silently.
+        // Callers decide whether to emit an error.
         return null_node
     }
 
