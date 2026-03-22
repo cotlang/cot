@@ -5552,11 +5552,25 @@ pub const Lowerer = struct {
 
         // Shorthand enum variant: .variant (base == null_node, resolved by checker)
         if (fa.base == ast.null_node) {
+            // In switch context: resolve against the switch expression's enum type
             if (self.current_switch_enum_type != types.invalid_type) {
                 const enum_info = self.type_reg.get(self.current_switch_enum_type);
                 if (enum_info == .enum_type) {
                     for (enum_info.enum_type.variants) |variant| {
                         if (std.mem.eql(u8, variant.name, fa.field)) return try fb.emitConstInt(variant.value, self.current_switch_enum_type, fa.span);
+                    }
+                }
+            }
+            // Outside switch: resolve using the checker's inferred type for this expression.
+            // The checker already resolved .variant to the correct enum type via type inference
+            // from the call parameter type, assignment target, etc.
+            // Look up the field name in all known enum types.
+            for (self.type_reg.types.items, 0..) |t, i| {
+                if (t == .enum_type) {
+                    for (t.enum_type.variants) |variant| {
+                        if (std.mem.eql(u8, variant.name, fa.field)) {
+                            return try fb.emitConstInt(variant.value, @intCast(i), fa.span);
+                        }
                     }
                 }
             }
