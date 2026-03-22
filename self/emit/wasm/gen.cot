@@ -215,7 +215,6 @@ struct GenState {
 
                 if (ret_val.op == SsaOp.string_make or ret_val.op == SsaOp.slice_make or ret_val.op == SsaOp.opt_make) {
                     // Compound return: push both components (ptr/tag, len/payload)
-                    // Zig gen.zig:231 — handles string_make, slice_make, AND opt_make
                     if (ret_val.args.count >= 2) {
                         self.getValue64(ret_val.args.get(0))
                         self.getValue64(ret_val.args.get(1))
@@ -225,33 +224,6 @@ struct GenState {
                     self.getValue64(ret_val_idx)
                     const len_local = self.compound_len_locals.get(ret_val_idx)
                     self.builder.appendFrom(As.local_get, constAddr(len_local))
-                } else if (ret_val.type_idx == STRING) {
-                    // STRING return from copy/phi — follow copy chain
-                    var src_idx = ret_val_idx
-                    var src = ret_val
-                    var depth: int = 0
-                    while (src.op == SsaOp.copy and src.args.count >= 1 and depth < 20) {
-                        src_idx = src.args.get(0)
-                        src = self.ssa_func.getValue(src_idx)
-                        depth += 1
-                    }
-                    if ((src.op == SsaOp.string_make or src.op == SsaOp.slice_make) and src.args.count >= 2) {
-                        self.getValue64(src.args.get(0))
-                        self.getValue64(src.args.get(1))
-                    } else if (self.compound_len_locals.contains(src_idx)) {
-                        self.getValue64(src_idx)
-                        const len_local = self.compound_len_locals.get(src_idx)
-                        self.builder.appendFrom(As.local_get, constAddr(len_local))
-                    } else {
-                        self.getValue64(ret_val_idx)
-                        self.builder.appendFrom(As.i64_const, constAddr(0))
-                    }
-                } else if (self.ssa_func.type_idx == STRING) {
-                    // Function returns STRING but control is not string_make/copy.
-                    // This can happen when passes (copyelim/CSE) replace the control.
-                    // Push the value as ptr, then push i64.const 0 as len fallback.
-                    self.getValue64(ret_val_idx)
-                    self.builder.appendFrom(As.i64_const, constAddr(0))
                 } else {
                     // Non-compound scalar return
                     self.getValue64(ret_val_idx)
