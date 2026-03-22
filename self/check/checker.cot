@@ -1762,7 +1762,26 @@ struct Checker {
         var right_n = null_node
         switch (self.ast.getNode(idx)) { Node.expr |e| => switch (e) { Expr.binary |bin| => { op = bin.op; left_n = bin.left; right_n = bin.right }, else => {} }, else => {} }
         const left_type = self.checkExpr(left_n)
+
+        // Union variant comparison: set context so .variant shorthand resolves for RHS.
+        // Zig checker.zig:1716-1731 — same as switch enum context but for == / != with union LHS.
+        // @safe auto-deref: if LHS is *Union, unwrap to Union for comparison context.
+        const old_switch_enum = self.current_switch_enum_type
+        if (op == Token.eql or op == Token.neq) {
+            var cmp_type = left_type
+            const left_info = self.types.get(left_type)
+            if (left_info.tag == TAG_POINTER) {
+                const elem_idx = switch (left_info) { Type.pointer |p| => p.elem, else => invalid_type }
+                if (self.types.get(elem_idx).tag == TAG_UNION) {
+                    cmp_type = elem_idx
+                }
+            }
+            if (self.types.get(cmp_type).tag == TAG_UNION) {
+                self.current_switch_enum_type = cmp_type
+            }
+        }
         const right_type = self.checkExpr(right_n)
+        self.current_switch_enum_type = old_switch_enum
         const left_t = self.types.get(left_type)
         const right_t = self.types.get(right_type)
 
@@ -1896,6 +1915,30 @@ struct Checker {
         if (op == Token.eql or op == Token.neq or
             op == Token.lss or op == Token.leq or
             op == Token.gtr or op == Token.geq) {
+            // Union variant tag comparison: union == .variant / union == Union.Variant
+            // @safe auto-deref: *Union treated as Union for comparison
+            if (op == Token.eql or op == Token.neq) {
+                var left_u = left_t
+                if (left_t.tag == TAG_POINTER) {
+                    const elem_idx = switch (left_t) { Type.pointer |p| => p.elem, else => invalid_type }
+                    const elem_t = self.types.get(elem_idx)
+                    if (elem_t.tag == TAG_UNION) { left_u = elem_t }
+                }
+                var right_u = right_t
+                if (right_t.tag == TAG_POINTER) {
+                    const elem_idx = switch (right_t) { Type.pointer |p| => p.elem, else => invalid_type }
+                    const elem_t = self.types.get(elem_idx)
+                    if (elem_t.tag == TAG_UNION) { right_u = elem_t }
+                }
+                if (left_u.tag == TAG_UNION) {
+                    const ut = switch (left_u) { Type.union_type |u| => u, else => UnionType { name: "", variant_count: 0, variants: 0, tag_type: 0 } }
+                    if (self.isUnionVariantRef(right_n, ut)) { return BOOL }
+                }
+                if (right_u.tag == TAG_UNION) {
+                    const ut = switch (right_u) { Type.union_type |u| => u, else => UnionType { name: "", variant_count: 0, variants: 0, tag_type: 0 } }
+                    if (self.isUnionVariantRef(left_n, ut)) { return BOOL }
+                }
+            }
             if (!self.isComparable(left_type, right_type)) {
                 self.reportError(idx, ErrorCode.e300, "invalid comparison")
                 return invalid_type
@@ -2231,6 +2274,22 @@ struct Checker {
                 for vi in 0..et.variant_count {
                     const ev = et.getVariant(vi)
                     if (ev.name == field_name) {
+                        return self.current_switch_enum_type
+                    }
+                }
+                const sw_suggestion = self.findSimilarVariant(field_name, self.current_switch_enum_type)
+                if (sw_suggestion) |ss| {
+                    self.reportError(idx, ErrorCode.e306, "undefined variant '${field_name}', did you mean '${ss}'?")
+                } else {
+                    self.reportError(idx, ErrorCode.e306, "undefined variant")
+                }
+            }
+            // Zig checker.zig:2567-2572 — union variant shorthand
+            if (enum_info.tag == TAG_UNION) {
+                const ut = switch (enum_info) { Type.union_type |u| => u, else => UnionType { name: "", variant_count: 0, variants: 0, tag_type: 0 } }
+                for vi in 0..ut.variant_count {
+                    const uv = ut.getVariant(vi)
+                    if (uv.name == field_name) {
                         return self.current_switch_enum_type
                     }
                 }
@@ -5522,6 +5581,7 @@ struct Checker {
         var base_n = null_node
         var field_name = ""
         switch (self.ast.getNode(idx)) { Node.expr |e| => switch (e) { Expr.field_access |fa| => { base_n = fa.base; field_name = fa.field }, else => {} }, else => {} }
+        if (base_n == null_node) { return (0, 0) }
         if (nodeTag(self.ast, base_n) == "ident") {
             var base_name = ""
             switch (self.ast.getNode(base_n)) { Node.expr |e| => switch (e) { Expr.ident |id| => { base_name = id.name }, else => {} }, else => {} }
@@ -6073,6 +6133,20 @@ struct Checker {
             }
         }
         return best
+    }
+
+    /// Check if an expression is a reference to a union variant (e.g., .Running or CuState.Running).
+    /// Zig ref: checker.zig:4221-4230
+    fn isUnionVariantRef(expr_idx: int, ut: UnionType) bool {
+        const node = self.ast.getNode(expr_idx)
+        var field_name = ""
+        switch (node) { Node.expr |e| => switch (e) { Expr.field_access |fa| => { field_name = fa.field }, else => {} }, else => {} }
+        if (field_name == "") { return false }
+        for i in 0..ut.variant_count {
+            const v = ut.getVariant(i)
+            if (v.name == field_name) { return true }
+        }
+        return false
     }
 
     /// Find similar enum/union variant name for "did you mean" suggestions.

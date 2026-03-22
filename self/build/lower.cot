@@ -562,6 +562,12 @@ struct Lowerer {
                 self.addParamFromNode(param_idx)
             }
 
+            // Initialize globals before user code in main() (Zig lower.zig:777-779)
+            if (fn_decl.name == "main") {
+                var init_args: List(int) = .{}
+                fb.emitCall("__cot_init_globals", init_args, false, VOID, fn_decl.span)
+            }
+
             if (fn_decl.body != null_node) {
                 self.lowerBlockNode(fn_decl.body)
 
@@ -947,16 +953,8 @@ struct Lowerer {
                 return true
             },
             Stmt.expr_stmt |es| => {
-                // Track current block before lowering — @trap()/@panic() create dead blocks
-                var prev_block = null_block
-                if (self.builder.func()) |fb2| { prev_block = fb2.currentBlock() }
+                // Zig lower.zig:1630 — expr_stmt always returns false (not a terminator)
                 self.lowerExprNode(es.expr)
-                // If block changed (e.g. @trap() switched to dead block), treat as terminated
-                if (self.builder.func()) |fb2| {
-                    if (prev_block != null_block and fb2.currentBlock() != prev_block) {
-                        return true
-                    }
-                }
                 return false
             },
             Stmt.defer_stmt |ds| => {

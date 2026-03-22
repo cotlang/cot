@@ -2201,9 +2201,10 @@ struct GenState {
                 self.ssaGenValue(val_idx)
             }
 
-            // Record bstart (first prog index for this block)
+            // Record bstart: LAST prog index of this block's values (Zig gen.zig:1359-1365)
+            // Must use last (not first) so branch targets resolve to the correct PC/state.
             if (self.builder.count > first_prog_idx) {
-                self.bstart.set(bi, first_prog_idx)
+                self.bstart.set(bi, self.builder.count - 1)
             } else {
                 self.bstart.set(bi, self.builder.count)
             }
