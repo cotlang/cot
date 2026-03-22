@@ -71,15 +71,25 @@ fn deadcode(func: *SsaFunc) void {
         func.setBlock(bi, blk)
     }
 
-    // 6. Remove unreachable blocks (Zig deadcode.zig:104-121)
-    var new_blocks: List(SsaBlock) = .{}
+    // 6. Clear unreachable blocks (keep indices stable for edge references).
+    // Zig uses *Block pointers so it can physically remove blocks. Selfcot uses
+    // indices so removing blocks invalidates edge references. Instead, clear
+    // dead blocks' values/controls/succs/preds to make them empty no-ops.
     for bi in 0..func.blocks.count {
-        const blk = func.getBlock(bi)
-        if (reachable.contains(blk.id)) {
-            new_blocks.append(blk)
+        var blk = func.getBlock(bi)
+        if (!reachable.contains(blk.id)) {
+            var empty_vals: List(int) = .{}
+            var empty_ctrls: List(int) = .{}
+            var empty_succs: List(SsaEdge) = .{}
+            var empty_preds: List(SsaEdge) = .{}
+            blk.values = empty_vals
+            blk.controls = empty_ctrls
+            blk.succs = empty_succs
+            blk.preds = empty_preds
+            blk.kind = SsaBlockKind.plain
+            func.setBlock(bi, blk)
         }
     }
-    func.blocks = new_blocks
 
     reachable.free()
     live.free()
