@@ -10,76 +10,165 @@ import "std/list"
 import "std/map"
 import "../build/ssa"
 
-/// Remove dead values from all blocks.
-/// A value is dead if: uses == 0 AND not a side-effecting op AND not a block control.
-/// Zig reference: compiler/ssa/passes/deadcode.zig
-/// When removing dead values, decrement uses of their args (resetArgs pattern).
-/// Iterate until fixed point — removing dead values may make their args dead.
+/// deadcode removes dead code from func.
+/// Zig reference: compiler/ssa/passes/deadcode.zig:25-124
 fn deadcode(func: *SsaFunc) void {
-    // Identify control values (must be kept alive)
-    var is_control: Map(int, bool) = .{}
-    var bi = 0
-    while (bi < func.blocks.count) {
-        const blk = func.getBlock(bi)
-        if (blk.controls.count > 0) {
-            var ci = 0
-            while (ci < blk.controls.count) {
-                is_control.set(blk.controls.get(ci), true)
-                ci += 1
+    // 1. Find reachable blocks via BFS from entry.
+    var reachable: Map(int, bool) = .{}
+    reachableBlocks(func, &reachable)
+
+    // 2. Remove edges from dead blocks to live blocks (phi consistency).
+    // Zig deadcode.zig:39-52
+    for bi in 0..func.blocks.count {
+        const blk_id = func.getBlock(bi).id
+        if (reachable.contains(blk_id)) { continue }
+        // Dead block — remove edges to live successors
+        var blk = func.getBlock(bi)
+        var si = 0
+        while (si < blk.succs.count) {
+            const succ_edge = blk.succs.get(si)
+            if (reachable.contains(func.getBlock(succ_edge.block).id)) {
+                blk.succs.orderedRemove(si)
+                // Also remove corresponding pred edge from the successor
+                var succ = func.getBlock(succ_edge.block)
+                removePredEdge(&succ, bi)
+                func.setBlock(succ_edge.block, succ)
+            } else {
+                si += 1
             }
         }
-        bi += 1
+        func.setBlock(bi, blk)
     }
 
-    // Iterate until fixed point: removing dead values decrements uses of their
-    // args, which may make more values dead (transitive dead code elimination).
-    // Zig does this via resetArgs() which decrements arg uses inline.
-    var changed = true
-    var iterations = 0
-    while (changed and iterations < 10) {
-        changed = false
-        iterations += 1
-
-        // Recompute use counts fresh each iteration
-        recomputeUses(func)
-
-        // Remove dead values from each block, decrementing arg uses
-        bi = 0
-        while (bi < func.blocks.count) {
-            var blk = func.getBlock(bi)
-            var new_values: List(int) = .{}
-            var vi = 0
-            while (vi < blk.values.count) {
-                const val_idx = blk.values.get(vi)
-                const val = func.getValue(val_idx)
-                if (isLive(val, val_idx, &is_control)) {
-                    new_values.append(val_idx)
-                } else {
-                    // Dead value — decrement uses of its args (resetArgs pattern)
-                    var ai = 0
-                    while (ai < val.args.count) {
-                        const arg_idx = val.args.get(ai)
-                        if (arg_idx >= 0 and arg_idx < func.next_value_id) {
-                            var arg_val = func.getValue(arg_idx)
-                            if (arg_val.uses > 0) {
-                                arg_val.uses -= 1
-                                func.setValue(arg_idx, arg_val)
-                            }
-                        }
-                        ai += 1
-                    }
-                    changed = true
-                }
-                vi += 1
+    // 3. Convert BlockFirst → BlockPlain (Zig deadcode.zig:55-64)
+    for bi in 0..func.blocks.count {
+        var blk = func.getBlock(bi)
+        if (!reachable.contains(blk.id)) { continue }
+        if (blk.kind == SsaBlockKind.first) {
+            if (blk.succs.count > 1) {
+                blk.succs.orderedRemove(1)
             }
-            blk.values.free()
-            blk.values = new_values
+            blk.kind = SsaBlockKind.plain
             func.setBlock(bi, blk)
-            bi += 1
         }
     }
 
-    is_control.free()
+    // 4. Find live values (Zig deadcode.zig:70-74)
+    var live: Map(int, bool) = .{}
+    liveValues(func, &reachable, &live)
+
+    // 5. Remove dead values from blocks (Zig deadcode.zig:88-102)
+    for bi in 0..func.blocks.count {
+        var blk = func.getBlock(bi)
+        var new_values: List(int) = .{}
+        for vi in 0..blk.values.count {
+            const val_idx = blk.values.get(vi)
+            if (live.contains(val_idx)) {
+                new_values.append(val_idx)
+            }
+        }
+        blk.values = new_values
+        func.setBlock(bi, blk)
+    }
+
+    // 6. Remove unreachable blocks (Zig deadcode.zig:104-121)
+    var new_blocks: List(SsaBlock) = .{}
+    for bi in 0..func.blocks.count {
+        const blk = func.getBlock(bi)
+        if (reachable.contains(blk.id)) {
+            new_blocks.append(blk)
+        }
+    }
+    func.blocks = new_blocks
+
+    reachable.free()
+    live.free()
+}
+
+/// BFS from entry block to find all reachable blocks.
+/// Zig deadcode.zig:127-149
+fn reachableBlocks(func: *SsaFunc, reachable: *Map(int, bool)) void {
+    if (func.blocks.count == 0) { return }
+    const entry_id = func.getBlock(0).id
+    reachable.set(entry_id, true)
+
+    var worklist: List(int) = .{}
+    worklist.append(0)
+
+    while (worklist.count > 0) {
+        const bi = worklist.pop()
+        const blk = func.getBlock(bi)
+        for si in 0..blk.succs.count {
+            const succ_idx = blk.succs.get(si).block
+            if (succ_idx >= 0 and succ_idx < func.blocks.count) {
+                const succ_id = func.getBlock(succ_idx).id
+                if (!reachable.contains(succ_id)) {
+                    reachable.set(succ_id, true)
+                    worklist.append(succ_idx)
+                }
+            }
+        }
+    }
+    worklist.free()
+}
+
+/// Mark live values via transitive closure from roots.
+/// Roots: control values of reachable blocks + side-effecting values + used values.
+/// Zig deadcode.zig:155-204
+fn liveValues(func: *SsaFunc, reachable: *Map(int, bool), live: *Map(int, bool)) void {
+    var q: List(int) = .{}
+
+    // Seed: control values + side-effecting values + used values
+    for bi in 0..func.blocks.count {
+        const blk = func.getBlock(bi)
+        if (!reachable.contains(blk.id)) { continue }
+
+        // Control values are live
+        for ci in 0..blk.controls.count {
+            const ctrl_idx = blk.controls.get(ci)
+            if (!live.contains(ctrl_idx)) {
+                live.set(ctrl_idx, true)
+                q.append(ctrl_idx)
+            }
+        }
+
+        // Values with side effects or uses > 0 are live
+        for vi in 0..blk.values.count {
+            const val_idx = blk.values.get(vi)
+            const val = func.getValue(val_idx)
+            if ((isSideEffecting(val.op) or val.uses > 0) and !live.contains(val_idx)) {
+                live.set(val_idx, true)
+                q.append(val_idx)
+            }
+        }
+    }
+
+    // Transitive closure: mark all args of live values as live
+    while (q.count > 0) {
+        const val_idx = q.pop()
+        if (val_idx < 0 or val_idx >= func.next_value_id) { continue }
+        const val = func.getValue(val_idx)
+        for ai in 0..val.args.count {
+            const arg_idx = val.args.get(ai)
+            if (arg_idx >= 0 and arg_idx < func.next_value_id and !live.contains(arg_idx)) {
+                live.set(arg_idx, true)
+                q.append(arg_idx)
+            }
+        }
+    }
+    q.free()
+}
+
+/// Remove predecessor edge pointing to block_idx from blk.
+fn removePredEdge(blk: *SsaBlock, block_idx: int) void {
+    var pi = 0
+    while (pi < blk.preds.count) {
+        if (blk.preds.get(pi).block == block_idx) {
+            blk.preds.orderedRemove(pi)
+        } else {
+            pi += 1
+        }
+    }
 }
 
 /// Recompute use counts for all values.
