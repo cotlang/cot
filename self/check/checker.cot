@@ -2148,12 +2148,18 @@ struct Checker {
         if (bt.tag == TAG_LIST) { return switch (bt) { Type.list_type |l| => l.elem, else => invalid_type } }
 
         // Comptime array indexing: @typeInfo(T).fields[0] → EnumField comptime value
-        // Zig reference: checker.zig comptime index resolution
+        // Zig reference: checker.zig:1129-1137 — evaluate full index expr as comptime
+        if (self.evalComptimeValue(idx)) |result_cv| {
+            // Return type based on the comptime result — enables further field access
+            if (result_cv.tag == CV_ENUM_FIELD) { return I64 }  // allows .name/.value via comptime path
+            if (result_cv.tag == CV_INT) { return I64 }
+            if (result_cv.tag == CV_STRING) { return STRING }
+            if (result_cv.tag == CV_ARRAY) { return I64 }
+            return I64
+        }
+        // Fallback: check if base is a comptime array (even if index isn't comptime)
         if (self.evalComptimeValue(base_n)) |cv| {
-            if (cv.tag == CV_ARRAY) {
-                // Return I64 as placeholder — the actual comptime value is resolved in lowerer
-                return I64
-            }
+            if (cv.tag == CV_ARRAY) { return I64 }
         }
 
         self.reportError(idx, ErrorCode.e303, "cannot index this type")
