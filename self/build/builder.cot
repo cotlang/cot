@@ -11,6 +11,7 @@ import "ir"
 import "ssa"
 import "../check/types"
 import "../parse/source"
+import "../debug"
 
 // ============================================================================
 // Parameter initialization helpers (extracted to keep stack frames small)
@@ -376,7 +377,11 @@ struct SSABuilder {
 
         self.insertPhis()
         self.verify()
-        return self.takeFunc()
+        const f = self.takeFunc()
+        var total_values: i64 = 0
+        for bi in 0..f.blocks.count { total_values += f.getBlock(bi).values.count }
+        debug_log(.ssa, "=== SSA built for '${f.name}': ${f.blocks.count} blocks, ${total_values} values, ${f.local_sizes.count} locals ===")
+        return f
     }
 
     // === Dispatch ===

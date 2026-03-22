@@ -33,6 +33,7 @@ fn parseMapTypeArgs(name: string) (int, int, int) {
 import "../parse/token"
 import "../parse/scanner"
 import "../parse/parser"
+import "../debug"
 
 // ============================================================================
 // Constants
@@ -446,20 +447,25 @@ struct Checker {
 
     fn checkFile() void {
         self.safe_mode = self.ast.safe_mode
+        debug_log(.check, "=== Type checking file (${self.ast.file_decls.count} declarations, safe=${self.safe_mode}) ===")
+
         // Pass 1: collect type declarations (struct, enum, union, type alias)
         for i in 0..self.ast.file_decls.count {
             self.collectTypeDecl(self.ast.file_decls.get(i))
         }
+        debug_log(.check, "  pass 1: type declarations collected")
 
         // Pass 2: collect non-type declarations (fn, var/const, impl)
         for i in 0..self.ast.file_decls.count {
             self.collectNonTypeDecl(self.ast.file_decls.get(i))
         }
+        debug_log(.check, "  pass 2: non-type declarations collected")
 
         // Pass 3: check declaration bodies
         for i in 0..self.ast.file_decls.count {
             self.checkDecl(self.ast.file_decls.get(i))
         }
+        debug_log(.check, "=== Type checking complete (${self.types.types.count} types registered) ===")
     }
 
     /// Collect declarations without checking bodies.
@@ -1001,6 +1007,7 @@ struct Checker {
     }
 
     fn checkFnDeclBody(idx: int, lookup_name: string) void {
+        debug_log(.check, "  check fn '${lookup_name}'")
         // Bound recursion depth to prevent stack corruption.
         // Each recursion level uses ~10KB of stack (checkFnDeclBody 3.4KB + checkBlockExpr 640B +
         // checkExprInner 544B + instantiateGenericFunc 2.7KB). With 8MB stack and ~16KB for the
