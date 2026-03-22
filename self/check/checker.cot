@@ -2116,6 +2116,15 @@ struct Checker {
         if (bt.tag == TAG_SLICE) { return switch (bt) { Type.slice |s| => s.elem, else => invalid_type } }
         if (bt.tag == TAG_LIST) { return switch (bt) { Type.list_type |l| => l.elem, else => invalid_type } }
 
+        // Comptime array indexing: @typeInfo(T).fields[0] → EnumField comptime value
+        // Zig reference: checker.zig comptime index resolution
+        if (self.evalComptimeValue(base_n)) |cv| {
+            if (cv.tag == CV_ARRAY) {
+                // Return I64 as placeholder — the actual comptime value is resolved in lowerer
+                return I64
+            }
+        }
+
         self.reportError(idx, ErrorCode.e303, "cannot index this type")
         return invalid_type
     }
