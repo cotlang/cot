@@ -2336,7 +2336,7 @@ struct Lowerer {
         // Short-circuit logical and/or — defer right-side lowering
         // Zig lower.zig:5086
         if (tok == Token.land or tok == Token.kw_and or tok == Token.lor or tok == Token.kw_or) {
-            return self.lowerShortCircuit(bin)
+            return self.lowerShortCircuit(left, bin)
         }
 
         // Union variant tag comparison — before lowering RHS
@@ -2456,10 +2456,8 @@ struct Lowerer {
     /// Short-circuit and/or at IR level: defer right-side lowering until inside the branch.
     /// Go reference: ssagen/ssa.go:3398-3442 (OANDAND/OOROR expr path).
     /// Pattern: result_local + store + load (matches Zig compiler lower.zig:301-334).
-    fn lowerShortCircuit(bin: Binary) int {
+    fn lowerShortCircuit(left: int, bin: Binary) int {
         const fb = self.builder.func() orelse return null_node
-        const left = self.lowerExprNode(bin.left)
-        if (left == null_node) { return null_node }
 
         const is_and = (bin.op == Token.land or bin.op == Token.kw_and)
 
