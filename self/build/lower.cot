@@ -5261,21 +5261,24 @@ struct Lowerer {
             fb.setBlock(next_block)
         }
 
-        // Else body
+        // Else body (Zig lower.zig:7935-7951)
         if (se.else_body != null_node) {
             if (result_type != VOID) {
                 const else_val = self.lowerExprNode(se.else_body)
                 if (else_val != null_node and result_local != null_local) {
                     fb.emitStoreLocal(result_local, else_val, se.span)
                 }
+                if (fb.needsTerminator()) {
+                    fb.emitJump(merge_block, se.span)
+                }
             } else {
-                self.lowerBlockNode(se.else_body)
+                if (!self.lowerBlockNode(se.else_body)) {
+                    fb.emitJump(merge_block, se.span)
+                }
             }
         }
-        if (fb.needsTerminator()) {
-            fb.emitJump(merge_block, se.span)
-        }
 
+        // Zig lower.zig:7953-7955
         fb.setBlock(merge_block)
         if (result_type != VOID and result_local != null_local) {
             return fb.emitLoadLocal(result_local, result_type, se.span)
