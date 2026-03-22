@@ -1560,27 +1560,17 @@ pub const Driver = struct {
             try layout.layout(ssa_func);
             try lower_native.lower(ssa_func);
 
-            // Debug: dump SSA when COT_SSA_DUMP env is set
-            if (std.posix.getenv("COT_SSA_DUMP")) |_| {
-                std.debug.print("\n=== SSA for '{s}' (locals: {d}, params: {d}) ===\n", .{ ir_func.name, ssa_func.local_sizes.len, ir_func.params.len });
-                if (ssa_func.local_sizes.len > 0) {
-                    std.debug.print("  local_sizes:", .{});
-                    for (ssa_func.local_sizes) |s| std.debug.print(" {d}", .{s});
-                    std.debug.print("\n", .{});
-                }
+            // SSA dump via pipeline debug (replaces COT_SSA_DUMP env var)
+            if (pipeline_debug.isEnabled(.ssa)) {
+                pipeline_debug.log(.ssa, "\n=== SSA for '{s}' (locals: {d}, params: {d}) ===", .{ ir_func.name, ssa_func.local_sizes.len, ir_func.params.len });
                 for (ssa_func.blocks.items) |blk| {
-                    std.debug.print("  Block b{d} (kind={s}, succs={d}, preds={d}):\n", .{
+                    pipeline_debug.log(.ssa, "  Block b{d} (kind={s}, succs={d}, preds={d}):", .{
                         blk.id, @tagName(blk.kind), blk.succs.len, blk.preds.len,
                     });
                     for (blk.values.items) |val| {
-                        std.debug.print("    v{d}: {s}", .{ val.id, @tagName(val.op) });
-                        for (val.args) |a| std.debug.print(" v{d}", .{a.id});
-                        std.debug.print(" aux={d} type={d}\n", .{ val.aux_int, val.type_idx });
-                    }
-                    if (blk.controls[0]) |c| {
-                        std.debug.print("    controls: v{d}", .{c.id});
-                        if (blk.controls[1]) |c2| std.debug.print(" v{d}", .{c2.id});
-                        std.debug.print("\n", .{});
+                        pipeline_debug.log(.ssa, "    v{d}: {s} aux={d} type={d} uses={d}", .{
+                            val.id, @tagName(val.op), val.aux_int, val.type_idx, val.uses,
+                        });
                     }
                 }
             }

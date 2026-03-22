@@ -16,12 +16,9 @@ const Prog = prog.Prog;
 const Addr = prog.Addr;
 const Symbol = prog.Symbol;
 
-// Debug logging - conditionally import if available
-const debug_enabled = false; // Set to true when integrated with main build
+const debug = @import("../../pipeline_debug.zig");
 fn debugLog(comptime fmt: []const u8, args: anytype) void {
-    if (debug_enabled) {
-        @import("std").debug.print(fmt ++ "\n", args);
-    }
+    debug.log(.codegen, fmt, args);
 }
 
 /// Result of assembling a function

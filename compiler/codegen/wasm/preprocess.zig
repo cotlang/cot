@@ -101,7 +101,9 @@ pub fn preprocess(allocator: std.mem.Allocator, sym: *Symbol) !void {
     // Final table entry
     try tableIdxs.append(allocator, @intCast(numResumePoints));
 
-    debug.log(.codegen, "  numResumePoints={d}, pc={d}", .{ numResumePoints, pc });
+    debug.log(.codegen, "  pass 1 complete: numResumePoints={d}, pc={d}, tableIdxs={d}", .{
+        numResumePoints, pc, tableIdxs.items.len,
+    });
 
     // ========================================================================
     // Pass 2: Prologue - Allocate stack frame
@@ -394,7 +396,11 @@ pub fn preprocess(allocator: std.mem.Allocator, sym: *Symbol) !void {
         }
     }
 
-    debug.log(.codegen, "  preprocess complete, branches resolved", .{});
+    debug.log(.codegen, "  preprocess complete: {d} branches resolved, dispatch_loop={}, has_loop={}", .{
+        @as(usize, if (entryPointLoopBranches.items.len > 0) entryPointLoopBranches.items.len else 0),
+        numResumePoints > 0,
+        entryPointLoopBranches.items.len > 0,
+    });
 }
 
 // ============================================================================

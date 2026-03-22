@@ -9,6 +9,7 @@ const token = @import("token.zig");
 const comptime_mod = @import("comptime.zig");
 
 const target_mod = @import("target.zig");
+const debug = @import("../pipeline_debug.zig");
 
 pub const ComptimeValue = comptime_mod.ComptimeValue;
 
@@ -365,9 +366,23 @@ pub const Checker = struct {
     pub fn checkFile(self: *Checker) CheckError!void {
         const file = self.tree.file orelse return;
         self.safe_mode = file.safe_mode;
+        debug.log(.check, "=== Type checking file ({d} declarations, safe={}) ===", .{
+            file.decls.len, self.safe_mode,
+        });
+
+        // Pass 1: Collect type declarations (structs, enums, unions, type aliases)
         for (file.decls) |idx| try self.collectTypeDecl(idx);
+        debug.log(.check, "  pass 1: type declarations collected", .{});
+
+        // Pass 2: Collect non-type declarations (functions, variables, impl blocks)
         for (file.decls) |idx| try self.collectNonTypeDecl(idx);
+        debug.log(.check, "  pass 2: non-type declarations collected", .{});
+
+        // Pass 3: Check all declarations (type check function bodies, expressions)
         for (file.decls) |idx| try self.checkDecl(idx);
+        debug.log(.check, "=== Type checking complete ({d} types registered) ===", .{
+            self.types.types.items.len,
+        });
     }
 
     fn collectTypeDecl(self: *Checker, idx: NodeIndex) CheckError!void {
@@ -767,6 +782,9 @@ pub const Checker = struct {
     }
 
     pub fn checkFnDeclWithName(self: *Checker, f: ast.FnDecl, idx: NodeIndex, lookup_name: []const u8) CheckError!void {
+        debug.log(.check, "  check fn '{s}' ({d} params, async={}, export={}, extern={})", .{
+            lookup_name, f.params.len, f.is_async, f.is_export, f.is_extern,
+        });
         const sym = self.scope.lookup(lookup_name) orelse return;
         const return_type = if (self.types.get(sym.type_idx) == .func) self.types.get(sym.type_idx).func.return_type else TypeRegistry.VOID;
         // For async functions, the registered return type is Future(T).

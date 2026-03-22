@@ -1342,9 +1342,16 @@ pub const GenState = struct {
         const text = try self.builder.append(.text);
         text.from = prog_mod.constAddr(self.frame_size);
 
+        debug.log(.codegen, "wasm/gen: frame_size={d}, {d} locals allocated", .{
+            self.frame_size, self.next_local,
+        });
+
         // Generate code for each block
         for (blocks, 0..) |block, i| {
             const next: ?*const SsaBlock = if (i + 1 < blocks.len) blocks[i + 1] else null;
+            debug.log(.codegen, "wasm/gen: block b{d} ({s}, {d} values, {d} succs)", .{
+                block.id, @tagName(block.kind), block.values.items.len, block.succs.len,
+            });
 
             // Record first Prog of this block
             const first_prog = self.builder.last;

@@ -9,6 +9,7 @@ const ssa = @import("../ssa/func.zig");
 const ssa_block = @import("../ssa/block.zig");
 const ssa_value = @import("../ssa/value.zig");
 const ssa_op = @import("../ssa/op.zig");
+const debug = @import("../pipeline_debug.zig");
 
 const Allocator = std.mem.Allocator;
 const Target = target_mod.Target;
@@ -430,7 +431,13 @@ pub const SSABuilder = struct {
 
         try self.insertPhis();
         try self.verify();
-        return self.takeFunc();
+        const f = self.takeFunc();
+        var total_values: usize = 0;
+        for (f.blocks.items) |b| total_values += b.values.items.len;
+        debug.log(.ssa, "=== SSA built for '{s}': {d} blocks, {d} values, {d} locals ===", .{
+            f.name, f.blocks.items.len, total_values, f.local_sizes.len,
+        });
+        return f;
     }
 
     fn getOrCreateBlock(self: *SSABuilder, ir_block_idx: ir.BlockIndex) !*Block {

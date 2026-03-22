@@ -20,12 +20,9 @@ const prog = @import("prog.zig");
 const assemble = @import("assemble.zig");
 const Symbol = prog.Symbol;
 
-// Debug logging - conditionally import if available
-const debug_enabled = false; // Set to true when integrated with main build
+const debug = @import("../../pipeline_debug.zig");
 fn debugLog(comptime fmt: []const u8, args: anytype) void {
-    if (debug_enabled) {
-        @import("std").debug.print(fmt ++ "\n", args);
-    }
+    debug.log(.codegen, fmt, args);
 }
 
 /// Function type signature
@@ -357,9 +354,12 @@ pub const Linker = struct {
 
     /// Link and emit the Wasm module
     pub fn emit(self: *Linker, writer: anytype) !void {
-        debugLog( "link: emitting module with {d} types, {d} funcs", .{
+        debugLog("link: emitting module ({d} types, {d} imports, {d} funcs, {d} globals, {d} data segments)", .{
             self.types.items.len,
+            self.imports.items.len,
             self.funcs.items.len,
+            self.globals.items.len,
+            self.data_segments.items.len,
         });
 
         // ====================================================================
@@ -679,6 +679,7 @@ pub const DataSegment = struct {
 
 /// Write a section with ID and content
 fn writeSection(writer: anytype, allocator: std.mem.Allocator, section: c.Section, content: []const u8) !void {
+    debugLog("  section {s}: {d} bytes", .{ @tagName(section), content.len });
     try writer.writeByte(@intFromEnum(section));
 
     // Write size as LEB128

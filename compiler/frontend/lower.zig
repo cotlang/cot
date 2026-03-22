@@ -11,6 +11,7 @@ const comptime_mod = @import("comptime.zig");
 const token = @import("token.zig");
 const arc = @import("arc_insertion.zig");
 const target_mod = @import("target.zig");
+const debug = @import("../pipeline_debug.zig");
 
 const Allocator = std.mem.Allocator;
 const Ast = ast.Ast;
@@ -589,13 +590,18 @@ pub const Lowerer = struct {
     }
 
     pub fn lowerToBuilder(self: *Lowerer) !void {
-        for (self.tree.getRootDecls()) |decl_idx| try self.lowerDecl(decl_idx);
+        const decls = self.tree.getRootDecls();
+        debug.log(.lower, "=== Lowering AST to IR ({d} declarations) ===", .{decls.len});
+        for (decls) |decl_idx| try self.lowerDecl(decl_idx);
         // Generic impl block methods are now queued on-demand via lowerMethodCall
         // (which calls ensureGenericFnQueued when it encounters a call to a method
         // in generic_inst_by_name). This avoids lowering unused methods.
         // Zig pattern: process queued generic instantiations as top-level functions
         // (deferred, not inline — avoids corrupting builder state during nested lowering)
         try self.lowerQueuedGenericFunctions();
+        debug.log(.lower, "=== Lowering complete: {d} IR functions generated ===", .{
+            self.builder.funcs.items.len,
+        });
     }
 
     pub fn generateTestRunner(self: *Lowerer) !void {
@@ -733,6 +739,10 @@ pub const Lowerer = struct {
         if (fn_decl.is_extern) return;
         if (fn_decl.type_params.len > 0) return; // Skip generic fn defs — lowered on demand at call sites
         if ((self.test_mode or self.bench_mode) and std.mem.eql(u8, fn_decl.name, "main")) return;
+
+        debug.log(.lower, "  lower fn '{s}' ({d} params, async={}, export={})", .{
+            fn_decl.name, fn_decl.params.len, fn_decl.is_async, fn_decl.is_export,
+        });
 
         // Async functions get special lowering
         if (fn_decl.is_async) {
