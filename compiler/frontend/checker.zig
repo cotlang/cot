@@ -1715,11 +1715,16 @@ pub const Checker = struct {
 
         // Union variant comparison: set context so .variant shorthand resolves for RHS.
         // Zig Sema pattern: same as switch enum context but for == / != with union LHS.
+        // @safe auto-deref: if LHS is *Union, unwrap to Union for comparison context.
         const old_switch_enum = self.current_switch_enum_type;
         if (bin.op == .eql or bin.op == .neq) {
+            var cmp_type = left_type;
             const left_info = self.types.get(left_type);
-            if (left_info == .union_type) {
-                self.current_switch_enum_type = left_type;
+            if (left_info == .pointer and self.types.get(left_info.pointer.elem) == .union_type) {
+                cmp_type = left_info.pointer.elem;
+            }
+            if (self.types.get(cmp_type) == .union_type) {
+                self.current_switch_enum_type = cmp_type;
             }
         }
         const right_type = try self.checkExpr(bin.right);
@@ -1843,9 +1848,12 @@ pub const Checker = struct {
             },
             .eql, .neq, .lss, .leq, .gtr, .geq => {
                 // Union variant tag comparison: union == .variant / union == Union.Variant
+                // @safe auto-deref: *Union treated as Union for comparison
                 if (bin.op == .eql or bin.op == .neq) {
-                    if (left == .union_type and self.isUnionVariantRef(bin.right, left.union_type)) return TypeRegistry.BOOL;
-                    if (right == .union_type and self.isUnionVariantRef(bin.left, right.union_type)) return TypeRegistry.BOOL;
+                    const left_u = if (left == .pointer and self.types.get(left.pointer.elem) == .union_type) self.types.get(left.pointer.elem) else left;
+                    const right_u = if (right == .pointer and self.types.get(right.pointer.elem) == .union_type) self.types.get(right.pointer.elem) else right;
+                    if (left_u == .union_type and self.isUnionVariantRef(bin.right, left_u.union_type)) return TypeRegistry.BOOL;
+                    if (right_u == .union_type and self.isUnionVariantRef(bin.left, right_u.union_type)) return TypeRegistry.BOOL;
                 }
                 if (!self.isComparable(left_type, right_type)) { self.err.errorWithCode(bin.span.start, .e300, "invalid operation"); return invalid_type; }
                 return TypeRegistry.BOOL;

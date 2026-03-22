@@ -5090,9 +5090,14 @@ pub const Lowerer = struct {
         // Union variant tag comparison: union == .variant / union == Union.Variant
         // Must be before lowering RHS — the RHS is a tag reference, not a value.
         // Pattern: extract tag from union (field 0, offset 0), compare against variant index.
+        // @safe auto-deref: *Union treated as Union for comparison.
         if (bin.op == .eql or bin.op == .neq) {
-            const left_type_idx = self.inferExprType(bin.left);
-            const left_info = self.type_reg.get(left_type_idx);
+            var left_type_idx = self.inferExprType(bin.left);
+            var left_info = self.type_reg.get(left_type_idx);
+            if (left_info == .pointer and self.type_reg.get(left_info.pointer.elem) == .union_type) {
+                left_type_idx = left_info.pointer.elem;
+                left_info = self.type_reg.get(left_type_idx);
+            }
             if (left_info == .union_type) {
                 if (self.resolveUnionVariantIndex(bin.right, left_info.union_type)) |vidx| {
                     const size = self.type_reg.sizeOf(left_type_idx);
@@ -7755,8 +7760,23 @@ pub const Lowerer = struct {
             break :blk tmp_local;
         };
 
+        // @safe auto-deref: if subject local is *Union, load through pointer into a temp
+        var effective_local = subject_local;
+        if (self.chk.safe_mode) {
+            const local_type = fb.locals.items[subject_local].type_idx;
+            const lt_info = self.type_reg.get(local_type);
+            if (lt_info == .pointer and self.type_reg.get(lt_info.pointer.elem) == .union_type) {
+                const union_type_idx = lt_info.pointer.elem;
+                const size = self.type_reg.sizeOf(union_type_idx);
+                const deref_local = try fb.addLocalWithSize("__union_deref", union_type_idx, false, size);
+                const ptr_val = try fb.emitLoadLocal(subject_local, local_type, se.span);
+                const val = try fb.emitPtrLoadValue(ptr_val, union_type_idx, se.span);
+                _ = try fb.emitStoreLocal(deref_local, val, se.span);
+                effective_local = deref_local;
+            }
+        }
         // Extract tag from union (offset 0)
-        const tag_val = try fb.emitFieldLocal(subject_local, 0, 0, TypeRegistry.I64, se.span);
+        const tag_val = try fb.emitFieldLocal(effective_local, 0, 0, TypeRegistry.I64, se.span);
         const merge_block = try fb.newBlock("switch.end");
 
         // Mark overlap group so arm locals share stack space (mutually exclusive)
@@ -7790,7 +7810,7 @@ pub const Lowerer = struct {
                 const payload_type = self.resolveUnionPayloadType(case.patterns, ut);
                 const ptr_type = self.type_reg.makePointer(payload_type) catch TypeRegistry.VOID;
                 const subj_ptr_type = self.type_reg.makePointer(subject_type) catch TypeRegistry.VOID;
-                const subj_addr = try fb.emitAddrLocal(subject_local, subj_ptr_type, se.span);
+                const subj_addr = try fb.emitAddrLocal(effective_local, subj_ptr_type, se.span);
                 const payload_addr = try fb.emitAddrOffset(subj_addr, 8, ptr_type, se.span);
                 const capture_local = try fb.addLocalWithSize(case.capture, ptr_type, false, 8);
                 _ = try fb.emitStoreLocal(capture_local, payload_addr, se.span);
@@ -7843,7 +7863,7 @@ pub const Lowerer = struct {
                             defer self.allocator.free(inner_values);
                             for (0..inner_total) |ij| {
                                 const union_offset: i64 = 8 + @as(i64, @intCast(union_ci * 8));
-                                inner_values[ij] = try fb.emitFieldLocal(subject_local, @intCast(1 + union_ci), union_offset, TypeRegistry.I64, se.span);
+                                inner_values[ij] = try fb.emitFieldLocal(effective_local, @intCast(1 + union_ci), union_offset, TypeRegistry.I64, se.span);
                                 union_ci += 1;
                             }
                             chunk_values[gc_ci] = try fb.emitGcStructNew(inner_struct.name, inner_values, field.type_idx, se.span);
@@ -7852,7 +7872,7 @@ pub const Lowerer = struct {
                             const n_chunks = self.gcFieldChunks(field.type_idx);
                             for (0..n_chunks) |_| {
                                 const union_offset: i64 = 8 + @as(i64, @intCast(union_ci * 8));
-                                chunk_values[gc_ci] = try fb.emitFieldLocal(subject_local, @intCast(1 + union_ci), union_offset, TypeRegistry.I64, se.span);
+                                chunk_values[gc_ci] = try fb.emitFieldLocal(effective_local, @intCast(1 + union_ci), union_offset, TypeRegistry.I64, se.span);
                                 gc_ci += 1;
                                 union_ci += 1;
                             }
@@ -7869,7 +7889,7 @@ pub const Lowerer = struct {
                     for (0..num_chunks) |ci| {
                         const union_offset: i64 = 8 + @as(i64, @intCast(ci * 8));
                         const cap_offset: i64 = @intCast(ci * 8);
-                        const chunk_val = try fb.emitFieldLocal(subject_local, @intCast(1 + ci), union_offset, TypeRegistry.I64, se.span);
+                        const chunk_val = try fb.emitFieldLocal(effective_local, @intCast(1 + ci), union_offset, TypeRegistry.I64, se.span);
                         _ = try fb.emitStoreLocalField(capture_local, @intCast(ci), cap_offset, chunk_val, se.span);
                     }
                 }
