@@ -213,8 +213,9 @@ struct GenState {
                 const ret_val_idx = blk.controls.get(0)
                 const ret_val = self.ssa_func.getValue(ret_val_idx)
 
-                if (ret_val.op == SsaOp.string_make or ret_val.op == SsaOp.slice_make) {
-                    // Compound return: push both components (ptr, len)
+                if (ret_val.op == SsaOp.string_make or ret_val.op == SsaOp.slice_make or ret_val.op == SsaOp.opt_make) {
+                    // Compound return: push both components (ptr/tag, len/payload)
+                    // Zig gen.zig:231 — handles string_make, slice_make, AND opt_make
                     if (ret_val.args.count >= 2) {
                         self.getValue64(ret_val.args.get(0))
                         self.getValue64(ret_val.args.get(1))
