@@ -216,8 +216,9 @@ fn lowerOp(op: SsaOp, type_idx: int, func: *SsaFunc, val_idx: int) SsaOp {
         .zero => SsaOp.wasm_lowered_zero,
 
         // ARC
-        .retain => SsaOp.wasm_lowered_retain,
-        .release => SsaOp.wasm_lowered_release,
+        // ARC retain/release not used on Wasm targets
+        .retain => SsaOp.invalid,
+        .release => SsaOp.invalid,
 
         // Everything else unchanged
         else => SsaOp.invalid,

@@ -126,18 +126,11 @@ fn addMemRuntime(linker: *Linker, heap_ptr_global: int) MemFunctions {
     const dealloc_raw_body = generateVoidStubBody()
     const dealloc_raw_idx = linker.addFunc(WasmFunc.init(DEALLOC_RAW_NAME, void_1i64_type, dealloc_raw_body, false))
 
-    // retain(obj: i64) -> i64  (increment refcount)
-    // Zig reference: arc.zig line 221-230
-    const retain_body = generateRetainBody()
-    const retain_idx = linker.addFunc(WasmFunc.init(RETAIN_NAME, alloc_raw_type, retain_body, false))
-
-    // Destructor type: (i64) -> void  (for call_indirect in release)
-    const destructor_type = linker.addType(params_1i64, results_void)
-
-    // release(obj: i64) -> void  (decrement refcount, call destructor+dealloc if zero)
-    // Zig reference: arc.zig line 248-256
-    const release_body = generateReleaseBody(linker.funcTypeIndex(destructor_type), dealloc_idx)
-    const release_idx = linker.addFunc(WasmFunc.init(RELEASE_NAME, void_1i64_type, release_body, false))
+    // ARC retain/release NOT generated for Wasm targets.
+    // Wasm uses bump allocation (no refcounting). Zig compiler doesn't
+    // add ARC functions for Wasm — they're native-only.
+    const retain_idx: int = -1
+    const release_idx: int = -1
 
     return MemFunctions {
         alloc_idx: alloc_idx,
@@ -152,7 +145,7 @@ fn addMemRuntime(linker: *Linker, heap_ptr_global: int) MemFunctions {
         dealloc_raw_idx: dealloc_raw_idx,
         retain_idx: retain_idx,
         release_idx: release_idx,
-        destructor_type: destructor_type,
+        destructor_type: -1,
     }
 }
 
