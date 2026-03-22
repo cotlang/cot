@@ -290,6 +290,17 @@ fn pass5DispatchLoop(sym: *Symbol, numResumePoints: int, tableIdxs: *List(int), 
         }
     }
 
+    // Zig preprocess.zig:317-320 — set all entry loop branches to target the loop instruction
+    if (entryPointLoopIdx) |loop_idx| {
+        for b in 0..entryPointLoopBranches.count {
+            const br_idx = entryPointLoopBranches.get(b)
+            var br_prog = sym.text.get(br_idx)
+            br_prog.to.addr_type = AddrType.branch
+            br_prog.to.branch_target = loop_idx
+            sym.text.set(br_idx, br_prog)
+        }
+    }
+
     if (entryPointLoopBranches.count > 0) {
         sym.text.append(Prog.init(As.end))
     }
@@ -335,24 +346,8 @@ fn pass6ResolveBranches(sym: *Symbol, entryPointLoopIdx: int, entryPointLoopBran
         }
     }
 
-    if (entryPointLoopIdx >= 0) {
-        const loopDepth = blockDepths.get(entryPointLoopIdx)
-        for b in 0..entryPointLoopBranches.count {
-            const br_idx = entryPointLoopBranches.get(b)
-            var depth_at_br = 0
-            for d in 0..br_idx + 1 {
-                const instr = sym.text.get(d).instr
-                if (instr == As.block or instr == As.loop or instr == As.@"if") {
-                    depth_at_br += 1
-                } else if (instr == As.end) {
-                    depth_at_br -= 1
-                }
-            }
-            var br_prog = sym.text.get(br_idx)
-            br_prog.to = constAddr(depth_at_br - loopDepth)
-            sym.text.set(br_idx, br_prog)
-        }
-    }
+    // Entry loop branches are now resolved by the standard path above
+    // (Zig preprocess.zig:317-320 sets branch_target to loop instruction in pass5)
 }
 
 // ============================================================================
