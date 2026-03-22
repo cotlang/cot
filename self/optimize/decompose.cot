@@ -23,10 +23,22 @@
 
 import "std/list"
 import "../build/ssa"
+import "../debug"
 import "../check/types"
 
 /// Run the decomposition pass.
 fn decompose(func: *SsaFunc) void {
+    var total_values: i64 = 0
+    var total_phis: i64 = 0
+    for bi in 0..func.blocks.count {
+        const blk = func.getBlock(bi)
+        for vi in 0..blk.values.count {
+            total_values += 1
+            if (func.getValue(blk.values.get(vi)).op == SsaOp.phi) { total_phis += 1 }
+        }
+    }
+    debug_log(.codegen, "=== Decompose pass for '${func.name}' (${func.blocks.count} blocks, ${total_values} values, ${total_phis} phis) ===")
+
     var decomposed: int = 0
 
     for bi in 0..func.blocks.count {
@@ -41,6 +53,8 @@ fn decompose(func: *SsaFunc) void {
             }
         }
     }
+
+    debug_log(.codegen, "=== Decompose complete for '${func.name}': ${decomposed} phis decomposed ===")
 }
 
 /// Decompose a phi node if it's a compound builtin type.

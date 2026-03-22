@@ -9,14 +9,31 @@
 
 import "std/list"
 import "../build/ssa"
+import "../debug"
 
 /// Combined copy + phi elimination pass.
 /// Zig reference: compiler/ssa/passes/copyelim.zig copyelim()
 fn copyelim(func: *SsaFunc) void {
+    // Count pre-pass stats (matches Zig compiler logging)
+    var total_values: i64 = 0
+    var total_copies: i64 = 0
+    var total_phis: i64 = 0
+    for bi in 0..func.blocks.count {
+        const blk = func.getBlock(bi)
+        for vi in 0..blk.values.count {
+            const v = func.getValue(blk.values.get(vi))
+            total_values += 1
+            if (v.op == SsaOp.copy) { total_copies += 1 }
+            if (v.op == SsaOp.phi) { total_phis += 1 }
+        }
+    }
+    debug_log(.copyelim, "=== Copyelim pass for '${func.name}' (${total_values} values, ${total_copies} copies, ${total_phis} phis) ===")
+
     phielim(func)
 
     // Update block control values — replace copy controls with their sources.
     // Zig reference: copyelim.zig:24-36
+    var ctrl_rewrites: i64 = 0
     for bi in 0..func.blocks.count {
         var blk = func.getBlock(bi)
         for ci in 0..blk.controls.count {
@@ -25,10 +42,13 @@ fn copyelim(func: *SsaFunc) void {
             if (ctrl_v.op == SsaOp.copy and ctrl_v.args.count > 0) {
                 const src = followCopyChain(func, ctrl)
                 blk.controls.set(ci, src)
+                ctrl_rewrites += 1
             }
         }
         func.setBlock(bi, blk)
     }
+
+    debug_log(.copyelim, "=== Copyelim complete for '${func.name}': ${ctrl_rewrites} control rewrites ===")
 }
 
 /// Follow a copy chain to its ultimate source.

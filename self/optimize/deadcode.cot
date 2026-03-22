@@ -9,10 +9,15 @@
 import "std/list"
 import "std/map"
 import "../build/ssa"
+import "../debug"
 
 /// deadcode removes dead code from func.
 /// Zig reference: compiler/ssa/passes/deadcode.zig:25-124
 fn deadcode(func: *SsaFunc) void {
+    var total_values: i64 = 0
+    for bi in 0..func.blocks.count { total_values += func.getBlock(bi).values.count }
+    debug_log(.deadcode, "=== Deadcode pass for '${func.name}' (${func.blocks.count} blocks, ${total_values} values) ===")
+
     // 1. Find reachable blocks via BFS from entry.
     var reachable: Map(int, bool) = .{}
     reachableBlocks(func, &reachable)
@@ -75,6 +80,10 @@ fn deadcode(func: *SsaFunc) void {
     // Selfcot uses index-based edges, so we leave unreachable blocks in place.
     // Their values have already been filtered by liveValues above.
     // Layout will schedule them last; gen will skip their empty value lists.
+
+    var remaining_values: i64 = 0
+    for bi2 in 0..func.blocks.count { remaining_values += func.getBlock(bi2).values.count }
+    debug_log(.deadcode, "=== Deadcode complete for '${func.name}': ${func.blocks.count} blocks, ${remaining_values} values remaining ===")
 
     reachable.free()
     live.free()

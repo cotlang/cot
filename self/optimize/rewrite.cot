@@ -13,10 +13,22 @@ import "std/list"
 import "std/map"
 import "std/string"
 import "../build/ssa"
+import "../debug"
 import "../check/types"
 
 /// Run the generic rewrite pass.
 fn rewrite(func: *SsaFunc, string_offsets: *Map(string, int)) void {
+    var total_values: i64 = 0
+    var const_strings: i64 = 0
+    for bi in 0..func.blocks.count {
+        const blk = func.getBlock(bi)
+        for vi in 0..blk.values.count {
+            total_values += 1
+            if (func.getValue(blk.values.get(vi)).op == SsaOp.const_string) { const_strings += 1 }
+        }
+    }
+    debug_log(.codegen, "=== Rewritegeneric pass for '${func.name}' (${func.blocks.count} blocks, ${total_values} values, ${const_strings} const_strings) ===")
+
     var rewritten: int = 0
 
     for bi in 0..func.blocks.count {
@@ -41,6 +53,8 @@ fn rewrite(func: *SsaFunc, string_offsets: *Map(string, int)) void {
         }
         to_rewrite.free()
     }
+
+    debug_log(.codegen, "=== Rewritegeneric complete for '${func.name}': ${rewritten} const_strings rewritten ===")
 }
 
 /// Rewrite const_string to string_make(const_64[offset], const_64[len]).
