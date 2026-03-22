@@ -10500,8 +10500,12 @@ pub const Lowerer = struct {
                     // Store arg to local (br_table can't carry values across blocks)
                     const arg_local = try fb.addLocalWithSize("__tag_val", TypeRegistry.I64, false, 8);
                     _ = try fb.emitStoreLocal(arg_local, arg, bc.span);
-                    // Result local for string (ptr + len = 16 bytes)
-                    const result_local = try fb.addLocalWithSize("__tag_result", TypeRegistry.STRING, false, 16);
+                    // Use SEPARATE ptr and len locals — compound STRING locals don't
+                    // correctly decompose across block boundaries (phi nodes needed for
+                    // compound types but not yet supported in the SSA builder).
+                    const ptr_local = try fb.addLocalWithSize("__tag_ptr", TypeRegistry.I64, false, 8);
+                    const len_local = try fb.addLocalWithSize("__tag_len", TypeRegistry.I64, false, 8);
+                    const ptr_type = try self.type_reg.makePointer(TypeRegistry.U8);
                     // Build if-chain for each variant
                     const merge_block = try fb.newBlock("tagname.merge");
                     for (variants) |v| {
@@ -10514,26 +10518,32 @@ pub const Lowerer = struct {
                         fb.setBlock(match_block);
                         const str = try fb.addStringLiteral(try self.allocator.dupe(u8, v.name));
                         const str_val = try fb.emitConstSlice(str, bc.span);
-                        _ = try fb.emitStoreLocalField(result_local, 0, 0, try fb.emitSlicePtr(str_val, try self.type_reg.makePointer(TypeRegistry.U8), bc.span), bc.span);
-                        _ = try fb.emitStoreLocalField(result_local, 1, 8, try fb.emitSliceLen(str_val, bc.span), bc.span);
+                        _ = try fb.emitStoreLocal(ptr_local, try fb.emitSlicePtr(str_val, ptr_type, bc.span), bc.span);
+                        _ = try fb.emitStoreLocal(len_local, try fb.emitSliceLen(str_val, bc.span), bc.span);
                         _ = try fb.emitJump(merge_block, bc.span);
                         fb.setBlock(next_block);
                     }
                     // Default: empty string for unknown values
                     const empty = try fb.addStringLiteral(try self.allocator.dupe(u8, ""));
                     const empty_val = try fb.emitConstSlice(empty, bc.span);
-                    _ = try fb.emitStoreLocalField(result_local, 0, 0, try fb.emitSlicePtr(empty_val, try self.type_reg.makePointer(TypeRegistry.U8), bc.span), bc.span);
-                    _ = try fb.emitStoreLocalField(result_local, 1, 8, try fb.emitSliceLen(empty_val, bc.span), bc.span);
+                    _ = try fb.emitStoreLocal(ptr_local, try fb.emitSlicePtr(empty_val, ptr_type, bc.span), bc.span);
+                    _ = try fb.emitStoreLocal(len_local, try fb.emitSliceLen(empty_val, bc.span), bc.span);
                     _ = try fb.emitJump(merge_block, bc.span);
                     fb.setBlock(merge_block);
-                    return fb.emitLoadLocal(result_local, TypeRegistry.STRING, bc.span);
+                    // Reconstruct string from separate ptr/len locals
+                    const result_ptr = try fb.emitLoadLocal(ptr_local, TypeRegistry.I64, bc.span);
+                    const result_len = try fb.emitLoadLocal(len_local, TypeRegistry.I64, bc.span);
+                    return fb.emit(ir.Node.init(.{ .string_header = .{ .ptr = result_ptr, .len = result_len } }, TypeRegistry.STRING, bc.span));
                 }
                 if (info == .union_type) {
                     // Tagged union: extract tag (field 0), then same if-chain pattern
                     const tag_val = try self.lowerFieldAccess(.{ .base = bc.args[0], .field = "__tag", .span = bc.span });
                     const tag_local = try fb.addLocalWithSize("__utag_val", TypeRegistry.I64, false, 8);
                     _ = try fb.emitStoreLocal(tag_local, tag_val, bc.span);
-                    const result_local = try fb.addLocalWithSize("__utag_result", TypeRegistry.STRING, false, 16);
+                    // Separate ptr/len locals (same pattern as enum @tagName above)
+                    const uptr_local = try fb.addLocalWithSize("__utag_ptr", TypeRegistry.I64, false, 8);
+                    const ulen_local = try fb.addLocalWithSize("__utag_len", TypeRegistry.I64, false, 8);
+                    const ptr_type2 = try self.type_reg.makePointer(TypeRegistry.U8);
                     const merge_block = try fb.newBlock("utagname.merge");
                     for (info.union_type.variants, 0..) |v, i| {
                         const val_node = try fb.emitLoadLocal(tag_local, TypeRegistry.I64, bc.span);
@@ -10545,18 +10555,20 @@ pub const Lowerer = struct {
                         fb.setBlock(match_block);
                         const str = try fb.addStringLiteral(try self.allocator.dupe(u8, v.name));
                         const str_val = try fb.emitConstSlice(str, bc.span);
-                        _ = try fb.emitStoreLocalField(result_local, 0, 0, try fb.emitSlicePtr(str_val, try self.type_reg.makePointer(TypeRegistry.U8), bc.span), bc.span);
-                        _ = try fb.emitStoreLocalField(result_local, 1, 8, try fb.emitSliceLen(str_val, bc.span), bc.span);
+                        _ = try fb.emitStoreLocal(uptr_local, try fb.emitSlicePtr(str_val, ptr_type2, bc.span), bc.span);
+                        _ = try fb.emitStoreLocal(ulen_local, try fb.emitSliceLen(str_val, bc.span), bc.span);
                         _ = try fb.emitJump(merge_block, bc.span);
                         fb.setBlock(next_block);
                     }
                     const empty = try fb.addStringLiteral(try self.allocator.dupe(u8, ""));
                     const empty_val = try fb.emitConstSlice(empty, bc.span);
-                    _ = try fb.emitStoreLocalField(result_local, 0, 0, try fb.emitSlicePtr(empty_val, try self.type_reg.makePointer(TypeRegistry.U8), bc.span), bc.span);
-                    _ = try fb.emitStoreLocalField(result_local, 1, 8, try fb.emitSliceLen(empty_val, bc.span), bc.span);
+                    _ = try fb.emitStoreLocal(uptr_local, try fb.emitSlicePtr(empty_val, ptr_type2, bc.span), bc.span);
+                    _ = try fb.emitStoreLocal(ulen_local, try fb.emitSliceLen(empty_val, bc.span), bc.span);
                     _ = try fb.emitJump(merge_block, bc.span);
                     fb.setBlock(merge_block);
-                    return fb.emitLoadLocal(result_local, TypeRegistry.STRING, bc.span);
+                    const u_result_ptr = try fb.emitLoadLocal(uptr_local, TypeRegistry.I64, bc.span);
+                    const u_result_len = try fb.emitLoadLocal(ulen_local, TypeRegistry.I64, bc.span);
+                    return fb.emit(ir.Node.init(.{ .string_header = .{ .ptr = u_result_ptr, .len = u_result_len } }, TypeRegistry.STRING, bc.span));
                 }
                 // Fallback: empty string
                 const empty = try fb.addStringLiteral(try self.allocator.dupe(u8, ""));

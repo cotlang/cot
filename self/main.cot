@@ -36,8 +36,12 @@ import "build/builder"
 import "build/arc"
 import "emit/wasm/driver"
 import "emit/wasm/link"
+import "debug"
 
 fn main() void {
+    // Initialize pipeline debug from COT_DEBUG/COT_TRACE env vars
+    initGlobal()
+
     if (argsCount() < 2) {
         printUsage()
         exit(1)

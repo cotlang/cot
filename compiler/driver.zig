@@ -6253,6 +6253,38 @@ pub const Driver = struct {
             // No need for individual deinit — arena frees everything at once
             ssa_builder.deinit();
 
+            // SSA text dump (Wasm path) — same as native path
+            if (debug.isEnabled(.ssa)) {
+                const ssa_dbg = @import("ssa/debug.zig");
+                debug.log(.ssa, "\n=== SSA for '{s}' ({d} blocks) ===", .{ ir_func.name, ssa_func.blocks.items.len });
+                for (ssa_func.blocks.items) |blk| {
+                    debug.log(.ssa, "  Block b{d} ({s}, {d} values, succs={d}, preds={d}):", .{
+                        blk.id, @tagName(blk.kind), blk.values.items.len, blk.succs.len, blk.preds.len,
+                    });
+                    for (blk.values.items) |val| {
+                        var abuf: [256]u8 = undefined;
+                        var alen: usize = 0;
+                        for (val.args) |a| {
+                            if (alen > 0) { abuf[alen] = ' '; alen += 1; }
+                            const s = std.fmt.bufPrint(abuf[alen..], "v{d}", .{a.id}) catch break;
+                            alen += s.len;
+                        }
+                        const type_name = type_reg.typeName(val.type_idx);
+                        debug.log(.ssa, "    v{d}: {s} <{s}> {s} aux={d} uses={d}", .{
+                            val.id, @tagName(val.op), type_name, abuf[0..alen], val.aux_int, val.uses,
+                        });
+                    }
+                    if (blk.controls[0]) |c| {
+                        if (blk.controls[1]) |c2| {
+                            debug.log(.ssa, "    control: v{d} v{d}", .{ c.id, c2.id });
+                        } else {
+                            debug.log(.ssa, "    control: v{d}", .{c.id});
+                        }
+                    }
+                }
+                _ = ssa_dbg;
+            }
+
             // COT_SSA: interactive HTML visualizer (Go GOSSAFUNC port)
             const ssa_html = @import("ssa/html.zig");
             var html_writer: ?ssa_html.HTMLWriter = null;

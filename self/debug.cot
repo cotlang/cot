@@ -1,0 +1,148 @@
+/// Pipeline Debug Infrastructure for Selfcot
+///
+/// Port of compiler/pipeline_debug.zig — provides systematic debugging output
+/// for the entire compilation pipeline.
+///
+/// Set COT_DEBUG=phase1,phase2 or COT_DEBUG=all to enable debug output.
+/// Set COT_TRACE=funcname to trace a specific function through ALL passes.
+///
+/// Usage:
+///   import "../debug"  (from optimize/ or emit/wasm/)
+///   import "debug"     (from self/ root)
+///   debug_log("codegen", "=== Pass for '${name}' ===")
+
+import "std/os"
+import "std/string"
+
+/// Global debug state — initialized once at startup from env vars.
+var g_all: bool = false
+var g_parse: bool = false
+var g_check: bool = false
+var g_lower: bool = false
+var g_ssa: bool = false
+var g_deadcode: bool = false
+var g_copyelim: bool = false
+var g_phielim: bool = false
+var g_schedule: bool = false
+var g_regalloc: bool = false
+var g_codegen: bool = false
+var g_strings: bool = false
+var g_abi: bool = false
+var g_trace_func: string = ""
+var g_initialized: bool = false
+
+/// Initialize global debug state from environment variables.
+/// Must be called once at startup before any compilation.
+/// Reads COT_DEBUG and COT_TRACE env vars.
+fn initGlobal() void {
+    if (g_initialized) { return }
+    g_initialized = true
+
+    // Read COT_DEBUG env var
+    const count = environCount()
+    for i in 0..count {
+        const e = env(i)
+        if (startsWith(e, "COT_DEBUG=")) {
+            const value = substring(e, 10, @lenOf(e))
+            parseDebugStr(value)
+        }
+        if (startsWith(e, "COT_TRACE=")) {
+            g_trace_func = substring(e, 10, @lenOf(e))
+            eprintln("\n=== COT_TRACE enabled for: ${g_trace_func} ===\n")
+        }
+    }
+}
+
+/// Parse comma-separated phase names from COT_DEBUG value.
+fn parseDebugStr(s: string) void {
+    // Simple comma-separated parsing
+    var start: i64 = 0
+    var i: i64 = 0
+    while (i <= @lenOf(s)) {
+        if (i == @lenOf(s) or charAt(s, i) == ',') {
+            if (i > start) {
+                const phase = substring(s, start, i)
+                enablePhase(phase)
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+}
+
+/// Enable a specific phase by name.
+fn enablePhase(name: string) void {
+    if (name == "all") { g_all = true }
+    if (name == "parse") { g_parse = true }
+    if (name == "check") { g_check = true }
+    if (name == "lower") { g_lower = true }
+    if (name == "ssa") { g_ssa = true }
+    if (name == "deadcode") { g_deadcode = true }
+    if (name == "copyelim") { g_copyelim = true }
+    if (name == "phielim") { g_phielim = true }
+    if (name == "schedule") { g_schedule = true }
+    if (name == "regalloc") { g_regalloc = true }
+    if (name == "codegen") { g_codegen = true }
+    if (name == "strings") { g_strings = true }
+    if (name == "abi") { g_abi = true }
+}
+
+/// Check if a phase has debug output enabled.
+fn isEnabled(phase: string) bool {
+    if (g_all) { return true }
+    if (phase == "parse") { return g_parse }
+    if (phase == "check") { return g_check }
+    if (phase == "lower") { return g_lower }
+    if (phase == "ssa") { return g_ssa }
+    if (phase == "deadcode") { return g_deadcode }
+    if (phase == "copyelim") { return g_copyelim }
+    if (phase == "phielim") { return g_phielim }
+    if (phase == "schedule") { return g_schedule }
+    if (phase == "regalloc") { return g_regalloc }
+    if (phase == "codegen") { return g_codegen }
+    if (phase == "strings") { return g_strings }
+    if (phase == "abi") { return g_abi }
+    return false
+}
+
+/// Log a message if the phase is enabled.
+/// Format: [phase] message
+fn debug_log(phase: string, msg: string) void {
+    if (!isEnabled(phase)) { return }
+    eprintln("[${phase}] ${msg}")
+}
+
+/// Check if tracing a specific function.
+fn shouldTrace(func_name: string) bool {
+    if (@lenOf(g_trace_func) == 0) { return false }
+    return g_trace_func == func_name
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+test "parseDebugStr enables phases" {
+    g_all = false
+    g_parse = false
+    g_codegen = false
+    parseDebugStr("parse,codegen")
+    @assert(g_parse)
+    @assert(g_codegen)
+    @assert(!g_check)
+}
+
+test "parseDebugStr all" {
+    g_all = false
+    parseDebugStr("all")
+    @assert(g_all)
+    @assert(isEnabled("parse"))
+    @assert(isEnabled("codegen"))
+    @assert(isEnabled("deadcode"))
+}
+
+test "isEnabled returns false when not set" {
+    g_all = false
+    g_parse = false
+    @assert(!isEnabled("parse"))
+}
