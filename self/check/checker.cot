@@ -1339,8 +1339,9 @@ struct Checker {
                     Type.optional |o| => o.elem,
                     else => invalid_type,
                 }
+                const capture_type = if (ifs.capture_is_ptr) { self.types.makePointer(elem_type) } else { elem_type }
                 self.pushScope()
-                self.defineSymbol(makeSymbol(ifs.capture, elem_type, null_node, false))
+                self.defineSymbol(makeSymbol(ifs.capture, capture_type, null_node, false))
                 self.checkStmt(ifs.then_branch)
                 self.popScope()
                 if (ifs.else_branch != null_node) { self.checkStmt(ifs.else_branch) }
@@ -1384,8 +1385,9 @@ struct Checker {
                     Type.optional |o| => o.elem,
                     else => invalid_type,
                 }
+                const wcapture_type = if (ws.capture_is_ptr) { self.types.makePointer(elem_type) } else { elem_type }
                 self.pushScope()
-                self.defineSymbol(makeSymbol(ws.capture, elem_type, null_node, false))
+                self.defineSymbol(makeSymbol(ws.capture, wcapture_type, null_node, false))
                 const old_in_loop = self.in_loop
                 self.in_loop = true
                 self.checkStmt(ws.body)
@@ -2274,6 +2276,25 @@ struct Checker {
         if (base.tag == TAG_LIST) {
             return self.checkListFieldAccess(idx, base_type, field_name)
         }
+        // Basic type method lookup: trait impl methods on i64, f64, bool, etc.
+        // Zig reference: checker.zig:2763 — .basic => lookupMethod(bk.name(), field)
+        if (base.tag == TAG_BASIC) {
+            const bk = switch (base) { Type.basic |b| => b, else => BasicKind.invalid }
+            const mi = self.types.lookupMethod(bk.name(), field_name)
+            if (mi >= 0) { return self.types.getMethodInfo(mi).func_type }
+        }
+        // Pointer element method lookup: (*T).method() → T.method()
+        if (base.tag == TAG_POINTER) {
+            const elem = switch (base) { Type.pointer |p| => p.elem, else => invalid_type }
+            if (elem != invalid_type) {
+                const elem_info = self.types.get(elem)
+                if (elem_info.tag == TAG_BASIC) {
+                    const bk = switch (elem_info) { Type.basic |b| => b, else => BasicKind.invalid }
+                    const mi = self.types.lookupMethod(bk.name(), field_name)
+                    if (mi >= 0) { return self.types.getMethodInfo(mi).func_type }
+                }
+            }
+        }
 
         self.reportError(idx, ErrorCode.e306, "field not found")
         return invalid_type
@@ -2647,7 +2668,8 @@ struct Checker {
         var then_n = null_node
         var else_n = null_node
         var capture = ""
-        switch (self.ast.getNode(idx)) { Node.expr |e| => switch (e) { Expr.if_expr |ie| => { cond_n = ie.condition; then_n = ie.then_branch; else_n = ie.else_branch; capture = ie.capture }, else => {} }, else => {} }
+        var capture_is_ptr = false
+        switch (self.ast.getNode(idx)) { Node.expr |e| => switch (e) { Expr.if_expr |ie| => { cond_n = ie.condition; then_n = ie.then_branch; else_n = ie.else_branch; capture = ie.capture; capture_is_ptr = ie.capture_is_ptr }, else => {} }, else => {} }
 
         const cond_type = self.checkExpr(cond_n)
 
@@ -2656,8 +2678,9 @@ struct Checker {
             const cond_t = self.types.get(cond_type)
             if (cond_t.tag == TAG_OPTIONAL) {
                 const elem_type = switch (cond_t) { Type.optional |o| => o.elem, else => invalid_type }
+                const ecapture_type = if (capture_is_ptr) { self.types.makePointer(elem_type) } else { elem_type }
                 self.pushScope()
-                self.defineSymbol(makeSymbol(capture, elem_type, null_node, false))
+                self.defineSymbol(makeSymbol(capture, ecapture_type, null_node, false))
                 const then_type = self.checkExpr(then_n)
                 self.popScope()
                 if (else_n != null_node) { self.checkExpr(else_n) }

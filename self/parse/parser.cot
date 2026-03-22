@@ -1365,6 +1365,10 @@ struct Parser {
             } else if (self.peekNextIsPeriod() or self.peekNextIsIdentColon()) {
                 // Struct init: Type { .x = 1 } or Type { x: 1 }
                 node = self.parseStructInitFrom(node)
+            } else if (self.peekNextIsRbrace()) {
+                // Empty struct init with defaults: Config {}
+                // Zig parser pattern: uppercase ident followed by {}
+                node = self.parseStructInitFrom(node)
             } else {
                 break
             }
@@ -1616,6 +1620,11 @@ struct Parser {
     fn peekNextIsPeriod() bool {
         if (self.tok != Token.lbrace) { return false }
         return self.peekToken() == Token.period
+    }
+
+    fn peekNextIsRbrace() bool {
+        if (self.tok != Token.lbrace) { return false }
+        return self.peekToken() == Token.rbrace
     }
 
     /// Check if { ident : follows — indicates struct init with colon syntax (@safe).
