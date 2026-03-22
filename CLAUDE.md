@@ -409,6 +409,7 @@ cursor --uninstall-extension cot-lang.cot-lang 2>/dev/null; cursor --install-ext
 | `claude/BR_TABLE_ARCHITECTURE.md` | Why br_table appears in generated code |
 | `claude/specs/WASM_3_0_REFERENCE.md` | Wasm 3.0 opcodes and adoption plan |
 | `claude/WASM_CODEGEN_REFERENCE.md` | **Wasm codegen pipeline — READ BEFORE TOUCHING WASM** |
+| `claude/COT_SSA_PLAN.md` | **COT_SSA visualizer: execution plan, 8 phases, selfcot port** |
 | `claude/WASM_ASYNC_ARCHITECTURE.md` | **Wasm async: state machines vs Go's stack unwind, Rust/Kotlin comparison** |
 | `claude/WASM_PLATFORM_VISION.md` | Wasm platform vision, browser IDE, Canvas UI, business cases |
 | `claude/ROADMAP.md` | Forward-looking roadmap: 0.4→1.0, competitive positioning |
