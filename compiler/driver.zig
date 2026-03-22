@@ -6309,52 +6309,70 @@ pub const Driver = struct {
 
             // Run Wasm-specific passes with optimization (Go pass order)
             // Reference: Go compile.go lines 58-145 — pass loop + HTMLWriter integration
-            // Each pass uses PhaseSnapshot.compare() for automatic change stats.
+            // Each pass is timed (Go: time.Now before/after, LogStat "TIME(ns)").
             const ssa_debug = @import("ssa/debug.zig");
+            _ = ssa_debug;
+            var t: i128 = undefined;
+            var elapsed: i128 = undefined;
 
+            t = debug.timestamp();
             try copyelim.copyelim(ssa_func);
+            elapsed = debug.timestamp() - t;
+            debug.logTimed(.copyelim, "  pass copyelim", elapsed, .{});
             if (html_writer != null) html_writer.?.writePhase("copyelim", "copyelim", ssa_func);
 
+            t = debug.timestamp();
             try rewritegeneric.rewrite(func_alloc, ssa_func, &string_offsets);
+            elapsed = debug.timestamp() - t;
+            debug.logTimed(.codegen, "  pass rewritegeneric", elapsed, .{});
             if (html_writer != null) html_writer.?.writePhase("rewritegeneric", "rewritegeneric", ssa_func);
 
+            t = debug.timestamp();
             try decompose_builtin.decompose(func_alloc, ssa_func, type_reg);
+            elapsed = debug.timestamp() - t;
+            debug.logTimed(.codegen, "  pass decompose", elapsed, .{});
             if (html_writer != null) html_writer.?.writePhase("decompose", "decompose", ssa_func);
 
+            t = debug.timestamp();
             try rewritedec.rewrite(func_alloc, ssa_func);
+            elapsed = debug.timestamp() - t;
+            debug.logTimed(.codegen, "  pass rewritedec", elapsed, .{});
             if (html_writer != null) html_writer.?.writePhase("rewritedec", "rewritedec", ssa_func);
 
+            t = debug.timestamp();
             try copyelim.copyelim(ssa_func);
+            elapsed = debug.timestamp() - t;
+            debug.logTimed(.copyelim, "  pass copyelim2", elapsed, .{});
             if (html_writer != null) html_writer.?.writePhase("copyelim2", "copyelim (2nd)", ssa_func);
 
+            t = debug.timestamp();
             try cse_pass.cse(ssa_func);
+            elapsed = debug.timestamp() - t;
+            debug.logTimed(.codegen, "  pass cse", elapsed, .{});
             if (html_writer != null) html_writer.?.writePhase("cse", "cse", ssa_func);
 
-            // Snapshot before deadcode for change tracking
-            var pre_deadcode = ssa_debug.PhaseSnapshot.capture(func_alloc, ssa_func, "pre_deadcode") catch null;
+            t = debug.timestamp();
             try deadcode.deadcode(ssa_func);
-            if (pre_deadcode) |*pre| {
-                var post = ssa_debug.PhaseSnapshot.capture(func_alloc, ssa_func, "post_deadcode") catch null;
-                if (post) |*p| {
-                    const stats = ssa_debug.PhaseSnapshot.compare(pre, p);
-                    if (stats.hasChanges()) {
-                        debug.log(.deadcode, "  deadcode changes: +{d}/-{d} values, +{d}/-{d} blocks", .{
-                            stats.values_added, stats.values_removed, stats.blocks_added, stats.blocks_removed,
-                        });
-                    }
-                    p.deinit();
-                }
-                pre.deinit();
-            }
+            elapsed = debug.timestamp() - t;
+            debug.logTimed(.deadcode, "  pass deadcode", elapsed, .{});
             if (html_writer != null) html_writer.?.writePhase("deadcode", "deadcode", ssa_func);
 
+            t = debug.timestamp();
             try schedule.schedule(ssa_func);
+            elapsed = debug.timestamp() - t;
+            debug.logTimed(.schedule, "  pass schedule", elapsed, .{});
             if (html_writer != null) html_writer.?.writePhase("schedule", "schedule", ssa_func);
 
+            t = debug.timestamp();
             try layout.layout(ssa_func);
+            elapsed = debug.timestamp() - t;
+            debug.logTimed(.codegen, "  pass layout", elapsed, .{});
             if (html_writer != null) html_writer.?.writePhase("layout", "layout", ssa_func);
 
+            t = debug.timestamp();
             try lower_wasm.lower(ssa_func);
+            elapsed = debug.timestamp() - t;
+            debug.logTimed(.codegen, "  pass lower_wasm", elapsed, .{});
             if (html_writer != null) {
                 html_writer.?.writePhase("lower_wasm", "lower_wasm", ssa_func);
                 html_writer.?.flushPhases(ssa_func);

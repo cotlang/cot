@@ -15,6 +15,7 @@
 
 import "std/os"
 import "std/string"
+import "std/sys"
 
 /// Debug phases — matches compiler/pipeline_debug.zig Phase enum exactly.
 const Phase = enum {
@@ -127,6 +128,20 @@ fn debug_log(phase: Phase, msg: string) void {
     if (!phaseEnabled(phase)) { return }
     const name = @tagName(phase)
     eprintln("[${name}] ${msg}")
+}
+
+/// Log a message with elapsed time in microseconds.
+/// Reference: Go compile.go — f.LogStat("TIME(ns)", elapsed)
+fn debug_log_timed(phase: Phase, msg: string, elapsed_ns: i64) void {
+    if (!phaseEnabled(phase)) { return }
+    const us = elapsed_ns / 1000
+    const name = @tagName(phase)
+    eprintln("[${name}] ${msg} [${us}µs]")
+}
+
+/// Get current timestamp in nanoseconds for timing passes.
+fn debug_timestamp() i64 {
+    return time()
 }
 
 /// Check if tracing a specific function.

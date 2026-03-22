@@ -126,6 +126,19 @@ pub fn log(phase: Phase, comptime fmt: []const u8, args: anytype) void {
     std.debug.print("[{s}] " ++ fmt ++ "\n", .{@tagName(phase)} ++ args);
 }
 
+/// Log a message with elapsed time in microseconds.
+/// Reference: Go compile.go — f.LogStat("TIME(ns)", elapsed)
+pub fn logTimed(phase: Phase, comptime fmt: []const u8, elapsed_ns: i128, args: anytype) void {
+    if (!isEnabled(phase)) return;
+    const us = @as(i64, @intCast(@divTrunc(elapsed_ns, 1000)));
+    std.debug.print("[{s}] " ++ fmt ++ " [{d}µs]\n", .{@tagName(phase)} ++ args ++ .{us});
+}
+
+/// Get current timestamp for timing passes.
+pub fn timestamp() i128 {
+    return std.time.nanoTimestamp();
+}
+
 /// Log without phase prefix (for continuation lines).
 pub fn logRaw(phase: Phase, comptime fmt: []const u8, args: anytype) void {
     if (!isEnabled(phase)) return;

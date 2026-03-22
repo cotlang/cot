@@ -377,17 +377,47 @@ fn generateAndAddFunc(linker: *Linker, ir_func: Func, ir: IR, types: *TypeRegist
     ssa_func.type_idx = ir_func.return_type
 
     // Run Wasm-specific SSA passes (Go pass order)
+    // Reference: Go compile.go — timed pass loop with per-pass µs reporting.
     // Zig reference: driver.zig lines 6158-6167
+    var t = debug_timestamp()
     copyelim(ssa_func)
+    debug_log_timed(.copyelim, "  pass copyelim", debug_timestamp() - t)
+
+    t = debug_timestamp()
     passRewriteGeneric(ssa_func, string_offsets)
+    debug_log_timed(.codegen, "  pass rewritegeneric", debug_timestamp() - t)
+
+    t = debug_timestamp()
     decompose(ssa_func)
+    debug_log_timed(.codegen, "  pass decompose", debug_timestamp() - t)
+
+    t = debug_timestamp()
     passRewriteDec(ssa_func)
+    debug_log_timed(.codegen, "  pass rewritedec", debug_timestamp() - t)
+
+    t = debug_timestamp()
     copyelim(ssa_func)
+    debug_log_timed(.copyelim, "  pass copyelim2", debug_timestamp() - t)
+
+    t = debug_timestamp()
     cse(ssa_func)
+    debug_log_timed(.codegen, "  pass cse", debug_timestamp() - t)
+
+    t = debug_timestamp()
     deadcode(ssa_func)
+    debug_log_timed(.deadcode, "  pass deadcode", debug_timestamp() - t)
+
+    t = debug_timestamp()
     schedule(ssa_func)
+    debug_log_timed(.schedule, "  pass schedule", debug_timestamp() - t)
+
+    t = debug_timestamp()
     layout(ssa_func)
+    debug_log_timed(.codegen, "  pass layout", debug_timestamp() - t)
+
+    t = debug_timestamp()
     lower(ssa_func)
+    debug_log_timed(.codegen, "  pass lower_wasm", debug_timestamp() - t)
 
     // Determine function type
     const type_idx = registerFuncType(linker, ir_func, types)
