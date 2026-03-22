@@ -1731,17 +1731,21 @@ pub const Checker = struct {
     fn checkBinary(self: *Checker, bin: ast.Binary) CheckError!TypeIndex {
         const left_type = try self.checkExpr(bin.left);
 
-        // Union variant comparison: set context so .variant shorthand resolves for RHS.
-        // Zig Sema pattern: same as switch enum context but for == / != with union LHS.
-        // @safe auto-deref: if LHS is *Union, unwrap to Union for comparison context.
+        // Enum/Union variant comparison: set context so .variant shorthand resolves for RHS.
+        // Zig Sema pattern: same as switch enum context but for == / != with enum/union LHS.
+        // @safe auto-deref: if LHS is *Enum/*Union, unwrap to Enum/Union for comparison context.
         const old_switch_enum = self.current_switch_enum_type;
         if (bin.op == .eql or bin.op == .neq) {
             var cmp_type = left_type;
             const left_info = self.types.get(left_type);
-            if (left_info == .pointer and self.types.get(left_info.pointer.elem) == .union_type) {
-                cmp_type = left_info.pointer.elem;
+            if (left_info == .pointer) {
+                const elem = self.types.get(left_info.pointer.elem);
+                if (elem == .union_type or elem == .enum_type) {
+                    cmp_type = left_info.pointer.elem;
+                }
             }
-            if (self.types.get(cmp_type) == .union_type) {
+            const cmp_info = self.types.get(cmp_type);
+            if (cmp_info == .union_type or cmp_info == .enum_type) {
                 self.current_switch_enum_type = cmp_type;
             }
         }

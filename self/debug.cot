@@ -1,7 +1,7 @@
 /// Pipeline Debug Infrastructure for Selfcot
 ///
 /// Port of compiler/pipeline_debug.zig — provides systematic debugging output
-/// for the entire compilation pipeline.
+/// for the entire compilation pipeline. Identical output format to the Zig compiler.
 ///
 /// Set COT_DEBUG=phase1,phase2 or COT_DEBUG=all to enable debug output.
 /// Set COT_TRACE=funcname to trace a specific function through ALL passes.
@@ -9,10 +9,28 @@
 /// Usage:
 ///   import "../debug"  (from optimize/ or emit/wasm/)
 ///   import "debug"     (from self/ root)
-///   debug_log("codegen", "=== Pass for '${name}' ===")
+///
+///   debug_log(.codegen, "=== Pass for '${name}' ===")
+///   debug_log(.ssa, "built ${blocks} blocks, ${values} values")
 
 import "std/os"
 import "std/string"
+
+/// Debug phases — matches compiler/pipeline_debug.zig Phase enum exactly.
+const Phase = enum {
+    parse,
+    check,
+    lower,
+    ssa,
+    deadcode,
+    copyelim,
+    phielim,
+    schedule,
+    regalloc,
+    codegen,
+    strings,
+    abi,
+}
 
 /// Global debug state — initialized once at startup from env vars.
 var g_all: bool = false
@@ -38,7 +56,6 @@ fn initGlobal() void {
     if (g_initialized) { return }
     g_initialized = true
 
-    // Read COT_DEBUG env var
     const count = environCount()
     for i in 0..count {
         const e = env(i)
@@ -55,7 +72,6 @@ fn initGlobal() void {
 
 /// Parse comma-separated phase names from COT_DEBUG value.
 fn parseDebugStr(s: string) void {
-    // Simple comma-separated parsing
     var start: i64 = 0
     var i: i64 = 0
     while (i <= @lenOf(s)) {
@@ -88,28 +104,29 @@ fn enablePhase(name: string) void {
 }
 
 /// Check if a phase has debug output enabled.
-fn isEnabled(phase: string) bool {
+fn phaseEnabled(phase: Phase) bool {
     if (g_all) { return true }
-    if (phase == "parse") { return g_parse }
-    if (phase == "check") { return g_check }
-    if (phase == "lower") { return g_lower }
-    if (phase == "ssa") { return g_ssa }
-    if (phase == "deadcode") { return g_deadcode }
-    if (phase == "copyelim") { return g_copyelim }
-    if (phase == "phielim") { return g_phielim }
-    if (phase == "schedule") { return g_schedule }
-    if (phase == "regalloc") { return g_regalloc }
-    if (phase == "codegen") { return g_codegen }
-    if (phase == "strings") { return g_strings }
-    if (phase == "abi") { return g_abi }
+    if (phase == .parse) { return g_parse }
+    if (phase == .check) { return g_check }
+    if (phase == .lower) { return g_lower }
+    if (phase == .ssa) { return g_ssa }
+    if (phase == .deadcode) { return g_deadcode }
+    if (phase == .copyelim) { return g_copyelim }
+    if (phase == .phielim) { return g_phielim }
+    if (phase == .schedule) { return g_schedule }
+    if (phase == .regalloc) { return g_regalloc }
+    if (phase == .codegen) { return g_codegen }
+    if (phase == .strings) { return g_strings }
+    if (phase == .abi) { return g_abi }
     return false
 }
 
 /// Log a message if the phase is enabled.
-/// Format: [phase] message
-fn debug_log(phase: string, msg: string) void {
-    if (!isEnabled(phase)) { return }
-    eprintln("[${phase}] ${msg}")
+/// Format: [phase] message — matches Zig compiler output exactly.
+fn debug_log(phase: Phase, msg: string) void {
+    if (!phaseEnabled(phase)) { return }
+    const name = @tagName(phase)
+    eprintln("[${name}] ${msg}")
 }
 
 /// Check if tracing a specific function.
@@ -130,19 +147,31 @@ test "parseDebugStr enables phases" {
     @assert(g_parse)
     @assert(g_codegen)
     @assert(!g_check)
+    // Reset
+    g_parse = false
+    g_codegen = false
 }
 
 test "parseDebugStr all" {
     g_all = false
     parseDebugStr("all")
     @assert(g_all)
-    @assert(isEnabled("parse"))
-    @assert(isEnabled("codegen"))
-    @assert(isEnabled("deadcode"))
+    @assert(phaseEnabled(.parse))
+    @assert(phaseEnabled(.codegen))
+    @assert(phaseEnabled(.deadcode))
+    // Reset
+    g_all = false
 }
 
-test "isEnabled returns false when not set" {
+test "phaseEnabled returns false when not set" {
     g_all = false
     g_parse = false
-    @assert(!isEnabled("parse"))
+    @assert(!phaseEnabled(.parse))
+}
+
+test "debug_log with tagName" {
+    g_all = true
+    debug_log(.codegen, "=== test pass ===")
+    debug_log(.check, "type checking")
+    g_all = false
 }
