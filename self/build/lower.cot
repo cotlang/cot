@@ -3687,7 +3687,8 @@ struct Lowerer {
     fn emitSretCall(func_name: string, args: List(int), return_type: int, span: Span) int {
         const fb = self.builder.func() orelse return null_node
         const ret_size = self.types.sizeOf(return_type)
-        const sret_local = fb.addLocalWithSize("__sret_tmp", return_type, false, ret_size)
+        // Zig ir.zig:312 — reuse shared SRET local across calls
+        const sret_local = fb.getOrCreateSretLocal(return_type, ret_size)
         const sret_addr = fb.emitAddrLocal(sret_local, I64, span)
         var sret_args: List(int) = .{}
         sret_args.append(sret_addr)

@@ -529,6 +529,8 @@ struct FuncBuilder {
     local_map: Map(string, int),
     shadow_stack: List(ShadowEntry),
     sret_return_type: ?int,
+    shared_sret_local: ?int,
+    shared_sret_size: int,
     is_destructor: bool,
     is_export: bool,
 
@@ -553,6 +555,8 @@ struct FuncBuilder {
             local_map: local_map,
             shadow_stack: shadow_stack,
             sret_return_type: null,
+            shared_sret_local: null,
+            shared_sret_size: 0,
             is_destructor: false,
             is_export: false,
         }
@@ -575,6 +579,8 @@ struct FuncBuilder {
             local_map: fb.local_map,
             shadow_stack: fb.shadow_stack,
             sret_return_type: null,
+            shared_sret_local: null,
+            shared_sret_size: 0,
             is_destructor: false,
             is_export: false,
         }
@@ -602,6 +608,24 @@ struct FuncBuilder {
         self.locals.append(Local.initWithSize(name, type_idx, mutable, size))
         self.shadow_stack.append(ShadowEntry { name: name, old_idx: self.local_map.getOrNull(name) })
         self.local_map.set(name, idx)
+        return idx
+    }
+
+    /// Zig ir.zig:312-327 — reuse shared SRET local across calls
+    fn getOrCreateSretLocal(ret_type: int, ret_size: int) int {
+        if (self.shared_sret_local) |existing| {
+            if (ret_size <= self.shared_sret_size) { return existing }
+            // Grow existing local
+            var local = self.locals.get(existing)
+            local.size = ret_size
+            self.locals.set(existing, local)
+            self.shared_sret_size = ret_size
+            return existing
+        }
+        const idx = self.locals.count
+        self.locals.append(Local.initWithSize("__sret_shared", ret_type, false, ret_size))
+        self.shared_sret_local = idx
+        self.shared_sret_size = ret_size
         return idx
     }
 
