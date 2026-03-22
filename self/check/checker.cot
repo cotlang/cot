@@ -2198,6 +2198,24 @@ struct Checker {
         return self.checkFieldAccessInner(idx, base_n, field_name)
     }
 
+    /// Zig checker.zig:2532-2555 — resolve field access on comptime values.
+    /// Returns the result type, or invalid_type if not comptime.
+    fn resolveComptimeFieldAccess(base_n: int, field_name: string) int {
+        const cv = self.evalComptimeValue(base_n) orelse return invalid_type
+        if (cv.tag == CV_TYPE_INFO) {
+            if (field_name == "fields") { return I64 }
+            if (field_name == "name") { return STRING }
+        }
+        if (cv.tag == CV_ENUM_FIELD) {
+            if (field_name == "name") { return STRING }
+            if (field_name == "value") { return I64 }
+        }
+        if (cv.tag == CV_ARRAY) {
+            if (field_name == "len") { return I64 }
+        }
+        return invalid_type
+    }
+
     /// .variant shorthand resolution for switch arms.
     fn checkVariantShorthand(idx: int, field_name: string) int {
         if (self.current_switch_enum_type != invalid_type) {
@@ -2221,22 +2239,39 @@ struct Checker {
         return invalid_type
     }
 
+    /// Resolve comptime field type: @typeInfo(T).fields, .name, .value, .len
+    /// Split out to avoid nested-if-in-optional codegen bug.
+    fn resolveComptimeFieldType(base_n: int, field_name: string) int {
+        // Use evalComptimeValue and extract tag outside the optional unwrap
+        // to avoid nested-if codegen issue with large optional struct capture.
+        const cv_tag = self.evalComptimeValueTag(base_n)
+        if (cv_tag < 0) { return invalid_type }
+        if (cv_tag == CV_TYPE_INFO and field_name == "fields") { return I64 }
+        if (cv_tag == CV_TYPE_INFO and field_name == "name") { return STRING }
+        if (cv_tag == CV_ENUM_FIELD and field_name == "name") { return STRING }
+        if (cv_tag == CV_ENUM_FIELD and field_name == "value") { return I64 }
+        if (cv_tag == CV_ARRAY and field_name == "len") { return I64 }
+        return invalid_type
+    }
+
+    /// Return the tag of a comptime value, or -1 if not comptime.
+    fn evalComptimeValueTag(idx: int) int {
+        const cv = self.evalComptimeValue(idx) orelse return -1
+        return cv.tag
+    }
+
     /// Main field access logic, split from checkFieldAccess to keep stack frames small.
     fn checkFieldAccessInner(idx: int, base_n: int, field_name: string) int {
         // Comptime value field access: @typeInfo(T).fields, @typeInfo(T).name, etc.
         // Zig reference: checker.zig:2532-2555
+        // Comptime field access — inline to avoid cross-function optional struct issues.
         if (self.evalComptimeValue(base_n)) |cv| {
-            if (cv.tag == CV_TYPE_INFO) {
-                if (field_name == "fields") { return I64 }
-                if (field_name == "name") { return STRING }
-            }
-            if (cv.tag == CV_ENUM_FIELD) {
-                if (field_name == "name") { return STRING }
-                if (field_name == "value") { return I64 }
-            }
-            if (cv.tag == CV_ARRAY) {
-                if (field_name == "len") { return I64 }
-            }
+            const tag = cv.tag
+            if (tag == CV_TYPE_INFO and field_name == "fields") { return I64 }
+            if (tag == CV_TYPE_INFO and field_name == "name") { return STRING }
+            if (tag == CV_ENUM_FIELD and field_name == "name") { return STRING }
+            if (tag == CV_ENUM_FIELD and field_name == "value") { return I64 }
+            if (tag == CV_ARRAY and field_name == "len") { return I64 }
         }
 
         // Nested type namespace: TypeName.Nested
