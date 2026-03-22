@@ -3273,11 +3273,13 @@ struct Lowerer {
             var param_type_idx = VOID
             if (func_type_info.tag == TAG_FUNC and i < param_count) {
                 switch (func_type_info) { Type.func |ft| => {
-                    const param = ft.getParam(i)
-                    param_type_idx = param.type_idx
-                    const pt = self.types.get(param_type_idx)
-                    param_is_pointer = (pt.tag == TAG_POINTER)
-                    param_is_compound = (pt.tag == TAG_SLICE) or (param_type_idx == STRING)
+                    if (ft.params != 0) {
+                        const param = ft.getParam(i)
+                        param_type_idx = param.type_idx
+                        const pt = self.types.get(param_type_idx)
+                        param_is_pointer = (pt.tag == TAG_POINTER)
+                        param_is_compound = (pt.tag == TAG_SLICE) or (param_type_idx == STRING)
+                    }
                 }, else => {} }
             }
 

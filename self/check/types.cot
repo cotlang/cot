@@ -1203,6 +1203,7 @@ struct TypeRegistry {
             const ff = switch (from_t) { Type.func |f| => f, else => FuncType { param_count: -1, params: 0, return_type: invalid_type } }
             const tf = switch (to_t) { Type.func |f| => f, else => FuncType { param_count: -1, params: 0, return_type: invalid_type } }
             if (ff.param_count != tf.param_count) { return false }
+            if (ff.params == 0 or tf.params == 0) { return ff.params == tf.params }
             for i in 0..ff.param_count {
                 const fp = ff.getParam(i)
                 const tp = tf.getParam(i)
