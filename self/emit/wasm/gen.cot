@@ -1802,6 +1802,11 @@ struct GenState {
     fn emitFuncAddr(val_idx: int) void {
         const v = self.ssa_func.getValue(val_idx)
         const fn_name = switch (v.aux) { SsaAux.str |s| => s, else => "" }
+        if (@ptrOf(fn_name) == 0 and @lenOf(fn_name) > 0) {
+            println("[BUG] emitFuncAddr: null ptr with len=${@lenOf(fn_name)} val_idx=${val_idx} func=${self.ssa_func.name}")
+            self.builder.appendFrom(As.i64_const, constAddr(0))
+            return
+        }
         if (@lenOf(fn_name) > 0) {
             if (self.func_table_indices) |fti| {
                 if (fti.contains(fn_name)) {

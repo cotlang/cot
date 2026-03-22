@@ -26,6 +26,10 @@ const LEB128_SIGN_BIT: int = 0x40
 /// Unsigned LEB128 encoding
 fn writeULEB128(w: *List(int), value: int) void {
     var v = value
+    if (v < 0) {
+        println("[BUG] writeULEB128 negative: ${v}")
+        v = 0
+    }
     while (true) {
         const b = v & LEB128_LOW_BITS_MASK
         v = v >> 7
