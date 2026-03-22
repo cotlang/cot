@@ -143,56 +143,11 @@ fn layout(func: *SsaFunc) void {
         if (!found) { break }
     }
 
-    // Physically reorder blocks to match layout order (Zig layout.zig:183-187).
-    // Build old→new index mapping so we can update edge references.
-    var old_to_new: Map(int, int) = .{}
-    for ni in 0..order.count {
-        old_to_new.set(order.get(ni), ni)
-    }
-
-    // Create new blocks list in layout order
-    var new_blocks: List(SsaBlock) = .{}
-    for ni in 0..order.count {
-        var blk = func.getBlock(order.get(ni))
-        blk.id = ni
-        new_blocks.append(blk)
-    }
-
-    // Update all edge references (succs/preds) to use new indices
-    for ni in 0..new_blocks.count {
-        var blk = new_blocks.get(ni)
-        for si in 0..blk.succs.count {
-            var edge = blk.succs.get(si)
-            if (old_to_new.contains(edge.block)) {
-                edge.block = old_to_new.get(edge.block)
-                blk.succs.set(si, edge)
-            }
-        }
-        for pi in 0..blk.preds.count {
-            var edge = blk.preds.get(pi)
-            if (old_to_new.contains(edge.block)) {
-                edge.block = old_to_new.get(edge.block)
-                blk.preds.set(pi, edge)
-            }
-        }
-        new_blocks.set(ni, blk)
-    }
-
-    // Replace blocks list and update entry
-    func.blocks = new_blocks
-    if (func.entry >= 0 and old_to_new.contains(func.entry)) {
-        func.entry = old_to_new.get(func.entry)
-    }
-
-    // Also store block_order for sequential iteration
-    // After physical reorder, block_order is [0, 1, 2, ...] (identity)
-    var new_order: List(int) = .{}
-    for ni in 0..new_blocks.count {
-        new_order.append(ni)
-    }
-    func.block_order = new_order
-
-    old_to_new.free()
+    // Store layout order — gen iterates using block_order.
+    // Physical reorder is tricky with Cot's value semantics for structs,
+    // so we use the block_order approach (functionally equivalent to Zig's
+    // physical reorder since gen.cot iterates in block_order sequence).
+    func.block_order = order
 
     // Free per-function temporaries
     scheduled.free()
