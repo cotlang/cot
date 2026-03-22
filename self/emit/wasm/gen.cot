@@ -2173,12 +2173,11 @@ struct GenState {
                 self.ssaGenValue(val_idx)
             }
 
-            // Record bstart: LAST prog index of this block's values (Zig gen.zig:1359-1365)
-            // Must use last (not first) so branch targets resolve to the correct PC/state.
+            // Record bstart (Zig gen.zig:1357-1365)
             if (self.builder.count > first_prog_idx) {
                 self.bstart.set(bi, self.builder.count - 1)
-            } else {
-                self.bstart.set(bi, self.builder.count)
+            } else if (self.builder.count > 0) {
+                self.bstart.set(bi, self.builder.count - 1)
             }
 
             // Emit phi moves before branches
