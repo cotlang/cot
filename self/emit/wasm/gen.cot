@@ -2362,7 +2362,7 @@ struct GenState {
         // PC_B is first declared local (index = param_count)
         self.next_local = self.param_count + 1
 
-        // Pass 1: Allocate i64 locals for ALL values (including floats)
+        // Pass 1: Allocate i64 locals (non-float values) — Zig gen.zig:1487-1523
         for bi in 0..self.ssa_func.blocks.count {
             const blk = self.ssa_func.getBlock(bi)
             for vi in 0..blk.values.count {
@@ -2375,7 +2375,7 @@ struct GenState {
                 if (v.op == SsaOp.slice_make or v.op == SsaOp.string_make or v.op == SsaOp.opt_make or
                     v.op == SsaOp.wasm_lowered_move or v.op == SsaOp.wasm_lowered_zero or
                     v.op == SsaOp.wasm_return_call) { continue }
-                // Skip store ops
+                // Skip store ops — Zig gen.zig:1500-1503
                 if (v.op == SsaOp.wasm_i64_store or v.op == SsaOp.wasm_i64_store8 or
                     v.op == SsaOp.wasm_i64_store16 or v.op == SsaOp.wasm_i64_store32 or
                     v.op == SsaOp.wasm_i32_store or v.op == SsaOp.wasm_i32_store8 or
@@ -2383,6 +2383,9 @@ struct GenState {
                     v.op == SsaOp.wasm_f64_store or v.op == SsaOp.wasm_f32_store or
                     v.op == SsaOp.wasm_gc_struct_set or
                     v.op == SsaOp.wasm_gc_array_set or v.op == SsaOp.wasm_gc_array_copy) { continue }
+                // Skip floats for pass 2 — Zig gen.zig:1504
+                if (isFloatType(v.type_idx)) { continue }
+                // Skip GC refs for pass 3 — Zig gen.zig:1505-1508
                 if (v.op == SsaOp.wasm_gc_struct_new or
                     v.op == SsaOp.wasm_gc_array_new or v.op == SsaOp.wasm_gc_array_new_default or
                     v.op == SsaOp.wasm_gc_array_new_fixed or v.op == SsaOp.wasm_gc_array_new_data) { continue }
@@ -2391,7 +2394,7 @@ struct GenState {
                 self.next_local += 1
                 self.value_to_local.set(val_idx, local_idx)
 
-                // Pre-allocate compound len local for string-returning calls
+                // Pre-allocate compound len local for string-returning calls — Zig gen.zig:1517-1522
                 const is_call_p1 = v.op == SsaOp.wasm_call or v.op == SsaOp.wasm_lowered_static_call
                 if (is_call_p1 and v.type_idx == STRING) {
                     const len_local = self.next_local
@@ -2401,8 +2404,26 @@ struct GenState {
             }
         }
 
-        // No f64 locals — all values stored as i64
-        self.float_local_count = 0
+        // Pass 2: Allocate f64 locals (float values - contiguous at end) — Zig gen.zig:1526-1542
+        var float_count = 0
+        for bi in 0..self.ssa_func.blocks.count {
+            const blk = self.ssa_func.getBlock(bi)
+            for vi in 0..blk.values.count {
+                const val_idx = blk.values.get(vi)
+                const v = self.ssa_func.getValue(val_idx)
+                if (v.op == SsaOp.arg) { continue }
+                if (v.uses == 0 and !hasSideEffects(v)) { continue }
+                if (isRematerializable(v)) { continue }
+                if (isCmp(v)) { continue }
+                if (!isFloatType(v.type_idx)) { continue }
+
+                const local_idx = self.next_local
+                self.next_local += 1
+                float_count += 1
+                self.value_to_local.set(val_idx, local_idx)
+            }
+        }
+        self.float_local_count = float_count
 
         // Pass 3: Allocate GC ref locals
         for bi in 0..self.ssa_func.blocks.count {
