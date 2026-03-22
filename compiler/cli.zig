@@ -28,6 +28,7 @@ pub const BuildOptions = struct {
     debug: bool = false,
     lib: bool = false,
     direct_native: bool = false,
+    ssa: ?[]const u8 = null,
 };
 
 pub const RunOptions = struct {
@@ -178,6 +179,13 @@ fn parseBuild(args: *std.process.ArgIterator) ?Command {
             opts.lib = true;
         } else if (std.mem.eql(u8, arg, "--direct-native")) {
             opts.direct_native = true;
+        } else if (std.mem.startsWith(u8, arg, "--ssa=")) {
+            opts.ssa = arg[6..];
+        } else if (std.mem.eql(u8, arg, "--ssa")) {
+            opts.ssa = args.next() orelse {
+                std.debug.print("Error: --ssa requires a function name\n", .{});
+                return null;
+            };
         } else if (!std.mem.startsWith(u8, arg, "-")) {
             opts.input_file = arg;
             has_input = true;
@@ -599,12 +607,14 @@ fn printBuildHelp() void {
         \\  -o <name>       Output name (default: input filename without .cot)
         \\  --target=<t>    Target: wasm32, wasm32-wasi, arm64-macos, arm64-linux, amd64-linux
         \\  --watch, -w     Recompile on file changes
+        \\  --ssa=<func>    Generate interactive SSA HTML visualizer for <func> (or * for all)
         \\
         \\Examples:
         \\  cot build app.cot               Produces ./app
         \\  cot build app.cot -o myapp      Produces ./myapp
         \\  cot build app.cot --watch       Recompile on save
         \\  cot build app.cot --target=wasm32  Produces ./app.wasm
+        \\  cot build app.cot --ssa=main    Generates main.ssa.html
         \\
     , .{});
 }

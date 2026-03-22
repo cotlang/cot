@@ -194,7 +194,7 @@ fn buildCommand(allocator: std.mem.Allocator, opts: cli.BuildOptions) void {
         }
         watchLoop(allocator, input_file, argv.items);
     } else {
-        compileAndLinkFull(allocator, input_file, output_name, compile_target, false, false, null, false, null, null, opts.release, false, opts.lib, opts.direct_native, opts.debug);
+        compileAndLinkFull(allocator, input_file, output_name, compile_target, false, false, null, false, null, null, opts.release, false, opts.lib, opts.direct_native, opts.debug, opts.ssa);
     }
 }
 
@@ -234,7 +234,7 @@ fn runOnce(allocator: std.mem.Allocator, input_file: []const u8, compile_target:
         std.process.exit(1);
     };
 
-    compileAndLinkFull(allocator, input_file, tmp_output, compile_target, false, true, null, false, null, null, release, false, false, direct_native, false);
+    compileAndLinkFull(allocator, input_file, tmp_output, compile_target, false, true, null, false, null, null, release, false, false, direct_native, false, null);
 
     // Build argv: wasmtime for wasm targets, direct execution for native
     const run_path = if (compile_target.isWasm())
@@ -320,7 +320,7 @@ fn testCommand(allocator: std.mem.Allocator, opts: cli.TestOptions) void {
         std.process.exit(1);
     };
 
-    compileAndLinkFull(allocator, input_file, tmp_output, opts.target, true, true, opts.filter, false, null, null, opts.release, opts.fail_fast, false, false, false);
+    compileAndLinkFull(allocator, input_file, tmp_output, opts.target, true, true, opts.filter, false, null, null, opts.release, opts.fail_fast, false, false, false, null);
 
     // Run the test: wasmtime for wasm targets, direct execution for native
     const run_path = if (opts.target.isWasm())
@@ -393,7 +393,7 @@ fn benchCommand(allocator: std.mem.Allocator, opts: cli.BenchOptions) void {
         std.process.exit(1);
     };
 
-    compileAndLinkFull(allocator, input_file, tmp_output, opts.target, false, true, null, true, opts.filter, opts.n, false, false, false, false, false);
+    compileAndLinkFull(allocator, input_file, tmp_output, opts.target, false, true, null, true, opts.filter, opts.n, false, false, false, false, false, null);
 
     // Run the benchmark: wasmtime for wasm targets, direct execution for native
     const run_path = if (opts.target.isWasm())
@@ -1284,7 +1284,7 @@ fn compileAndLink(
     quiet: bool,
     test_filter: ?[]const u8,
 ) void {
-    compileAndLinkFull(allocator, input_file, output_name, compile_target, test_mode, quiet, test_filter, false, null, null, false, false, false, false, false);
+    compileAndLinkFull(allocator, input_file, output_name, compile_target, test_mode, quiet, test_filter, false, null, null, false, false, false, false, false, null);
 }
 
 const LinkerKind = enum { zig_cc, system_cc, none };
@@ -1321,6 +1321,7 @@ fn compileAndLinkFull(
     lib_mode: bool,
     direct_native: bool,
     debug_mode: bool,
+    ssa_html_name: ?[]const u8,
 ) void {
     // Load cot.json for project-level link settings (libs, etc.)
     var project_config = project.loadConfig(allocator, null) catch null;
@@ -1330,6 +1331,8 @@ fn compileAndLinkFull(
     compile_driver.setTarget(compile_target);
     compile_driver.release_mode = release_mode;
     compile_driver.debug_mode = debug_mode;
+    // --ssa=funcname overrides COT_SSA env var
+    if (ssa_html_name) |sf| compile_driver.ssa_html_func = sf;
     compile_driver.lib_mode = lib_mode;
     // Direct native path is the default for native targets.
     // The indirect (Wasm → CLIF) path is only used for --target=wasm32.

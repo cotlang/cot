@@ -189,7 +189,7 @@ try lower_native.lower(ssa_func);
   - Call `html_writer.close()` after all passes complete
   - Print path to stderr: `"dumped SSA for {name} to {path}"`
 
-- [ ] **4.6** Add `--ssa` CLI flag as alternative to env var
+- [x] **4.6** Add `--ssa` CLI flag as alternative to env var
   - `cot build file.cot --ssa=funcname` equivalent to `COT_SSA=funcname`
   - Parse in `compiler/cli.zig`
 
@@ -223,26 +223,26 @@ try lower_native.lower(ssa_func);
 
 ### Phase 6: Testing & Validation
 
-- [ ] **6.1** Manual test: `COT_SSA=main cot build test/cases/arithmetic.cot`
+- [x] **6.1** Manual test: `COT_SSA=main cot build test/cases/arithmetic.cot`
   - Verify HTML opens in browser
   - Verify all passes appear as columns
   - Verify value highlighting works across passes
   - Verify dark mode toggle works
 
-- [ ] **6.2** Manual test: `COT_SSA=main cot build test/cases/strings.cot`
+- [x] **6.2** Manual test: `COT_SSA=main cot build test/cases/strings.cot`
   - Verify compound type decomposition is visible
   - Verify string_make/string_len operations shown correctly
 
-- [ ] **6.3** Manual test with Wasm target
+- [x] **6.3** Manual test with Wasm target
   - `COT_SSA=main cot build test/cases/arithmetic.cot --target=wasm`
   - Verify Wasm-specific passes appear (lower_wasm)
   - Verify Wasm opcodes shown after lowering
 
-- [ ] **6.4** Manual test with native target
+- [x] **6.4** Manual test with native target
   - `COT_SSA=main cot build test/cases/arithmetic.cot`
   - Verify native-specific passes appear (lower_native)
 
-- [ ] **6.5** Edge cases
+- [x] **6.5** Edge cases
   - Function with no passes (trivial function)
   - Function with many blocks (large switch statement)
   - Generic function (rewritegeneric visible)

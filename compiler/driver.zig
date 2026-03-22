@@ -1552,13 +1552,46 @@ pub const Driver = struct {
             // Set function type for CLIF signature building (not set by SSA builder)
             ssa_func.type_idx = ir_func.type_idx;
 
+            // COT_SSA: interactive HTML visualizer (native path)
+            const ssa_html = @import("ssa/html.zig");
+            var html_writer_native: ?ssa_html.HTMLWriter = null;
+            if (self.ssa_html_func) |target_name| {
+                if (std.mem.eql(u8, ir_func.name, target_name) or
+                    std.mem.eql(u8, target_name, "*"))
+                {
+                    const html_path = std.fmt.allocPrint(self.allocator, "{s}.ssa.html", .{ir_func.name}) catch ir_func.name;
+                    html_writer_native = ssa_html.HTMLWriter.init(self.allocator, ir_func.name, html_path, type_reg);
+                    if (self.parsed_file_texts.len > 0) {
+                        html_writer_native.?.writeSources(self.parsed_file_texts[0], if (self.parsed_file_paths.len > 0) self.parsed_file_paths[0] else "unknown");
+                    }
+                    html_writer_native.?.writePhase("start", "start", ssa_func);
+                }
+            }
+
             // Run SSA passes (native path — copyelim not in native SSA pipeline)
             try rewritegeneric.rewrite(func_alloc, ssa_func, &string_offsets);
+            if (html_writer_native != null) html_writer_native.?.writePhase("rewritegeneric", "rewritegeneric", ssa_func);
+
             try decompose_builtin.decompose(func_alloc, ssa_func, type_reg);
+            if (html_writer_native != null) html_writer_native.?.writePhase("decompose", "decompose", ssa_func);
+
             try rewritedec.rewrite(func_alloc, ssa_func);
+            if (html_writer_native != null) html_writer_native.?.writePhase("rewritedec", "rewritedec", ssa_func);
+
             try schedule.schedule(ssa_func);
+            if (html_writer_native != null) html_writer_native.?.writePhase("schedule", "schedule", ssa_func);
+
             try layout.layout(ssa_func);
+            if (html_writer_native != null) html_writer_native.?.writePhase("layout", "layout", ssa_func);
+
             try lower_native.lower(ssa_func);
+            if (html_writer_native != null) {
+                html_writer_native.?.writePhase("lower_native", "lower_native", ssa_func);
+                html_writer_native.?.flushPhases(ssa_func);
+                html_writer_native.?.close();
+                html_writer_native.?.deinit();
+                html_writer_native = null;
+            }
 
             // SSA dump via pipeline debug (replaces COT_SSA_DUMP env var)
             if (debug.isEnabled(.ssa)) {
