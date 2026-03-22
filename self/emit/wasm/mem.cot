@@ -115,10 +115,10 @@ fn addMemRuntime(linker: *Linker, heap_ptr_global: int) MemFunctions {
     const alloc_raw_body = generateAllocRawBody(heap_ptr_global)
     const alloc_raw_idx = linker.addFunc(WasmFunc.init(ALLOC_RAW_NAME, alloc_raw_type, alloc_raw_body, false))
 
-    // realloc_raw(ptr: i64, old_size: i64, new_size: i64) -> i64
-    // Zig reference: arc.zig line 340-346
+    // realloc_raw(ptr, old_size, new_size): just return ptr (bump allocator can't move)
+    // Zig mem_runtime.zig:137-139 — generateReturnFirstArgBody
     const realloc_raw_type = linker.addType(params_3i64, results_i64)
-    const realloc_raw_body = generateReallocRawBody(heap_ptr_global, memcpy_idx)
+    const realloc_raw_body = generateReturnFirstArgBody()
     const realloc_raw_idx = linker.addFunc(WasmFunc.init(REALLOC_RAW_NAME, realloc_raw_type, realloc_raw_body, false))
 
     // dealloc_raw(ptr: i64) -> void  (no-op on Wasm bump allocator)
@@ -580,6 +580,14 @@ fn generateAllocRawBody(heap_ptr_global: int) List(int) {
 }
 
 // ============================================================================
+/// Generate body that just returns the first argument (local.get 0).
+/// Zig mem_runtime.zig:137 — bump allocator can't move, just return ptr.
+fn generateReturnFirstArgBody() List(int) {
+    var code = CodeBuilder.init()
+    code.emitLocalGet(0)
+    return code.finish()
+}
+
 // realloc_raw(ptr: i64, old_size: i64, new_size: i64) -> i64
 // Bump allocator: allocate new block and copy old data.
 // Zig reference: arc.zig generateReallocRawBody()
