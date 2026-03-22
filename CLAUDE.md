@@ -179,7 +179,14 @@ zig build
 - After `zig build`, the dev binary is at `./zig-out/bin/cot` — it is NOT on PATH. This is intentional.
 - **NEVER** assume `cot` refers to the dev build. Always use the full path for compiler development.
 
-**🚨 SUBMODULE COMMIT RULE:** When committing changes in the parent repo, **NEVER include `stdlib` in `git add`** unless you are intentionally updating the submodule reference. The `stdlib` directory will frequently show as "modified" in `git status`/`git diff` because the local checkout may be ahead of the tracked ref. **Always stage files by explicit name** (e.g., `git add compiler/foo.zig compiler/bar.zig`). **NEVER use `git add .` or `git add -A`**. If you accidentally commit a stdlib ref change pointing to a commit that doesn't exist on the remote, CI will break for ALL jobs because `actions/checkout` can't fetch the submodule.
+**🚨 SUBMODULE WORKFLOW:** `stdlib/` is a git submodule (`cotlang/std`). It frequently shows as "modified" in `git status` because the local checkout may be ahead of the tracked ref. **The rule is simple: keep the submodule ref in sync across dev environments.**
+
+**To update stdlib:**
+1. `cd stdlib && git add . && git commit -m "..." && git push` — commit and push inside the submodule first
+2. `cd .. && git add stdlib` — update the parent repo's ref to the pushed commit
+3. Commit the parent repo normally
+
+**To commit parent repo changes WITHOUT updating stdlib:** Stage files by explicit name (e.g., `git add compiler/foo.zig self/build/lower.cot`). **NEVER use `git add .` or `git add -A`** — these will accidentally include the stdlib ref change. If the ref points to a commit that doesn't exist on the stdlib remote, CI breaks for ALL jobs because `actions/checkout` can't fetch the submodule.
 
 ---
 
