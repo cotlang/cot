@@ -2262,16 +2262,10 @@ struct Checker {
 
     /// Main field access logic, split from checkFieldAccess to keep stack frames small.
     fn checkFieldAccessInner(idx: int, base_n: int, field_name: string) int {
-        // Comptime value field access: @typeInfo(T).fields, @typeInfo(T).name, etc.
-        // Zig reference: checker.zig:2532-2555
-        // Comptime field access — inline to avoid cross-function optional struct issues.
-        if (self.evalComptimeValue(base_n)) |cv| {
-            const tag = cv.tag
-            if (tag == CV_TYPE_INFO and field_name == "fields") { return I64 }
-            if (tag == CV_TYPE_INFO and field_name == "name") { return STRING }
-            if (tag == CV_ENUM_FIELD and field_name == "name") { return STRING }
-            if (tag == CV_ENUM_FIELD and field_name == "value") { return I64 }
-            if (tag == CV_ARRAY and field_name == "len") { return I64 }
+        // Zig checker.zig:2532-2555 — comptime field access
+        if (base_n != null_node) {
+            const cv_type = self.resolveComptimeFieldAccess(base_n, field_name)
+            if (cv_type != invalid_type) { return cv_type }
         }
 
         // Nested type namespace: TypeName.Nested

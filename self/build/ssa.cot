@@ -86,6 +86,7 @@ const SsaOp = enum(u16) {
     phi, copy, fwd_ref, arg,
     select0, select1, make_tuple, select_n, cond_select,
     string_len, string_ptr, string_make, slice_len, slice_ptr, slice_cap, slice_make, string_concat,
+    opt_make, opt_tag, opt_data,
 
     // === Function Calls ===
     call, tail_call, static_call, closure_call, inter_call,
