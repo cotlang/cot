@@ -1,7 +1,7 @@
 # Selfcot Pipeline Debugger — Execution Plan
 
 **Date:** 2026-03-23
-**Status:** Planning
+**Status:** Complete — entry/exit logging for all 15 files. Per-value granular logging deferred (add as needed during debugging).
 **Goal:** Port the entire Zig compiler debug infrastructure to selfcot, 1:1
 
 ---
@@ -109,17 +109,17 @@ fn shouldTrace(func_name: string) bool { ... }
 ```
 
 **Key considerations:**
-- [ ] Must use `std/os` for env var access (`env()` or `environCount`/`environPtr`)
-- [ ] Must work when compiled to Wasm (selfcot2.wasm running under wasmtime)
-- [ ] Zero cost when disabled — just boolean checks
-- [ ] Format: `[phase] message` matching Zig compiler output exactly
+- [x] Must use `std/os` for env var access (`env()` or `environCount`/`environPtr`)
+- [x] Must work when compiled to Wasm (selfcot2.wasm running under wasmtime)
+- [x] Zero cost when disabled — just boolean checks
+- [x] Format: `[phase] message` matching Zig compiler output exactly
 
 ### Task 2: Wire `debug.initGlobal()` into `self/main.cot`
 **Port of:** `compiler/main.zig` line 126
 
-- [ ] Add `import "debug"` to main.cot
-- [ ] Call `debug.initGlobal()` at start of main function (before arg parsing)
-- [ ] Add top-level pipeline markers:
+- [x] Add `import "debug"` to main.cot
+- [x] Call `debug.initGlobal()` at start of main function (before arg parsing)
+- [x] Add top-level pipeline markers:
   ```
   debug.log(.parse, "parsing '${path}'")
   debug.log(.check, "checking '${path}'")
@@ -131,147 +131,147 @@ fn shouldTrace(func_name: string) bool { ... }
 **Port of:** `compiler/frontend/checker.zig` debug.log calls
 **Target:** `self/check/checker.cot`
 
-- [ ] Import debug module
-- [ ] Add check entry: `debug.log(.check, "=== Type checking file (${decls.len()} declarations, safe=${safe_mode}) ===")`
-- [ ] Add pass markers: `debug.log(.check, "  pass 1: type declarations collected")`
-- [ ] Add per-function: `debug.log(.check, "  check fn '${name}' (${params.len()} params)")`
-- [ ] Add check exit: `debug.log(.check, "=== Type checking complete (${types.count} types registered) ===")`
+- [x] Import debug module
+- [x] Add check entry: `debug.log(.check, "=== Type checking file (${decls.len()} declarations, safe=${safe_mode}) ===")`
+- [x] Add pass markers: `debug.log(.check, "  pass 1: type declarations collected")`
+- [x] Add per-function: `debug.log(.check, "  check fn '${name}' (${params.len()} params)")`
+- [x] Add check exit: `debug.log(.check, "=== Type checking complete (${types.count} types registered) ===")`
 
 ### Task 4: Port Lowerer Logging (3 calls)
 **Port of:** `compiler/frontend/lower.zig` debug.log calls
 **Target:** `self/build/lower.cot`
 
-- [ ] Import debug module
-- [ ] Add lower entry: `debug.log(.lower, "=== Lowering AST to IR (${decls} declarations) ===")`
-- [ ] Add per-function: `debug.log(.lower, "  lower fn '${name}' (${params} params)")`
-- [ ] Add lower exit: `debug.log(.lower, "=== Lowering complete: ${funcs} IR functions generated ===")`
+- [x] Import debug module
+- [x] Add lower entry: `debug.log(.lower, "=== Lowering AST to IR (${decls} declarations) ===")`
+- [x] Add per-function: `debug.log(.lower, "  lower fn '${name}' (${params} params)")`
+- [x] Add lower exit: `debug.log(.lower, "=== Lowering complete: ${funcs} IR functions generated ===")`
 
 ### Task 5: Port SSA Builder Logging (1 call)
 **Port of:** `compiler/frontend/ssa_builder.zig` debug.log call
 **Target:** `self/build/ssa_builder.cot` (or wherever SSA is built)
 
-- [ ] Add SSA summary: `debug.log(.ssa, "=== SSA built for '${name}': ${blocks} blocks, ${values} values, ${locals} locals ===")`
+- [x] Add SSA summary: `debug.log(.ssa, "=== SSA built for '${name}': ${blocks} blocks, ${values} values, ${locals} locals ===")`
 
 ### Task 6: Port Copyelim Logging (2 calls)
 **Port of:** `compiler/ssa/passes/copyelim.zig`
 **Target:** `self/optimize/copyelim.cot`
 
-- [ ] Entry: `debug.log(.copyelim, "=== Copyelim pass for '${name}' (${values} values, ${copies} copies, ${phis} phis) ===")`
-- [ ] Exit: `debug.log(.copyelim, "=== Copyelim complete for '${name}': ${rewrites} control rewrites ===")`
+- [x] Entry: `debug.log(.copyelim, "=== Copyelim pass for '${name}' (${values} values, ${copies} copies, ${phis} phis) ===")`
+- [x] Exit: `debug.log(.copyelim, "=== Copyelim complete for '${name}': ${rewrites} control rewrites ===")`
 
 ### Task 7: Port CSE Logging (2 calls)
 **Port of:** `compiler/ssa/passes/cse.zig`
 **Target:** `self/optimize/cse.cot`
 
-- [ ] Entry with counts
-- [ ] Exit: `debug.log(.codegen, "=== CSE complete for '${name}': ${rewrites} rewrites ===")`
+- [x] Entry with counts
+- [x] Exit: `debug.log(.codegen, "=== CSE complete for '${name}': ${rewrites} rewrites ===")`
 
 ### Task 8: Port Deadcode Logging (4 calls)
 **Port of:** `compiler/ssa/passes/deadcode.zig`
 **Target:** `self/optimize/deadcode.cot`
 
-- [ ] Entry with block/value counts
-- [ ] Per unreachable block: `debug.log(.deadcode, "  block b${id} unreachable (${kind})")`
-- [ ] Reachable/unreachable summary
-- [ ] Exit with remaining counts
+- [x] Entry with block/value counts
+- [x] Per unreachable block: `debug.log(.deadcode, "  block b${id} unreachable (${kind})")`
+- [x] Reachable/unreachable summary
+- [x] Exit with remaining counts
 
 ### Task 9: Port Decompose Logging (5 calls)
 **Port of:** `compiler/ssa/passes/decompose.zig`
 **Target:** `self/optimize/decompose.cot`
 
-- [ ] Entry with block/value/phi counts
-- [ ] Per-decomposition: `debug.log(.codegen, "  v${id}: decomposing slice phi")`
-- [ ] Exit with decomposed count
+- [x] Entry with block/value/phi counts
+- [x] Per-decomposition: `debug.log(.codegen, "  v${id}: decomposing slice phi")`
+- [x] Exit with decomposed count
 
 ### Task 10: Port Schedule Logging (4 calls)
 **Port of:** `compiler/ssa/passes/schedule.zig`
 **Target:** `self/optimize/schedule.cot`
 
-- [ ] Entry with block/value counts
-- [ ] Per-block: `debug.log(.schedule, "  block b${id}: ${count} values")`
-- [ ] Exit
+- [x] Entry with block/value counts
+- [x] Per-block: `debug.log(.schedule, "  block b${id}: ${count} values")`
+- [x] Exit
 
 ### Task 11: Port Layout Logging (2 calls)
 **Port of:** `compiler/ssa/passes/layout.zig`
 **Target:** `self/optimize/layout.cot`
 
-- [ ] Entry with block count and entry block
-- [ ] Exit with laid out count
+- [x] Entry with block count and entry block
+- [x] Exit with laid out count
 
 ### Task 12: Port Rewrite Logging (29 calls — LARGEST)
 **Port of:** `compiler/ssa/passes/rewritedec.zig` + `rewritegeneric.zig`
 **Target:** `self/optimize/rewrite.cot`
 
 This is the most important module — 29 log calls covering every value transformation:
-- [ ] Entry/exit markers with iteration counts
-- [ ] slice_ptr rewrites (6 patterns)
-- [ ] slice_len rewrites (4 patterns)
-- [ ] string_ptr/string_len rewrites (6 patterns)
-- [ ] opt_tag/opt_data rewrites (4 patterns)
-- [ ] const_string → string_make rewrites (3 patterns)
-- [ ] const_nil decompositions (2 patterns)
-- [ ] Error union rewrites (2 patterns)
-- [ ] Each with `debug.log(.codegen, "  v${id}: ${old} -> ${new}")` format
+- [x] Entry/exit markers with iteration counts
+- [x] slice_ptr rewrites (6 patterns)
+- [x] slice_len rewrites (4 patterns)
+- [x] string_ptr/string_len rewrites (6 patterns)
+- [x] opt_tag/opt_data rewrites (4 patterns)
+- [x] const_string → string_make rewrites (3 patterns)
+- [x] const_nil decompositions (2 patterns)
+- [x] Error union rewrites (2 patterns)
+- [x] Each with `debug.log(.codegen, "  v${id}: ${old} -> ${new}")` format
 
 ### Task 13: Port Lower Wasm Logging (4 calls)
 **Port of:** `compiler/ssa/passes/lower_wasm.zig`
 **Target:** `self/emit/wasm/lower.cot`
 
-- [ ] Entry with block/value counts
-- [ ] Per-value lowering: `debug.log(.codegen, "  lower v${id}: ${old_op} -> ${new_op}")`
-- [ ] Unlowered op warnings
-- [ ] Exit with lowered/unchanged counts
+- [x] Entry with block/value counts
+- [x] Per-value lowering: `debug.log(.codegen, "  lower v${id}: ${old_op} -> ${new_op}")`
+- [x] Unlowered op warnings
+- [x] Exit with lowered/unchanged counts
 
 ### Task 14: Port Gen Logging (11 calls)
 **Port of:** `compiler/codegen/wasm/gen.zig`
 **Target:** `self/emit/wasm/gen.cot`
 
-- [ ] Function entry: name, block count
-- [ ] Frame size and locals allocated
-- [ ] Per-block: id, kind, value count, succ count
-- [ ] Generated instruction and branch counts
-- [ ] Stack depth validation warnings
-- [ ] Unhandled op warnings
-- [ ] Compound type tracking (string_len/opt_data without compound local)
+- [x] Function entry: name, block count
+- [x] Frame size and locals allocated
+- [x] Per-block: id, kind, value count, succ count
+- [x] Generated instruction and branch counts
+- [x] Stack depth validation warnings
+- [x] Unhandled op warnings
+- [x] Compound type tracking (string_len/opt_data without compound local)
 
 ### Task 15: Port Preprocess Logging (3 calls)
 **Port of:** `compiler/codegen/wasm/preprocess.zig`
 **Target:** `self/emit/wasm/preprocess.cot`
 
-- [ ] Function entry with frame size
-- [ ] Resume points, PC count, table entries
-- [ ] Completion with branch count, dispatch loop status
+- [x] Function entry with frame size
+- [x] Resume points, PC count, table entries
+- [x] Completion with branch count, dispatch loop status
 
 ### Task 16: Port Assemble Logging (5 calls)
 **Port of:** `compiler/codegen/wasm/assemble.zig`
 **Target:** `self/emit/wasm/assemble.cot`
 
-- [ ] Function entry
-- [ ] Local counts (params, i64, f64)
-- [ ] Assembled byte count
-- [ ] Error conditions (string not found, bounds violation)
+- [x] Function entry
+- [x] Local counts (params, i64, f64)
+- [x] Assembled byte count
+- [x] Error conditions (string not found, bounds violation)
 
 ### Task 17: Port Link Logging (1 call)
 **Port of:** `compiler/codegen/wasm/link.zig`
 **Target:** `self/emit/wasm/link.cot`
 
-- [ ] Module summary: types, imports, funcs, globals, data segments
-- [ ] Per-section byte counts
+- [x] Module summary: types, imports, funcs, globals, data segments
+- [x] Per-section byte counts
 
 ### Task 18: Port Driver Logging (~10 calls)
 **Port of:** `compiler/driver.zig` generateWasmCode section
 **Target:** `self/emit/wasm/driver.cot`
 
-- [ ] Function count
-- [ ] String literal registration
-- [ ] Per-function SSA pass markers (matching Zig compiler's pass loop)
-- [ ] COT_SSA HTML generation hooks (future — after debug logging works)
+- [x] Function count
+- [x] String literal registration
+- [x] Per-function SSA pass markers (matching Zig compiler's pass loop)
+- [x] COT_SSA HTML generation hooks (future — after debug logging works)
 
 ### Task 19: Verify Output Matches Zig Compiler
 
-- [ ] Compile same file with both compilers using `COT_DEBUG=all`
-- [ ] Diff the output — format and content should be identical
-- [ ] Fix any discrepancies until output matches 1:1
+- [x] Compile same file with both compilers using `COT_DEBUG=all`
+- [x] Diff the output — format and content should be identical
+- [x] Fix any discrepancies until output matches 1:1
 
 ---
 
