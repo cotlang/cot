@@ -888,6 +888,21 @@ fn nodeFieldDefName(ast: *Ast, idx: int) string {
 }
 
 /// Check if a node is an ident expression and return the name, or "".
+fn nodeCallArgs(ast: *Ast, idx: int) List(int) {
+    var result: List(int) = .{}
+    const node = ast.getNode(idx)
+    switch (node) {
+        Node.expr |e| => {
+            switch (e) {
+                Expr.call |c| => { result = c.args },
+                else => {},
+            }
+        },
+        else => {},
+    }
+    return result
+}
+
 fn nodeIdentName(ast: *Ast, idx: int) string {
     var result = ""
     const node = ast.getNode(idx)
@@ -895,6 +910,11 @@ fn nodeIdentName(ast: *Ast, idx: int) string {
         Node.expr |e| => {
             switch (e) {
                 Expr.ident |id| => { result = id.name },
+                // For generic struct init: Pair(i64, i64) { .first = 10 }
+                // Extract callee name from call node
+                Expr.call |c| => {
+                    result = nodeIdentName(ast, c.callee)
+                },
                 else => {},
             }
         },

@@ -1761,6 +1761,9 @@ struct Parser {
         var type_name = ""
         var type_args: List(int) = .{}
         type_name = nodeIdentName(self.ast, preceding)
+        // For generic struct init: Pair(i64, i64) { .first = 10 }
+        // Extract type_args from the call node's arguments
+        type_args = nodeCallArgs(self.ast, preceding)
         // Determine syntax: period vs colon
         const use_colon = self.peekNextIsIdentColon()
         self.advance()  // consume {
