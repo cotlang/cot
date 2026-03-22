@@ -1,7 +1,7 @@
 # COT_SSA — Interactive SSA Visualizer Execution Plan
 
 **Date:** 2026-03-23
-**Status:** Phase 1-4 complete, Phase 5 in progress
+**Status:** Phase 1-7 complete
 **Goal:** Port Go's GOSSAFUNC HTML visualizer to Cot, then to selfcot (self-hosted compiler)
 
 ---
@@ -281,28 +281,28 @@ schedule → layout → lower_wasm
 
 ### Port Plan
 
-- [ ] **7.1** Create `self/emit/html.cot` — HTMLWriter in Cot
+- [x] **7.1** Create `self/emit/html.cot` — HTMLWriter in Cot
   - Port the Zig `compiler/ssa/html.zig` to Cot syntax
   - Same struct, same methods, same HTML/CSS/JS template
   - Uses `@safe` mode (all struct params are auto-pointers)
   - String building via `StringBuilder` from `std/string`
 
-- [ ] **7.2** Port hash computation
+- [x] **7.2** Port hash computation
   - CRC32 hash of SSA text representation
   - Must match Zig compiler's format for comparison
 
-- [ ] **7.3** Port SSA rendering (Func/Block/Value HTML)
+- [x] **7.3** Port SSA rendering (Func/Block/Value HTML)
   - `fn valueHTML(v: Value) string` → `<span class="v42 ssa-value">v42</span>`
   - `fn valueLongHTML(v: Value) string` → full value with op, type, args
   - `fn blockHTML(b: Block) string` → `<span class="b5 ssa-block">b5</span>`
   - `fn funcHTML(f: Func) string` → full function rendering
 
-- [ ] **7.4** Hook into selfcot driver
+- [x] **7.4** Hook into selfcot driver
   - Read `COT_SSA` env var in `self/emit/wasm/driver.cot`
   - After each pass, call `htmlWriter.writePhase(name)`
   - Write HTML file on close
 
-- [ ] **7.5** Port source column
+- [x] **7.5** Port source column
   - Read source file text
   - Generate line-numbered source column
   - Cross-reference with Value.pos
