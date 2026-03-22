@@ -13,6 +13,23 @@ import "../parse/ast"
 import "errors"
 import "types"
 import "comptime"
+
+/// Parse Map type args from monomorphized name: "Map(K;V)" → (1, K, V)
+/// Port of Zig checker.zig:178-190 (parseMapTypeArgs)
+fn parseMapTypeArgs(name: string) (int, int, int) {
+    const open = indexOf(name, "(")
+    if (open < 0) { return (0, 0, 0) }
+    const close = lastIndexOf(name, ")")
+    if (close <= open + 1) { return (0, 0, 0) }
+    const args_str = substring(name, open + 1, close)
+    const semi = indexOf(args_str, ";")
+    if (semi < 0) { return (0, 0, 0) }
+    const k_str = substring(args_str, 0, semi)
+    const v_str = substring(args_str, semi + 1, @lenOf(args_str))
+    const k = parseInt(k_str)
+    const v = parseInt(v_str)
+    return (1, k, v)
+}
 import "../parse/token"
 import "../parse/scanner"
 import "../parse/parser"
@@ -1441,6 +1458,20 @@ struct Checker {
                         elem_type = m.value
                     },
                     Type.list_type |l| => { elem_type = l.elem },
+                    Type.struct_type |st| => {
+                        // Zig checker.zig:3594-3607 — Map generic as struct
+                        if (startsWith(st.name, "Map(")) {
+                            const map_args = parseMapTypeArgs(st.name)
+                            if (map_args.0 != 0) {
+                                elem_type = map_args.2  // V
+                                // idx_type = map_args.1 (K) — set if index binding exists
+                            } else {
+                                self.reportError(idx, ErrorCode.e300, "cannot iterate over this type")
+                            }
+                        } else {
+                            self.reportError(idx, ErrorCode.e300, "cannot iterate over this type")
+                        }
+                    },
                     else => {
                         if (iter_type == STRING) {
                             elem_type = U8
@@ -5336,7 +5367,25 @@ struct Checker {
     fn evalConstBuiltin(idx: int) (int, int) {
         var bk = 0
         var type_arg_n = null_node
-        switch (self.ast.getNode(idx)) { Node.expr |e| => switch (e) { Expr.builtin_call |bc| => { bk = bc.kind; type_arg_n = bc.type_arg }, else => {} }, else => {} }
+        var bc_args: List(int) = .{}
+        switch (self.ast.getNode(idx)) { Node.expr |e| => switch (e) { Expr.builtin_call |bc| => { bk = bc.kind; type_arg_n = bc.type_arg; bc_args = bc.args }, else => {} }, else => {} }
+        // @hasField(T, "name") — Zig checker.zig:989-1009
+        if (bk == BuiltinKind.has_field and type_arg_n != null_node and bc_args.count >= 1) {
+            const ti = self.resolveTypeArg(type_arg_n)
+            if (ti != invalid_type) {
+                const t = self.types.get(ti)
+                if (t.tag == TAG_STRUCT) {
+                    const st = switch (t) { Type.struct_type |s| => s, else => StructType { name: "", field_count: 0, fields: 0, size: 0, alignment: 0, layout: 0 } }
+                    const fs = self.evalConstString(bc_args.get(0))
+                    if (fs.0 != 0) {
+                        for fi in 0..st.field_count {
+                            if (st.getField(fi).name == fs.1) { return (1, 1) }
+                        }
+                        return (1, 0)
+                    }
+                }
+            }
+        }
         if (bk == BuiltinKind.size_of and type_arg_n != null_node) {
             const type_idx = self.resolveTypeExpr(type_arg_n)
             if (type_idx != invalid_type) {
