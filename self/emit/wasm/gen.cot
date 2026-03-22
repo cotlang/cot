@@ -2143,21 +2143,14 @@ struct GenState {
         // Emit TEXT marker at start (preprocess reads frame_size from it)
         const text_idx = self.builder.appendFrom(As.text, constAddr(self.frame_size))
 
-        // Generate code for each block in layout order (Zig gen.zig:1346)
-        const use_order = self.ssa_func.block_order.count > 0
-        var num_iter = self.ssa_func.blocks.count
-        if (use_order) { num_iter = self.ssa_func.block_order.count }
-
-        for iter_i in 0..num_iter {
-            var bi = iter_i
-            if (use_order) { bi = self.ssa_func.block_order.get(iter_i) }
+        // Generate code for each block (Zig gen.zig:1346)
+        for iter_i in 0..self.ssa_func.blocks.count {
+            const bi = iter_i
             var next_bi = -1
-            if (use_order and iter_i + 1 < num_iter) {
-                next_bi = self.ssa_func.block_order.get(iter_i + 1)
-            } else if (!use_order and iter_i + 1 < num_iter) {
+            if (iter_i + 1 < self.ssa_func.blocks.count) {
                 next_bi = iter_i + 1
             }
-            const has_next = next_bi >= 0 and next_bi < self.ssa_func.blocks.count
+            const has_next = next_bi >= 0
 
             // Record first Prog of this block
             const first_prog_idx = self.builder.count
