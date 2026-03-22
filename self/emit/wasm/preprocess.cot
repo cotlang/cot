@@ -17,6 +17,7 @@
 import "std/list"
 import "prog"
 import "types"
+import "../../debug"
 
 // ============================================================================
 // Helpers
@@ -355,12 +356,14 @@ fn pass6ResolveBranches(sym: *Symbol, entryPointLoopIdx: int, entryPointLoopBran
 // ============================================================================
 
 fn preprocess(sym: *Symbol) void {
+    debug_log(.codegen, "preprocess: '${sym.name}' framesize=${sym.frame_size}")
     if (sym.frame_size < 0) { return }
     if (sym.text.count == 0) { return }
 
     const result = pass1CountResumePoints(sym)
     const numResumePoints = result.0
     const tableIdxs = result.1
+    debug_log(.codegen, "  pass 1 complete: numResumePoints=${numResumePoints}, tableIdxs=${tableIdxs.count}")
 
     // Convert index-based branch targets to pc-based BEFORE any insertions
     convertBranchTargetsToPc(sym)
@@ -371,6 +374,8 @@ fn preprocess(sym: *Symbol) void {
     var tblIdxs = tableIdxs
     const loopIdx = pass5DispatchLoop(sym, numResumePoints, &tblIdxs, &entryPointLoopBranches)
     pass6ResolveBranches(sym, loopIdx, &entryPointLoopBranches)
+
+    debug_log(.codegen, "  preprocess complete: ${entryPointLoopBranches.count} branches resolved")
 }
 
 // ============================================================================

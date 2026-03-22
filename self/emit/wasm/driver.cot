@@ -23,6 +23,7 @@ import "../../optimize/schedule"
 import "../../optimize/layout"
 import "lower"
 import "passes"
+import "../../debug"
 
 import "passes_dec"
 import "link"
@@ -76,6 +77,7 @@ struct CompileOptions {
 /// Generate a complete Wasm binary from IR functions, globals, and type registry.
 /// Returns the binary as List(int) (byte values).
 fn generateWasmCode(ir: IR, types: *TypeRegistry, opts: CompileOptions) List(int) {
+    debug_log(.codegen, "driver: generating Wasm for ${ir.funcs.count} functions")
     var linker = Linker.init()
 
     // Configure memory: 256 pages = 16MB

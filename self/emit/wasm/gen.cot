@@ -20,6 +20,7 @@ import "../../build/ssa"
 import "../../check/types"
 import "prog"
 import "types"
+import "../../debug"
 
 // Memory layout constants
 const GLOBAL_BASE: int = 0x20000  // 128KB, after stack and heap start
@@ -2136,6 +2137,8 @@ struct GenState {
     // ========================================================================
 
     fn generate() Symbol {
+        debug_log(.codegen, "wasm/gen: generating '${self.ssa_func.name}' (${self.ssa_func.blocks.count} blocks)")
+
         // Compute use counts (self-hosted SSA doesn't auto-track)
         self.computeUses()
 
@@ -2200,6 +2203,9 @@ struct GenState {
         sym.float_local_count = self.float_local_count
         sym.gc_ref_locals = self.gc_ref_locals
         sym.text = self.builder.progs
+
+        debug_log(.codegen, "wasm/gen: generated ${self.builder.count} instructions, ${self.branches.count} branches, frame_size=${self.frame_size}")
+
         return sym
     }
 
