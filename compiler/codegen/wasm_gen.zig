@@ -545,12 +545,6 @@ pub const FuncGen = struct {
                 }
             },
 
-            // ARC retain/release: native-only. Wasm uses WasmGC.
-            // These ops should never appear in the Wasm pipeline.
-            .wasm_lowered_retain, .wasm_lowered_release => {
-                debug.log(.codegen, "    ERROR: ARC op in Wasm pipeline (native-only): {s}", .{@tagName(v.op)});
-                try self.code.emitUnreachable();
-            },
 
             // Stores (Go lines 280-284)
             .wasm_i64_store => {

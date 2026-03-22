@@ -1049,11 +1049,6 @@ pub const GenState = struct {
                 p.to = prog_mod.constAddr(v.aux_int);
             },
 
-            // ARC retain/release: native-only. Wasm uses WasmGC.
-            .wasm_lowered_retain, .wasm_lowered_release => {
-                _ = try self.builder.append(.@"unreachable");
-            },
-
             // WasmGC struct operations
             // Reference: Wasm GC proposal spec — 0xFB prefix + opcode + type/field indices
             .wasm_gc_struct_new => {

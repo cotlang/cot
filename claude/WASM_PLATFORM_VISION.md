@@ -174,6 +174,86 @@ Architecturally possible when the compiler is in the runtime.
 
 ---
 
+## Cotty as Self-Contained IDE — Single App, Full Toolchain
+
+### The Vision
+
+Cotty bundles the entire Cot toolchain inside a single macOS app (and eventually Linux/browser). Download `Cotty.app`, open it, write Cot. Compiler, LSP, formatter, linter, test runner — everything works immediately with zero setup.
+
+### What Gets Bundled
+
+The `cot` binary is already a single executable that contains every tool:
+
+| Tool | Command | Ships Inside Cotty |
+|------|---------|-------------------|
+| Compiler | `cot build` | Yes — `Cotty.app/Contents/Resources/cot` |
+| LSP | `cot lsp` | Yes — same binary, Cotty's LSP client points to it |
+| Formatter | `cot fmt` | Yes — format on save, zero config |
+| Linter | `cot lint` | Yes — inline diagnostics |
+| Test runner | `cot test` | Yes — run tests from editor, results in panel |
+| REPL/runner | `cot run` | Yes — run scripts from terminal pane |
+
+One binary (~5MB), all tools. No separate installs.
+
+### User Experience: New User
+
+1. Download `Cotty.app` (signed, notarized, Sparkle auto-updates — Ghostty installer pattern)
+2. Open it
+3. `File → New Project` creates `cot.json`, `src/main.cot`
+4. Write code — get completions, diagnostics, hover docs immediately (bundled LSP)
+5. `Cmd+B` builds (bundled compiler)
+6. `Cmd+R` runs (output in terminal pane)
+7. `Cmd+T` runs tests (results in test panel)
+
+No `brew install`, no PATH setup, no "install the Cot extension", no "point to your compiler". Just works.
+
+### Architecture
+
+```
+Cotty.app/
+  Contents/
+    MacOS/
+      Cotty              ← Swift/Metal shell (thin)
+    Frameworks/
+      libcotty.dylib     ← all IDE logic (Cot)
+    Resources/
+      cot                ← compiler/LSP/fmt/lint/test binary
+      stdlib/            ← standard library source
+      shell-integration/ ← zsh/bash integration scripts
+```
+
+Cotty's LSP client spawns `Resources/cot lsp` — no system PATH lookup. Build commands invoke `Resources/cot build`. The bundled stdlib means `import "std/json"` works out of the box.
+
+### Version Coupling
+
+When you ship a new Cotty, it ships with the matching compiler version. No version mismatch headaches. Auto-update via Sparkle keeps compiler and IDE in sync. The compiler version is shown in the status bar.
+
+### The External Install Still Matters
+
+The standalone toolchain (`brew install cot`) remains for:
+- **CI/CD** — headless builds, no GUI needed
+- **Other editors** — VS Code, Neovim, Cursor users get `cot lsp` via PATH
+- **Scripting** — `cot run script.cot` from any terminal
+- **Building without a GUI** — servers, containers, automation
+
+Same compiler, two distribution paths: `brew install cot` for the toolchain, `Cotty.app` for the batteries-included experience.
+
+### Why This Works for Cot Specifically
+
+Most languages can't do this cleanly because their toolchains are sprawling (cargo + rustup + clippy + rust-analyzer, or npm + node + tsc + eslint + prettier). Cot's toolchain is ONE binary with subcommands. That's what makes bundling trivial — it's already self-contained.
+
+The self-hosted compiler (selfcot) compiles to a single native binary with zero dependencies. No runtime, no VM, no framework. Just a binary and stdlib source files.
+
+### Future: Browser Cotty
+
+When Cotty runs in the browser (Phase 4), the same pattern applies but with Wasm:
+- `selfcot.wasm` replaces `Resources/cot` — compiler runs in-browser
+- LSP runs as Wasm — diagnostics without a server
+- stdlib bundled as virtual filesystem
+- Zero install, zero server cost, infinite scale
+
+---
+
 ## Competitive Position
 
 No other language has all of these at once:

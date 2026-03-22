@@ -139,6 +139,40 @@ pub const WasiFunctions = struct {
 };
 
 // =============================================================================
+// Runtime function name check — used by driver.zig to distinguish runtime
+// functions (handled as module stubs) from user extern fns (Wasm imports).
+// =============================================================================
+
+pub fn isRuntimeFunction(name: []const u8) bool {
+    const runtime_names = [_][]const u8{
+        FD_WRITE_NAME, FD_WRITE_SIMPLE_NAME, FD_READ_SIMPLE_NAME, FD_CLOSE_NAME,
+        FD_SEEK_NAME, FD_OPEN_NAME, TIME_NAME, RANDOM_NAME, EXIT_NAME,
+        ARGS_COUNT_NAME, ARG_LEN_NAME, ARG_PTR_NAME,
+        ENVIRON_COUNT_NAME, ENVIRON_LEN_NAME, ENVIRON_PTR_NAME,
+        NET_SOCKET_NAME, NET_BIND_NAME, NET_LISTEN_NAME, NET_ACCEPT_NAME,
+        NET_CONNECT_NAME, NET_SET_REUSE_ADDR_NAME,
+        KQUEUE_CREATE_NAME, KEVENT_ADD_NAME, KEVENT_DEL_NAME, KEVENT_WAIT_NAME,
+        EPOLL_CREATE_NAME, EPOLL_ADD_NAME, EPOLL_DEL_NAME, EPOLL_WAIT_NAME,
+        SET_NONBLOCK_NAME, FORK_NAME, EXECVE_NAME, DUP2_NAME, PIPE_NAME,
+        WAITPID_NAME, ISATTY_NAME, MKDIR_NAME, DIR_OPEN_NAME, DIR_NEXT_NAME,
+        DIR_CLOSE_NAME, STAT_TYPE_NAME, UNLINK_NAME,
+        // Names registered in driver.zig without pub const (process/pty ops)
+        "setsid", "ioctl_winsize", "ioctl_set_ctty", "kill",
+        "openpty", "poll_read", "buildPath", "argvBuild1", "buildEnvp",
+        "__cot_install_signals",
+        // Memory/print runtime (handled by mem_runtime, print_runtime, etc.)
+        "alloc", "dealloc", "realloc", "alloc_raw", "dealloc_raw", "realloc_raw",
+        "memcpy", "memset_zero", "string_eq", "string_concat",
+        "growslice", "nextslicecap",
+        "println", "eprintln", "print_int", "eprint_int", "int_to_string",
+    };
+    for (&runtime_names) |rn| {
+        if (std.mem.eql(u8, name, rn)) return true;
+    }
+    return false;
+}
+
+// =============================================================================
 // addToLinker — register all WASI runtime functions
 // =============================================================================
 

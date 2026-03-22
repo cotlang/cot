@@ -107,6 +107,10 @@ pub const Driver = struct {
     // Collected from checker scopes after type checking.
     // Registered in func_index_map so native backend can resolve calls.
     user_extern_fns: std.ArrayListUnmanaged([]const u8) = .{},
+    // Extern fn signatures — parallel arrays with user_extern_fns.
+    // Wasm-level param count (strings decomposed to ptr+len = 2 params).
+    user_extern_param_counts: std.ArrayListUnmanaged(u32) = .{},
+    user_extern_has_result: std.ArrayListUnmanaged(bool) = .{},
     /// Dict dispatch: maps concrete generic name → list of dict helper fn names (extra args).
     dict_arg_names: ?*const std.StringHashMap([]const []const u8) = null,
 
@@ -353,7 +357,7 @@ pub const Driver = struct {
         if (err_reporter.hasErrors()) return error.TypeCheckError;
 
         // Collect user-declared extern fn names for native func_index_map
-        self.collectExternFns(&global_scope);
+        self.collectExternFns(&global_scope, &type_reg);
 
         // Lower to IR
         var lowerer = lower_mod.Lowerer.init(self.allocator, &tree, &type_reg, &err_reporter, &chk, self.target);
@@ -460,9 +464,9 @@ pub const Driver = struct {
 
         // Collect user-declared extern fn names for native func_index_map
         for (file_scopes.items) |fs| {
-            self.collectExternFns(fs);
+            self.collectExternFns(fs, &type_reg);
         }
-        self.collectExternFns(&global_scope);
+        self.collectExternFns(&global_scope, &type_reg);
 
         // Go LinkFuncName pattern: build module name map for qualified IR function names.
         // This prevents name collisions when two modules export functions with the same name
@@ -756,17 +760,45 @@ pub const Driver = struct {
         return self.generateCode(final_ir.funcs, final_ir.globals, &type_reg, main_file.path, main_file.source_text);
     }
 
-    /// Collect user-declared extern fn names from a checker scope.
+    /// Collect user-declared extern fn names and signatures from a checker scope.
     /// These are functions declared with `extern fn` in user code (e.g. sqlite3_open).
     /// They need func_index_map entries so the native backend can emit calls to them.
+    /// For --target=js, param counts are used to generate Wasm import entries.
     /// Reference: cg_clif abi/mod.rs:97-115 — Linkage::Import pattern for external symbols
-    fn collectExternFns(self: *Driver, scope: *const checker_mod.Scope) void {
+    fn collectExternFns(self: *Driver, scope: *const checker_mod.Scope, type_reg: *types_mod.TypeRegistry) void {
         var iter = scope.symbols.iterator();
         while (iter.next()) |entry| {
             const sym = entry.value_ptr.*;
             if (sym.is_extern and sym.kind == .function) {
-                // Skip names already in runtime_func_names (e.g. alloc, dealloc)
                 self.user_extern_fns.append(self.allocator, sym.name) catch {};
+
+                // Resolve param count and return type from the type registry.
+                // Cot's Wasm ABI: all params are i64, strings decompose to (ptr, len).
+                var param_count: u32 = 0;
+                var has_result: bool = false;
+                const ti = sym.type_idx;
+                if (ti < type_reg.types.items.len) {
+                    const t = type_reg.types.items[ti];
+                    if (t == .func) {
+                        // Count Wasm-level params: strings/slices = 2 params (ptr+len), everything else = 1
+                        for (t.func.params) |p| {
+                            const pt = p.type_idx;
+                            if (pt < type_reg.types.items.len) {
+                                const pt_info = type_reg.types.items[pt];
+                                if (pt_info == .slice or pt == types_mod.TypeRegistry.STRING) {
+                                    param_count += 2; // ptr + len
+                                } else {
+                                    param_count += 1;
+                                }
+                            } else {
+                                param_count += 1;
+                            }
+                        }
+                        has_result = t.func.return_type != types_mod.TypeRegistry.VOID;
+                    }
+                }
+                self.user_extern_param_counts.append(self.allocator, param_count) catch {};
+                self.user_extern_has_result.append(self.allocator, has_result) catch {};
             }
         }
     }
@@ -5909,6 +5941,41 @@ pub const Driver = struct {
         // Reference: WASI preview1 fd_write
         // ====================================================================
         const wasi_funcs = try wasi_runtime.addToLinker(self.allocator, &linker, self.target);
+
+        // ====================================================================
+        // For --target=js (browser): register user extern fns as real Wasm imports
+        // instead of stubs. These become import entries in the Wasm binary that
+        // the JS host must provide. Module name "env" (standard convention).
+        // Runtime functions (alloc, fd_write, etc.) remain as module stubs.
+        // Reference: WASI import pattern in wasi_runtime.zig — same addType+addImport.
+        // Reference: Go syscall/js — wasm_exec.js provides host functions.
+        // ====================================================================
+        if (!self.target.isWasi()) {
+            for (self.user_extern_fns.items, 0..) |name, idx| {
+                // Skip runtime functions — they're already handled as module stubs
+                // by wasi_runtime, mem_runtime, print_runtime, etc.
+                if (wasi_runtime.isRuntimeFunction(name)) continue;
+
+                const param_count = self.user_extern_param_counts.items[idx];
+                const has_result = self.user_extern_has_result.items[idx];
+
+                // Create Wasm type: all params are i64 (Cot's Wasm calling convention)
+                const wasm_constants = @import("codegen/wasm/constants.zig");
+                var param_types_buf: [32]wasm_constants.ValType = undefined;
+                const pc = @min(param_count, 32);
+                for (0..pc) |i| {
+                    param_types_buf[i] = .i64;
+                }
+                const result_types: []const wasm_constants.ValType = if (has_result) &.{.i64} else &.{};
+                const type_idx = try linker.addType(param_types_buf[0..pc], result_types);
+
+                _ = try linker.addImport(.{
+                    .module = "env",
+                    .name = name,
+                    .type_idx = type_idx,
+                });
+            }
+        }
 
         // On Wasm targets, WASI imports shift all module function indices.
         // All module function indices must be offset by import_count to get

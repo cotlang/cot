@@ -209,11 +209,8 @@ fn lowerValue(v: *Value) bool {
         .move => .wasm_lowered_move,
         .zero => .wasm_lowered_zero,
 
-        // ====================================================================
-        // ARC (Reference Counting)
-        // ====================================================================
-        .retain => .wasm_lowered_retain,
-        .release => .wasm_lowered_release,
+        // ARC: no-op on Wasm (Wasm uses WasmGC, not ARC)
+        .retain, .release => .wasm_nop,
 
         // ====================================================================
         // Control Flow & Structural - already target-independent, leave as-is
@@ -287,7 +284,6 @@ fn lowerValue(v: *Value) bool {
         .wasm_unreachable, .wasm_nop, .wasm_return,
         .wasm_lowered_move, .wasm_lowered_zero, .wasm_lowered_nil_check,
         .wasm_lowered_static_call, .wasm_lowered_closure_call, .wasm_lowered_inter_call,
-        .wasm_lowered_retain, .wasm_lowered_release,
         // WasmGC ops (already Wasm-level, pass through)
         .wasm_gc_struct_new, .wasm_gc_struct_get, .wasm_gc_struct_set,
         .wasm_gc_array_new, .wasm_gc_array_new_default, .wasm_gc_array_new_fixed, .wasm_gc_array_new_data,
