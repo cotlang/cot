@@ -2693,20 +2693,20 @@ pub const Lowerer = struct {
                         // Compound optional field: wrap T → ?T
                         try self.storeCompoundOptField(fb, local_idx, field_idx, field_offset, value_node_ir, field_init.value, span);
                     } else {
-                        // @safe auto-ref: dereference pointer when field expects struct value
+                        // @safe auto-ref: dereference pointer when field expects struct/union value
                         var actual_value = value_node_ir;
-                        if (self.chk.safe_mode and field_type == .struct_type) {
+                        if (self.chk.safe_mode and (field_type == .struct_type or field_type == .union_type)) {
                             const value_type_idx = fb.nodes.items[value_node_ir].type_idx;
                             const value_type = self.type_reg.get(value_type_idx);
                             if (value_type == .pointer and self.type_reg.isAssignable(value_type.pointer.elem, struct_field.type_idx)) {
                                 actual_value = try fb.emitPtrLoadValue(value_node_ir, struct_field.type_idx, span);
                             }
                         }
-                        // @safe auto-ref: take address when field expects *Struct and value is Struct
+                        // @safe auto-ref: take address when field expects *Struct/*Union and value is Struct/Union
                         if (self.chk.safe_mode and field_type == .pointer) {
                             const value_type_idx = fb.nodes.items[value_node_ir].type_idx;
                             const value_type = self.type_reg.get(value_type_idx);
-                            if (value_type == .struct_type and self.type_reg.isAssignable(value_type_idx, field_type.pointer.elem)) {
+                            if ((value_type == .struct_type or value_type == .union_type) and self.type_reg.isAssignable(value_type_idx, field_type.pointer.elem)) {
                                 actual_value = try self.autoRefValue(fb, value_node_ir, field_init.value, struct_field.type_idx, span);
                             }
                         }
@@ -2876,7 +2876,14 @@ pub const Lowerer = struct {
                         _ = try fb.emitStoreLocalField(local_idx, 0, 0, tag_val, span);
                         // Store payload at offset 8
                         if (call.args.len > 0) {
-                            const payload_val = try self.lowerExprNode(call.args[0]);
+                            var payload_val = try self.lowerExprNode(call.args[0]);
+                            // @safe auto-deref: if arg is *T but payload expects T, deref
+                            if (self.chk.safe_mode and v.payload_type != TypeRegistry.VOID) {
+                                const pv_type = self.type_reg.get(fb.nodes.items[payload_val].type_idx);
+                                if (pv_type == .pointer and self.type_reg.isAssignable(pv_type.pointer.elem, v.payload_type)) {
+                                    payload_val = try fb.emitPtrLoadValue(payload_val, v.payload_type, span);
+                                }
+                            }
                             // WasmGC: struct payloads are GC refs — extract fields as i64 chunks
                             if (self.target.isWasmGC() and v.payload_type != TypeRegistry.VOID) {
                                 const payload_info = self.type_reg.get(v.payload_type);
@@ -5080,6 +5087,25 @@ pub const Lowerer = struct {
             return try self.lowerShortCircuit(fb, left, bin);
         }
 
+        // Union variant tag comparison: union == .variant / union == Union.Variant
+        // Must be before lowering RHS — the RHS is a tag reference, not a value.
+        // Pattern: extract tag from union (field 0, offset 0), compare against variant index.
+        if (bin.op == .eql or bin.op == .neq) {
+            const left_type_idx = self.inferExprType(bin.left);
+            const left_info = self.type_reg.get(left_type_idx);
+            if (left_info == .union_type) {
+                if (self.resolveUnionVariantIndex(bin.right, left_info.union_type)) |vidx| {
+                    const size = self.type_reg.sizeOf(left_type_idx);
+                    const union_local = try fb.addLocalWithSize("__union_cmp", left_type_idx, false, size);
+                    _ = try fb.emitStoreLocal(union_local, left, bin.span);
+                    const tag = try fb.emitFieldLocal(union_local, 0, 0, TypeRegistry.I64, bin.span);
+                    const idx_val = try fb.emitConstInt(@intCast(vidx), TypeRegistry.I64, bin.span);
+                    const cmp_op: ir.BinaryOp = if (bin.op == .eql) .eq else .ne;
+                    return try fb.emitBinary(cmp_op, tag, idx_val, TypeRegistry.BOOL, bin.span);
+                }
+            }
+        }
+
         const right = try self.lowerExprNode(bin.right);
         if (right == ir.null_node) return ir.null_node;
         const result_type = self.inferBinaryType(bin.op, bin.left, bin.right);
@@ -5534,7 +5560,17 @@ pub const Lowerer = struct {
         }
 
         // Union: .tag pseudo-field, payload extraction, or variant tag
-        if (base_type == .union_type) {
+        // @safe auto-deref: *Union → Union for field access
+        var union_base_type_idx = base_type_idx;
+        var union_base_type = base_type;
+        if (base_type == .pointer) {
+            const elem = self.type_reg.get(base_type.pointer.elem);
+            if (elem == .union_type) {
+                union_base_type_idx = base_type.pointer.elem;
+                union_base_type = elem;
+            }
+        }
+        if (union_base_type == .union_type) {
             // Resolve base to local if possible (same pattern as struct field access)
             const base_node_ast = self.tree.getNode(fa.base);
             const base_expr = if (base_node_ast) |n| n.asExpr() else null;
@@ -5551,7 +5587,7 @@ pub const Lowerer = struct {
                 const base_val = try self.lowerExprNode(fa.base);
                 return try fb.emitFieldValue(base_val, 0, 0, TypeRegistry.I64, fa.span);
             }
-            for (base_type.union_type.variants, 0..) |variant, i| {
+            for (union_base_type.union_type.variants, 0..) |variant, i| {
                 if (std.mem.eql(u8, variant.name, fa.field)) {
                     if (variant.payload_type != types.invalid_type) {
                         // Payload extraction: load from union at offset 8
@@ -5562,14 +5598,14 @@ pub const Lowerer = struct {
                         return try fb.emitFieldValue(base_val, 1, 8, variant.payload_type, fa.span);
                     }
                     // Unit variant: create temp local with tag stored
-                    const union_size = self.type_reg.sizeOf(base_type_idx);
+                    const union_size = self.type_reg.sizeOf(union_base_type_idx);
                     if (union_size > 8) {
-                        const tmp_local = try fb.addLocalWithSize("__union_tmp", base_type_idx, false, union_size);
+                        const tmp_local = try fb.addLocalWithSize("__union_tmp", union_base_type_idx, false, union_size);
                         const tag_val = try fb.emitConstInt(@intCast(i), TypeRegistry.I64, fa.span);
                         _ = try fb.emitStoreLocalField(tmp_local, 0, 0, tag_val, fa.span);
-                        return try fb.emitLoadLocal(tmp_local, base_type_idx, fa.span);
+                        return try fb.emitLoadLocal(tmp_local, union_base_type_idx, fa.span);
                     }
-                    return try fb.emitConstInt(@intCast(i), base_type_idx, fa.span);
+                    return try fb.emitConstInt(@intCast(i), union_base_type_idx, fa.span);
                 }
             }
             return ir.null_node;
@@ -6130,20 +6166,20 @@ pub const Lowerer = struct {
                         // Compound optional field: wrap T → ?T (must match lowerStructInit pattern)
                         try self.storeCompoundOptField(fb, temp_idx, field_idx, field_offset, value_node, field_init.value, si.span);
                     } else {
-                        // @safe auto-ref: dereference pointer when field expects struct value
+                        // @safe auto-ref: dereference pointer when field expects struct/union value
                         var actual_value = value_node;
-                        if (self.chk.safe_mode and field_type == .struct_type) {
+                        if (self.chk.safe_mode and (field_type == .struct_type or field_type == .union_type)) {
                             const value_type_idx = fb.nodes.items[value_node].type_idx;
                             const value_type = self.type_reg.get(value_type_idx);
                             if (value_type == .pointer and self.type_reg.isAssignable(value_type.pointer.elem, struct_field.type_idx)) {
                                 actual_value = try fb.emitPtrLoadValue(value_node, struct_field.type_idx, si.span);
                             }
                         }
-                        // @safe auto-ref: take address when field expects *Struct and value is Struct
+                        // @safe auto-ref: take address when field expects *Struct/*Union and value is Struct/Union
                         if (self.chk.safe_mode and field_type == .pointer) {
                             const value_type_idx = fb.nodes.items[value_node].type_idx;
                             const value_type = self.type_reg.get(value_type_idx);
-                            if (value_type == .struct_type and self.type_reg.isAssignable(value_type_idx, field_type.pointer.elem)) {
+                            if ((value_type == .struct_type or value_type == .union_type) and self.type_reg.isAssignable(value_type_idx, field_type.pointer.elem)) {
                                 actual_value = try self.autoRefValue(fb, value_node, field_init.value, struct_field.type_idx, si.span);
                             }
                         }
@@ -7486,7 +7522,14 @@ pub const Lowerer = struct {
                 result_type = self.inferExprType(se.else_body);
             }
         }
-        const subject_type = self.inferExprType(se.subject);
+        var subject_type = self.inferExprType(se.subject);
+        // @safe auto-deref: switch on *Union → switch on Union
+        if (self.chk.safe_mode) {
+            const si = self.type_reg.get(subject_type);
+            if (si == .pointer and self.type_reg.get(si.pointer.elem) == .union_type) {
+                subject_type = si.pointer.elem;
+            }
+        }
         const is_union = self.type_reg.get(subject_type) == .union_type;
         // Union switches always use the dedicated handler that compares tags
         // (tag extraction + integer equality). The generic select/block paths
@@ -7555,8 +7598,13 @@ pub const Lowerer = struct {
 
     fn lowerSwitchStatement(self: *Lowerer, se: ast.SwitchExpr) Error!ir.NodeIndex {
         const fb = self.current_func orelse return ir.null_node;
-        const subject_type = self.inferExprType(se.subject);
-        const subject_info = self.type_reg.get(subject_type);
+        var subject_type = self.inferExprType(se.subject);
+        var subject_info = self.type_reg.get(subject_type);
+        // @safe auto-deref: switch on *Union → switch on Union
+        if (self.chk.safe_mode and subject_info == .pointer and self.type_reg.get(subject_info.pointer.elem) == .union_type) {
+            subject_type = subject_info.pointer.elem;
+            subject_info = self.type_reg.get(subject_type);
+        }
         const is_union = subject_info == .union_type;
         // Zig Sema pattern: set current enum type for .variant shorthand resolution
         const old_switch_enum = self.current_switch_enum_type;
@@ -8299,15 +8347,29 @@ pub const Lowerer = struct {
                                 const tag_val = try fb.emitConstInt(@intCast(i), TypeRegistry.I64, fa.span);
                                 _ = try fb.emitStoreLocalField(tmp_local, 0, 0, tag_val, fa.span);
                                 if (call.args.len > 0) {
-                                    const payload_val = try self.lowerExprNode(call.args[0]);
+                                    var payload_val = try self.lowerExprNode(call.args[0]);
+                                    // @safe auto-deref: if arg is *T but payload expects T, deref
+                                    if (self.chk.safe_mode and v.payload_type != TypeRegistry.VOID) {
+                                        const pv_type = self.type_reg.get(fb.nodes.items[payload_val].type_idx);
+                                        if (pv_type == .pointer and self.type_reg.isAssignable(pv_type.pointer.elem, v.payload_type)) {
+                                            payload_val = try fb.emitPtrLoadValue(payload_val, v.payload_type, fa.span);
+                                        }
+                                    }
                                     _ = try fb.emitStoreLocalField(tmp_local, 1, 8, payload_val, fa.span);
                                 }
                                 return try fb.emitLoadLocal(tmp_local, base_type_idx, fa.span);
                             }
-                            const payload: ?ir.NodeIndex = if (call.args.len > 0)
+                            var payload: ?ir.NodeIndex = if (call.args.len > 0)
                                 try self.lowerExprNode(call.args[0])
                             else
                                 null;
+                            // @safe auto-deref: if arg is *T but payload expects T, deref
+                            if (self.chk.safe_mode and payload != null and v.payload_type != TypeRegistry.VOID) {
+                                const pv_type = self.type_reg.get(fb.nodes.items[payload.?].type_idx);
+                                if (pv_type == .pointer and self.type_reg.isAssignable(pv_type.pointer.elem, v.payload_type)) {
+                                    payload = try fb.emitPtrLoadValue(payload.?, v.payload_type, fa.span);
+                                }
+                            }
                             return try fb.emitUnionInit(@intCast(i), payload, base_type_idx, fa.span);
                         }
                     }
@@ -8555,7 +8617,7 @@ pub const Lowerer = struct {
                         if (param_info == .pointer) {
                             const arg_type = self.inferExprType(arg_idx);
                             const arg_info = self.type_reg.get(arg_type);
-                            if (arg_info == .struct_type and self.type_reg.isAssignable(arg_type, param_info.pointer.elem)) {
+                            if ((arg_info == .struct_type or arg_info == .union_type) and self.type_reg.isAssignable(arg_type, param_info.pointer.elem)) {
                                 // WasmGC: struct values are already GC refs — *Struct and Struct
                                 // are the same thing. No address-taking needed.
                                 if (self.target.isWasmGC()) {
@@ -8592,6 +8654,23 @@ pub const Lowerer = struct {
                                 }
                                 }
                             }
+                        }
+                    }
+                }
+            }
+
+            // @safe auto-deref: when arg is *T (from @safe wrapping) but param expects T
+            // (generic function with unwrapped param), deref the pointer to get the value.
+            if (self.chk.safe_mode and !param_is_pointer) {
+                if (param_types) |params| {
+                    if (arg_i < params.len) {
+                        const arg_type = self.inferExprType(arg_idx);
+                        const arg_info = self.type_reg.get(arg_type);
+                        const param_tidx = params[arg_i].type_idx;
+                        if (arg_info == .pointer and (self.type_reg.get(arg_info.pointer.elem) == .struct_type or self.type_reg.get(arg_info.pointer.elem) == .union_type) and
+                            self.type_reg.isAssignable(arg_info.pointer.elem, param_tidx))
+                        {
+                            arg_node = try fb.emitPtrLoadValue(arg_node, param_tidx, call.span);
                         }
                     }
                 }
@@ -9506,7 +9585,7 @@ pub const Lowerer = struct {
                         if (param_info == .pointer) {
                             const arg_type = self.inferExprType(arg_idx);
                             const arg_info = self.type_reg.get(arg_type);
-                            if (arg_info == .struct_type and self.type_reg.isAssignable(arg_type, param_info.pointer.elem)) {
+                            if ((arg_info == .struct_type or arg_info == .union_type) and self.type_reg.isAssignable(arg_type, param_info.pointer.elem)) {
                                 // WasmGC: struct values are already GC refs — pass directly
                                 if (self.target.isWasmGC()) {
                                     // arg_node is already the GC ref, pass it directly
@@ -9539,6 +9618,24 @@ pub const Lowerer = struct {
                                 }
                                 }
                             }
+                        }
+                    }
+                }
+            }
+
+            // @safe auto-deref: when arg is *T (from @safe wrapping) but param expects T
+            // (generic function with unwrapped param), deref the pointer to get the value.
+            if (self.chk.safe_mode and !param_is_pointer) {
+                if (param_types) |params| {
+                    const param_idx_d = arg_i + receiver_offset;
+                    if (param_idx_d < params.len) {
+                        const arg_type = self.inferExprType(arg_idx);
+                        const arg_info = self.type_reg.get(arg_type);
+                        const param_tidx = params[param_idx_d].type_idx;
+                        if (arg_info == .pointer and (self.type_reg.get(arg_info.pointer.elem) == .struct_type or self.type_reg.get(arg_info.pointer.elem) == .union_type) and
+                            self.type_reg.isAssignable(arg_info.pointer.elem, param_tidx))
+                        {
+                            arg_node = try fb.emitPtrLoadValue(arg_node, param_tidx, call.span);
                         }
                     }
                 }

@@ -2143,7 +2143,6 @@ struct GenState {
         // Compute use counts (self-hosted SSA doesn't auto-track)
         self.computeUses()
 
-
         // Allocate locals for values (3-pass: i64, f64, GC ref)
         self.allocateLocals()
 

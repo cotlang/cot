@@ -1712,7 +1712,19 @@ pub const Checker = struct {
 
     fn checkBinary(self: *Checker, bin: ast.Binary) CheckError!TypeIndex {
         const left_type = try self.checkExpr(bin.left);
+
+        // Union variant comparison: set context so .variant shorthand resolves for RHS.
+        // Zig Sema pattern: same as switch enum context but for == / != with union LHS.
+        const old_switch_enum = self.current_switch_enum_type;
+        if (bin.op == .eql or bin.op == .neq) {
+            const left_info = self.types.get(left_type);
+            if (left_info == .union_type) {
+                self.current_switch_enum_type = left_type;
+            }
+        }
         const right_type = try self.checkExpr(bin.right);
+        self.current_switch_enum_type = old_switch_enum;
+
         const left = self.types.get(left_type);
         const right = self.types.get(right_type);
 
@@ -1830,6 +1842,11 @@ pub const Checker = struct {
                 return TypeRegistry.commonType(left_type, right_type);
             },
             .eql, .neq, .lss, .leq, .gtr, .geq => {
+                // Union variant tag comparison: union == .variant / union == Union.Variant
+                if (bin.op == .eql or bin.op == .neq) {
+                    if (left == .union_type and self.isUnionVariantRef(bin.right, left.union_type)) return TypeRegistry.BOOL;
+                    if (right == .union_type and self.isUnionVariantRef(bin.left, right.union_type)) return TypeRegistry.BOOL;
+                }
                 if (!self.isComparable(left_type, right_type)) { self.err.errorWithCode(bin.span.start, .e300, "invalid operation"); return invalid_type; }
                 return TypeRegistry.BOOL;
             },
@@ -1981,14 +1998,14 @@ pub const Checker = struct {
                 const param_tidx = ft.params[i + param_offset].type_idx;
                 const pt = self.types.get(param_tidx);
                 const is_safe_struct = self.safe_mode and pt == .pointer and
-                    self.types.get(pt.pointer.elem) == .struct_type and
+                    (self.types.get(pt.pointer.elem) == .struct_type or self.types.get(pt.pointer.elem) == .union_type) and
                     self.types.isAssignable(arg_type, pt.pointer.elem);
-                // @safe reverse coercion: *Struct arg → Struct param (generic methods keep T as value)
+                // @safe reverse coercion: *Struct/Union arg → Struct/Union param (generic methods keep T as value)
                 // When a generic method has param T=Struct (not wrapped because is_substituted),
                 // but the arg is *Struct (auto-ref'd by @safe), allow the deref coercion.
                 const at = self.types.get(arg_type);
                 const is_safe_deref = self.safe_mode and at == .pointer and
-                    self.types.get(at.pointer.elem) == .struct_type and
+                    (self.types.get(at.pointer.elem) == .struct_type or self.types.get(at.pointer.elem) == .union_type) and
                     self.types.isAssignable(at.pointer.elem, param_tidx);
                 if (!is_safe_struct and !is_safe_deref) {
                     self.err.errorWithCode(c.span.start, .e300, "type mismatch");
@@ -2530,7 +2547,7 @@ pub const Checker = struct {
             }
         }
         if (f.base == null_node) {
-            // Zig Sema pattern: .variant shorthand in switch — resolve from switch subject type
+            // Zig Sema pattern: .variant shorthand in switch/comparison — resolve from context type
             if (self.current_switch_enum_type != invalid_type) {
                 const enum_info = self.types.get(self.current_switch_enum_type);
                 if (enum_info == .enum_type) {
@@ -2538,6 +2555,12 @@ pub const Checker = struct {
                         if (std.mem.eql(u8, v.name, f.field)) return self.current_switch_enum_type;
                     }
                     self.errWithSuggestion(f.span.start, "undefined variant", findSimilarVariant(f.field, enum_info.enum_type.variants));
+                }
+                if (enum_info == .union_type) {
+                    for (enum_info.union_type.variants) |v| {
+                        if (std.mem.eql(u8, v.name, f.field)) return self.current_switch_enum_type;
+                    }
+                    self.errWithSuggestion(f.span.start, "undefined variant", findSimilarVariant(f.field, enum_info.union_type.variants));
                 }
             }
             return invalid_type;
@@ -2942,8 +2965,16 @@ pub const Checker = struct {
     }
 
     fn checkSwitchExpr(self: *Checker, se: ast.SwitchExpr) CheckError!TypeIndex {
-        const subject_type = try self.checkExpr(se.subject);
-        const subject_info = self.types.get(subject_type);
+        var subject_type = try self.checkExpr(se.subject);
+        var subject_info = self.types.get(subject_type);
+        // @safe auto-deref: switch on *Union → switch on Union
+        if (self.safe_mode and subject_info == .pointer) {
+            const elem = self.types.get(subject_info.pointer.elem);
+            if (elem == .union_type) {
+                subject_type = subject_info.pointer.elem;
+                subject_info = elem;
+            }
+        }
         const is_union = subject_info == .union_type;
         const is_enum = subject_info == .enum_type;
         // Zig Sema pattern: set current enum type for .variant shorthand resolution in case patterns
@@ -3324,9 +3355,13 @@ pub const Checker = struct {
             if (var_type == invalid_type) var_type = self.materializeType(val_type)
             else if (!self.types.isAssignable(val_type, var_type)) {
                 // @safe coercion: Foo annotation accepts *Foo value (e.g. var f: Foo = new Foo{...})
-                if (self.safe_mode and self.types.get(var_type) == .struct_type and self.types.get(val_type) == .pointer and
-                    self.types.get(self.types.get(val_type).pointer.elem) == .struct_type and
-                    self.types.isAssignable(self.types.get(val_type).pointer.elem, var_type))
+                const vt_info = self.types.get(var_type);
+                const is_composite_var = vt_info == .struct_type or vt_info == .union_type;
+                if (self.safe_mode and is_composite_var and self.types.get(val_type) == .pointer and blk: {
+                    const elem = self.types.get(val_type).pointer.elem;
+                    const elem_info = self.types.get(elem);
+                    break :blk (elem_info == .struct_type or elem_info == .union_type) and self.types.isAssignable(elem, var_type);
+                })
                 {
                     var_type = val_type; // upgrade to *Foo
                 } else {
@@ -4039,9 +4074,11 @@ pub const Checker = struct {
     pub fn safeWrapType(self: *Checker, type_idx: TypeIndex) !TypeIndex {
         if (!self.safe_mode) return type_idx;
         const t = self.types.get(type_idx);
-        if (t == .struct_type) return try self.types.makePointer(type_idx);
+        // Structs and unions are passed by pointer in @safe mode (like TypeScript objects)
+        if (t == .struct_type or t == .union_type) return try self.types.makePointer(type_idx);
         if (t == .error_union) {
-            if (self.types.get(t.error_union.elem) == .struct_type) {
+            const elem = self.types.get(t.error_union.elem);
+            if (elem == .struct_type or elem == .union_type) {
                 const wrapped = try self.types.makePointer(t.error_union.elem);
                 return try self.types.makeErrorUnionWithSet(wrapped, t.error_union.error_set);
             }
@@ -4169,6 +4206,19 @@ pub const Checker = struct {
             .slice => |sl| blk: { const me = self.materializeType(sl.elem); if (me == sl.elem) break :blk idx; break :blk self.types.makeSlice(me) catch idx; },
             else => idx,
         };
+    }
+
+    /// Check if an AST expression is a reference to a variant of the given union type.
+    /// Handles both qualified (Union.Variant) and shorthand (.Variant) forms.
+    fn isUnionVariantRef(self: *Checker, expr_idx: ast.NodeIndex, ut: types.UnionType) bool {
+        const node = self.tree.getNode(expr_idx) orelse return false;
+        const expr = node.asExpr() orelse return false;
+        if (expr != .field_access) return false;
+        const fa = expr.field_access;
+        for (ut.variants) |v| {
+            if (std.mem.eql(u8, v.name, fa.field)) return true;
+        }
+        return false;
     }
 
     fn isComparable(self: *Checker, a: TypeIndex, b: TypeIndex) bool {

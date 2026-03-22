@@ -2492,7 +2492,8 @@ struct Lowerer {
         const new_len = fb.emitBinary(BinaryOp.add, len1, len2, I64, bin.span)
 
         // Create string_header(new_ptr, new_len) — produces string_make in SSA
-        return fb.emit(Node.init(Data.string_header(StringHeader { ptr: new_ptr, len: new_len }), STRING, bin.span))
+        const node = Node.init(Data.string_header(StringHeader { ptr: new_ptr, len: new_len }), STRING, bin.span)
+        return fb.emit(node)
     }
 
     fn lowerUnary(un: Unary, idx: int) int {
@@ -6042,7 +6043,9 @@ struct Lowerer {
         const new_len = fb.emitBinary(BinaryOp.add, len1, len2, I64, span)
 
         // Return slice_header(ptr, len, cap=len)
-        return fb.emit(Node.init(Data.slice_header(SliceHeader { ptr: new_ptr, len: new_len, cap: new_len }), slice_type_idx, span))
+        // NOTE: split to avoid compiler bug where return fb.emit(Node.init(...)) crashes
+        const node = Node.init(Data.slice_header(SliceHeader { ptr: new_ptr, len: new_len, cap: new_len }), slice_type_idx, span)
+        return fb.emit(node)
     }
 
     // ========================================================================

@@ -493,12 +493,26 @@ fn emitLoadAddr(sink: *MachBuffer, rd: Writable(Reg), basereg: Reg, off: i64) !v
         if (shift >= 48) break;
     }
 
+    // ARM64: in the register-register ADD/SUB form, register 31 = XZR (not SP).
+    // If basereg is SP, copy it to tmp2 (x17) first using the immediate form
+    // (where register 31 = SP), then use tmp2 as the base in the register form.
+    // Cranelift reference: emit.rs large-offset handling uses separate temp for SP.
+    var actual_base = basereg;
+    if (machregToGpr(basereg) == 31 and basereg.toRealReg().?.hwEnc() != 31) {
+        // basereg is SP (hw_enc 63, not XZR hw_enc 31) — copy to tmp2 first
+        const tmp2 = tmp2Reg();
+        const tmp2_wr = Writable(Reg).fromReg(tmp2);
+        // ADD tmp2, SP, #0 (immediate form: register 31 = SP)
+        try sink.put4(encArithRrImm12(0b100_10001, 0, 0, basereg, tmp2_wr));
+        actual_base = tmp2;
+    }
+
     if (off >= 0) {
-        // ADD rd, basereg, spilltmp
-        try sink.put4(encArithRrr(0b10001011_000, 0b000000, rd, basereg, tmp));
+        // ADD rd, actual_base, spilltmp
+        try sink.put4(encArithRrr(0b10001011_000, 0b000000, rd, actual_base, tmp));
     } else {
-        // SUB rd, basereg, spilltmp
-        try sink.put4(encArithRrr(0b11001011_000, 0b000000, rd, basereg, tmp));
+        // SUB rd, actual_base, spilltmp
+        try sink.put4(encArithRrr(0b11001011_000, 0b000000, rd, actual_base, tmp));
     }
 }
 

@@ -227,6 +227,25 @@ var c = Color.Red
 union State { Init, Running, Done }
 union Result { Ok: i64, Err: i32 }
 union Event { Click: i64, Hover, KeyPress: i64 }
+
+// Construction
+var s = State.Running
+var r = Result.Ok(42)
+
+// Variant comparison (tag check) — returns bool
+if (s == .Running) { ... }       // shorthand
+if (s == State.Running) { ... }  // qualified
+if (s != .Done) { ... }
+if (r == .Ok) { ... }            // works with payload variants too
+
+// Tag access
+var tag = s.tag                   // i64 tag value (0, 1, 2, ...)
+
+// Payload extraction via switch
+switch (r) {
+    Result.Ok |val| => println(val),
+    Result.Err |code| => println(code),
+}
 ```
 
 ## Error Sets & Error Handling

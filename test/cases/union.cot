@@ -63,3 +63,37 @@ test "union enum payload inline" {
     const val = switch (t) { CuTagged.kind |k| => k as int, else => -1 }
     @assertEq(val, 3)
 }
+
+test "union variant comparison shorthand" {
+    var s = CuState.Running
+    @assert(s == .Running)
+    @assert(s != .Init)
+    @assert(s != .Done)
+}
+
+test "union variant comparison qualified" {
+    var s = CuState.Init
+    @assert(s == CuState.Init)
+    @assert(s != CuState.Running)
+}
+
+test "union variant comparison with payload" {
+    var v = CuValue.Integer(42)
+    @assert(v == .Integer)
+    @assert(v != .Small)
+    @assert(v == CuValue.Integer)
+}
+
+test "union variant comparison in if" {
+    var e = CuEvent.Click(100)
+    if (e == .Click) {
+        @assert(true)
+    } else {
+        @assert(false)
+    }
+    if (e != .Hover) {
+        @assert(true)
+    } else {
+        @assert(false)
+    }
+}
