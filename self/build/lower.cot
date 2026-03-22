@@ -2331,27 +2331,64 @@ struct Lowerer {
         const fb = self.builder.func() orelse return null_node
         const tok = bin.op
 
-        // Short-circuit logical and/or
+        // Zig lower.zig:5078 — lower left FIRST
+        const left = self.lowerExprNode(bin.left)
+        if (left == null_node) { return null_node }
+
+        // Short-circuit logical and/or — defer right-side lowering
+        // Zig lower.zig:5086
         if (tok == Token.land or tok == Token.kw_and or tok == Token.lor or tok == Token.kw_or) {
             return self.lowerShortCircuit(bin)
         }
 
-        // String concatenation (++ or + on strings)
-        // Ref: lower.zig:5087-5109
-        if (tok == Token.concat or tok == Token.add) {
-            const left_type = self.inferExprType(bin.left)
-            if (left_type == STRING) {
-                return self.lowerStringConcat(bin)
+        // Union variant tag comparison — before lowering RHS
+        // Zig lower.zig:5094-5112
+        if (tok == Token.eql or tok == Token.neq) {
+            var left_type_idx = self.inferExprType(bin.left)
+            var left_info = self.types.get(left_type_idx)
+            if (left_info.tag == TAG_POINTER and self.types.get(switch (left_info) { Type.pointer |p| => p.elem, else => invalid_type }).tag == TAG_UNION) {
+                left_type_idx = switch (left_info) { Type.pointer |p| => p.elem, else => invalid_type }
+                left_info = self.types.get(left_type_idx)
+            }
+            if (left_info.tag == TAG_UNION) {
+                const vidx = self.resolveUnionVariantIndex(left_type_idx, bin.right)
+                if (vidx >= 0) {
+                    const size = self.types.sizeOf(left_type_idx)
+                    const union_local = fb.addLocalWithSize("__union_cmp", left_type_idx, false, size)
+                    fb.emitStoreLocal(union_local, left, bin.span)
+                    const tag = fb.emitFieldLocal(union_local, 0, 0, I64, bin.span)
+                    const idx_val = fb.emitConstInt(vidx, I64, bin.span)
+                    const cmp_op = if (tok == Token.eql) { BinaryOp.eq } else { BinaryOp.ne }
+                    return fb.emitBinary(cmp_op, tag, idx_val, BOOL, bin.span)
+                }
             }
         }
 
-        // Lower both operands for remaining binary ops
-        const left = self.lowerExprNode(bin.left)
+        // Zig lower.zig:5114 — lower right AFTER left and after union check
         const right = self.lowerExprNode(bin.right)
-        if (left == null_node or right == null_node) { return null_node }
+        if (right == null_node) { return null_node }
+        const result_type = self.inferBinaryType(bin.op, bin.left, bin.right)
+
+        // String concatenation — Zig lower.zig:5120-5139
+        if (result_type == STRING and (tok == Token.concat or tok == Token.add)) {
+            const ptr_type = self.types.makePointer(U8)
+            const ptr1 = fb.emitSlicePtr(left, ptr_type, bin.span)
+            const len1 = fb.emitSliceLen(left, bin.span)
+            const ptr2 = fb.emitSlicePtr(right, ptr_type, bin.span)
+            const len2 = fb.emitSliceLen(right, bin.span)
+            var args: List(int) = .{}
+            args.append(ptr1)
+            args.append(len1)
+            args.append(ptr2)
+            args.append(len2)
+            const new_ptr = fb.emitCall("string_concat", args, false, I64, bin.span)
+            const new_len = fb.emitBinary(BinaryOp.add, len1, len2, I64, bin.span)
+            const node = Node.init(Data.string_header(StringHeader { ptr: new_ptr, len: new_len }), STRING, bin.span)
+            return fb.emit(node)
+        }
 
         // Array concat: [N]T ++ [M]T → [N+M]T (or + in @safe mode)
-        // Ref: lower.zig:5110-5125
+        // Zig lower.zig:5140-5155
         if (tok == Token.concat or tok == Token.add) {
             const left_type_idx = self.inferExprType(bin.left)
             const right_type_idx = self.inferExprType(bin.right)
@@ -2389,8 +2426,6 @@ struct Lowerer {
                 }
             }
         }
-
-        const result_type = self.inferBinaryType(bin.op, bin.left, bin.right)
 
         // Dict dispatch: if inside a dict-stenciled body and this op is on a type-param type,
         // emit indirect call through the dictionary fn-ptr param instead of a direct binary op.
