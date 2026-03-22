@@ -33,7 +33,7 @@ pub const ssa_lower_wasm = @import("ssa/passes/lower_wasm.zig");
 pub const ssa_layout = @import("ssa/passes/layout.zig");
 
 // Debug and pipeline
-pub const pipeline_debug = @import("pipeline_debug.zig");
+pub const debug = @import("pipeline_debug.zig");
 pub const driver = @import("driver.zig");
 pub const cli = @import("cli.zig");
 pub const project = @import("project.zig");
@@ -123,7 +123,7 @@ fn findRuntimePath(allocator: std.mem.Allocator, tgt: Target) ![]const u8 {
 }
 
 pub fn main() !void {
-    pipeline_debug.initGlobal();
+    debug.initGlobal();
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -1564,7 +1564,7 @@ fn compileAndLinkFull(
 
 // Initialize debug before tests
 test {
-    pipeline_debug.initGlobal();
+    debug.initGlobal();
 }
 
 const CLAUDE_MD_CONTENT =

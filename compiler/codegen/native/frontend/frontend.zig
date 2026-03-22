@@ -8,7 +8,7 @@
 const std = @import("std");
 const ssa_mod = @import("ssa.zig");
 const variable_mod = @import("variable.zig");
-const pipeline_debug = @import("../../../pipeline_debug.zig");
+const debug = @import("../../../pipeline_debug.zig");
 
 // Re-export
 pub const SSABuilder = ssa_mod.SSABuilder;
@@ -142,7 +142,7 @@ pub const FunctionBuilder = struct {
         const block = try self.func.dfg.makeBlock();
         try self.func_ctx.ssa.declareBlock(block);
         try self.func_ctx.status.put(self.func_ctx.allocator, block, .empty);
-        pipeline_debug.log(.codegen, "createBlock: created block {d} in DFG (status=empty, NOT in Layout yet)", .{block.index});
+        debug.log(.codegen, "createBlock: created block {d} in DFG (status=empty, NOT in Layout yet)", .{block.index});
         return block;
     }
 
@@ -153,9 +153,9 @@ pub const FunctionBuilder = struct {
         // Check that previous block is properly filled (in debug mode)
         if (self.position) |prev| {
             std.debug.assert(self.isPristine(prev) or self.isFilled(prev));
-            pipeline_debug.log(.codegen, "switchToBlock: switching from block {d} to block {d}", .{ prev.index, block.index });
+            debug.log(.codegen, "switchToBlock: switching from block {d} to block {d}", .{ prev.index, block.index });
         } else {
-            pipeline_debug.log(.codegen, "switchToBlock: switching to block {d} (no previous block)", .{block.index});
+            debug.log(.codegen, "switchToBlock: switching to block {d} (no previous block)", .{block.index});
         }
 
         // Cannot switch to a filled block
@@ -202,20 +202,20 @@ pub const FunctionBuilder = struct {
     /// Port of cranelift-frontend/src/frontend.rs ensure_inserted_block()
     pub fn ensureInsertedBlock(self: *Self) !void {
         const block = self.position orelse {
-            pipeline_debug.log(.codegen, "ensureInsertedBlock: position is NULL, returning early", .{});
+            debug.log(.codegen, "ensureInsertedBlock: position is NULL, returning early", .{});
             return;
         };
 
         if (self.isPristine(block)) {
             if (!self.func.layout.isBlockInserted(block)) {
-                pipeline_debug.log(.codegen, "ensureInsertedBlock: adding block {d} to Layout (was pristine, not in layout)", .{block.index});
+                debug.log(.codegen, "ensureInsertedBlock: adding block {d} to Layout (was pristine, not in layout)", .{block.index});
                 try self.func.layout.appendBlock(self.func_ctx.allocator, block);
             } else {
-                pipeline_debug.log(.codegen, "ensureInsertedBlock: block {d} already in Layout (was pristine)", .{block.index});
+                debug.log(.codegen, "ensureInsertedBlock: block {d} already in Layout (was pristine)", .{block.index});
             }
             try self.func_ctx.status.put(self.func_ctx.allocator, block, .partial);
         } else {
-            pipeline_debug.log(.codegen, "ensureInsertedBlock: block {d} not pristine, skipping layout insert", .{block.index});
+            debug.log(.codegen, "ensureInsertedBlock: block {d} not pristine, skipping layout insert", .{block.index});
             std.debug.assert(!self.isFilled(block));
         }
     }
@@ -414,7 +414,7 @@ pub const FunctionBuilder = struct {
                 if (status == .partial or status == .filled) {
                     const is_in_layout = self.func.layout.isBlockInserted(block);
                     if (!is_in_layout) {
-                        pipeline_debug.log(.codegen, "FINALIZE ERROR: Block {d} has status {s} but is NOT in Layout!", .{
+                        debug.log(.codegen, "FINALIZE ERROR: Block {d} has status {s} but is NOT in Layout!", .{
                             block.index,
                             @tagName(status),
                         });
@@ -427,9 +427,9 @@ pub const FunctionBuilder = struct {
         // Log final Layout state
         const layout_entry = self.func.layout.entryBlock();
         if (layout_entry) |entry| {
-            pipeline_debug.log(.codegen, "finalize: Layout entry block = {d}", .{entry.index});
+            debug.log(.codegen, "finalize: Layout entry block = {d}", .{entry.index});
         } else {
-            pipeline_debug.log(.codegen, "finalize: WARNING - Layout has no entry block!", .{});
+            debug.log(.codegen, "finalize: WARNING - Layout has no entry block!", .{});
         }
 
         // Clear context for reuse

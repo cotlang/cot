@@ -11,6 +11,133 @@ const ID = u32;
 pub const Format = enum { text, dot };
 
 // ============================================================================
+// Liveness Analysis — Go print.go:126 findlive()
+// ============================================================================
+
+/// Compute reachable blocks and live values.
+/// A block is reachable if BFS from entry can reach it.
+/// A value is live if it has side effects, is a control value of a
+/// reachable block, or is transitively used by a live value.
+/// Reference: Go deadcode.go findlive + print.go fprintFunc
+pub fn findlive(allocator: std.mem.Allocator, f: *const Func) !struct { reachable: []bool, live: []bool } {
+    const reachable = try allocator.alloc(bool, f.numBlocks());
+    @memset(reachable, false);
+    const live = try allocator.alloc(bool, f.numValues());
+    @memset(live, false);
+
+    // BFS for reachable blocks
+    if (f.entry) |entry| {
+        reachable[entry.id] = true;
+        var worklist = std.ArrayListUnmanaged(*const Block){};
+        defer worklist.deinit(allocator);
+        try worklist.append(allocator, entry);
+        while (worklist.items.len > 0) {
+            const b = worklist.pop().?;
+            for (b.succs) |e| {
+                if (!reachable[e.b.id]) {
+                    reachable[e.b.id] = true;
+                    try worklist.append(allocator, e.b);
+                }
+            }
+        }
+    }
+
+    // Seed live values: control values + side-effecting values
+    var q = std.ArrayListUnmanaged(*const Value){};
+    defer q.deinit(allocator);
+    for (f.blocks.items) |b| {
+        if (!reachable[b.id]) continue;
+        for (b.controlValues()) |v| {
+            if (!live[v.id]) {
+                live[v.id] = true;
+                try q.append(allocator, v);
+            }
+        }
+        for (b.values.items) |v| {
+            if (v.op.hasSideEffects() or v.op.info().call or v.op.info().nil_check) {
+                if (!live[v.id]) {
+                    live[v.id] = true;
+                    try q.append(allocator, v);
+                }
+            }
+        }
+    }
+
+    // Transitive closure
+    while (q.items.len > 0) {
+        const v = q.pop().?;
+        for (v.args) |arg| {
+            if (!live[arg.id]) {
+                live[arg.id] = true;
+                try q.append(allocator, arg);
+            }
+        }
+    }
+
+    return .{ .reachable = reachable, .live = live };
+}
+
+// ============================================================================
+// Unified Func Printer — Go print.go:42-50 funcPrinter interface
+// ============================================================================
+
+/// Abstract printer interface for SSA functions.
+/// Implemented by text printer, HTML printer, and hash printer.
+/// Reference: Go print.go funcPrinter interface
+pub const FuncPrinter = struct {
+    ctx: *anyopaque,
+    headerFn: *const fn (*anyopaque, *const Func) void,
+    startBlockFn: *const fn (*anyopaque, *const Block, bool) void,
+    endBlockFn: *const fn (*anyopaque, *const Block, bool) void,
+    valueFn: *const fn (*anyopaque, *const Value, bool) void,
+
+    pub fn header(self: FuncPrinter, f: *const Func) void {
+        self.headerFn(self.ctx, f);
+    }
+    pub fn startBlock(self: FuncPrinter, b: *const Block, reachable: bool) void {
+        self.startBlockFn(self.ctx, b, reachable);
+    }
+    pub fn endBlock(self: FuncPrinter, b: *const Block, reachable: bool) void {
+        self.endBlockFn(self.ctx, b, reachable);
+    }
+    pub fn value(self: FuncPrinter, v: *const Value, live: bool) void {
+        self.valueFn(self.ctx, v, live);
+    }
+};
+
+/// Print a function using the given printer, with proper liveness analysis.
+/// Reference: Go print.go:125-192 fprintFunc
+pub fn fprintFunc(allocator: std.mem.Allocator, p: FuncPrinter, f: *const Func) !void {
+    const liveness = try findlive(allocator, f);
+    defer allocator.free(liveness.reachable);
+    defer allocator.free(liveness.live);
+
+    p.header(f);
+    for (f.blocks.items) |b| {
+        p.startBlock(b, liveness.reachable[b.id]);
+
+        // Print values: phis first, then dependency order, then dep cycles
+        // Reference: Go print.go:133-185
+        if (f.scheduled) {
+            for (b.values.items) |v| {
+                p.value(v, liveness.live[v.id]);
+            }
+        } else {
+            // Phis first
+            for (b.values.items) |v| {
+                if (v.op == .phi) p.value(v, liveness.live[v.id]);
+            }
+            // Then non-phis
+            for (b.values.items) |v| {
+                if (v.op != .phi) p.value(v, liveness.live[v.id]);
+            }
+        }
+
+        p.endBlock(b, liveness.reachable[b.id]);
+    }
+}
+
+// ============================================================================
 // Dump Functions
 // ============================================================================
 

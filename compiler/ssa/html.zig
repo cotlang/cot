@@ -440,71 +440,94 @@ fn renderBlockLongHTML(allocator: Allocator, out: *std.ArrayListUnmanaged(u8), b
     }
 }
 
-/// Render an entire function's SSA as HTML.
+/// Render an entire function's SSA as HTML using unified fprintFunc with findlive.
 /// Reference: Go html.go lines 1053-1065 (Func.HTML) + print.go lines 125-192 (fprintFunc)
 fn renderFuncHTML(allocator: Allocator, out: *std.ArrayListUnmanaged(u8), f: *const Func, type_reg: ?*const TypeRegistry) void {
-    // Compute liveness for dead code visualization
-    // (simplified: mark all values with uses > 0 as live)
-    for (f.blocks.items) |b| {
-        const reachable = true; // TODO: compute reachability for dead-block marking
+    // Use the unified fprintFunc with proper liveness analysis
+    // Reference: Go print.go:125 — fprintFunc calls findlive() for dead code marking
+    const ssa_debug = @import("debug.zig");
+    var html_ctx = HTMLFuncPrinterCtx{
+        .allocator = allocator,
+        .out = out,
+        .type_reg = type_reg,
+    };
+    const printer = ssa_debug.FuncPrinter{
+        .ctx = @ptrCast(&html_ctx),
+        .headerFn = @ptrCast(&HTMLFuncPrinterCtx.header),
+        .startBlockFn = @ptrCast(&HTMLFuncPrinterCtx.startBlock),
+        .endBlockFn = @ptrCast(&HTMLFuncPrinterCtx.endBlock),
+        .valueFn = @ptrCast(&HTMLFuncPrinterCtx.value),
+    };
+    ssa_debug.fprintFunc(allocator, printer, f) catch {};
+}
 
-        // Start block
-        // Reference: Go html.go lines 1195-1217 (htmlFuncPrinter.startBlock)
+/// Context for HTML function printing.
+/// Implements the FuncPrinter interface callbacks.
+/// Reference: Go html.go lines 1189-1254 (htmlFuncPrinter)
+const HTMLFuncPrinterCtx = struct {
+    allocator: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    type_reg: ?*const TypeRegistry,
+
+    fn header(self: *HTMLFuncPrinterCtx, f: *const Func) void {
+        _ = f;
+        _ = self;
+    }
+
+    fn startBlock(self: *HTMLFuncPrinterCtx, b: *const Block, reachable: bool) void {
         var buf: [64]u8 = undefined;
-        const bid = std.fmt.bufPrint(&buf, "b{d}", .{b.id}) catch continue;
+        const bid = std.fmt.bufPrint(&buf, "b{d}", .{b.id}) catch return;
 
-        out.appendSlice(allocator, "<ul class=\"") catch continue;
-        out.appendSlice(allocator, bid) catch continue;
+        self.out.appendSlice(self.allocator, "<ul class=\"") catch return;
+        self.out.appendSlice(self.allocator, bid) catch return;
         if (!reachable) {
-            out.appendSlice(allocator, " ssa-print-func dead-block\">") catch continue;
+            self.out.appendSlice(self.allocator, " ssa-print-func dead-block\">") catch return;
         } else {
-            out.appendSlice(allocator, " ssa-print-func\">") catch continue;
+            self.out.appendSlice(self.allocator, " ssa-print-func\">") catch return;
         }
 
-        // Block header with predecessors
-        out.appendSlice(allocator, "<li class=\"ssa-start-block\">") catch continue;
-        renderBlockHTML(allocator, out, b);
-        out.appendSlice(allocator, ":") catch {};
+        self.out.appendSlice(self.allocator, "<li class=\"ssa-start-block\">") catch return;
+        renderBlockHTML(self.allocator, self.out, b);
+        self.out.appendSlice(self.allocator, ":") catch {};
 
         if (b.preds.len > 0) {
-            out.appendSlice(allocator, " &#8592;") catch {}; // left arrow
+            self.out.appendSlice(self.allocator, " &#8592;") catch {};
             for (b.preds) |e| {
-                out.appendSlice(allocator, " ") catch {};
-                renderBlockHTML(allocator, out, e.b);
+                self.out.appendSlice(self.allocator, " ") catch {};
+                renderBlockHTML(self.allocator, self.out, e.b);
             }
         }
 
-        // Collapse button
         if (b.values.items.len > 0) {
-            out.appendSlice(allocator, "<button onclick=\"hideBlock(this)\">-</button>") catch {};
+            self.out.appendSlice(self.allocator, "<button onclick=\"hideBlock(this)\">-</button>") catch {};
         }
-        out.appendSlice(allocator, "</li>") catch {};
+        self.out.appendSlice(self.allocator, "</li>") catch {};
 
-        // Values
         if (b.values.items.len > 0) {
-            out.appendSlice(allocator, "<li class=\"ssa-value-list\"><ul>") catch {};
-
-            for (b.values.items) |v| {
-                const live = v.uses > 0 or v.op.hasSideEffects();
-                if (!live) {
-                    out.appendSlice(allocator, "<li class=\"ssa-long-value dead-value\">") catch {};
-                } else {
-                    out.appendSlice(allocator, "<li class=\"ssa-long-value\">") catch {};
-                }
-                renderValueLongHTML(allocator, out, v, type_reg);
-                out.appendSlice(allocator, "</li>") catch {};
-            }
-
-            out.appendSlice(allocator, "</ul></li>") catch {};
+            self.out.appendSlice(self.allocator, "<li class=\"ssa-value-list\"><ul>") catch {};
         }
-
-        // Block footer with successors
-        // Reference: Go html.go lines 1219-1228 (htmlFuncPrinter.endBlock)
-        out.appendSlice(allocator, "<li class=\"ssa-end-block\">") catch {};
-        renderBlockLongHTML(allocator, out, b);
-        out.appendSlice(allocator, "</li></ul>") catch {};
     }
-}
+
+    fn endBlock(self: *HTMLFuncPrinterCtx, b: *const Block, reachable: bool) void {
+        _ = reachable;
+        if (b.values.items.len > 0) {
+            self.out.appendSlice(self.allocator, "</ul></li>") catch {};
+        }
+        self.out.appendSlice(self.allocator, "<li class=\"ssa-end-block\">") catch {};
+        renderBlockLongHTML(self.allocator, self.out, b);
+        self.out.appendSlice(self.allocator, "</li></ul>") catch {};
+    }
+
+    fn value(self: *HTMLFuncPrinterCtx, v: *const Value, live: bool) void {
+        if (!live) {
+            self.out.appendSlice(self.allocator, "<li class=\"ssa-long-value dead-value\">") catch {};
+        } else {
+            self.out.appendSlice(self.allocator, "<li class=\"ssa-long-value\">") catch {};
+        }
+        renderValueLongHTML(self.allocator, self.out, v, self.type_reg);
+        self.out.appendSlice(self.allocator, "</li>") catch {};
+    }
+};
 
 // ============================================================================
 // Hash Computation

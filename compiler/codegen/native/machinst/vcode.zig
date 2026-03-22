@@ -19,7 +19,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const pipeline_debug = @import("../../../pipeline_debug.zig");
+const debug = @import("../../../pipeline_debug.zig");
 
 // Import from other machinst modules
 const reg_mod = @import("reg.zig");
@@ -1174,7 +1174,7 @@ pub fn VCode(comptime I: type) type {
 
                 // Get instruction range for this block
                 const insn_range = self.blockInsns(block);
-                pipeline_debug.log(.codegen, "emit: block {d}: insts {d}..{d}", .{ block_idx, insn_range.start.index(), insn_range.end.index() });
+                debug.log(.codegen, "emit: block {d}: insts {d}..{d}", .{ block_idx, insn_range.start.index(), insn_range.end.index() });
 
                 // Convert to regalloc InstRange for the iterator
                 const regalloc_range = regalloc_index.InstRange.new(
@@ -1271,7 +1271,7 @@ pub fn VCode(comptime I: type) type {
                             // Process regalloc edit (move insertion)
                             switch (edit.*) {
                                 .move => |m| {
-                                    pipeline_debug.log(.codegen, "emit: regalloc edit: move from {any} to {any}", .{ m.from, m.to });
+                                    debug.log(.codegen, "emit: regalloc edit: move from {any} to {any}", .{ m.from, m.to });
                                     // Generate a move instruction from the ISA
                                     // This is ISA-specific and requires I.genMove()
                                     try emitMove(I, &buffer, m.from, m.to, emit_info, &emit_state, self.sized_stackslots_size);

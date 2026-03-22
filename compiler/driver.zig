@@ -34,7 +34,7 @@ const thread_native = @import("codegen/native/thread_native.zig");
 const scheduler_native = @import("codegen/native/scheduler_native.zig");
 const signal_native = @import("codegen/native/signal_native.zig");
 const target_mod = @import("frontend/target.zig");
-const pipeline_debug = @import("pipeline_debug.zig");
+const debug = @import("pipeline_debug.zig");
 
 // Wasm codegen
 const wasm_old = @import("codegen/wasm.zig"); // Old module builder (for CodeBuilder)
@@ -1019,7 +1019,7 @@ pub const Driver = struct {
         // 7. Link into object file
 
         // Step 1: Generate Wasm bytecode first
-        pipeline_debug.log(.codegen, "driver: generating Wasm for native AOT compilation", .{});
+        debug.log(.codegen, "driver: generating Wasm for native AOT compilation", .{});
         const wasm_bytes = try self.generateWasmCode(funcs, globals, type_reg);
         defer self.allocator.free(wasm_bytes);
 
@@ -1035,7 +1035,7 @@ pub const Driver = struct {
     /// This is a faithful port of Cranelift's compilation flow from
     /// wasmtime/cranelift/src/compiler.rs and cranelift/codegen/src/machinst/compile.rs
     fn generateNativeCode(self: *Driver, wasm_bytes: []const u8) ![]u8 {
-        pipeline_debug.log(.codegen, "driver: AOT compiling {d} bytes of Wasm to native", .{wasm_bytes.len});
+        debug.log(.codegen, "driver: AOT compiling {d} bytes of Wasm to native", .{wasm_bytes.len});
 
         // ====================================================================
         // Step 1: Parse Wasm module
@@ -1043,12 +1043,12 @@ pub const Driver = struct {
         // ====================================================================
         var wasm_parser_inst = wasm_parser.Parser.init(self.allocator, wasm_bytes);
         var wasm_module = wasm_parser_inst.parse() catch |e| {
-            pipeline_debug.log(.codegen, "driver: Wasm parse error: {any}", .{e});
+            debug.log(.codegen, "driver: Wasm parse error: {any}", .{e});
             return error.WasmParseError;
         };
         defer wasm_module.deinit();
 
-        pipeline_debug.log(.codegen, "driver: parsed Wasm module with {d} functions, {d} types", .{
+        debug.log(.codegen, "driver: parsed Wasm module with {d} functions, {d} types", .{
             wasm_module.code.len,
             wasm_module.types.len,
         });
@@ -1065,7 +1065,7 @@ pub const Driver = struct {
             .freestanding => "freestanding",
             .wasi => "WASI",
         };
-        pipeline_debug.log(.codegen, "driver: target: {s} / {s}", .{ arch_name, os_name });
+        debug.log(.codegen, "driver: target: {s} / {s}", .{ arch_name, os_name });
 
         // ====================================================================
         // Step 2: Translate each Wasm function to CLIF IR
@@ -1127,7 +1127,7 @@ pub const Driver = struct {
         };
 
         for (wasm_module.code, 0..) |func_code, func_idx| {
-            pipeline_debug.log(.codegen, "driver: translating function {d}", .{func_idx});
+            debug.log(.codegen, "driver: translating function {d}", .{func_idx});
 
             // Get function type from module
             const type_idx = if (func_idx < wasm_module.funcs.len)
@@ -1145,7 +1145,7 @@ pub const Driver = struct {
             // ----------------------------------------------------------------
             var decoder = wasm_decoder.Decoder.init(self.allocator, func_code.body);
             const wasm_ops = decoder.decodeAll() catch |e| {
-                pipeline_debug.log(.codegen, "driver: decode error for function {d}: {any}", .{ func_idx, e });
+                debug.log(.codegen, "driver: decode error for function {d}: {any}", .{ func_idx, e });
                 return error.WasmDecodeError;
             };
             defer {
@@ -1159,7 +1159,7 @@ pub const Driver = struct {
                 self.allocator.free(wasm_ops);
             }
 
-            pipeline_debug.log(.codegen, "driver: decoded {d} operators", .{wasm_ops.len});
+            debug.log(.codegen, "driver: decoded {d} operators", .{wasm_ops.len});
 
             // ----------------------------------------------------------------
             // Step 2b: Create CLIF Function and translate
@@ -1214,21 +1214,21 @@ pub const Driver = struct {
                 locals_converted,
                 basic_ops.items,
             ) catch |e| {
-                pipeline_debug.log(.codegen, "driver: translation error for function {d}: {any}", .{ func_idx, e });
+                debug.log(.codegen, "driver: translation error for function {d}: {any}", .{ func_idx, e });
                 return error.WasmTranslationError;
             };
 
             // Debug: check CLIF function size
             const num_blocks = clif_func.dfg.blocks.items.len;
             const num_insts = clif_func.dfg.insts.items.len;
-            pipeline_debug.log(.codegen, "driver: translated function {d} to CLIF ({d} blocks, {d} insts)", .{ func_idx, num_blocks, num_insts });
+            debug.log(.codegen, "driver: translated function {d} to CLIF ({d} blocks, {d} insts)", .{ func_idx, num_blocks, num_insts });
 
             // ----------------------------------------------------------------
             // D1/D3: Layout verification - ensure blocks are in Layout, not just DFG
             // Reference: Cranelift requires blocks in Layout for compilation
             // Uses the D3 Layout vs DFG comparison utility
             // ----------------------------------------------------------------
-            clif_func.logLayoutComparison(pipeline_debug);
+            clif_func.logLayoutComparison(debug);
 
             const layout_block_count = blk: {
                 var count: usize = 0;
@@ -1238,8 +1238,8 @@ pub const Driver = struct {
             };
 
             if (layout_block_count == 0 and num_blocks > 0) {
-                pipeline_debug.log(.codegen, "CRITICAL: Blocks exist in DFG but Layout is EMPTY!", .{});
-                pipeline_debug.log(.codegen, "This indicates ensureInsertedBlock() was never called during translation", .{});
+                debug.log(.codegen, "CRITICAL: Blocks exist in DFG but Layout is EMPTY!", .{});
+                debug.log(.codegen, "This indicates ensureInsertedBlock() was never called during translation", .{});
                 // Don't return error yet - let's see what compilation produces
             }
 
@@ -1254,12 +1254,12 @@ pub const Driver = struct {
                 isa,
                 &ctrl_plane,
             ) catch |e| {
-                pipeline_debug.log(.codegen, "driver: compile error for function {d}: {any}", .{ func_idx, e });
+                debug.log(.codegen, "driver: compile error for function {d}: {any}", .{ func_idx, e });
                 return error.NativeCompileError;
             };
 
             try compiled_funcs.append(self.allocator, compiled);
-            pipeline_debug.log(.codegen, "driver: compiled function {d}: {d} bytes", .{
+            debug.log(.codegen, "driver: compiled function {d}: {d} bytes", .{
                 func_idx,
                 compiled.codeSize(),
             });
@@ -1269,7 +1269,7 @@ pub const Driver = struct {
         // Step 3: Generate object file
         // Reference: cranelift-object crate
         // ====================================================================
-        pipeline_debug.log(.codegen, "driver: generating object file for {d} functions", .{compiled_funcs.items.len});
+        debug.log(.codegen, "driver: generating object file for {d} functions", .{compiled_funcs.items.len});
 
         const object_bytes = switch (self.target.os) {
             .macos => try self.generateMachO(compiled_funcs.items, wasm_module.exports, wasm_module.data_segments, wasm_module.globals, wasm_module.funcs, wasm_module.types),
@@ -1288,7 +1288,7 @@ pub const Driver = struct {
     /// This produces the same CompiledCode output as the Wasm path, but without
     /// encoding/decoding Wasm, without vmctx, and with native pointers.
     fn generateNativeCodeDirect(self: *Driver, funcs: []const ir_mod.Func, globals: []const ir_mod.Global, type_reg: *types_mod.TypeRegistry) ![]u8 {
-        pipeline_debug.log(.codegen, "driver: direct native path for {d} functions", .{funcs.len});
+        debug.log(.codegen, "driver: direct native path for {d} functions", .{funcs.len});
 
         // Select ISA based on target
         const isa = switch (self.target.arch) {
@@ -1525,7 +1525,7 @@ pub const Driver = struct {
 
         // Phase 2: For each function, build SSA → run passes → translate → compile
         for (funcs, 0..) |*ir_func, func_idx| {
-            pipeline_debug.log(.codegen, "driver: direct native: compiling '{s}' ({d}/{d})", .{
+            debug.log(.codegen, "driver: direct native: compiling '{s}' ({d}/{d})", .{
                 ir_func.name, func_idx + 1, funcs.len,
             });
 
@@ -1561,14 +1561,14 @@ pub const Driver = struct {
             try lower_native.lower(ssa_func);
 
             // SSA dump via pipeline debug (replaces COT_SSA_DUMP env var)
-            if (pipeline_debug.isEnabled(.ssa)) {
-                pipeline_debug.log(.ssa, "\n=== SSA for '{s}' (locals: {d}, params: {d}) ===", .{ ir_func.name, ssa_func.local_sizes.len, ir_func.params.len });
+            if (debug.isEnabled(.ssa)) {
+                debug.log(.ssa, "\n=== SSA for '{s}' (locals: {d}, params: {d}) ===", .{ ir_func.name, ssa_func.local_sizes.len, ir_func.params.len });
                 for (ssa_func.blocks.items) |blk| {
-                    pipeline_debug.log(.ssa, "  Block b{d} (kind={s}, succs={d}, preds={d}):", .{
+                    debug.log(.ssa, "  Block b{d} (kind={s}, succs={d}, preds={d}):", .{
                         blk.id, @tagName(blk.kind), blk.succs.len, blk.preds.len,
                     });
                     for (blk.values.items) |val| {
-                        pipeline_debug.log(.ssa, "    v{d}: {s} aux={d} type={d} uses={d}", .{
+                        debug.log(.ssa, "    v{d}: {s} aux={d} type={d} uses={d}", .{
                             val.id, @tagName(val.op), val.aux_int, val.type_idx, val.uses,
                         });
                     }
@@ -1580,22 +1580,22 @@ pub const Driver = struct {
             defer clif_func.deinit();
 
             ssa_to_clif.translate(ssa_func, &clif_func, type_reg, ir_func.params, ir_func.return_type, &func_index_map, funcs, self.allocator, string_data_symbol_idx, ctxt_symbol_idx, &global_symbol_map) catch |e| {
-                pipeline_debug.log(.codegen, "driver: SSA→CLIF translation error for '{s}': {any}", .{ ir_func.name, e });
+                debug.log(.codegen, "driver: SSA→CLIF translation error for '{s}': {any}", .{ ir_func.name, e });
                 return error.SsaToClifError;
             };
 
             const num_blocks = clif_func.dfg.blocks.items.len;
             const num_insts = clif_func.dfg.insts.items.len;
-            pipeline_debug.log(.codegen, "driver: translated '{s}' to CLIF ({d} blocks, {d} insts)", .{ ir_func.name, num_blocks, num_insts });
+            debug.log(.codegen, "driver: translated '{s}' to CLIF ({d} blocks, {d} insts)", .{ ir_func.name, num_blocks, num_insts });
 
             // Compile CLIF → native machine code
             const compiled = native_compile.compile(self.allocator, &clif_func, isa, &ctrl_plane) catch |e| {
-                pipeline_debug.log(.codegen, "driver: compile error for '{s}': {any}", .{ ir_func.name, e });
+                debug.log(.codegen, "driver: compile error for '{s}': {any}", .{ ir_func.name, e });
                 return error.NativeCompileError;
             };
 
             try compiled_funcs.append(self.allocator, compiled);
-            pipeline_debug.log(.codegen, "driver: compiled '{s}': {d} bytes", .{
+            debug.log(.codegen, "driver: compiled '{s}': {d} bytes", .{
                 ir_func.name, compiled.codeSize(),
             });
         }
@@ -1662,11 +1662,11 @@ pub const Driver = struct {
                 }
             }
 
-            pipeline_debug.log(.codegen, "driver: compiled {d} total functions (user + runtime)", .{compiled_funcs.items.len});
+            debug.log(.codegen, "driver: compiled {d} total functions (user + runtime)", .{compiled_funcs.items.len});
         }
 
         // Phase 4: Generate object file
-        pipeline_debug.log(.codegen, "driver: generating object file for {d} direct-native functions", .{compiled_funcs.items.len});
+        debug.log(.codegen, "driver: generating object file for {d} direct-native functions", .{compiled_funcs.items.len});
 
         const object_bytes = try self.generateMachODirect(
             compiled_funcs.items,
@@ -5716,7 +5716,7 @@ pub const Driver = struct {
     /// Generate WebAssembly binary.
     /// Uses Go-style Linker for module structure with proper SP globals.
     fn generateWasmCode(self: *Driver, funcs: []const ir_mod.Func, globals: []const ir_mod.Global, type_reg: *types_mod.TypeRegistry) ![]u8 {
-        pipeline_debug.log(.codegen, "driver: generating Wasm for {d} functions", .{funcs.len});
+        debug.log(.codegen, "driver: generating Wasm for {d} functions", .{funcs.len});
 
         var linker = wasm.Linker.init(self.allocator);
         defer linker.deinit();
@@ -6181,7 +6181,7 @@ pub const Driver = struct {
                 const offset = try linker.addData(&metadata_buf);
                 try metadata_addrs.put(entry.key_ptr.*, offset);
 
-                pipeline_debug.log(.codegen, "driver: metadata for {s} at offset {d}, dtor_idx={d}", .{ entry.key_ptr.*, offset, dtor_idx });
+                debug.log(.codegen, "driver: metadata for {s} at offset {d}, dtor_idx={d}", .{ entry.key_ptr.*, offset, dtor_idx });
                 type_id += 1;
             }
         }
@@ -6197,7 +6197,7 @@ pub const Driver = struct {
                 if (!string_offsets.contains(str)) {
                     const offset = try linker.addData(str);
                     try string_offsets.put(str, offset);
-                    pipeline_debug.log(.codegen, "driver: string literal at offset {d}: \"{s}\"", .{ offset, str });
+                    debug.log(.codegen, "driver: string literal at offset {d}: \"{s}\"", .{ offset, str });
                 }
             }
         }
@@ -6244,6 +6244,9 @@ pub const Driver = struct {
 
             // Run Wasm-specific passes with optimization (Go pass order)
             // Reference: Go compile.go lines 58-145 — pass loop + HTMLWriter integration
+            // Each pass uses PhaseSnapshot.compare() for automatic change stats.
+            const ssa_debug = @import("ssa/debug.zig");
+
             try copyelim.copyelim(ssa_func);
             if (html_writer != null) html_writer.?.writePhase("copyelim", "copyelim", ssa_func);
 
@@ -6262,7 +6265,22 @@ pub const Driver = struct {
             try cse_pass.cse(ssa_func);
             if (html_writer != null) html_writer.?.writePhase("cse", "cse", ssa_func);
 
+            // Snapshot before deadcode for change tracking
+            var pre_deadcode = ssa_debug.PhaseSnapshot.capture(func_alloc, ssa_func, "pre_deadcode") catch null;
             try deadcode.deadcode(ssa_func);
+            if (pre_deadcode) |*pre| {
+                var post = ssa_debug.PhaseSnapshot.capture(func_alloc, ssa_func, "post_deadcode") catch null;
+                if (post) |*p| {
+                    const stats = ssa_debug.PhaseSnapshot.compare(pre, p);
+                    if (stats.hasChanges()) {
+                        debug.log(.deadcode, "  deadcode changes: +{d}/-{d} values, +{d}/-{d} blocks", .{
+                            stats.values_added, stats.values_removed, stats.blocks_added, stats.blocks_removed,
+                        });
+                    }
+                    p.deinit();
+                }
+                pre.deinit();
+            }
             if (html_writer != null) html_writer.?.writePhase("deadcode", "deadcode", ssa_func);
 
             try schedule.schedule(ssa_func);
