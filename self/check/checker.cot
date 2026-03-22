@@ -3366,6 +3366,7 @@ struct Checker {
         // --- Comptime ---
 
         if (kind == BuiltinKind.compile_error) {
+            // Zig checker.zig:2173-2177 — emit error with message from string arg
             var msg = "compile error"
             if (argc >= 1) {
                 switch (self.ast.getNode(args.get(0))) {
@@ -3529,7 +3530,12 @@ struct Checker {
             Node.expr |ae| => switch (ae) {
                 Expr.literal |lit| => {
                     if (lit.kind == LiteralKind.@"string") {
-                        field_name = lit.value
+                        // Strip quotes: "x" → x
+                        if (@lenOf(lit.value) >= 2 and charAt(lit.value, 0) == 34 and charAt(lit.value, @lenOf(lit.value) - 1) == 34) {
+                            field_name = substring(lit.value, 1, @lenOf(lit.value) - 1)
+                        } else {
+                            field_name = lit.value
+                        }
                         is_str = true
                     }
                 },
@@ -3575,7 +3581,12 @@ struct Checker {
             Node.expr |ae| => switch (ae) {
                 Expr.literal |lit| => {
                     if (lit.kind == LiteralKind.@"string") {
-                        field_name = lit.value
+                        // Strip quotes: "a" → a
+                        if (@lenOf(lit.value) >= 2 and charAt(lit.value, 0) == 34 and charAt(lit.value, @lenOf(lit.value) - 1) == 34) {
+                            field_name = substring(lit.value, 1, @lenOf(lit.value) - 1)
+                        } else {
+                            field_name = lit.value
+                        }
                         is_str = true
                     }
                 },
@@ -5380,6 +5391,10 @@ struct Checker {
             var val_str = ""
             switch (self.ast.getNode(idx)) { Node.expr |e| => switch (e) { Expr.literal |lit| => { kind = lit.kind; val_str = lit.value }, else => {} }, else => {} }
             if (kind == LiteralKind.@"string") {
+                // Strip quotes: "macos" → macos (match @targetOs() which returns unquoted)
+                if (@lenOf(val_str) >= 2 and charAt(val_str, 0) == 34 and charAt(val_str, @lenOf(val_str) - 1) == 34) {
+                    return (1, substring(val_str, 1, @lenOf(val_str) - 1))
+                }
                 return (1, val_str)
             }
         }
