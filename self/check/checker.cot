@@ -5019,6 +5019,21 @@ struct Checker {
     /// Port of Zig checker.zig:859-1141 (evalComptimeValue).
     /// Handles: literal, unary, binary, paren, ident, builtin_call, if_expr,
     /// block_expr, comptime_block, field_access, index.
+    /// Build ComptimeTypeInfo from a type index — split out to avoid large stack frames.
+    fn buildComptimeTypeInfo(type_idx: int) ?ComptimeValue {
+        const t = self.types.get(type_idx)
+        if (t.tag != TAG_ENUM) { return null }
+        const name = self.types.typeName(type_idx)
+        const vc = self.types.enumVariantCount(type_idx)
+        var fields: List(ComptimeValue) = .{}
+        for vi in 0..vc {
+            const vn = self.types.enumVariantName(type_idx, vi)
+            const vv = self.types.enumVariantValue(type_idx, vi)
+            fields.append(ComptimeValue.makeEnumField(vn, vv))
+        }
+        return ComptimeValue.makeTypeInfo(TI_ENUM_INFO, name, fields)
+    }
+
     fn evalComptimeValue(idx: int) ?ComptimeValue {
         if (idx == null_node) { return null }
         const tag = nodeTag(self.ast, idx)
@@ -5151,16 +5166,7 @@ struct Checker {
             if (bk == BuiltinKind.type_info and type_arg_n != null_node) {
                 const type_idx = self.resolveTypeExpr(type_arg_n)
                 if (type_idx != invalid_type) {
-                    const t = self.types.get(type_idx)
-                    if (t.tag == TAG_ENUM) {
-                        const et = switch (t) { Type.enum_type |e| => e, else => EnumType { name: "", variant_count: 0, variants: 0, backing_type: 0 } }
-                        var fields: List(ComptimeValue) = .{}
-                        for vi in 0..et.variant_count {
-                            const v = et.getVariant(vi)
-                            fields.append(ComptimeValue.makeEnumField(v.name, v.value))
-                        }
-                        return ComptimeValue.makeTypeInfo(TI_ENUM_INFO, et.name, fields)
-                    }
+                    return self.buildComptimeTypeInfo(type_idx)
                 }
             }
             return null

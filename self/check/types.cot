@@ -553,6 +553,31 @@ struct TypeRegistry {
         }
     }
 
+    fn enumVariantCount(idx: int) int {
+        const t = self.get(idx)
+        return switch (t) { Type.enum_type |e| => e.variant_count, else => 0 }
+    }
+
+    fn enumVariantName(idx: int, vi: int) string {
+        const t = self.get(idx)
+        switch (t) { Type.enum_type |e| => {
+            if (vi >= 0 and vi < e.variant_count) {
+                return e.getVariant(vi).name
+            }
+        }, else => {} }
+        return ""
+    }
+
+    fn enumVariantValue(idx: int, vi: int) int {
+        const t = self.get(idx)
+        switch (t) { Type.enum_type |e| => {
+            if (vi >= 0 and vi < e.variant_count) {
+                return e.getVariant(vi).value
+            }
+        }, else => {} }
+        return 0
+    }
+
     /// Resolve distinct types to their underlying type.
     fn resolveDistinct(idx: int) int {
         const t = self.get(idx)
