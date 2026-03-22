@@ -380,10 +380,11 @@ struct GenState {
             SsaOp.wasm_f64_const, SsaOp.const_float,
             SsaOp.const_bool, SsaOp.const_nil => { self.emitConstant(val_idx) },
 
-            // Compound type ops
-            SsaOp.string_make, SsaOp.slice_make,
+            // Compound type ops — Zig gen.zig:384, 391, 395, 406, 410
+            SsaOp.string_make, SsaOp.slice_make, SsaOp.opt_make,
             SsaOp.string_ptr, SsaOp.slice_ptr,
-            SsaOp.string_len, SsaOp.slice_len => { self.emitCompoundOp(val_idx) },
+            SsaOp.string_len, SsaOp.slice_len,
+            SsaOp.opt_tag, SsaOp.opt_data => { self.emitCompoundOp(val_idx) },
 
             // i64 arithmetic, bitwise, bit counting, comparisons, not, neg
             SsaOp.wasm_i64_add, SsaOp.wasm_i64_sub, SsaOp.wasm_i64_mul,
@@ -531,7 +532,8 @@ struct GenState {
         const v = self.ssa_func.getValue(val_idx)
         switch (v.op) {
             // Compound type ops - no code generated (decomposed when accessed)
-            SsaOp.string_make, SsaOp.slice_make => {
+            // Zig gen.zig:384 — string_make, slice_make, AND opt_make
+            SsaOp.string_make, SsaOp.slice_make, SsaOp.opt_make => {
                 // No code - these values are decomposed when accessed
             },
 
@@ -546,6 +548,22 @@ struct GenState {
                 if (self.compound_len_locals.contains(arg_idx)) {
                     const len_local = self.compound_len_locals.get(arg_idx)
                     self.builder.appendFrom(As.local_get, constAddr(len_local))
+                } else {
+                    self.getValue64(arg_idx)
+                }
+            },
+            // Optional pointer extraction ops — same pattern as string/slice
+            // Zig gen.zig:406-417
+            SsaOp.opt_tag => {
+                // Get tag component: stored in arg's main local
+                self.getValue64(v.args.get(0))
+            },
+            SsaOp.opt_data => {
+                // Get payload component: stored in arg's compound len local
+                const arg_idx = v.args.get(0)
+                if (self.compound_len_locals.contains(arg_idx)) {
+                    const data_local = self.compound_len_locals.get(arg_idx)
+                    self.builder.appendFrom(As.local_get, constAddr(data_local))
                 } else {
                     self.getValue64(arg_idx)
                 }
@@ -2231,8 +2249,8 @@ struct GenState {
         if (v.uses == 0 and !hasSideEffects(v)) { return }
 
         // Skip compound type ops — no code generated
-        // Go: no case for OpSliceMake/OpStringMake in wasm/ssa.go
-        if (v.op == SsaOp.string_make or v.op == SsaOp.slice_make) { return }
+        // Zig gen.zig:1398 — skip string_make, slice_make, opt_make
+        if (v.op == SsaOp.string_make or v.op == SsaOp.slice_make or v.op == SsaOp.opt_make) { return }
 
         // Skip rematerializable values (generate on demand)
         if (isRematerializable(v)) { return }
@@ -2353,7 +2371,7 @@ struct GenState {
                 if (v.uses == 0 and !hasSideEffects(v)) { continue }
                 if (isRematerializable(v)) { continue }
                 if (isCmp(v)) { continue }
-                if (v.op == SsaOp.slice_make or v.op == SsaOp.string_make or
+                if (v.op == SsaOp.slice_make or v.op == SsaOp.string_make or v.op == SsaOp.opt_make or
                     v.op == SsaOp.wasm_lowered_move or v.op == SsaOp.wasm_lowered_zero or
                     v.op == SsaOp.wasm_return_call) { continue }
                 // Skip store ops

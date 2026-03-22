@@ -811,6 +811,33 @@ struct SSABuilder {
             return value
         }
 
+        // ?*T optional pointer store: decompose into tag@0, payload@8
+        // Zig ssa_builder.zig:883-921 — Go interface pattern (ITab, IData)
+        if (value_type.tag == TAG_OPTIONAL) {
+            const opt_elem = switch (value_type) { Type.optional |o| => o.elem, else => invalid_type }
+            const opt_elem_info = self.type_reg.get(opt_elem)
+            if (opt_elem_info.tag == TAG_POINTER) {
+                const val_v = self.func.getValue(value)
+                var tag_component: int = null_value
+                var data_component: int = null_value
+
+                if (val_v.op == SsaOp.opt_make and val_v.argsLen() >= 2) {
+                    tag_component = val_v.args.get(0)
+                    data_component = val_v.args.get(1)
+                } else {
+                    tag_component = self.emitNewValueWithArg(SsaOp.opt_tag, I64, value)
+                    data_component = self.emitNewValueWithArg(SsaOp.opt_data, I64, value)
+                }
+
+                const addr_val = self.emitLocalAddr(local_idx, VOID)
+                self.emitStore(addr_val, tag_component)
+                const data_addr = self.emitOffPtr(addr_val, 8)
+                self.emitStore(data_addr, data_component)
+                self.assign(local_idx, value)
+                return value
+            }
+        }
+
         const addr_val = self.emitLocalAddr(local_idx, VOID)
         const type_size = self.type_reg.sizeOf(value_type_idx)
         var is_large = self.isLargeCompound(value_type_idx)

@@ -55,6 +55,9 @@ fn rewriteValue(func: *SsaFunc, block_idx: int, val_idx: int) bool {
         .string_ptr => rewriteStringPtr(func, block_idx, val_idx),
         .string_len => rewriteStringLen(func, block_idx, val_idx),
         .string_concat => rewriteStringConcat(func, block_idx, val_idx),
+        // Zig rewritedec.zig:91-92 — opt_tag/opt_data decomposition
+        .opt_tag => rewriteOptTag(func, block_idx, val_idx),
+        .opt_data => rewriteOptData(func, block_idx, val_idx),
         else => false,
     }
 }
@@ -416,6 +419,100 @@ fn extractStringComponent(func: *SsaFunc, block_idx: int, str_idx: int, extract_
     func.setValue(extract_idx, extract)
     func.addValueToBlock(extract_idx, block_idx)
     return extract_idx
+}
+
+/// Rewrite OptTag extraction.
+/// Zig rewritedec.zig:488-527
+/// Patterns:
+///   opt_tag(opt_make(tag, payload)) → tag
+///   opt_tag(load<?*T>(ptr)) → load<i64>(ptr)
+///   opt_tag(const_nil) → const_int(0)
+fn rewriteOptTag(func: *SsaFunc, block_idx: int, val_idx: int) bool {
+    const val = func.getValue(val_idx)
+    if (val.args.count < 1) { return false }
+    const arg_idx = followCopy(func, val.args.get(0))
+    const arg = func.getValue(arg_idx)
+
+    // Pattern 1: OptTag(OptMake tag payload) → tag
+    if (arg.op == SsaOp.opt_make and arg.args.count >= 1) {
+        copyOf(func, val_idx, arg.args.get(0))
+        return true
+    }
+
+    // Pattern 2: OptTag(Load<?*T> ptr) → Load<i64>(ptr)
+    if (arg.op == SsaOp.load and arg.args.count >= 1) {
+        const ptr_idx = arg.args.get(0)
+        const load_idx = func.newValue(SsaOp.load, I64, block_idx, val.pos_line, val.pos_col)
+        var load_val = func.getValue(load_idx)
+        load_val.addArg(ptr_idx)
+        func.setValue(load_idx, load_val)
+        func.addValueToBlock(load_idx, block_idx)
+        copyOf(func, val_idx, load_idx)
+        return true
+    }
+
+    // Pattern 3: OptTag(ConstNil) → ConstInt(0)
+    if (arg.op == SsaOp.const_nil) {
+        const zero_idx = func.newValue(SsaOp.const_int, I64, block_idx, val.pos_line, val.pos_col)
+        var zero = func.getValue(zero_idx)
+        zero.aux_int = 0
+        func.setValue(zero_idx, zero)
+        func.addValueToBlock(zero_idx, block_idx)
+        copyOf(func, val_idx, zero_idx)
+        return true
+    }
+
+    return false
+}
+
+/// Rewrite OptData extraction.
+/// Zig rewritedec.zig:536-579
+/// Patterns:
+///   opt_data(opt_make(tag, payload)) → payload
+///   opt_data(load<?*T>(ptr)) → load<i64>(off_ptr(ptr, 8))
+///   opt_data(const_nil) → const_int(0)
+fn rewriteOptData(func: *SsaFunc, block_idx: int, val_idx: int) bool {
+    const val = func.getValue(val_idx)
+    if (val.args.count < 1) { return false }
+    const arg_idx = followCopy(func, val.args.get(0))
+    const arg = func.getValue(arg_idx)
+
+    // Pattern 1: OptData(OptMake tag payload) → payload
+    if (arg.op == SsaOp.opt_make and arg.args.count >= 2) {
+        copyOf(func, val_idx, arg.args.get(1))
+        return true
+    }
+
+    // Pattern 2: OptData(Load<?*T> ptr) → Load<i64>(OffPtr(ptr, 8))
+    if (arg.op == SsaOp.load and arg.args.count >= 1) {
+        const ptr_idx = arg.args.get(0)
+        const off_ptr_idx = func.newValue(SsaOp.off_ptr, I64, block_idx, val.pos_line, val.pos_col)
+        var off_ptr = func.getValue(off_ptr_idx)
+        off_ptr.aux_int = 8
+        off_ptr.addArg(ptr_idx)
+        func.setValue(off_ptr_idx, off_ptr)
+        func.addValueToBlock(off_ptr_idx, block_idx)
+        const load_idx = func.newValue(SsaOp.load, I64, block_idx, val.pos_line, val.pos_col)
+        var load_val = func.getValue(load_idx)
+        load_val.addArg(off_ptr_idx)
+        func.setValue(load_idx, load_val)
+        func.addValueToBlock(load_idx, block_idx)
+        copyOf(func, val_idx, load_idx)
+        return true
+    }
+
+    // Pattern 3: OptData(ConstNil) → ConstInt(0)
+    if (arg.op == SsaOp.const_nil) {
+        const zero_idx = func.newValue(SsaOp.const_int, I64, block_idx, val.pos_line, val.pos_col)
+        var zero = func.getValue(zero_idx)
+        zero.aux_int = 0
+        func.setValue(zero_idx, zero)
+        func.addValueToBlock(zero_idx, block_idx)
+        copyOf(func, val_idx, zero_idx)
+        return true
+    }
+
+    return false
 }
 
 // ============================================================================
