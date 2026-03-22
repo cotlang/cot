@@ -3967,8 +3967,30 @@ struct Checker {
             if (d1 != null_node) {
                 ret_type = self.resolveTypeExpr(d1)
             }
+            // Zig checker pattern: resolve each param type, allocate params array
+            // Parser stores param count in d2, param type nodes as consecutive
+            // AST nodes before the fn type node (idx - d2 .. idx - 1).
+            const param_count = d2
+            if (param_count > 0) {
+                const params_ptr = @intCast(i64, alloc_raw(param_count * @sizeOf(FuncParam)))
+                for pi in 0..param_count {
+                    // Param type nodes are stored at idx - param_count + pi
+                    // (consecutive nodes added by parseFnType before the type_expr node)
+                    const param_type_node = idx - param_count + pi
+                    var pt = self.resolveTypeExpr(param_type_node)
+                    if (self.safe_mode) { pt = self.safeWrapType(pt) }
+                    var fp = @intToPtr(*FuncParam, params_ptr + pi * @sizeOf(FuncParam))
+                    fp.name = ""
+                    fp.type_idx = pt
+                }
+                return self.types.add(Type.func(FuncType {
+                    param_count: param_count,
+                    params: params_ptr,
+                    return_type: ret_type,
+                }))
+            }
             return self.types.add(Type.func(FuncType {
-                param_count: d2,
+                param_count: 0,
                 params: 0,
                 return_type: ret_type,
             }))
