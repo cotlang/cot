@@ -5135,6 +5135,8 @@ struct Checker {
 
     fn evalComptimeValue(idx: int) ?ComptimeValue {
         if (idx == null_node) { return null }
+        // Zig checker.zig:858 — bounds check before accessing node
+        if (idx < 0 or idx >= self.ast.nodes.count) { return null }
         const tag = nodeTag(self.ast, idx)
 
         // Literal: int, float, string, bool, undefined
