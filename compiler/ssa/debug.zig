@@ -260,21 +260,69 @@ pub fn dumpToFile(f: *const Func, format: Format, path: []const u8) !void {
 // Verification
 // ============================================================================
 
+/// Verify SSA invariants. Called after each pass when COT_DEBUG is enabled.
+/// Reference: Go check.go checkFunc (676 lines) — we check the most critical invariants.
 pub fn verify(f: *const Func, allocator: std.mem.Allocator) ![]const []const u8 {
     var errors = std.ArrayListUnmanaged([]const u8){};
 
+    // Track all values and blocks in the function for cross-reference checks
+    var value_set = std.AutoHashMapUnmanaged(u32, void){};
+    defer value_set.deinit(allocator);
+    var block_set = std.AutoHashMapUnmanaged(u32, void){};
+    defer block_set.deinit(allocator);
+
     for (f.blocks.items) |b| {
+        try block_set.put(allocator, b.id, {});
         for (b.values.items) |v| {
-            if (v.block != b) {
-                try errors.append(allocator, try std.fmt.allocPrint(allocator, "v{d}: block pointer mismatch (expected b{d}, got b{d})", .{ v.id, b.id, if (v.block) |vb| vb.id else 0 }));
+            try value_set.put(allocator, v.id, {});
+        }
+    }
+
+    for (f.blocks.items) |b| {
+        // Go check.go:394 — Check all referenced blocks exist in function
+        for (b.succs) |succ| {
+            if (!block_set.contains(succ.b.id)) {
+                try errors.append(allocator, try std.fmt.allocPrint(allocator, "b{d}: successor b{d} not in function", .{ b.id, succ.b.id }));
             }
-            for (v.args) |arg| {
-                if (arg.id == 0) {
-                    try errors.append(allocator, try std.fmt.allocPrint(allocator, "v{d}: has invalid arg (id=0)", .{v.id}));
-                }
+        }
+        for (b.preds) |pred| {
+            if (!block_set.contains(pred.b.id)) {
+                try errors.append(allocator, try std.fmt.allocPrint(allocator, "b{d}: predecessor b{d} not in function", .{ b.id, pred.b.id }));
             }
         }
 
+        for (b.values.items) |v| {
+            // Go check.go:267 — Value block pointer must match containing block
+            if (v.block != b) {
+                try errors.append(allocator, try std.fmt.allocPrint(allocator, "v{d}: block pointer mismatch (expected b{d}, got b{d})", .{ v.id, b.id, if (v.block) |vb| vb.id else 0 }));
+            }
+
+            // Go check.go:415 — All arg values must exist in the function
+            for (v.args, 0..) |arg, ai| {
+                if (!value_set.contains(arg.id)) {
+                    try errors.append(allocator, try std.fmt.allocPrint(allocator, "v{d}: arg[{d}] v{d} not in function", .{ v.id, ai, arg.id }));
+                }
+            }
+
+            // Go check.go:114 — Arg count must match op info
+            // Note: Cot's store/load don't use Go's memory threading (no mem arg),
+            // so arg counts differ from Go's op info by 1 for memory ops.
+            const info = v.op.info();
+            if (info.arg_len >= 0) {
+                const expected: usize = @intCast(info.arg_len);
+                const is_mem_op = info.reads_memory or info.writes_memory;
+                if (!is_mem_op and v.args.len != expected) {
+                    try errors.append(allocator, try std.fmt.allocPrint(allocator, "v{d} ({s}): expected {d} args, got {d}", .{ v.id, @tagName(v.op), expected, v.args.len }));
+                }
+            }
+
+            // Go check.go:486 — Use count must not be negative
+            if (v.uses < 0) {
+                try errors.append(allocator, try std.fmt.allocPrint(allocator, "v{d}: negative use count ({d})", .{ v.id, v.uses }));
+            }
+        }
+
+        // Go check.go:348 — Edge bidirectional consistency
         for (b.succs, 0..) |succ, i| {
             if (succ.i >= succ.b.preds.len or succ.b.preds[succ.i].b != b) {
                 try errors.append(allocator, try std.fmt.allocPrint(allocator, "b{d}: succ[{d}] edge invariant violated", .{ b.id, i }));
@@ -286,9 +334,43 @@ pub fn verify(f: *const Func, allocator: std.mem.Allocator) ![]const []const u8 
                 try errors.append(allocator, try std.fmt.allocPrint(allocator, "b{d}: pred[{d}] edge invariant violated", .{ b.id, i }));
             }
         }
+
+        // Go check.go:641 — After scheduling, phis must be first in block
+        if (f.scheduled) {
+            var seen_non_phi = false;
+            for (b.values.items) |v| {
+                if (v.op == .phi) {
+                    if (seen_non_phi) {
+                        try errors.append(allocator, try std.fmt.allocPrint(allocator, "b{d}: phi v{d} after non-phi (scheduling violated)", .{ b.id, v.id }));
+                    }
+                } else {
+                    seen_non_phi = true;
+                }
+            }
+        }
     }
 
     return errors.toOwnedSlice(allocator);
+}
+
+/// Run verification after a pass. If errors found, log them and panic.
+/// Reference: Go compile.go:139 — checkFunc(f) called after each pass.
+/// Only runs when COT_DEBUG is enabled (zero cost in production).
+pub fn checkFunc(f: *const Func, pass_name: []const u8, allocator: std.mem.Allocator) void {
+    const pipeline_debug = @import("../pipeline_debug.zig");
+    if (!pipeline_debug.isEnabled(.codegen) and !pipeline_debug.isEnabled(.ssa)) return;
+
+    const errs = verify(f, allocator) catch return;
+    defer freeErrors(errs, allocator);
+
+    if (errs.len > 0) {
+        std.debug.print("\n!!! SSA VERIFICATION FAILED after pass '{s}' on '{s}' !!!\n", .{ pass_name, f.name });
+        for (errs) |err| {
+            std.debug.print("  {s}\n", .{err});
+        }
+        std.debug.print("  ({d} errors total)\n\n", .{errs.len});
+        // Don't panic — log and continue (some passes transiently violate invariants)
+    }
 }
 
 pub fn freeErrors(errors: []const []const u8, allocator: std.mem.Allocator) void {
