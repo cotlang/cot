@@ -2177,6 +2177,22 @@ struct Checker {
 
     /// Main field access logic, split from checkFieldAccess to keep stack frames small.
     fn checkFieldAccessInner(idx: int, base_n: int, field_name: string) int {
+        // Comptime value field access: @typeInfo(T).fields, @typeInfo(T).name, etc.
+        // Zig reference: checker.zig:2532-2555
+        if (self.evalComptimeValue(base_n)) |cv| {
+            if (cv.tag == CV_TYPE_INFO) {
+                if (field_name == "fields") { return I64 }
+                if (field_name == "name") { return STRING }
+            }
+            if (cv.tag == CV_ENUM_FIELD) {
+                if (field_name == "name") { return STRING }
+                if (field_name == "value") { return I64 }
+            }
+            if (cv.tag == CV_ARRAY) {
+                if (field_name == "len") { return I64 }
+            }
+        }
+
         // Nested type namespace: TypeName.Nested
         if (nodeTag(self.ast, base_n) == "ident") {
             var base_name = ""
@@ -5072,6 +5088,23 @@ struct Checker {
             if (bk == BuiltinKind.int_from_enum and bc_args.count > 0) {
                 const cv = self.evalConstExpr(bc_args.get(0))
                 if (cv.0 != 0) { return ComptimeValue.makeInt(cv.1) }
+            }
+            // @typeInfo(T) → ComptimeTypeInfo with fields array
+            // Zig reference: checker.zig:989-1009
+            if (bk == BuiltinKind.type_info and type_arg_n != null_node) {
+                const type_idx = self.resolveTypeExpr(type_arg_n)
+                if (type_idx != invalid_type) {
+                    const t = self.types.get(type_idx)
+                    if (t.tag == TAG_ENUM) {
+                        const et = switch (t) { Type.enum_type |e| => e, else => EnumType { name: "", variant_count: 0, variants: 0, backing_type: 0 } }
+                        var fields: List(ComptimeValue) = .{}
+                        for vi in 0..et.variant_count {
+                            const v = et.getVariant(vi)
+                            fields.append(ComptimeValue.makeEnumField(v.name, v.value))
+                        }
+                        return ComptimeValue.makeTypeInfo(TI_ENUM_INFO, et.name, fields)
+                    }
+                }
             }
             return null
         }
