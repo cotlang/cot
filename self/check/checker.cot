@@ -5135,31 +5135,6 @@ struct Checker {
         return ComptimeValue.makeTypeInfo(TI_ENUM_INFO, name, fields)
     }
 
-    /// Zig checker.zig:2532-2555 — resolve field access on comptime values.
-    fn resolveComptimeFieldAccess(base_n: int, field_name: string) int {
-        if (self.evalComptimeValue(base_n)) |cv| {
-            const is_ti = cv.tag == CV_TYPE_INFO
-            const is_ef = cv.tag == CV_ENUM_FIELD
-            const is_arr = cv.tag == CV_ARRAY
-            const is_fields = field_name == "fields"
-            const is_name = field_name == "name"
-            const is_value = field_name == "value"
-            const is_len = field_name == "len"
-            if (is_ti and is_fields) { return I64 }
-            if (is_ti and is_name) { return STRING }
-            if (is_ef and is_name) { return STRING }
-            if (is_ef and is_value) { return I64 }
-            if (is_arr and is_len) { return I64 }
-        }
-        return invalid_type
-    }
-
-    /// Return the tag of a comptime value, or -1 if not comptime.
-    fn evalComptimeValueTag(idx: int) int {
-        const cv = self.evalComptimeValue(idx) orelse return -1
-        return cv.tag
-    }
-
     /// Comptime field access: split from evalComptimeValue to reduce frame size.
     /// Zig checker.zig:1129 pattern — field access on comptime value.
     fn evalComptimeFieldAccess(idx: int) ?ComptimeValue {

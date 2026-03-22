@@ -481,7 +481,7 @@ fn addParamType(params: *List(int), param: Local, types: *TypeRegistry) void {
             k += 1
         }
     } else {
-        // All values stored as i64 (Go's all-i64 approach) — no f64 params
+        // All values stored as i64 (Go's all-i64 approach) — floats are bit-cast to i64
         params.append(VT_I64)
     }
 }
@@ -497,7 +497,7 @@ fn buildFuncResults(results: *List(int), ir_func: Func, types: *TypeRegistry) vo
         results.append(VT_I64)
         results.append(VT_I64)
     } else {
-        // All values stored as i64 (Go's all-i64 approach) — no f64 returns
+        // All values stored as i64 (Go's all-i64 approach) — floats are bit-cast to i64
         results.append(VT_I64)
     }
 }
