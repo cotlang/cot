@@ -3193,11 +3193,14 @@ struct Lowerer {
             var type_name = switch (base_type) {
                 Type.struct_type |st| => st.name,
                 Type.enum_type |et| => et.name,
+                Type.union_type |ut| => ut.name,
                 Type.pointer |p| => switch (self.types.get(p.elem)) {
                     Type.struct_type |st| => st.name,
                     Type.enum_type |et| => et.name,
+                    Type.basic |bk| => bk.name(),
                     else => "",
                 },
+                Type.basic |bk| => bk.name(),
                 else => "",
             }
             if (type_name == "" and base_type_idx == STRING) { type_name = "string" }
