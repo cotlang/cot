@@ -11375,6 +11375,35 @@ pub const Lowerer = struct {
                 }
                 return ir.null_node;
             },
+            // @isUnique(ptr) — Swift's isKnownUniquelyReferenced().
+            // Reads refcount at (ptr - 8), returns true if refcount == 1.
+            // ARC header layout: [total_size:4][metadata:4][refcount:8][user_data...]
+            // The ptr points to user_data, so refcount is at ptr - 8.
+            // Wasm: always returns true (no refcounting, always unique owner).
+            .is_unique => {
+                const arg = try self.lowerExprNode(bc.args[0]);
+                if (self.target.isWasm()) {
+                    return try fb.emitConstBool(true, bc.span);
+                }
+                // If ptr is 0 (null/empty), return true (empty is always "unique")
+                const zero = try fb.emitConstInt(0, TypeRegistry.I64, bc.span);
+                const is_null = try fb.emitBinary(.eq, arg, zero, TypeRegistry.BOOL, bc.span);
+                const check_blk = try fb.newBlock("is_unique.check");
+                const merge_blk = try fb.newBlock("is_unique.merge");
+                _ = try fb.emitBranch(is_null, merge_blk, check_blk, bc.span);
+                fb.setBlock(check_blk);
+                // Load refcount from ptr - 8
+                const eight = try fb.emitConstInt(8, TypeRegistry.I64, bc.span);
+                const rc_addr = try fb.emitBinary(.sub, arg, eight, TypeRegistry.I64, bc.span);
+                const refcount = try fb.emitPtrLoadValue(rc_addr, TypeRegistry.I64, bc.span);
+                const one = try fb.emitConstInt(1, TypeRegistry.I64, bc.span);
+                const is_one = try fb.emitBinary(.eq, refcount, one, TypeRegistry.BOOL, bc.span);
+                _ = try fb.emitJump(merge_blk, bc.span);
+                fb.setBlock(merge_blk);
+                // Phi: null → true, non-null → (refcount == 1)
+                const true_val = try fb.emitConstBool(true, bc.span);
+                return try fb.emitSelect(is_null, true_val, is_one, TypeRegistry.BOOL, bc.span);
+            },
             // @panic("message") — Zig @panic: write file:line + message to stderr, then exit(2)
             // Reference: Zig std/debug.zig panic(), Go runtime.gopanic
             // Output: "file.cot:42: panic: user message\n"

@@ -224,6 +224,8 @@ pub const BuiltinKind = enum {
     // ARC management (conditional on type — no-op for non-ARC types)
     arc_retain,
     arc_release,
+    // ARC COW support — Swift's isKnownUniquelyReferenced()
+    is_unique,
     // Panic with message
     panic,
     // Bit manipulation — Wasm i64.ctz/i64.clz/i64.popcnt
@@ -289,6 +291,7 @@ pub const BuiltinKind = enum {
         .{ "constCast", .const_cast },
         .{ "arcRetain", .arc_retain },
         .{ "arcRelease", .arc_release },
+        .{ "isUnique", .is_unique },
         .{ "panic", .panic },
         .{ "ctz", .ctz },
         .{ "clz", .clz },
@@ -356,6 +359,7 @@ pub const BuiltinKind = enum {
             .const_cast => "constCast",
             .arc_retain => "arcRetain",
             .arc_release => "arcRelease",
+            .is_unique => "isUnique",
             .panic => "panic",
             .ctz => "ctz",
             .clz => "clz",

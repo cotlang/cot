@@ -1628,7 +1628,7 @@ pub const Parser = struct {
             .embed_file,
             .type_of,
             .int_from_enum, .tag_name, .error_name, .int_from_bool, .const_cast, .int_from_float,
-            .arc_retain, .arc_release,
+            .arc_retain, .arc_release, .is_unique,
             .panic, .ctz, .clz, .pop_count,
             .atomic_load,
             => {

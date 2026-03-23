@@ -2439,6 +2439,13 @@ pub const Checker = struct {
                 _ = try self.checkExpr(bc.args[0]);
                 return TypeRegistry.VOID;
             },
+            // @isUnique(ptr) — Swift's isKnownUniquelyReferenced().
+            // Returns true if the refcount of the ARC allocation at ptr is exactly 1.
+            // Used for copy-on-write: if unique, mutate in-place; if shared, copy first.
+            .is_unique => {
+                _ = try self.checkExpr(bc.args[0]);
+                return TypeRegistry.BOOL;
+            },
             // @panic("message") — Zig @panic: writes message to stderr, then traps
             .panic => {
                 if (bc.args[0] != null_node) _ = try self.checkExpr(bc.args[0]);
