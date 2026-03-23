@@ -1,5 +1,9 @@
 # Claude AI Instructions
 
+## 🚨🚨🚨 NEVER CHECK OUT OLD VERSIONS OR COMPARE AGAINST OLD BUILDS 🚨🚨🚨
+
+**DO NOT** use `git checkout`, `git stash`, or build old versions to compare behavior. This wastes massive amounts of time. Fix the current code by reading it, understanding it, and comparing with the Zig reference. The Zig compiler IS the reference — not an old selfcot build.
+
 ## 🚨🚨🚨 CURRENT 0.4 FOCUS: FIX ALL SELFCOT WASM CODEGEN TO MATCH ZIG 🚨🚨🚨
 
 **Goal:** selfcot must produce identical Wasm output to the Zig compiler. Run `selfcot test test/cases/*.cot` — every test that passes with `./zig-out/bin/cot test --target=wasm` must also pass with selfcot. Currently 6 of 21 test files have runtime failures (arrays, chars, loops, optional, strings, structs). Fix each by porting the exact Zig code to `self/`. Once all tests pass, selfcot2.wasm must compile selfcot3.wasm identically — that's full self-hosting and the 0.4 release gate.
