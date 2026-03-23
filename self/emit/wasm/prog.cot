@@ -218,7 +218,6 @@ struct ProgBuilder {
     }
 
     fn deinit() void {
-        self.progs.deinit()
     }
 
     fn append(instr: As) int {

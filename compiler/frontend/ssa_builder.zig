@@ -447,6 +447,7 @@ pub const SSABuilder = struct {
     }
 
     fn convertNode(self: *SSABuilder, node_idx: ir.NodeIndex) anyerror!?*Value {
+        if (node_idx == ir.null_node) return null;
         if (self.node_values.get(node_idx)) |existing| return existing;
         const node = self.ir_func.getNode(node_idx);
         const cur = self.cur_block orelse {
@@ -1230,8 +1231,11 @@ pub const SSABuilder = struct {
         // concrete name → wrapper → stencil with dict args. No injection here.
         // Go pattern (reader.go:1377-1396): wrappers handle dictionary passing.
 
-        for (args) |arg_idx| {
-            const arg_val = try self.convertNode(arg_idx) orelse return error.MissingValue;
+        for (args, 0..) |arg_idx, argi| {
+            const arg_val = try self.convertNode(arg_idx) orelse {
+                std.debug.print("convertCall '{s}' in '{s}': arg[{d}] node={d} returned null\n", .{ func_name, self.func.name, argi, arg_idx });
+                return error.MissingValue;
+            };
             try self.addCallArg(call_val, arg_val, cur);
         }
         try cur.addValue(self.allocator, call_val);

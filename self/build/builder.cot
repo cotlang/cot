@@ -244,14 +244,6 @@ struct SSABuilder {
 
     /// Free all builder-owned memory (does NOT free the SsaFunc — caller owns that after build()).
     fn deinit() void {
-        self.vars.deinit()
-        self.fwd_vars.deinit()
-        self.defvars.deinit()
-        self.block_map.deinit()
-        self.node_values.deinit()
-        self.loop_stack.deinit()
-        self.local_slot_offsets.deinit()
-        self.logical_operands.deinit()
     }
 
     // === Block management ===

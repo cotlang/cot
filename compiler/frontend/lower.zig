@@ -4873,9 +4873,10 @@ pub const Lowerer = struct {
         }
 
         // List(T) and Map(K,V): Swift COW value types with refcounted buffer.
-        // Destroy = release(buf). The buf's deinit method handles element cleanup
-        // when the refcount hits 0 (via maybeRegisterScopeDestroy calling deinit).
-        // Swift ref: Array.deinit → swift_release(storage) → storage.deinit releases elements.
+        // Compiler handles element cleanup (Swift's value witness destroy pattern).
+        // When buf is uniquely owned: destroy each element, then release buf.
+        // When buf is shared: just release buf (other owners handle their elements).
+        // Swift ref: ContiguousArrayBuffer.deinit → _fixLifetime + _deallocateUninitializedArray
         if (info == .list or info == .map) {
             const coll_size = self.type_reg.sizeOf(type_idx);
             const tmp = try fb.addLocalWithSize("__destroy_coll", type_idx, false, coll_size);
