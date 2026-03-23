@@ -15,7 +15,7 @@ import "../debug"
 /// Zig reference: compiler/ssa/passes/deadcode.zig:25-124
 fn deadcode(func: *SsaFunc) void {
     var total_values: i64 = 0
-    for bi in 0..func.blocks.count { total_values += func.getBlock(bi).values.count }
+    for bi in 0..func.blocks.count { total_values += func.blocks.get(bi).values.count }
     debug_log(.deadcode, "=== Deadcode pass for '${func.name}' (${func.blocks.count} blocks, ${total_values} values) ===")
 
     // 1. Find reachable blocks via BFS from entry.
@@ -25,36 +25,32 @@ fn deadcode(func: *SsaFunc) void {
     // 2. Remove edges from dead blocks to live blocks (phi consistency).
     // Zig deadcode.zig:39-52
     for bi in 0..func.blocks.count {
-        const blk_id = func.getBlock(bi).id
-        if (reachable.contains(blk_id)) { continue }
+        const blk = func.blocks.get(bi)
+        if (reachable.contains(blk.id)) { continue }
         // Dead block — remove edges to live successors
-        var blk = func.getBlock(bi)
         var si = 0
         while (si < blk.succs.count) {
             const succ_edge = blk.succs.get(si)
-            if (reachable.contains(func.getBlock(succ_edge.block).id)) {
+            if (reachable.contains(func.blocks.get(succ_edge.block).id)) {
                 blk.succs.orderedRemove(si)
                 // Also remove corresponding pred edge from the successor
-                var succ = func.getBlock(succ_edge.block)
-                removePredEdge(&succ, bi)
-                func.setBlock(succ_edge.block, succ)
+                const succ = func.blocks.get(succ_edge.block)
+                removePredEdge(succ, bi)
             } else {
                 si += 1
             }
         }
-        func.setBlock(bi, blk)
     }
 
     // 3. Convert BlockFirst → BlockPlain (Zig deadcode.zig:55-64)
     for bi in 0..func.blocks.count {
-        var blk = func.getBlock(bi)
+        const blk = func.blocks.get(bi)
         if (!reachable.contains(blk.id)) { continue }
         if (blk.kind == SsaBlockKind.first) {
             if (blk.succs.count > 1) {
                 blk.succs.orderedRemove(1)
             }
             blk.kind = SsaBlockKind.plain
-            func.setBlock(bi, blk)
         }
     }
 
@@ -64,16 +60,15 @@ fn deadcode(func: *SsaFunc) void {
 
     // 5. Remove dead values from blocks (Zig deadcode.zig:88-102)
     for bi in 0..func.blocks.count {
-        var blk = func.getBlock(bi)
-        var new_values: List(int) = .{}
+        const blk = func.blocks.get(bi)
+        var new_values: List(*SsaValue) = .{}
         for vi in 0..blk.values.count {
-            const val_idx = blk.values.get(vi)
-            if (live.contains(val_idx)) {
-                new_values.append(val_idx)
+            const val = blk.values.get(vi)
+            if (live.contains(val.id)) {
+                new_values.append(val)
             }
         }
         blk.values = new_values
-        func.setBlock(bi, blk)
     }
 
     // Note: Zig physically removes unreachable blocks (pointer-based edges).
@@ -82,7 +77,7 @@ fn deadcode(func: *SsaFunc) void {
     // Layout will schedule them last; gen will skip their empty value lists.
 
     var remaining_values: i64 = 0
-    for bi2 in 0..func.blocks.count { remaining_values += func.getBlock(bi2).values.count }
+    for bi2 in 0..func.blocks.count { remaining_values += func.blocks.get(bi2).values.count }
     debug_log(.deadcode, "=== Deadcode complete for '${func.name}': ${func.blocks.count} blocks, ${remaining_values} values remaining ===")
 
     reachable.free()
@@ -93,21 +88,21 @@ fn deadcode(func: *SsaFunc) void {
 /// Zig deadcode.zig:127-149
 fn reachableBlocks(func: *SsaFunc, reachable: *Map(int, bool)) void {
     if (func.blocks.count == 0) { return }
-    const entry_id = func.getBlock(0).id
-    reachable.set(entry_id, true)
+    const entry = func.blocks.get(0)
+    reachable.set(entry.id, true)
 
     var worklist: List(int) = .{}
     worklist.append(0)
 
     while (worklist.count > 0) {
         const bi = worklist.pop()
-        const blk = func.getBlock(bi)
+        const blk = func.blocks.get(bi)
         for si in 0..blk.succs.count {
             const succ_idx = blk.succs.get(si).block
             if (succ_idx >= 0 and succ_idx < func.blocks.count) {
-                const succ_id = func.getBlock(succ_idx).id
-                if (!reachable.contains(succ_id)) {
-                    reachable.set(succ_id, true)
+                const succ = func.blocks.get(succ_idx)
+                if (!reachable.contains(succ.id)) {
+                    reachable.set(succ.id, true)
                     worklist.append(succ_idx)
                 }
             }
@@ -120,43 +115,40 @@ fn reachableBlocks(func: *SsaFunc, reachable: *Map(int, bool)) void {
 /// Roots: control values of reachable blocks + side-effecting values + used values.
 /// Zig deadcode.zig:155-204
 fn liveValues(func: *SsaFunc, reachable: *Map(int, bool), live: *Map(int, bool)) void {
-    var q: List(int) = .{}
+    var q: List(*SsaValue) = .{}
 
     // Seed: control values + side-effecting values + used values
     for bi in 0..func.blocks.count {
-        const blk = func.getBlock(bi)
+        const blk = func.blocks.get(bi)
         if (!reachable.contains(blk.id)) { continue }
 
         // Control values are live
         for ci in 0..blk.controls.count {
-            const ctrl_idx = blk.controls.get(ci)
-            if (!live.contains(ctrl_idx)) {
-                live.set(ctrl_idx, true)
-                q.append(ctrl_idx)
+            const ctrl = blk.controls.get(ci)
+            if (!live.contains(ctrl.id)) {
+                live.set(ctrl.id, true)
+                q.append(ctrl)
             }
         }
 
         // Values with side effects or uses > 0 are live
         for vi in 0..blk.values.count {
-            const val_idx = blk.values.get(vi)
-            const val = func.getValue(val_idx)
-            if ((isSideEffecting(val.op) or val.uses > 0) and !live.contains(val_idx)) {
-                live.set(val_idx, true)
-                q.append(val_idx)
+            const val = blk.values.get(vi)
+            if ((isSideEffecting(val.op) or val.uses > 0) and !live.contains(val.id)) {
+                live.set(val.id, true)
+                q.append(val)
             }
         }
     }
 
     // Transitive closure: mark all args of live values as live
     while (q.count > 0) {
-        const val_idx = q.pop()
-        if (val_idx < 0 or val_idx >= func.next_value_id) { continue }
-        const val = func.getValue(val_idx)
+        const val = q.pop()
         for ai in 0..val.args.count {
-            const arg_idx = val.args.get(ai)
-            if (arg_idx >= 0 and arg_idx < func.next_value_id and !live.contains(arg_idx)) {
-                live.set(arg_idx, true)
-                q.append(arg_idx)
+            const arg = val.args.get(ai)
+            if (arg != null_val and !live.contains(arg.id)) {
+                live.set(arg.id, true)
+                q.append(arg)
             }
         }
     }
@@ -164,7 +156,7 @@ fn liveValues(func: *SsaFunc, reachable: *Map(int, bool), live: *Map(int, bool))
 }
 
 /// Remove predecessor edge pointing to block_idx from blk.
-fn removePredEdge(blk: *SsaBlock, block_idx: int) void {
+fn removePredEdge(blk: SsaBlock, block_idx: int) void {
     var pi = 0
     while (pi < blk.preds.count) {
         if (blk.preds.get(pi).block == block_idx) {
@@ -180,30 +172,22 @@ fn removePredEdge(blk: *SsaBlock, block_idx: int) void {
 /// must not contribute to use counts.
 fn recomputeUses(func: *SsaFunc) void {
     // Zero all uses
-    const total = func.next_value_id
-    var vi = 0
-    while (vi < total) {
-        var val = func.getValue(vi)
-        val.uses = 0
-        func.setValue(vi, val)
-        vi += 1
+    for vi in 0..func.values.count {
+        func.values.get(vi).uses = 0
     }
 
     // Count uses: only from values that are in blocks (not removed values)
     var bi = 0
     while (bi < func.blocks.count) {
-        const blk = func.getBlock(bi)
+        const blk = func.blocks.get(bi)
         var bvi = 0
         while (bvi < blk.values.count) {
-            const val_idx = blk.values.get(bvi)
-            const val = func.getValue(val_idx)
+            const val = blk.values.get(bvi)
             var ai = 0
             while (ai < val.args.count) {
-                const arg_idx = val.args.get(ai)
-                if (arg_idx >= 0 and arg_idx < total) {
-                    var arg_val = func.getValue(arg_idx)
-                    arg_val.uses += 1
-                    func.setValue(arg_idx, arg_val)
+                const arg = val.args.get(ai)
+                if (arg != null_val) {
+                    arg.uses += 1
                 }
                 ai += 1
             }
@@ -215,19 +199,15 @@ fn recomputeUses(func: *SsaFunc) void {
         // wrongly removed as dead.
         var ci = 0
         while (ci < blk.controls.count) {
-            const ctrl_idx = blk.controls.get(ci)
-            if (ctrl_idx >= 0 and ctrl_idx < total) {
-                var ctrl_val = func.getValue(ctrl_idx)
-                ctrl_val.uses += 1
-                func.setValue(ctrl_idx, ctrl_val)
+            const ctrl = blk.controls.get(ci)
+            if (ctrl != null_val) {
+                ctrl.uses += 1
                 // Count uses from control value's args
                 var cai = 0
-                while (cai < ctrl_val.args.count) {
-                    const ctrl_arg = ctrl_val.args.get(cai)
-                    if (ctrl_arg >= 0 and ctrl_arg < total) {
-                        var ca_val = func.getValue(ctrl_arg)
-                        ca_val.uses += 1
-                        func.setValue(ctrl_arg, ca_val)
+                while (cai < ctrl.args.count) {
+                    const ctrl_arg = ctrl.args.get(cai)
+                    if (ctrl_arg != null_val) {
+                        ctrl_arg.uses += 1
                     }
                     cai += 1
                 }
@@ -239,9 +219,9 @@ fn recomputeUses(func: *SsaFunc) void {
 }
 
 /// Check if a value is live (should be kept).
-fn isLive(val: SsaValue, val_idx: int, is_control: *Map(int, bool)) bool {
+fn isLive(val: SsaValue, is_control: *Map(int, bool)) bool {
     // Control values are always live
-    if (is_control.contains(val_idx)) { return true }
+    if (is_control.contains(val.id)) { return true }
 
     // Values with uses are live
     if (val.uses > 0) { return true }
@@ -316,21 +296,18 @@ test "deadcode removes unused values" {
     const b0 = func.newBlock(SsaBlockKind.ret)
 
     // v0 = const_int 42 (dead — no uses)
-    const v0 = func.newValue(SsaOp.const_int, I64, b0, 0, 0)
-    func.addValueToBlock(v0, b0)
+    const v0 = func.newValue(SsaOp.const_int, I64, b0.idx, 0, 0)
+    func.addValueToBlock(v0, b0.idx)
 
     // v1 = const_int 10 (used as control)
-    const v1 = func.newValue(SsaOp.const_int, I64, b0, 0, 0)
-    func.addValueToBlock(v1, b0)
-    var blk = func.getBlock(b0)
-    blk.setControl(v1)
-    func.setBlock(b0, blk)
+    const v1 = func.newValue(SsaOp.const_int, I64, b0.idx, 0, 0)
+    func.addValueToBlock(v1, b0.idx)
+    b0.setControl(v1)
 
     deadcode(&func)
 
-    const result_blk = func.getBlock(b0)
-    @assertEq(result_blk.values.count, 1)
-    @assertEq(result_blk.values.get(0), v1)
+    @assertEq(b0.values.count, 1)
+    @assertEq(b0.values.get(0).id, v1.id)
 }
 
 test "deadcode keeps side effects" {
@@ -338,18 +315,17 @@ test "deadcode keeps side effects" {
     const b0 = func.newBlock(SsaBlockKind.ret)
 
     // v0 = const_int (dead)
-    const v0 = func.newValue(SsaOp.const_int, I64, b0, 0, 0)
-    func.addValueToBlock(v0, b0)
+    const v0 = func.newValue(SsaOp.const_int, I64, b0.idx, 0, 0)
+    func.addValueToBlock(v0, b0.idx)
 
     // v1 = store (side effect — kept)
-    const v1 = func.newValue(SsaOp.store, I64, b0, 0, 0)
-    func.addValueToBlock(v1, b0)
+    const v1 = func.newValue(SsaOp.store, I64, b0.idx, 0, 0)
+    func.addValueToBlock(v1, b0.idx)
 
     deadcode(&func)
 
-    const result_blk = func.getBlock(b0)
-    @assertEq(result_blk.values.count, 1)
-    @assertEq(result_blk.values.get(0), v1)
+    @assertEq(b0.values.count, 1)
+    @assertEq(b0.values.get(0).id, v1.id)
 }
 
 test "deadcode keeps transitive deps" {
@@ -357,28 +333,23 @@ test "deadcode keeps transitive deps" {
     const b0 = func.newBlock(SsaBlockKind.ret)
 
     // v0 = const_int 42
-    const v0 = func.newValue(SsaOp.const_int, I64, b0, 0, 0)
-    func.addValueToBlock(v0, b0)
+    const v0 = func.newValue(SsaOp.const_int, I64, b0.idx, 0, 0)
+    func.addValueToBlock(v0, b0.idx)
 
     // v1 = add(v0, v0) — used by control
-    const v1 = func.newValue(SsaOp.add, I64, b0, 0, 0)
-    var val1 = func.getValue(v1)
-    val1.addArg(v0)
-    val1.addArg(v0)
-    func.setValue(v1, val1)
-    func.addValueToBlock(v1, b0)
+    const v1 = func.newValue(SsaOp.add, I64, b0.idx, 0, 0)
+    v1.addArg(v0)
+    v1.addArg(v0)
+    func.addValueToBlock(v1, b0.idx)
 
     // v2 = const_int 99 (dead)
-    const v2 = func.newValue(SsaOp.const_int, I64, b0, 0, 0)
-    func.addValueToBlock(v2, b0)
+    const v2 = func.newValue(SsaOp.const_int, I64, b0.idx, 0, 0)
+    func.addValueToBlock(v2, b0.idx)
 
-    var blk = func.getBlock(b0)
-    blk.setControl(v1)
-    func.setBlock(b0, blk)
+    b0.setControl(v1)
 
     deadcode(&func)
 
     // v0 and v1 kept (v1=control, v0=arg of v1), v2 removed
-    const result_blk = func.getBlock(b0)
-    @assertEq(result_blk.values.count, 2)
+    @assertEq(b0.values.count, 2)
 }

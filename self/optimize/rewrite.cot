@@ -21,10 +21,10 @@ fn rewrite(func: *SsaFunc, string_offsets: *Map(string, int)) void {
     var total_values: i64 = 0
     var const_strings: i64 = 0
     for bi in 0..func.blocks.count {
-        const blk = func.getBlock(bi)
+        const blk = func.blocks.get(bi)
         for vi in 0..blk.values.count {
             total_values += 1
-            if (func.getValue(blk.values.get(vi)).op == SsaOp.const_string) { const_strings += 1 }
+            if (blk.values.get(vi).op == SsaOp.const_string) { const_strings += 1 }
         }
     }
     debug_log(.codegen, "=== Rewritegeneric pass for '${func.name}' (${func.blocks.count} blocks, ${total_values} values, ${const_strings} const_strings) ===")
@@ -32,22 +32,21 @@ fn rewrite(func: *SsaFunc, string_offsets: *Map(string, int)) void {
     var rewritten: int = 0
 
     for bi in 0..func.blocks.count {
-        var blk = func.getBlock(bi)
+        const blk = func.blocks.get(bi)
 
-        // Collect const_string value indices to rewrite
-        var to_rewrite: List(int) = .{}
+        // Collect const_string values to rewrite
+        var to_rewrite: List(*SsaValue) = .{}
         for vi in 0..blk.values.count {
-            const val_idx = blk.values.get(vi)
-            const val = func.getValue(val_idx)
+            const val = blk.values.get(vi)
             if (val.op == SsaOp.const_string) {
-                to_rewrite.append(val_idx)
+                to_rewrite.append(val)
             }
         }
 
         // Rewrite each collected value
         for ri in 0..to_rewrite.count {
-            const val_idx = to_rewrite.get(ri)
-            if (rewriteConstString(func, bi, val_idx, string_offsets)) {
+            const val = to_rewrite.get(ri)
+            if (rewriteConstString(func, bi, val, string_offsets)) {
                 rewritten += 1
             }
         }
@@ -65,9 +64,7 @@ fn rewrite(func: *SsaFunc, string_offsets: *Map(string, int)) void {
 ///
 /// For Cot/Wasm:
 ///   (const_string aux_int=idx) => (string_make (const_64 [offset]) (const_64 [len]))
-fn rewriteConstString(func: *SsaFunc, block_idx: int, val_idx: int, string_offsets: *Map(string, int)) bool {
-    var val = func.getValue(val_idx)
-
+fn rewriteConstString(func: *SsaFunc, block_idx: int, val: *SsaValue, string_offsets: *Map(string, int)) bool {
     // Get string index from aux_int
     const string_idx = val.aux_int
 
@@ -85,26 +82,21 @@ fn rewriteConstString(func: *SsaFunc, block_idx: int, val_idx: int, string_offse
     }
 
     // Create ptr constant: const_64 with data section offset
-    const ptr_val_idx = func.newValue(SsaOp.const_64, I64, block_idx, val.pos_line, val.pos_col)
-    var ptr_val = func.getValue(ptr_val_idx)
+    const ptr_val = func.newValue(SsaOp.const_64, I64, block_idx, val.pos_line, val.pos_col)
     ptr_val.aux_int = offset
-    func.setValue(ptr_val_idx, ptr_val)
-    func.addValueToBlock(ptr_val_idx, block_idx)
+    func.addValueToBlock(ptr_val, block_idx)
 
     // Create len constant: const_64 with string length
-    const len_val_idx = func.newValue(SsaOp.const_64, I64, block_idx, val.pos_line, val.pos_col)
-    var len_val = func.getValue(len_val_idx)
+    const len_val = func.newValue(SsaOp.const_64, I64, block_idx, val.pos_line, val.pos_col)
     len_val.aux_int = str_len
-    func.setValue(len_val_idx, len_val)
-    func.addValueToBlock(len_val_idx, block_idx)
+    func.addValueToBlock(len_val, block_idx)
 
     // Transform const_string to string_make
     val.op = SsaOp.string_make
     val.aux_int = 0
     val.args.clear()
-    val.args.append(ptr_val_idx)
-    val.args.append(len_val_idx)
-    func.setValue(val_idx, val)
+    val.args.append(ptr_val)
+    val.args.append(len_val)
 
     return true
 }
@@ -121,11 +113,9 @@ test "rewriteConstString basic" {
     func.string_literals.append("hello")
 
     // Create const_string value (string index 0)
-    const v = func.newValue(SsaOp.const_string, STRING, blk, 0, 0)
-    var val = func.getValue(v)
-    val.aux_int = 0
-    func.setValue(v, val)
-    func.addValueToBlock(v, blk)
+    const v = func.newValue(SsaOp.const_string, STRING, blk.idx, 0, 0)
+    v.aux_int = 0
+    func.addValueToBlock(v, blk.idx)
 
     // Create string offsets map
     var offsets: Map(string, int) = .{}
@@ -135,17 +125,16 @@ test "rewriteConstString basic" {
     rewrite(&func, &offsets)
 
     // Verify transformation
-    const result = func.getValue(v)
-    @assertEq(result.op == SsaOp.string_make, true)
-    @assertEq(result.args.count, 2)
+    @assertEq(v.op == SsaOp.string_make, true)
+    @assertEq(v.args.count, 2)
 
     // Check ptr constant
-    const ptr_val = func.getValue(result.args.get(0))
+    const ptr_val = v.args.get(0)
     @assertEq(ptr_val.op == SsaOp.const_64, true)
     @assertEq(ptr_val.aux_int, 100)
 
     // Check len constant
-    const len_val = func.getValue(result.args.get(1))
+    const len_val = v.args.get(1)
     @assertEq(len_val.op == SsaOp.const_64, true)
     @assertEq(len_val.aux_int, 5)
 
@@ -156,31 +145,27 @@ test "rewriteConstString out of bounds" {
     const blk = func.newBlock(SsaBlockKind.first)
 
     // Create const_string with invalid index (no string literals)
-    const v = func.newValue(SsaOp.const_string, STRING, blk, 0, 0)
-    var val = func.getValue(v)
-    val.aux_int = 99
-    func.setValue(v, val)
-    func.addValueToBlock(v, blk)
+    const v = func.newValue(SsaOp.const_string, STRING, blk.idx, 0, 0)
+    v.aux_int = 99
+    func.addValueToBlock(v, blk.idx)
 
     var offsets: Map(string, int) = .{}
     rewrite(&func, &offsets)
 
     // Should remain unchanged
-    const result = func.getValue(v)
-    @assertEq(result.op == SsaOp.const_string, true)
+    @assertEq(v.op == SsaOp.const_string, true)
 }
 
 test "rewrite skips non-const_string" {
     var func = SsaFunc.init("test_skip")
     const blk = func.newBlock(SsaBlockKind.first)
 
-    const v = func.newValue(SsaOp.add, I64, blk, 0, 0)
-    func.addValueToBlock(v, blk)
+    const v = func.newValue(SsaOp.add, I64, blk.idx, 0, 0)
+    func.addValueToBlock(v, blk.idx)
 
     var offsets: Map(string, int) = .{}
     rewrite(&func, &offsets)
 
     // add should remain unchanged
-    const result = func.getValue(v)
-    @assertEq(result.op == SsaOp.add, true)
+    @assertEq(v.op == SsaOp.add, true)
 }

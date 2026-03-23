@@ -19,9 +19,9 @@ fn copyelim(func: *SsaFunc) void {
     var total_copies: i64 = 0
     var total_phis: i64 = 0
     for bi in 0..func.blocks.count {
-        const blk = func.getBlock(bi)
+        const blk = func.blocks.get(bi)
         for vi in 0..blk.values.count {
-            const v = func.getValue(blk.values.get(vi))
+            const v = blk.values.get(vi)
             total_values += 1
             if (v.op == SsaOp.copy) { total_copies += 1 }
             if (v.op == SsaOp.phi) { total_phis += 1 }
@@ -35,17 +35,15 @@ fn copyelim(func: *SsaFunc) void {
     // Zig reference: copyelim.zig:24-36
     var ctrl_rewrites: i64 = 0
     for bi in 0..func.blocks.count {
-        var blk = func.getBlock(bi)
+        const blk = func.blocks.get(bi)
         for ci in 0..blk.controls.count {
             const ctrl = blk.controls.get(ci)
-            const ctrl_v = func.getValue(ctrl)
-            if (ctrl_v.op == SsaOp.copy and ctrl_v.args.count > 0) {
+            if (ctrl.op == SsaOp.copy and ctrl.args.count > 0) {
                 const src = followCopyChain(func, ctrl)
                 blk.controls.set(ci, src)
                 ctrl_rewrites += 1
             }
         }
-        func.setBlock(bi, blk)
     }
 
     debug_log(.copyelim, "=== Copyelim complete for '${func.name}': ${ctrl_rewrites} control rewrites ===")
@@ -54,52 +52,28 @@ fn copyelim(func: *SsaFunc) void {
 /// Follow a copy chain to its ultimate source.
 /// Simple approach without path compression — avoids ARC issues with in-place
 /// arg mutation. Uses a step limit to prevent infinite loops in unreachable code.
-fn followCopyChain(func: *SsaFunc, val_idx: int) int {
-    var cur = val_idx
+fn followCopyChain(func: *SsaFunc, val: *SsaValue) *SsaValue {
+    var cur = val
     var steps = 0
     while (steps < 1000) {
-        const v = func.getValue(cur)
-        if (v.op != SsaOp.copy or v.args.count == 0) { return cur }
-        cur = v.args.get(0)
+        if (cur.op != SsaOp.copy or cur.args.count == 0) { return cur }
+        cur = cur.args.get(0)
         steps += 1
     }
     return cur
 }
 
 /// Replace copy args in a value with their ultimate sources.
-/// Rebuilds args list to avoid in-place mutation of shared List backing arrays.
-fn replaceCopyArgs(func: *SsaFunc, val_idx: int) void {
-    var val = func.getValue(val_idx)
-    if (val.args.count == 0) { return }
-
-    var any_changed = false
+/// Zig reference: copyelim.zig copyelimValue() — in-place setArg.
+fn replaceCopyArgs(func: *SsaFunc, val: *SsaValue) void {
     var ai = 0
     while (ai < val.args.count) {
         const arg = val.args.get(ai)
-        const arg_val = func.getValue(arg)
-        if (arg_val.op == SsaOp.copy) {
-            any_changed = true
-            break
+        if (arg.op == SsaOp.copy) {
+            val.setArg(ai, followCopyChain(func, arg))
         }
         ai += 1
     }
-    if (!any_changed) { return }
-
-    // Build new args list with copies resolved
-    var new_args: List(int) = .{}
-    ai = 0
-    while (ai < val.args.count) {
-        const arg = val.args.get(ai)
-        const arg_val = func.getValue(arg)
-        if (arg_val.op == SsaOp.copy) {
-            new_args.append(followCopyChain(func, arg))
-        } else {
-            new_args.append(arg)
-        }
-        ai += 1
-    }
-    val.args = new_args
-    func.setValue(val_idx, val)
 }
 
 /// Phi elimination: convert redundant phis to copies.
@@ -111,14 +85,14 @@ fn phielim(func: *SsaFunc) void {
         changed = false
         var bi = 0
         while (bi < func.blocks.count) {
-            const blk = func.getBlock(bi)
+            const blk = func.blocks.get(bi)
             var vi = 0
             while (vi < blk.values.count) {
-                const val_idx = blk.values.get(vi)
+                const val = blk.values.get(vi)
                 // Eliminate copy args first (matching Go's combined pass).
                 // Zig reference: copyelim.zig:97 — copyelimValue(v) for EVERY value.
-                replaceCopyArgs(func, val_idx)
-                if (phielimValue(func, val_idx)) {
+                replaceCopyArgs(func, val)
+                if (phielimValue(func, val)) {
                     changed = true
                 }
                 vi += 1
@@ -130,29 +104,27 @@ fn phielim(func: *SsaFunc) void {
 
 /// Try to convert a phi to a copy.
 /// Returns true if the phi was converted.
-fn phielimValue(func: *SsaFunc, val_idx: int) bool {
-    var val = func.getValue(val_idx)
+fn phielimValue(func: *SsaFunc, val: *SsaValue) bool {
     if (val.op != SsaOp.phi) { return false }
 
     // Find the single non-self argument
-    var w: int = -1
+    var w: *SsaValue = null_val
     var ai = 0
     while (ai < val.args.count) {
         const arg = val.args.get(ai)
-        if (arg == val_idx) { ai += 1; continue }  // skip self-references
-        if (arg == w) { ai += 1; continue }          // skip duplicates of w
-        if (w != -1) { return false }                 // two distinct args — not redundant
+        if (arg.id == val.id) { ai += 1; continue }  // skip self-references
+        if (w != null_val and arg.id == w.id) { ai += 1; continue }  // skip duplicates of w
+        if (w != null_val) { return false }            // two distinct args — not redundant
         w = arg
         ai += 1
     }
 
-    if (w == -1) { return false }  // all self-refs — dead cycle
+    if (w == null_val) { return false }  // all self-refs — dead cycle
 
     // Convert phi to copy(w)
     val.op = SsaOp.copy
     val.args.count = 0
     val.addArg(w)
-    func.setValue(val_idx, val)
     return true
 }
 
@@ -165,66 +137,57 @@ test "phielim redundant phi" {
     const b0 = func.newBlock(SsaBlockKind.plain)
 
     // v0 = const_int 42
-    const v0 = func.newValue(SsaOp.const_int, I64, b0, 0, 0)
-    func.addValueToBlock(v0, b0)
+    const v0 = func.newValue(SsaOp.const_int, I64, b0.idx, 0, 0)
+    func.addValueToBlock(v0, b0.idx)
 
     // v1 = phi(v0, v0) — redundant, should become copy(v0)
-    const v1 = func.newValue(SsaOp.phi, I64, b0, 0, 0)
-    var val1 = func.getValue(v1)
-    val1.addArg(v0)
-    val1.addArg(v0)
-    func.setValue(v1, val1)
-    func.addValueToBlock(v1, b0)
+    const v1 = func.newValue(SsaOp.phi, I64, b0.idx, 0, 0)
+    v1.addArg(v0)
+    v1.addArg(v0)
+    func.addValueToBlock(v1, b0.idx)
 
     copyelim(&func)
 
-    const result = func.getValue(v1)
-    @assertEq(result.op == SsaOp.copy, true)
-    @assertEq(result.args.count, 1)
-    @assertEq(result.args.get(0), v0)
+    @assertEq(v1.op == SsaOp.copy, true)
+    @assertEq(v1.args.count, 1)
+    @assertEq(v1.args.get(0).id, v0.id)
 }
 
 test "phielim non-redundant phi" {
     var func = SsaFunc.init("test_nonredundant")
     const b0 = func.newBlock(SsaBlockKind.plain)
 
-    const v0 = func.newValue(SsaOp.const_int, I64, b0, 0, 0)
-    func.addValueToBlock(v0, b0)
-    const v1 = func.newValue(SsaOp.const_int, I64, b0, 0, 0)
-    func.addValueToBlock(v1, b0)
+    const v0 = func.newValue(SsaOp.const_int, I64, b0.idx, 0, 0)
+    func.addValueToBlock(v0, b0.idx)
+    const v1 = func.newValue(SsaOp.const_int, I64, b0.idx, 0, 0)
+    func.addValueToBlock(v1, b0.idx)
 
     // v2 = phi(v0, v1) — NOT redundant (two distinct args)
-    const v2 = func.newValue(SsaOp.phi, I64, b0, 0, 0)
-    var val2 = func.getValue(v2)
-    val2.addArg(v0)
-    val2.addArg(v1)
-    func.setValue(v2, val2)
-    func.addValueToBlock(v2, b0)
+    const v2 = func.newValue(SsaOp.phi, I64, b0.idx, 0, 0)
+    v2.addArg(v0)
+    v2.addArg(v1)
+    func.addValueToBlock(v2, b0.idx)
 
     copyelim(&func)
 
-    const result = func.getValue(v2)
-    @assertEq(result.op == SsaOp.phi, true)  // should remain a phi
+    @assertEq(v2.op == SsaOp.phi, true)  // should remain a phi
 }
 
 test "phielim self-referencing phi" {
     var func = SsaFunc.init("test_selfref")
     const b0 = func.newBlock(SsaBlockKind.plain)
 
-    const v0 = func.newValue(SsaOp.const_int, I64, b0, 0, 0)
-    func.addValueToBlock(v0, b0)
+    const v0 = func.newValue(SsaOp.const_int, I64, b0.idx, 0, 0)
+    func.addValueToBlock(v0, b0.idx)
 
     // v1 = phi(v0, v1) — redundant: only non-self arg is v0
-    const v1 = func.newValue(SsaOp.phi, I64, b0, 0, 0)
-    var val1 = func.getValue(v1)
-    val1.addArg(v0)
-    val1.addArg(v1)  // self-reference
-    func.setValue(v1, val1)
-    func.addValueToBlock(v1, b0)
+    const v1 = func.newValue(SsaOp.phi, I64, b0.idx, 0, 0)
+    v1.addArg(v0)
+    v1.addArg(v1)  // self-reference
+    func.addValueToBlock(v1, b0.idx)
 
     copyelim(&func)
 
-    const result = func.getValue(v1)
-    @assertEq(result.op == SsaOp.copy, true)
-    @assertEq(result.args.get(0), v0)
+    @assertEq(v1.op == SsaOp.copy, true)
+    @assertEq(v1.args.get(0).id, v0.id)
 }

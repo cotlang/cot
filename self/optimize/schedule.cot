@@ -61,7 +61,7 @@ fn isLoadOp(op: SsaOp) bool {
 /// Schedule all blocks in a function.
 fn schedule(func: *SsaFunc) void {
     var total_values: i64 = 0
-    for bi in 0..func.blocks.count { total_values += func.getBlock(bi).values.count }
+    for bi in 0..func.blocks.count { total_values += func.blocks.get(bi).values.count }
     debug_log(.schedule, "=== Schedule pass for '${func.name}' (${func.blocks.count} blocks, ${total_values} values) ===")
 
     for bi in 0..func.blocks.count {
@@ -73,16 +73,16 @@ fn schedule(func: *SsaFunc) void {
 
 /// Schedule a single block using priority-based topological sort.
 fn scheduleBlock(func: *SsaFunc, block_idx: int) void {
-    const blk = func.getBlock(block_idx)
+    const blk = func.blocks.get(block_idx)
     const num_values = blk.values.count
     if (num_values == 0) { return }
 
     // Build scores and in-block dependency graph
-    var scores: Map(int, int) = .{}     // val_idx → score
-    var orig_pos: Map(int, int) = .{}   // val_idx → original position
-    var in_edges: Map(int, int) = .{}   // val_idx → incoming edge count
+    var scores: Map(int, int) = .{}     // val.id → score
+    var orig_pos: Map(int, int) = .{}   // val.id → original position
+    var in_edges: Map(int, int) = .{}   // val.id → incoming edge count
 
-    // Dependency edges: from → to (to depends on from)
+    // Dependency edges: from → to (to depends on from), stored as value IDs
     var edge_from: List(int) = .{}
     var edge_to: List(int) = .{}
 
@@ -90,54 +90,51 @@ fn scheduleBlock(func: *SsaFunc, block_idx: int) void {
     var control_set: Map(int, bool) = .{}
     if (blk.controls.count > 0) {
         for ci in 0..blk.controls.count {
-            control_set.set(blk.controls.get(ci), true)
+            control_set.set(blk.controls.get(ci).id, true)
         }
     }
 
     // Initialize scores and positions
     for vi in 0..num_values {
-        const val_idx = blk.values.get(vi)
-        const val = func.getValue(val_idx)
-        const is_ctrl = control_set.contains(val_idx)
-        scores.set(val_idx, getScore(val, is_ctrl))
-        orig_pos.set(val_idx, vi)
-        in_edges.set(val_idx, 0)
+        const val = blk.values.get(vi)
+        const is_ctrl = control_set.contains(val.id)
+        scores.set(val.id, getScore(val, is_ctrl))
+        orig_pos.set(val.id, vi)
+        in_edges.set(val.id, 0)
     }
 
     // Build data dependency edges (in-block only)
     var in_block: Map(int, bool) = .{}
     for vi in 0..num_values {
-        in_block.set(blk.values.get(vi), true)
+        in_block.set(blk.values.get(vi).id, true)
     }
 
     for vi in 0..num_values {
-        const val_idx = blk.values.get(vi)
-        const val = func.getValue(val_idx)
+        const val = blk.values.get(vi)
         if (val.op == SsaOp.phi) { continue }
         for ai in 0..val.args.count {
-            const arg_idx = val.args.get(ai)
-            if (in_block.contains(arg_idx)) {
-                edge_from.append(arg_idx)
-                edge_to.append(val_idx)
+            const arg = val.args.get(ai)
+            if (in_block.contains(arg.id)) {
+                edge_from.append(arg.id)
+                edge_to.append(val.id)
             }
         }
     }
 
     // Memory ordering: chain stores/calls linearly
-    var last_mem: int = -1
+    var last_mem: *SsaValue = null_val
     for vi in 0..num_values {
-        const val_idx = blk.values.get(vi)
-        const val = func.getValue(val_idx)
+        const val = blk.values.get(vi)
         if (isMemoryOp(val.op)) {
-            if (last_mem >= 0) {
-                edge_from.append(last_mem)
-                edge_to.append(val_idx)
+            if (last_mem != null_val) {
+                edge_from.append(last_mem.id)
+                edge_to.append(val.id)
             }
-            last_mem = val_idx
+            last_mem = val
         } else if (isLoadOp(val.op)) {
-            if (last_mem >= 0) {
-                edge_from.append(last_mem)
-                edge_to.append(val_idx)
+            if (last_mem != null_val) {
+                edge_from.append(last_mem.id)
+                edge_to.append(val.id)
             }
             // Loads don't update last_mem (don't chain to each other)
         }
@@ -145,34 +142,34 @@ fn scheduleBlock(func: *SsaFunc, block_idx: int) void {
 
     // Count incoming edges
     for ei in 0..edge_to.count {
-        const to_idx = edge_to.get(ei)
-        if (in_edges.contains(to_idx)) {
-            in_edges.set(to_idx, in_edges.get(to_idx) + 1)
+        const to_id = edge_to.get(ei)
+        if (in_edges.contains(to_id)) {
+            in_edges.set(to_id, in_edges.get(to_id) + 1)
         }
     }
 
     // Initialize ready set (zero incoming edges)
-    var ready: List(int) = .{}
+    var ready: List(*SsaValue) = .{}
     for vi in 0..num_values {
-        const val_idx = blk.values.get(vi)
-        if (in_edges.get(val_idx) == 0) {
-            ready.append(val_idx)
+        const val = blk.values.get(vi)
+        if (in_edges.get(val.id) == 0) {
+            ready.append(val)
         }
     }
 
     // Process in priority order
-    var result: List(int) = .{}
+    var result: List(*SsaValue) = .{}
 
     while (ready.count > 0) {
         // Find best candidate (lowest score, then earliest original position)
         var best_i: int = 0
-        var best_score = scores.get(ready.get(0))
-        var best_pos = orig_pos.get(ready.get(0))
+        var best_score = scores.get(ready.get(0).id)
+        var best_pos = orig_pos.get(ready.get(0).id)
 
         for ri in 1..ready.count {
-            const idx = ready.get(ri)
-            const s = scores.get(idx)
-            const p = orig_pos.get(idx)
+            const candidate = ready.get(ri)
+            const s = scores.get(candidate.id)
+            const p = orig_pos.get(candidate.id)
             if (s < best_score or (s == best_score and p < best_pos)) {
                 best_score = s
                 best_pos = p
@@ -190,24 +187,29 @@ fn scheduleBlock(func: *SsaFunc, block_idx: int) void {
 
         // Update ready set: decrement edges from chosen
         for ei in 0..edge_from.count {
-            if (edge_from.get(ei) == chosen) {
-                const to_idx = edge_to.get(ei)
-                const new_count = in_edges.get(to_idx) - 1
-                in_edges.set(to_idx, new_count)
+            if (edge_from.get(ei) == chosen.id) {
+                const to_id = edge_to.get(ei)
+                const new_count = in_edges.get(to_id) - 1
+                in_edges.set(to_id, new_count)
                 if (new_count == 0) {
-                    ready.append(to_idx)
+                    // Find the value pointer for this id
+                    for vi in 0..num_values {
+                        const v = blk.values.get(vi)
+                        if (v.id == to_id) {
+                            ready.append(v)
+                            break
+                        }
+                    }
                 }
             }
         }
     }
 
     // Replace block's values with scheduled order
-    var new_blk = func.getBlock(block_idx)
-    new_blk.values.clear()
+    blk.values.clear()
     for ri in 0..result.count {
-        new_blk.values.append(result.get(ri))
+        blk.values.append(result.get(ri))
     }
-    func.setBlock(block_idx, new_blk)
 
     // Free per-block temporaries
     scores.free()
@@ -229,7 +231,7 @@ test "schedule empty block" {
     var func = SsaFunc.init("test_empty")
     const blk = func.newBlock(SsaBlockKind.first)
     schedule(&func)
-    @assertEq(func.getBlock(blk).values.count, 0)
+    @assertEq(func.blocks.get(blk.idx).values.count, 0)
 }
 
 test "schedule preserves dependencies" {
@@ -237,28 +239,24 @@ test "schedule preserves dependencies" {
     const blk = func.newBlock(SsaBlockKind.first)
 
     // v1 = const_int 42
-    const v1 = func.newValue(SsaOp.const_int, I64, blk, 0, 0)
-    var val1 = func.getValue(v1)
-    val1.aux_int = 42
-    func.setValue(v1, val1)
-    func.addValueToBlock(v1, blk)
+    const v1 = func.newValue(SsaOp.const_int, I64, blk.idx, 0, 0)
+    v1.aux_int = 42
+    func.addValueToBlock(v1, blk.idx)
 
     // v2 = add(v1, v1)
-    const v2 = func.newValue(SsaOp.add, I64, blk, 0, 0)
-    var val2 = func.getValue(v2)
-    val2.addArg2(v1, v1)
-    func.setValue(v2, val2)
-    func.addValueToBlock(v2, blk)
+    const v2 = func.newValue(SsaOp.add, I64, blk.idx, 0, 0)
+    v2.addArg2(v1, v1)
+    func.addValueToBlock(v2, blk.idx)
 
     schedule(&func)
 
     // v1 must come before v2
-    const result_blk = func.getBlock(blk)
+    const result_blk = func.blocks.get(blk.idx)
     var v1_pos: int = -1
     var v2_pos: int = -1
     for i in 0..result_blk.values.count {
-        if (result_blk.values.get(i) == v1) { v1_pos = i }
-        if (result_blk.values.get(i) == v2) { v2_pos = i }
+        if (result_blk.values.get(i).id == v1.id) { v1_pos = i }
+        if (result_blk.values.get(i).id == v2.id) { v2_pos = i }
     }
     @assert(v1_pos >= 0)
     @assert(v2_pos >= 0)

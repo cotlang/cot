@@ -18,30 +18,24 @@ import "../../check/types"
 /// Lower a function's generic ops to Wasm-specific ops.
 fn lower(func: *SsaFunc) void {
     for bi in 0..func.blocks.count {
-        const blk = func.getBlock(bi)
+        const blk = func.blocks.get(bi)
         for vi in 0..blk.values.count {
-            const val_idx = blk.values.get(vi)
-            lowerValue(func, val_idx)
+            lowerValue(func, blk.values.get(vi))
         }
         // Also lower control values (may not be in values list)
         for ci in 0..blk.controls.count {
-            const ctrl_idx = blk.controls.get(ci)
-            if (ctrl_idx >= 0 and ctrl_idx < func.next_value_id) {
-                lowerValue(func, ctrl_idx)
-            }
+            lowerValue(func, blk.controls.get(ci))
         }
     }
 }
 
 /// Lower a single value's op from generic to Wasm-specific.
 /// Returns true if the op was changed.
-fn lowerValue(func: *SsaFunc, val_idx: int) bool {
-    var val = func.getValue(val_idx)
-    const new_op = lowerOp(val.op, val.type_idx, func, val_idx)
+fn lowerValue(func: *SsaFunc, val: *SsaValue) bool {
+    const new_op = lowerOp(val.op, val.type_idx, func, val)
 
     if (new_op != SsaOp.invalid) {
         val.op = new_op
-        func.setValue(val_idx, val)
         return true
     }
     return false
@@ -49,14 +43,14 @@ fn lowerValue(func: *SsaFunc, val_idx: int) bool {
 
 /// Map a generic op to its Wasm-specific equivalent.
 /// Returns SsaOp.invalid if no mapping (op stays as-is).
-fn lowerOp(op: SsaOp, type_idx: int, func: *SsaFunc, val_idx: int) SsaOp {
+fn lowerOp(op: SsaOp, type_idx: int, func: *SsaFunc, val: *SsaValue) SsaOp {
     // Type-dependent cases (load/store need float check)
     if (op == SsaOp.load or op == SsaOp.load64) {
         if (isFloatType(type_idx)) { return SsaOp.wasm_f64_load }
         return SsaOp.wasm_i64_load
     }
     if (op == SsaOp.store) {
-        if (isStoreFloatType(func, val_idx)) { return SsaOp.wasm_f64_store }
+        if (isStoreFloatType(val)) { return SsaOp.wasm_f64_store }
         return SsaOp.wasm_i64_store
     }
 
@@ -236,11 +230,9 @@ fn isFloatType(type_idx: int) bool {
 }
 
 /// Check if a store value's second argument is a float type.
-fn isStoreFloatType(func: *SsaFunc, val_idx: int) bool {
-    const val = func.getValue(val_idx)
+fn isStoreFloatType(val: *SsaValue) bool {
     if (val.args.count >= 2) {
-        const arg1 = func.getValue(val.args.get(1))
-        return isFloatType(arg1.type_idx)
+        return isFloatType(val.args.get(1).type_idx)
     }
     return false
 }
@@ -261,117 +253,110 @@ test "lower const_int to wasm_i64_const" {
     var func = SsaFunc.init("test_const")
     const blk = func.newBlock(SsaBlockKind.first)
 
-    const v = func.newValue(SsaOp.const_int, I64, blk, 0, 0)
-    var val = func.getValue(v)
-    val.aux_int = 42
-    func.setValue(v, val)
-    func.addValueToBlock(v, blk)
+    const v = func.newValue(SsaOp.const_int, I64, blk.idx, 0, 0)
+    v.aux_int = 42
+    func.addValueToBlock(v, blk.idx)
 
     lower(&func)
 
-    const result = func.getValue(v)
-    @assertEq(result.op == SsaOp.wasm_i64_const, true)
-    @assertEq(result.aux_int, 42)
+    @assertEq(v.op == SsaOp.wasm_i64_const, true)
+    @assertEq(v.aux_int, 42)
 }
 
 test "lower add to wasm_i64_add" {
     var func = SsaFunc.init("test_add")
     const blk = func.newBlock(SsaBlockKind.first)
 
-    const c1 = func.newValue(SsaOp.const_int, I64, blk, 0, 0)
-    func.addValueToBlock(c1, blk)
-    const c2 = func.newValue(SsaOp.const_int, I64, blk, 0, 0)
-    func.addValueToBlock(c2, blk)
+    const c1 = func.newValue(SsaOp.const_int, I64, blk.idx, 0, 0)
+    func.addValueToBlock(c1, blk.idx)
+    const c2 = func.newValue(SsaOp.const_int, I64, blk.idx, 0, 0)
+    func.addValueToBlock(c2, blk.idx)
 
-    const add_v = func.newValue(SsaOp.add, I64, blk, 0, 0)
-    var add_val = func.getValue(add_v)
-    add_val.addArg2(c1, c2)
-    func.setValue(add_v, add_val)
-    func.addValueToBlock(add_v, blk)
+    const add_v = func.newValue(SsaOp.add, I64, blk.idx, 0, 0)
+    add_v.addArg2(c1, c2)
+    func.addValueToBlock(add_v, blk.idx)
 
     lower(&func)
 
-    @assertEq(func.getValue(c1).op == SsaOp.wasm_i64_const, true)
-    @assertEq(func.getValue(c2).op == SsaOp.wasm_i64_const, true)
-    @assertEq(func.getValue(add_v).op == SsaOp.wasm_i64_add, true)
+    @assertEq(c1.op == SsaOp.wasm_i64_const, true)
+    @assertEq(c2.op == SsaOp.wasm_i64_const, true)
+    @assertEq(add_v.op == SsaOp.wasm_i64_add, true)
 }
 
 test "lower comparisons" {
     var func = SsaFunc.init("test_cmp")
     const blk = func.newBlock(SsaBlockKind.first)
 
-    const lt_v = func.newValue(SsaOp.lt, I64, blk, 0, 0)
-    func.addValueToBlock(lt_v, blk)
-    const ult_v = func.newValue(SsaOp.ult, I64, blk, 0, 0)
-    func.addValueToBlock(ult_v, blk)
+    const lt_v = func.newValue(SsaOp.lt, I64, blk.idx, 0, 0)
+    func.addValueToBlock(lt_v, blk.idx)
+    const ult_v = func.newValue(SsaOp.ult, I64, blk.idx, 0, 0)
+    func.addValueToBlock(ult_v, blk.idx)
 
     lower(&func)
 
-    @assertEq(func.getValue(lt_v).op == SsaOp.wasm_i64_lt_s, true)
-    @assertEq(func.getValue(ult_v).op == SsaOp.wasm_i64_lt_u, true)
+    @assertEq(lt_v.op == SsaOp.wasm_i64_lt_s, true)
+    @assertEq(ult_v.op == SsaOp.wasm_i64_lt_u, true)
 }
 
 test "lower float arithmetic" {
     var func = SsaFunc.init("test_float")
     const blk = func.newBlock(SsaBlockKind.first)
 
-    const add_f = func.newValue(SsaOp.add64f, F64, blk, 0, 0)
-    func.addValueToBlock(add_f, blk)
+    const add_f = func.newValue(SsaOp.add64f, F64, blk.idx, 0, 0)
+    func.addValueToBlock(add_f, blk.idx)
 
     lower(&func)
 
-    @assertEq(func.getValue(add_f).op == SsaOp.wasm_f64_add, true)
+    @assertEq(add_f.op == SsaOp.wasm_f64_add, true)
 }
 
 test "lower memory operations" {
     var func = SsaFunc.init("test_mem")
     const blk = func.newBlock(SsaBlockKind.first)
 
-    const load_v = func.newValue(SsaOp.load, I64, blk, 0, 0)
-    func.addValueToBlock(load_v, blk)
-    const store_v = func.newValue(SsaOp.store, I64, blk, 0, 0)
-    func.addValueToBlock(store_v, blk)
+    const load_v = func.newValue(SsaOp.load, I64, blk.idx, 0, 0)
+    func.addValueToBlock(load_v, blk.idx)
+    const store_v = func.newValue(SsaOp.store, I64, blk.idx, 0, 0)
+    func.addValueToBlock(store_v, blk.idx)
 
     lower(&func)
 
-    @assertEq(func.getValue(load_v).op == SsaOp.wasm_i64_load, true)
-    @assertEq(func.getValue(store_v).op == SsaOp.wasm_i64_store, true)
+    @assertEq(load_v.op == SsaOp.wasm_i64_load, true)
+    @assertEq(store_v.op == SsaOp.wasm_i64_store, true)
 }
 
 test "lower static_call" {
     var func = SsaFunc.init("test_call")
     const blk = func.newBlock(SsaBlockKind.first)
 
-    const call_v = func.newValue(SsaOp.static_call, I64, blk, 0, 0)
-    func.addValueToBlock(call_v, blk)
+    const call_v = func.newValue(SsaOp.static_call, I64, blk.idx, 0, 0)
+    func.addValueToBlock(call_v, blk.idx)
 
     lower(&func)
 
-    @assertEq(func.getValue(call_v).op == SsaOp.wasm_lowered_static_call, true)
+    @assertEq(call_v.op == SsaOp.wasm_lowered_static_call, true)
 }
 
 test "phi unchanged" {
     var func = SsaFunc.init("test_phi")
     const blk = func.newBlock(SsaBlockKind.first)
 
-    const phi_v = func.newValue(SsaOp.phi, I64, blk, 0, 0)
-    func.addValueToBlock(phi_v, blk)
+    const phi_v = func.newValue(SsaOp.phi, I64, blk.idx, 0, 0)
+    func.addValueToBlock(phi_v, blk.idx)
 
     lower(&func)
 
-    // phi should remain unchanged
-    @assertEq(func.getValue(phi_v).op == SsaOp.phi, true)
+    @assertEq(phi_v.op == SsaOp.phi, true)
 }
 
 test "wasm ops unchanged" {
     var func = SsaFunc.init("test_already_wasm")
     const blk = func.newBlock(SsaBlockKind.first)
 
-    const v = func.newValue(SsaOp.wasm_i64_add, I64, blk, 0, 0)
-    func.addValueToBlock(v, blk)
+    const v = func.newValue(SsaOp.wasm_i64_add, I64, blk.idx, 0, 0)
+    func.addValueToBlock(v, blk.idx)
 
     lower(&func)
 
-    // Already Wasm — should not change
-    @assertEq(func.getValue(v).op == SsaOp.wasm_i64_add, true)
+    @assertEq(v.op == SsaOp.wasm_i64_add, true)
 }

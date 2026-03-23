@@ -14,40 +14,37 @@ import "../debug"
 /// Run CSE on a function.
 fn cse(func: *SsaFunc) void {
     var total_values: i64 = 0
-    for bi in 0..func.blocks.count { total_values += func.getBlock(bi).values.count }
+    for bi in 0..func.blocks.count { total_values += func.blocks.get(bi).values.count }
     debug_log(.codegen, "=== CSE pass for '${func.name}' (${func.blocks.count} blocks, ${total_values} values) ===")
-    const total = func.next_value_id
 
     // Build a hash for each value and look for duplicates within the same block.
-    // rewrite[v] = w means "replace v with w"
-    var rewrite: Map(int, int) = .{}
+    // rewrite[val.id] = *SsaValue means "replace val with that value"
+    var rewrite: Map(int, *SsaValue) = .{}
 
     var bi = 0
     while (bi < func.blocks.count) {
-        const blk = func.getBlock(bi)
+        const blk = func.blocks.get(bi)
 
-        // Hash table: hash → first value index with that hash
-        var seen: Map(int, int) = .{}
+        // Hash table: hash → first *SsaValue with that hash
+        var seen: Map(int, *SsaValue) = .{}
 
         var vi = 0
         while (vi < blk.values.count) {
-            const val_idx = blk.values.get(vi)
-            const val = func.getValue(val_idx)
+            const val = blk.values.get(vi)
 
             // Skip non-CSE-able ops (side effects, phis, memory ops)
             if (!canCSE(val.op)) { vi += 1; continue }
 
             const h = hashValue(val)
             if (seen.contains(h)) {
-                const existing_idx = seen.get(h)
-                const existing = func.getValue(existing_idx)
-                if (valuesEqual(val, existing, val_idx, existing_idx)) {
-                    // Duplicate found — rewrite val_idx → existing_idx
-                    rewrite.set(val_idx, existing_idx)
+                const existing = seen.get(h)
+                if (valuesEqual(val, existing)) {
+                    // Duplicate found — rewrite val → existing
+                    rewrite.set(val.id, existing)
                 }
                 // Hash collision but not equal — keep both (simple approach)
             } else {
-                seen.set(h, val_idx)
+                seen.set(h, val)
             }
             vi += 1
         }
@@ -63,41 +60,31 @@ fn cse(func: *SsaFunc) void {
     }
 
     // Apply rewrites: for each value, replace args that have rewrites
-    var vi = 0
-    while (vi < total) {
-        var val = func.getValue(vi)
+    for vi in 0..func.values.count {
+        const val = func.values.get(vi)
         var changed = false
         var ai = 0
         while (ai < val.args.count) {
             const arg = val.args.get(ai)
-            if (rewrite.contains(arg)) {
-                val.args.set(ai, rewrite.get(arg))
+            if (rewrite.contains(arg.id)) {
+                val.setArg(ai, rewrite.get(arg.id))
                 changed = true
             }
             ai += 1
         }
-        if (changed) {
-            func.setValue(vi, val)
-        }
-        vi += 1
     }
 
     // Also rewrite block controls
     bi = 0
     while (bi < func.blocks.count) {
-        var blk = func.getBlock(bi)
-        var ctrl_changed = false
+        const blk = func.blocks.get(bi)
         var ci = 0
         while (ci < blk.controls.count) {
             const ctrl = blk.controls.get(ci)
-            if (rewrite.contains(ctrl)) {
-                blk.controls.set(ci, rewrite.get(ctrl))
-                ctrl_changed = true
+            if (rewrite.contains(ctrl.id)) {
+                blk.controls.set(ci, rewrite.get(ctrl.id))
             }
             ci += 1
-        }
-        if (ctrl_changed) {
-            func.setBlock(bi, blk)
         }
         bi += 1
     }
@@ -171,7 +158,7 @@ fn hashValue(val: SsaValue) int {
     h = h ^ (val.aux_int * 13)
     var ai = 0
     while (ai < val.args.count) {
-        h = h ^ (val.args.get(ai) * (7 + ai))
+        h = h ^ (val.args.get(ai).id * (7 + ai))
         ai += 1
     }
     // Make hash positive
@@ -180,14 +167,14 @@ fn hashValue(val: SsaValue) int {
 }
 
 /// Check if two values are structurally equal (same op, type, aux, args).
-fn valuesEqual(a: SsaValue, b: SsaValue, a_idx: int, b_idx: int) bool {
+fn valuesEqual(a: SsaValue, b: SsaValue) bool {
     if (a.op != b.op) { return false }
     if (a.type_idx != b.type_idx) { return false }
     if (a.aux_int != b.aux_int) { return false }
     if (a.args.count != b.args.count) { return false }
     var ai = 0
     while (ai < a.args.count) {
-        if (a.args.get(ai) != b.args.get(ai)) { return false }
+        if (a.args.get(ai).id != b.args.get(ai).id) { return false }
         ai += 1
     }
     return true
@@ -202,33 +189,26 @@ test "cse eliminates duplicate constants" {
     const b0 = func.newBlock(SsaBlockKind.plain)
 
     // v0 = const_int 42
-    const v0 = func.newValue(SsaOp.const_int, I64, b0, 0, 0)
-    var val0 = func.getValue(v0)
-    val0.aux_int = 42
-    func.setValue(v0, val0)
-    func.addValueToBlock(v0, b0)
+    const v0 = func.newValue(SsaOp.const_int, I64, b0.idx, 0, 0)
+    v0.aux_int = 42
+    func.addValueToBlock(v0, b0.idx)
 
     // v1 = const_int 42 (duplicate of v0)
-    const v1 = func.newValue(SsaOp.const_int, I64, b0, 0, 0)
-    var val1 = func.getValue(v1)
-    val1.aux_int = 42
-    func.setValue(v1, val1)
-    func.addValueToBlock(v1, b0)
+    const v1 = func.newValue(SsaOp.const_int, I64, b0.idx, 0, 0)
+    v1.aux_int = 42
+    func.addValueToBlock(v1, b0.idx)
 
     // v2 = add(v0, v1) — v1 should be rewritten to v0
-    const v2 = func.newValue(SsaOp.add, I64, b0, 0, 0)
-    var val2 = func.getValue(v2)
-    val2.addArg(v0)
-    val2.addArg(v1)
-    func.setValue(v2, val2)
-    func.addValueToBlock(v2, b0)
+    const v2 = func.newValue(SsaOp.add, I64, b0.idx, 0, 0)
+    v2.addArg(v0)
+    v2.addArg(v1)
+    func.addValueToBlock(v2, b0.idx)
 
     cse(&func)
 
     // After CSE, v2's second arg should point to v0 (v1 rewritten to v0)
-    const result = func.getValue(v2)
-    @assertEq(result.args.get(0), v0)
-    @assertEq(result.args.get(1), v0)
+    @assertEq(v2.args.get(0).id, v0.id)
+    @assertEq(v2.args.get(1).id, v0.id)
 }
 
 test "cse keeps different constants" {
@@ -236,71 +216,57 @@ test "cse keeps different constants" {
     const b0 = func.newBlock(SsaBlockKind.plain)
 
     // v0 = const_int 42
-    const v0 = func.newValue(SsaOp.const_int, I64, b0, 0, 0)
-    var val0 = func.getValue(v0)
-    val0.aux_int = 42
-    func.setValue(v0, val0)
-    func.addValueToBlock(v0, b0)
+    const v0 = func.newValue(SsaOp.const_int, I64, b0.idx, 0, 0)
+    v0.aux_int = 42
+    func.addValueToBlock(v0, b0.idx)
 
     // v1 = const_int 99 (different value — NOT duplicate)
-    const v1 = func.newValue(SsaOp.const_int, I64, b0, 0, 0)
-    var val1 = func.getValue(v1)
-    val1.aux_int = 99
-    func.setValue(v1, val1)
-    func.addValueToBlock(v1, b0)
+    const v1 = func.newValue(SsaOp.const_int, I64, b0.idx, 0, 0)
+    v1.aux_int = 99
+    func.addValueToBlock(v1, b0.idx)
 
     // v2 = add(v0, v1)
-    const v2 = func.newValue(SsaOp.add, I64, b0, 0, 0)
-    var val2 = func.getValue(v2)
-    val2.addArg(v0)
-    val2.addArg(v1)
-    func.setValue(v2, val2)
-    func.addValueToBlock(v2, b0)
+    const v2 = func.newValue(SsaOp.add, I64, b0.idx, 0, 0)
+    v2.addArg(v0)
+    v2.addArg(v1)
+    func.addValueToBlock(v2, b0.idx)
 
     cse(&func)
 
     // No rewrites — args unchanged
-    const result = func.getValue(v2)
-    @assertEq(result.args.get(0), v0)
-    @assertEq(result.args.get(1), v1)
+    @assertEq(v2.args.get(0).id, v0.id)
+    @assertEq(v2.args.get(1).id, v1.id)
 }
 
 test "cse eliminates duplicate arithmetic" {
     var func = SsaFunc.init("test_arith")
     const b0 = func.newBlock(SsaBlockKind.plain)
 
-    const v0 = func.newValue(SsaOp.const_int, I64, b0, 0, 0)
-    func.addValueToBlock(v0, b0)
-    const v1 = func.newValue(SsaOp.const_int, I64, b0, 0, 0)
-    func.addValueToBlock(v1, b0)
+    const v0 = func.newValue(SsaOp.const_int, I64, b0.idx, 0, 0)
+    func.addValueToBlock(v0, b0.idx)
+    const v1 = func.newValue(SsaOp.const_int, I64, b0.idx, 0, 0)
+    func.addValueToBlock(v1, b0.idx)
 
     // v2 = add(v0, v1)
-    const v2 = func.newValue(SsaOp.add, I64, b0, 0, 0)
-    var val2 = func.getValue(v2)
-    val2.addArg(v0)
-    val2.addArg(v1)
-    func.setValue(v2, val2)
-    func.addValueToBlock(v2, b0)
+    const v2 = func.newValue(SsaOp.add, I64, b0.idx, 0, 0)
+    v2.addArg(v0)
+    v2.addArg(v1)
+    func.addValueToBlock(v2, b0.idx)
 
     // v3 = add(v0, v1) — same as v2, should be eliminated
-    const v3 = func.newValue(SsaOp.add, I64, b0, 0, 0)
-    var val3 = func.getValue(v3)
-    val3.addArg(v0)
-    val3.addArg(v1)
-    func.setValue(v3, val3)
-    func.addValueToBlock(v3, b0)
+    const v3 = func.newValue(SsaOp.add, I64, b0.idx, 0, 0)
+    v3.addArg(v0)
+    v3.addArg(v1)
+    func.addValueToBlock(v3, b0.idx)
 
     // v4 = mul(v2, v3) — v3 should be rewritten to v2
-    const v4 = func.newValue(SsaOp.mul, I64, b0, 0, 0)
-    var val4 = func.getValue(v4)
-    val4.addArg(v2)
-    val4.addArg(v3)
-    func.setValue(v4, val4)
-    func.addValueToBlock(v4, b0)
+    const v4 = func.newValue(SsaOp.mul, I64, b0.idx, 0, 0)
+    v4.addArg(v2)
+    v4.addArg(v3)
+    func.addValueToBlock(v4, b0.idx)
 
     cse(&func)
 
-    const result = func.getValue(v4)
-    @assertEq(result.args.get(0), v2)
-    @assertEq(result.args.get(1), v2)  // v3 rewritten to v2
+    @assertEq(v4.args.get(0).id, v2.id)
+    @assertEq(v4.args.get(1).id, v2.id)  // v3 rewritten to v2
 }

@@ -24,7 +24,7 @@ import "../check/types"
 /// Iterates to fixpoint (multiple passes for nested decompositions).
 fn rewrite(func: *SsaFunc) void {
     var total_values: i64 = 0
-    for bi in 0..func.blocks.count { total_values += func.getBlock(bi).values.count }
+    for bi in 0..func.blocks.count { total_values += func.blocks.get(bi).values.count }
     debug_log(.codegen, "=== Rewritedec pass for '${func.name}' (${func.blocks.count} blocks, ${total_values} values) ===")
 
     var rewritten: int = 0
@@ -36,10 +36,10 @@ fn rewrite(func: *SsaFunc) void {
         iterations += 1
 
         for bi in 0..func.blocks.count {
-            const blk = func.getBlock(bi)
+            const blk = func.blocks.get(bi)
             for vi in 0..blk.values.count {
-                const val_idx = blk.values.get(vi)
-                if (rewriteValue(func, bi, val_idx)) {
+                const val = blk.values.get(vi)
+                if (rewriteValue(func, bi, val)) {
                     changed = true
                     rewritten += 1
                 }
@@ -53,30 +53,28 @@ fn rewrite(func: *SsaFunc) void {
 }
 
 /// Rewrite a single value if applicable.
-fn rewriteValue(func: *SsaFunc, block_idx: int, val_idx: int) bool {
-    const val = func.getValue(val_idx)
+fn rewriteValue(func: *SsaFunc, block_idx: int, val: *SsaValue) bool {
     return switch (val.op) {
-        .slice_ptr => rewriteSlicePtr(func, block_idx, val_idx),
-        .slice_len => rewriteSliceLen(func, block_idx, val_idx),
-        .slice_cap => rewriteSliceCap(func, block_idx, val_idx),
-        .string_ptr => rewriteStringPtr(func, block_idx, val_idx),
-        .string_len => rewriteStringLen(func, block_idx, val_idx),
-        .string_concat => rewriteStringConcat(func, block_idx, val_idx),
+        .slice_ptr => rewriteSlicePtr(func, block_idx, val),
+        .slice_len => rewriteSliceLen(func, block_idx, val),
+        .slice_cap => rewriteSliceCap(func, block_idx, val),
+        .string_ptr => rewriteStringPtr(func, block_idx, val),
+        .string_len => rewriteStringLen(func, block_idx, val),
+        .string_concat => rewriteStringConcat(func, block_idx, val),
         // Zig rewritedec.zig:91-92 — opt_tag/opt_data decomposition
-        .opt_tag => rewriteOptTag(func, block_idx, val_idx),
-        .opt_data => rewriteOptData(func, block_idx, val_idx),
+        .opt_tag => rewriteOptTag(func, block_idx, val),
+        .opt_data => rewriteOptData(func, block_idx, val),
         else => false,
     }
 }
 
 /// Follow copy chain to find the original value.
-fn followCopy(func: *SsaFunc, val_idx: int) int {
-    var current = val_idx
+fn followCopy(val: *SsaValue) *SsaValue {
+    var current = val
     var depth: int = 0
     while (depth < 100) {
-        const val = func.getValue(current)
-        if (val.op == SsaOp.copy and val.args.count >= 1) {
-            current = val.args.get(0)
+        if (current.op == SsaOp.copy and current.args.count >= 1) {
+            current = current.args.get(0)
             depth += 1
         } else {
             return current
@@ -86,18 +84,14 @@ fn followCopy(func: *SsaFunc, val_idx: int) int {
 }
 
 /// Make val become a copy of src.
-fn copyOf(func: *SsaFunc, val_idx: int, src_idx: int) void {
-    var val = func.getValue(val_idx)
+fn copyOf(val: *SsaValue, src: *SsaValue) void {
     val.op = SsaOp.copy
     val.aux_int = 0
     val.aux = SsaAux.none
     val.args.clear()
-    val.args.append(src_idx)
-    func.setValue(val_idx, val)
+    val.args.append(src)
 
-    var src = func.getValue(src_idx)
     src.uses += 1
-    func.setValue(src_idx, src)
 }
 
 /// Check if a type is a slice type (not a basic type).
@@ -115,46 +109,40 @@ fn isSliceType(type_idx: int) bool {
 /// SlicePtr(SliceMake ptr _ _) → ptr
 /// SlicePtr(Load<slice> ptr) → Load<ptr>(ptr)
 /// SlicePtr(ConstNil) → ConstInt(0)
-fn rewriteSlicePtr(func: *SsaFunc, block_idx: int, val_idx: int) bool {
-    const val = func.getValue(val_idx)
+fn rewriteSlicePtr(func: *SsaFunc, block_idx: int, val: *SsaValue) bool {
     if (val.args.count < 1) { return false }
-    const arg_idx = followCopy(func, val.args.get(0))
-    const arg = func.getValue(arg_idx)
+    const arg = followCopy(val.args.get(0))
 
     // Pattern 1: SlicePtr(SliceMake ptr _ _) → ptr
     if (arg.op == SsaOp.slice_make and arg.args.count >= 1) {
-        copyOf(func, val_idx, arg.args.get(0))
+        copyOf(val, arg.args.get(0))
         return true
     }
 
     // Pattern 2: SlicePtr(StringMake ptr _) → ptr
     if (arg.op == SsaOp.string_make and arg.args.count >= 1) {
-        copyOf(func, val_idx, arg.args.get(0))
+        copyOf(val, arg.args.get(0))
         return true
     }
 
     // Pattern 3: SlicePtr(Load<slice/string> ptr) → Load<ptr>(ptr)
     if (arg.op == SsaOp.load and (isSliceType(arg.type_idx) or arg.type_idx == STRING)) {
         if (arg.args.count >= 1) {
-            const ptr_idx = arg.args.get(0)
-            const load_idx = func.newValue(SsaOp.load, I64, block_idx, val.pos_line, val.pos_col)
-            var load_val = func.getValue(load_idx)
-            load_val.addArg(ptr_idx)
-            func.setValue(load_idx, load_val)
-            func.addValueToBlock(load_idx, block_idx)
-            copyOf(func, val_idx, load_idx)
+            const ptr_arg = arg.args.get(0)
+            const load_val = func.newValue(SsaOp.load, I64, block_idx, val.pos_line, val.pos_col)
+            load_val.addArg(ptr_arg)
+            func.addValueToBlock(load_val, block_idx)
+            copyOf(val, load_val)
             return true
         }
     }
 
     // Pattern 4: SlicePtr(ConstNil) → ConstInt(0)
     if (arg.op == SsaOp.const_nil and (isSliceType(arg.type_idx) or arg.type_idx == STRING)) {
-        const zero_idx = func.newValue(SsaOp.const_int, I64, block_idx, val.pos_line, val.pos_col)
-        var zero = func.getValue(zero_idx)
+        const zero = func.newValue(SsaOp.const_int, I64, block_idx, val.pos_line, val.pos_col)
         zero.aux_int = 0
-        func.setValue(zero_idx, zero)
-        func.addValueToBlock(zero_idx, block_idx)
-        copyOf(func, val_idx, zero_idx)
+        func.addValueToBlock(zero, block_idx)
+        copyOf(val, zero)
         return true
     }
 
@@ -164,54 +152,46 @@ fn rewriteSlicePtr(func: *SsaFunc, block_idx: int, val_idx: int) bool {
 /// SliceLen(SliceMake _ len _) → len
 /// SliceLen(Load<slice> ptr) → Load<i64>(OffPtr ptr 8)
 /// SliceLen(ConstNil) → ConstInt(0)
-fn rewriteSliceLen(func: *SsaFunc, block_idx: int, val_idx: int) bool {
-    const val = func.getValue(val_idx)
+fn rewriteSliceLen(func: *SsaFunc, block_idx: int, val: *SsaValue) bool {
     if (val.args.count < 1) { return false }
-    const arg_idx = followCopy(func, val.args.get(0))
-    const arg = func.getValue(arg_idx)
+    const arg = followCopy(val.args.get(0))
 
     // Pattern 1: SliceLen(SliceMake _ len _) → len
     if (arg.op == SsaOp.slice_make and arg.args.count >= 2) {
-        copyOf(func, val_idx, arg.args.get(1))
+        copyOf(val, arg.args.get(1))
         return true
     }
 
     // Pattern 2: SliceLen(StringMake _ len) → len
     if (arg.op == SsaOp.string_make and arg.args.count >= 2) {
-        copyOf(func, val_idx, arg.args.get(1))
+        copyOf(val, arg.args.get(1))
         return true
     }
 
     // Pattern 3: SliceLen(Load<slice/string> ptr) → Load<i64>(OffPtr ptr 8)
     if (arg.op == SsaOp.load and (isSliceType(arg.type_idx) or arg.type_idx == STRING)) {
         if (arg.args.count >= 1) {
-            const ptr_idx = arg.args.get(0)
+            const ptr_arg = arg.args.get(0)
             // Create OffPtr(ptr, 8)
-            const off_ptr_idx = func.newValue(SsaOp.off_ptr, I64, block_idx, val.pos_line, val.pos_col)
-            var off_ptr = func.getValue(off_ptr_idx)
+            const off_ptr = func.newValue(SsaOp.off_ptr, I64, block_idx, val.pos_line, val.pos_col)
             off_ptr.aux_int = 8
-            off_ptr.addArg(ptr_idx)
-            func.setValue(off_ptr_idx, off_ptr)
-            func.addValueToBlock(off_ptr_idx, block_idx)
+            off_ptr.addArg(ptr_arg)
+            func.addValueToBlock(off_ptr, block_idx)
             // Create Load(off_ptr)
-            const load_idx = func.newValue(SsaOp.load, I64, block_idx, val.pos_line, val.pos_col)
-            var load_val = func.getValue(load_idx)
-            load_val.addArg(off_ptr_idx)
-            func.setValue(load_idx, load_val)
-            func.addValueToBlock(load_idx, block_idx)
-            copyOf(func, val_idx, load_idx)
+            const load_val = func.newValue(SsaOp.load, I64, block_idx, val.pos_line, val.pos_col)
+            load_val.addArg(off_ptr)
+            func.addValueToBlock(load_val, block_idx)
+            copyOf(val, load_val)
             return true
         }
     }
 
     // Pattern 4: SliceLen(ConstNil) → ConstInt(0)
     if (arg.op == SsaOp.const_nil and (isSliceType(arg.type_idx) or arg.type_idx == STRING)) {
-        const zero_idx = func.newValue(SsaOp.const_int, I64, block_idx, val.pos_line, val.pos_col)
-        var zero = func.getValue(zero_idx)
+        const zero = func.newValue(SsaOp.const_int, I64, block_idx, val.pos_line, val.pos_col)
         zero.aux_int = 0
-        func.setValue(zero_idx, zero)
-        func.addValueToBlock(zero_idx, block_idx)
-        copyOf(func, val_idx, zero_idx)
+        func.addValueToBlock(zero, block_idx)
+        copyOf(val, zero)
         return true
     }
 
@@ -221,52 +201,44 @@ fn rewriteSliceLen(func: *SsaFunc, block_idx: int, val_idx: int) bool {
 /// SliceCap(SliceMake _ _ cap) → cap
 /// SliceCap(Load<slice> ptr) → Load<i64>(OffPtr ptr 16)
 /// SliceCap(ConstNil) → ConstInt(0)
-fn rewriteSliceCap(func: *SsaFunc, block_idx: int, val_idx: int) bool {
-    const val = func.getValue(val_idx)
+fn rewriteSliceCap(func: *SsaFunc, block_idx: int, val: *SsaValue) bool {
     if (val.args.count < 1) { return false }
-    const arg_idx = followCopy(func, val.args.get(0))
-    const arg = func.getValue(arg_idx)
+    const arg = followCopy(val.args.get(0))
 
     // Pattern 1: SliceCap(SliceMake _ _ cap) → cap (3-arg)
     if (arg.op == SsaOp.slice_make and arg.args.count >= 3) {
-        copyOf(func, val_idx, arg.args.get(2))
+        copyOf(val, arg.args.get(2))
         return true
     }
 
     // Pattern 2: SliceCap(SliceMake _ len) → len (2-arg legacy, cap=len)
     if (arg.op == SsaOp.slice_make and arg.args.count == 2) {
-        copyOf(func, val_idx, arg.args.get(1))
+        copyOf(val, arg.args.get(1))
         return true
     }
 
     // Pattern 3: SliceCap(Load<slice> ptr) → Load<i64>(OffPtr ptr 16)
     if (arg.op == SsaOp.load and isSliceType(arg.type_idx)) {
         if (arg.args.count >= 1) {
-            const ptr_idx = arg.args.get(0)
-            const off_ptr_idx = func.newValue(SsaOp.off_ptr, I64, block_idx, val.pos_line, val.pos_col)
-            var off_ptr = func.getValue(off_ptr_idx)
+            const ptr_arg = arg.args.get(0)
+            const off_ptr = func.newValue(SsaOp.off_ptr, I64, block_idx, val.pos_line, val.pos_col)
             off_ptr.aux_int = 16
-            off_ptr.addArg(ptr_idx)
-            func.setValue(off_ptr_idx, off_ptr)
-            func.addValueToBlock(off_ptr_idx, block_idx)
-            const load_idx = func.newValue(SsaOp.load, I64, block_idx, val.pos_line, val.pos_col)
-            var load_val = func.getValue(load_idx)
-            load_val.addArg(off_ptr_idx)
-            func.setValue(load_idx, load_val)
-            func.addValueToBlock(load_idx, block_idx)
-            copyOf(func, val_idx, load_idx)
+            off_ptr.addArg(ptr_arg)
+            func.addValueToBlock(off_ptr, block_idx)
+            const load_val = func.newValue(SsaOp.load, I64, block_idx, val.pos_line, val.pos_col)
+            load_val.addArg(off_ptr)
+            func.addValueToBlock(load_val, block_idx)
+            copyOf(val, load_val)
             return true
         }
     }
 
     // Pattern 4: SliceCap(ConstNil) → ConstInt(0)
     if (arg.op == SsaOp.const_nil and isSliceType(arg.type_idx)) {
-        const zero_idx = func.newValue(SsaOp.const_int, I64, block_idx, val.pos_line, val.pos_col)
-        var zero = func.getValue(zero_idx)
+        const zero = func.newValue(SsaOp.const_int, I64, block_idx, val.pos_line, val.pos_col)
         zero.aux_int = 0
-        func.setValue(zero_idx, zero)
-        func.addValueToBlock(zero_idx, block_idx)
-        copyOf(func, val_idx, zero_idx)
+        func.addValueToBlock(zero, block_idx)
+        copyOf(val, zero)
         return true
     }
 
@@ -280,37 +252,31 @@ fn rewriteSliceCap(func: *SsaFunc, block_idx: int, val_idx: int) bool {
 /// StringPtr(StringMake ptr _) → ptr
 /// StringPtr(Load<string> ptr) → Load<ptr>(ptr)
 /// StringPtr(ConstNil<string>) → ConstInt(0)
-fn rewriteStringPtr(func: *SsaFunc, block_idx: int, val_idx: int) bool {
-    const val = func.getValue(val_idx)
+fn rewriteStringPtr(func: *SsaFunc, block_idx: int, val: *SsaValue) bool {
     if (val.args.count < 1) { return false }
-    const arg_idx = followCopy(func, val.args.get(0))
-    const arg = func.getValue(arg_idx)
+    const arg = followCopy(val.args.get(0))
 
     if (arg.op == SsaOp.string_make and arg.args.count >= 1) {
-        copyOf(func, val_idx, arg.args.get(0))
+        copyOf(val, arg.args.get(0))
         return true
     }
 
     if (arg.op == SsaOp.load and arg.type_idx == STRING) {
         if (arg.args.count >= 1) {
-            const ptr_idx = arg.args.get(0)
-            const load_idx = func.newValue(SsaOp.load, I64, block_idx, val.pos_line, val.pos_col)
-            var load_val = func.getValue(load_idx)
-            load_val.addArg(ptr_idx)
-            func.setValue(load_idx, load_val)
-            func.addValueToBlock(load_idx, block_idx)
-            copyOf(func, val_idx, load_idx)
+            const ptr_arg = arg.args.get(0)
+            const load_val = func.newValue(SsaOp.load, I64, block_idx, val.pos_line, val.pos_col)
+            load_val.addArg(ptr_arg)
+            func.addValueToBlock(load_val, block_idx)
+            copyOf(val, load_val)
             return true
         }
     }
 
     if (arg.op == SsaOp.const_nil and arg.type_idx == STRING) {
-        const zero_idx = func.newValue(SsaOp.const_int, I64, block_idx, val.pos_line, val.pos_col)
-        var zero = func.getValue(zero_idx)
+        const zero = func.newValue(SsaOp.const_int, I64, block_idx, val.pos_line, val.pos_col)
         zero.aux_int = 0
-        func.setValue(zero_idx, zero)
-        func.addValueToBlock(zero_idx, block_idx)
-        copyOf(func, val_idx, zero_idx)
+        func.addValueToBlock(zero, block_idx)
+        copyOf(val, zero)
         return true
     }
 
@@ -320,43 +286,35 @@ fn rewriteStringPtr(func: *SsaFunc, block_idx: int, val_idx: int) bool {
 /// StringLen(StringMake _ len) → len
 /// StringLen(Load<string> ptr) → Load<i64>(OffPtr ptr 8)
 /// StringLen(ConstNil<string>) → ConstInt(0)
-fn rewriteStringLen(func: *SsaFunc, block_idx: int, val_idx: int) bool {
-    const val = func.getValue(val_idx)
+fn rewriteStringLen(func: *SsaFunc, block_idx: int, val: *SsaValue) bool {
     if (val.args.count < 1) { return false }
-    const arg_idx = followCopy(func, val.args.get(0))
-    const arg = func.getValue(arg_idx)
+    const arg = followCopy(val.args.get(0))
 
     if (arg.op == SsaOp.string_make and arg.args.count >= 2) {
-        copyOf(func, val_idx, arg.args.get(1))
+        copyOf(val, arg.args.get(1))
         return true
     }
 
     if (arg.op == SsaOp.load and arg.type_idx == STRING) {
         if (arg.args.count >= 1) {
-            const ptr_idx = arg.args.get(0)
-            const off_ptr_idx = func.newValue(SsaOp.off_ptr, I64, block_idx, val.pos_line, val.pos_col)
-            var off_ptr = func.getValue(off_ptr_idx)
+            const ptr_arg = arg.args.get(0)
+            const off_ptr = func.newValue(SsaOp.off_ptr, I64, block_idx, val.pos_line, val.pos_col)
             off_ptr.aux_int = 8
-            off_ptr.addArg(ptr_idx)
-            func.setValue(off_ptr_idx, off_ptr)
-            func.addValueToBlock(off_ptr_idx, block_idx)
-            const load_idx = func.newValue(SsaOp.load, I64, block_idx, val.pos_line, val.pos_col)
-            var load_val = func.getValue(load_idx)
-            load_val.addArg(off_ptr_idx)
-            func.setValue(load_idx, load_val)
-            func.addValueToBlock(load_idx, block_idx)
-            copyOf(func, val_idx, load_idx)
+            off_ptr.addArg(ptr_arg)
+            func.addValueToBlock(off_ptr, block_idx)
+            const load_val = func.newValue(SsaOp.load, I64, block_idx, val.pos_line, val.pos_col)
+            load_val.addArg(off_ptr)
+            func.addValueToBlock(load_val, block_idx)
+            copyOf(val, load_val)
             return true
         }
     }
 
     if (arg.op == SsaOp.const_nil and arg.type_idx == STRING) {
-        const zero_idx = func.newValue(SsaOp.const_int, I64, block_idx, val.pos_line, val.pos_col)
-        var zero = func.getValue(zero_idx)
+        const zero = func.newValue(SsaOp.const_int, I64, block_idx, val.pos_line, val.pos_col)
         zero.aux_int = 0
-        func.setValue(zero_idx, zero)
-        func.addValueToBlock(zero_idx, block_idx)
-        copyOf(func, val_idx, zero_idx)
+        func.addValueToBlock(zero, block_idx)
+        copyOf(val, zero)
         return true
     }
 
@@ -364,68 +322,57 @@ fn rewriteStringLen(func: *SsaFunc, block_idx: int, val_idx: int) bool {
 }
 
 /// StringConcat(s1, s2) → static_call("string_concat", ptr1, len1, ptr2, len2) + string_make
-fn rewriteStringConcat(func: *SsaFunc, block_idx: int, val_idx: int) bool {
-    const val = func.getValue(val_idx)
+fn rewriteStringConcat(func: *SsaFunc, block_idx: int, val: *SsaValue) bool {
     if (val.args.count < 2) { return false }
 
-    const s1_idx = val.args.get(0)
-    const s2_idx = val.args.get(1)
+    const s1 = val.args.get(0)
+    const s2 = val.args.get(1)
 
     // Extract ptr/len from s1
-    const s1_ptr = extractStringComponent(func, block_idx, s1_idx, SsaOp.string_ptr, 0, val.pos_line, val.pos_col)
-    const s1_len = extractStringComponent(func, block_idx, s1_idx, SsaOp.string_len, 1, val.pos_line, val.pos_col)
+    const s1_ptr = extractStringComponent(func, block_idx, s1, SsaOp.string_ptr, 0, val.pos_line, val.pos_col)
+    const s1_len = extractStringComponent(func, block_idx, s1, SsaOp.string_len, 1, val.pos_line, val.pos_col)
 
     // Extract ptr/len from s2
-    const s2_ptr = extractStringComponent(func, block_idx, s2_idx, SsaOp.string_ptr, 0, val.pos_line, val.pos_col)
-    const s2_len = extractStringComponent(func, block_idx, s2_idx, SsaOp.string_len, 1, val.pos_line, val.pos_col)
+    const s2_ptr = extractStringComponent(func, block_idx, s2, SsaOp.string_ptr, 0, val.pos_line, val.pos_col)
+    const s2_len = extractStringComponent(func, block_idx, s2, SsaOp.string_len, 1, val.pos_line, val.pos_col)
 
     // Create static_call to string_concat(ptr1, len1, ptr2, len2)
-    const call_idx = func.newValue(SsaOp.static_call, I64, block_idx, val.pos_line, val.pos_col)
-    var call_val = func.getValue(call_idx)
+    const call_val = func.newValue(SsaOp.static_call, I64, block_idx, val.pos_line, val.pos_col)
     call_val.aux = SsaAux.str("string_concat")
     call_val.addArg(s1_ptr)
     call_val.addArg(s1_len)
     call_val.addArg(s2_ptr)
     call_val.addArg(s2_len)
-    func.setValue(call_idx, call_val)
-    func.addValueToBlock(call_idx, block_idx)
+    func.addValueToBlock(call_val, block_idx)
 
     // Create new_len = s1_len + s2_len
-    const new_len_idx = func.newValue(SsaOp.add, I64, block_idx, val.pos_line, val.pos_col)
-    var new_len = func.getValue(new_len_idx)
+    const new_len = func.newValue(SsaOp.add, I64, block_idx, val.pos_line, val.pos_col)
     new_len.addArg2(s1_len, s2_len)
-    func.setValue(new_len_idx, new_len)
-    func.addValueToBlock(new_len_idx, block_idx)
+    func.addValueToBlock(new_len, block_idx)
 
     // Create string_make(new_ptr, new_len)
-    const result_idx = func.newValue(SsaOp.string_make, STRING, block_idx, val.pos_line, val.pos_col)
-    var result = func.getValue(result_idx)
-    result.addArg2(call_idx, new_len_idx)
-    func.setValue(result_idx, result)
-    func.addValueToBlock(result_idx, block_idx)
+    const result = func.newValue(SsaOp.string_make, STRING, block_idx, val.pos_line, val.pos_col)
+    result.addArg2(call_val, new_len)
+    func.addValueToBlock(result, block_idx)
 
-    copyOf(func, val_idx, result_idx)
+    copyOf(val, result)
     return true
 }
 
 /// Extract a string component (ptr or len) from a string value.
 /// If the value is string_make, extract directly from the arg at component_idx.
 /// Otherwise create an extraction op that will be rewritten in the next iteration.
-fn extractStringComponent(func: *SsaFunc, block_idx: int, str_idx: int, extract_op: SsaOp, component_idx: int, line: int, col: int) int {
-    const str_val = func.getValue(str_idx)
-
+fn extractStringComponent(func: *SsaFunc, block_idx: int, str_val: *SsaValue, extract_op: SsaOp, component_idx: int, line: int, col: int) *SsaValue {
     // If it's string_make, extract directly
     if ((str_val.op == SsaOp.string_make or str_val.op == SsaOp.slice_make) and str_val.args.count > component_idx) {
         return str_val.args.get(component_idx)
     }
 
     // Otherwise create extraction op
-    const extract_idx = func.newValue(extract_op, I64, block_idx, line, col)
-    var extract = func.getValue(extract_idx)
-    extract.addArg(str_idx)
-    func.setValue(extract_idx, extract)
-    func.addValueToBlock(extract_idx, block_idx)
-    return extract_idx
+    const extract = func.newValue(extract_op, I64, block_idx, line, col)
+    extract.addArg(str_val)
+    func.addValueToBlock(extract, block_idx)
+    return extract
 }
 
 /// Rewrite OptTag extraction.
@@ -434,38 +381,32 @@ fn extractStringComponent(func: *SsaFunc, block_idx: int, str_idx: int, extract_
 ///   opt_tag(opt_make(tag, payload)) → tag
 ///   opt_tag(load<?*T>(ptr)) → load<i64>(ptr)
 ///   opt_tag(const_nil) → const_int(0)
-fn rewriteOptTag(func: *SsaFunc, block_idx: int, val_idx: int) bool {
-    const val = func.getValue(val_idx)
+fn rewriteOptTag(func: *SsaFunc, block_idx: int, val: *SsaValue) bool {
     if (val.args.count < 1) { return false }
-    const arg_idx = followCopy(func, val.args.get(0))
-    const arg = func.getValue(arg_idx)
+    const arg = followCopy(val.args.get(0))
 
     // Pattern 1: OptTag(OptMake tag payload) → tag
     if (arg.op == SsaOp.opt_make and arg.args.count >= 1) {
-        copyOf(func, val_idx, arg.args.get(0))
+        copyOf(val, arg.args.get(0))
         return true
     }
 
     // Pattern 2: OptTag(Load<?*T> ptr) → Load<i64>(ptr)
     if (arg.op == SsaOp.load and arg.args.count >= 1) {
-        const ptr_idx = arg.args.get(0)
-        const load_idx = func.newValue(SsaOp.load, I64, block_idx, val.pos_line, val.pos_col)
-        var load_val = func.getValue(load_idx)
-        load_val.addArg(ptr_idx)
-        func.setValue(load_idx, load_val)
-        func.addValueToBlock(load_idx, block_idx)
-        copyOf(func, val_idx, load_idx)
+        const ptr_arg = arg.args.get(0)
+        const load_val = func.newValue(SsaOp.load, I64, block_idx, val.pos_line, val.pos_col)
+        load_val.addArg(ptr_arg)
+        func.addValueToBlock(load_val, block_idx)
+        copyOf(val, load_val)
         return true
     }
 
     // Pattern 3: OptTag(ConstNil) → ConstInt(0)
     if (arg.op == SsaOp.const_nil) {
-        const zero_idx = func.newValue(SsaOp.const_int, I64, block_idx, val.pos_line, val.pos_col)
-        var zero = func.getValue(zero_idx)
+        const zero = func.newValue(SsaOp.const_int, I64, block_idx, val.pos_line, val.pos_col)
         zero.aux_int = 0
-        func.setValue(zero_idx, zero)
-        func.addValueToBlock(zero_idx, block_idx)
-        copyOf(func, val_idx, zero_idx)
+        func.addValueToBlock(zero, block_idx)
+        copyOf(val, zero)
         return true
     }
 
@@ -478,44 +419,36 @@ fn rewriteOptTag(func: *SsaFunc, block_idx: int, val_idx: int) bool {
 ///   opt_data(opt_make(tag, payload)) → payload
 ///   opt_data(load<?*T>(ptr)) → load<i64>(off_ptr(ptr, 8))
 ///   opt_data(const_nil) → const_int(0)
-fn rewriteOptData(func: *SsaFunc, block_idx: int, val_idx: int) bool {
-    const val = func.getValue(val_idx)
+fn rewriteOptData(func: *SsaFunc, block_idx: int, val: *SsaValue) bool {
     if (val.args.count < 1) { return false }
-    const arg_idx = followCopy(func, val.args.get(0))
-    const arg = func.getValue(arg_idx)
+    const arg = followCopy(val.args.get(0))
 
     // Pattern 1: OptData(OptMake tag payload) → payload
     if (arg.op == SsaOp.opt_make and arg.args.count >= 2) {
-        copyOf(func, val_idx, arg.args.get(1))
+        copyOf(val, arg.args.get(1))
         return true
     }
 
     // Pattern 2: OptData(Load<?*T> ptr) → Load<i64>(OffPtr(ptr, 8))
     if (arg.op == SsaOp.load and arg.args.count >= 1) {
-        const ptr_idx = arg.args.get(0)
-        const off_ptr_idx = func.newValue(SsaOp.off_ptr, I64, block_idx, val.pos_line, val.pos_col)
-        var off_ptr = func.getValue(off_ptr_idx)
+        const ptr_arg = arg.args.get(0)
+        const off_ptr = func.newValue(SsaOp.off_ptr, I64, block_idx, val.pos_line, val.pos_col)
         off_ptr.aux_int = 8
-        off_ptr.addArg(ptr_idx)
-        func.setValue(off_ptr_idx, off_ptr)
-        func.addValueToBlock(off_ptr_idx, block_idx)
-        const load_idx = func.newValue(SsaOp.load, I64, block_idx, val.pos_line, val.pos_col)
-        var load_val = func.getValue(load_idx)
-        load_val.addArg(off_ptr_idx)
-        func.setValue(load_idx, load_val)
-        func.addValueToBlock(load_idx, block_idx)
-        copyOf(func, val_idx, load_idx)
+        off_ptr.addArg(ptr_arg)
+        func.addValueToBlock(off_ptr, block_idx)
+        const load_val = func.newValue(SsaOp.load, I64, block_idx, val.pos_line, val.pos_col)
+        load_val.addArg(off_ptr)
+        func.addValueToBlock(load_val, block_idx)
+        copyOf(val, load_val)
         return true
     }
 
     // Pattern 3: OptData(ConstNil) → ConstInt(0)
     if (arg.op == SsaOp.const_nil) {
-        const zero_idx = func.newValue(SsaOp.const_int, I64, block_idx, val.pos_line, val.pos_col)
-        var zero = func.getValue(zero_idx)
+        const zero = func.newValue(SsaOp.const_int, I64, block_idx, val.pos_line, val.pos_col)
         zero.aux_int = 0
-        func.setValue(zero_idx, zero)
-        func.addValueToBlock(zero_idx, block_idx)
-        copyOf(func, val_idx, zero_idx)
+        func.addValueToBlock(zero, block_idx)
+        copyOf(val, zero)
         return true
     }
 
@@ -531,98 +464,77 @@ test "rewrite slice_len from slice_make" {
     const blk = func.newBlock(SsaBlockKind.first)
 
     // Create ptr and len
-    const ptr_v = func.newValue(SsaOp.const_64, I64, blk, 0, 0)
-    var pv = func.getValue(ptr_v)
-    pv.aux_int = 100
-    func.setValue(ptr_v, pv)
-    func.addValueToBlock(ptr_v, blk)
+    const ptr_v = func.newValue(SsaOp.const_64, I64, blk.idx, 0, 0)
+    ptr_v.aux_int = 100
+    func.addValueToBlock(ptr_v, blk.idx)
 
-    const len_v = func.newValue(SsaOp.const_64, I64, blk, 0, 0)
-    var lv = func.getValue(len_v)
-    lv.aux_int = 42
-    func.setValue(len_v, lv)
-    func.addValueToBlock(len_v, blk)
+    const len_v = func.newValue(SsaOp.const_64, I64, blk.idx, 0, 0)
+    len_v.aux_int = 42
+    func.addValueToBlock(len_v, blk.idx)
 
     // Create slice_make(ptr, len, cap)
     const SLICE_TYPE: int = 100
-    const sm = func.newValue(SsaOp.slice_make, SLICE_TYPE, blk, 0, 0)
-    var sm_val = func.getValue(sm)
-    sm_val.addArg3(ptr_v, len_v, len_v)
-    func.setValue(sm, sm_val)
-    func.addValueToBlock(sm, blk)
+    const sm = func.newValue(SsaOp.slice_make, SLICE_TYPE, blk.idx, 0, 0)
+    sm.addArg3(ptr_v, len_v, len_v)
+    func.addValueToBlock(sm, blk.idx)
 
     // Create slice_len(slice_make)
-    const sl = func.newValue(SsaOp.slice_len, I64, blk, 0, 0)
-    var sl_val = func.getValue(sl)
-    sl_val.addArg(sm)
-    func.setValue(sl, sl_val)
-    func.addValueToBlock(sl, blk)
+    const sl = func.newValue(SsaOp.slice_len, I64, blk.idx, 0, 0)
+    sl.addArg(sm)
+    func.addValueToBlock(sl, blk.idx)
 
     rewrite(&func)
 
     // slice_len should become copy(len_v)
-    const result = func.getValue(sl)
-    @assertEq(result.op == SsaOp.copy, true)
-    @assertEq(result.args.count, 1)
-    @assertEq(result.args.get(0), len_v)
+    @assertEq(sl.op == SsaOp.copy, true)
+    @assertEq(sl.args.count, 1)
+    @assertEq(sl.args.get(0).id, len_v.id)
 }
 
 test "rewrite string_len from string_make" {
     var func = SsaFunc.init("test_string_len")
     const blk = func.newBlock(SsaBlockKind.first)
 
-    const ptr_v = func.newValue(SsaOp.const_64, I64, blk, 0, 0)
-    func.addValueToBlock(ptr_v, blk)
+    const ptr_v = func.newValue(SsaOp.const_64, I64, blk.idx, 0, 0)
+    func.addValueToBlock(ptr_v, blk.idx)
 
-    const len_v = func.newValue(SsaOp.const_64, I64, blk, 0, 0)
-    var lv = func.getValue(len_v)
-    lv.aux_int = 5
-    func.setValue(len_v, lv)
-    func.addValueToBlock(len_v, blk)
+    const len_v = func.newValue(SsaOp.const_64, I64, blk.idx, 0, 0)
+    len_v.aux_int = 5
+    func.addValueToBlock(len_v, blk.idx)
 
-    const sm = func.newValue(SsaOp.string_make, STRING, blk, 0, 0)
-    var sm_val = func.getValue(sm)
-    sm_val.addArg2(ptr_v, len_v)
-    func.setValue(sm, sm_val)
-    func.addValueToBlock(sm, blk)
+    const sm = func.newValue(SsaOp.string_make, STRING, blk.idx, 0, 0)
+    sm.addArg2(ptr_v, len_v)
+    func.addValueToBlock(sm, blk.idx)
 
-    const sl = func.newValue(SsaOp.string_len, I64, blk, 0, 0)
-    var sl_val = func.getValue(sl)
-    sl_val.addArg(sm)
-    func.setValue(sl, sl_val)
-    func.addValueToBlock(sl, blk)
+    const sl = func.newValue(SsaOp.string_len, I64, blk.idx, 0, 0)
+    sl.addArg(sm)
+    func.addValueToBlock(sl, blk.idx)
 
     rewrite(&func)
 
-    const result = func.getValue(sl)
-    @assertEq(result.op == SsaOp.copy, true)
-    @assertEq(result.args.get(0), len_v)
+    @assertEq(sl.op == SsaOp.copy, true)
+    @assertEq(sl.args.get(0).id, len_v.id)
 }
 
 test "rewrite string_ptr from string_make" {
     var func = SsaFunc.init("test_string_ptr")
     const blk = func.newBlock(SsaBlockKind.first)
 
-    const ptr_v = func.newValue(SsaOp.const_64, I64, blk, 0, 0)
-    func.addValueToBlock(ptr_v, blk)
-    const len_v = func.newValue(SsaOp.const_64, I64, blk, 0, 0)
-    func.addValueToBlock(len_v, blk)
+    const ptr_v = func.newValue(SsaOp.const_64, I64, blk.idx, 0, 0)
+    func.addValueToBlock(ptr_v, blk.idx)
+    const len_v = func.newValue(SsaOp.const_64, I64, blk.idx, 0, 0)
+    func.addValueToBlock(len_v, blk.idx)
 
-    const sm = func.newValue(SsaOp.string_make, STRING, blk, 0, 0)
-    var sm_val = func.getValue(sm)
-    sm_val.addArg2(ptr_v, len_v)
-    func.setValue(sm, sm_val)
-    func.addValueToBlock(sm, blk)
+    const sm = func.newValue(SsaOp.string_make, STRING, blk.idx, 0, 0)
+    sm.addArg2(ptr_v, len_v)
+    func.addValueToBlock(sm, blk.idx)
 
-    const sp = func.newValue(SsaOp.string_ptr, I64, blk, 0, 0)
-    var sp_val = func.getValue(sp)
-    sp_val.addArg(sm)
-    func.setValue(sp, sp_val)
-    func.addValueToBlock(sp, blk)
+    const sp = func.newValue(SsaOp.string_ptr, I64, blk.idx, 0, 0)
+    sp.addArg(sm)
+    func.addValueToBlock(sp, blk.idx)
 
     rewrite(&func)
 
-    const result = func.getValue(sp)
-    @assertEq(result.op == SsaOp.copy, true)
-    @assertEq(result.args.get(0), ptr_v)
+    @assertEq(sp.op == SsaOp.copy, true)
+    @assertEq(sp.args.get(0).id, ptr_v.id)
 }

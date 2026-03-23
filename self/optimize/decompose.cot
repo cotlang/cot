@@ -31,10 +31,10 @@ fn decompose(func: *SsaFunc) void {
     var total_values: i64 = 0
     var total_phis: i64 = 0
     for bi in 0..func.blocks.count {
-        const blk = func.getBlock(bi)
+        const blk = func.blocks.get(bi)
         for vi in 0..blk.values.count {
             total_values += 1
-            if (func.getValue(blk.values.get(vi)).op == SsaOp.phi) { total_phis += 1 }
+            if (blk.values.get(vi).op == SsaOp.phi) { total_phis += 1 }
         }
     }
     debug_log(.codegen, "=== Decompose pass for '${func.name}' (${func.blocks.count} blocks, ${total_values} values, ${total_phis} phis) ===")
@@ -42,13 +42,12 @@ fn decompose(func: *SsaFunc) void {
     var decomposed: int = 0
 
     for bi in 0..func.blocks.count {
-        var blk = func.getBlock(bi)
+        const blk = func.blocks.get(bi)
         for vi in 0..blk.values.count {
-            const val_idx = blk.values.get(vi)
-            var val = func.getValue(val_idx)
+            const val = blk.values.get(vi)
             if (val.op != SsaOp.phi) { continue }
 
-            if (decomposeBuiltinPhi(func, bi, val_idx)) {
+            if (decomposeBuiltinPhi(func, bi, val)) {
                 decomposed += 1
             }
         }
@@ -58,17 +57,15 @@ fn decompose(func: *SsaFunc) void {
 }
 
 /// Decompose a phi node if it's a compound builtin type.
-fn decomposeBuiltinPhi(func: *SsaFunc, block_idx: int, val_idx: int) bool {
-    const val = func.getValue(val_idx)
-
+fn decomposeBuiltinPhi(func: *SsaFunc, block_idx: int, val: *SsaValue) bool {
     // Check if phi type is a string
     if (val.type_idx == STRING) {
-        return decomposeStringPhi(func, block_idx, val_idx)
+        return decomposeStringPhi(func, block_idx, val)
     }
 
     // Check if phi type is a slice (not a basic type)
     if (isSliceType(val.type_idx)) {
-        return decomposeSlicePhi(func, block_idx, val_idx)
+        return decomposeSlicePhi(func, block_idx, val)
     }
 
     return false
@@ -82,69 +79,53 @@ fn decomposeBuiltinPhi(func: *SsaFunc, block_idx: int, val_idx: int) bool {
 ///         len_phi = phi(slice_len(s1), slice_len(s2))
 ///         cap_phi = phi(slice_cap(s1), slice_cap(s2))
 ///         result = slice_make(ptr_phi, len_phi, cap_phi)
-fn decomposeSlicePhi(func: *SsaFunc, block_idx: int, val_idx: int) bool {
-    const val = func.getValue(val_idx)
+fn decomposeSlicePhi(func: *SsaFunc, block_idx: int, val: *SsaValue) bool {
     if (val.args.count == 0) { return false }
 
     const line = val.pos_line
     const col = val.pos_col
 
     // Create component phis
-    const ptr_phi_idx = func.newValue(SsaOp.phi, I64, block_idx, line, col)
-    func.addValueToBlock(ptr_phi_idx, block_idx)
+    const ptr_phi = func.newValue(SsaOp.phi, I64, block_idx, line, col)
+    func.addValueToBlock(ptr_phi, block_idx)
 
-    const len_phi_idx = func.newValue(SsaOp.phi, I64, block_idx, line, col)
-    func.addValueToBlock(len_phi_idx, block_idx)
+    const len_phi = func.newValue(SsaOp.phi, I64, block_idx, line, col)
+    func.addValueToBlock(len_phi, block_idx)
 
-    const cap_phi_idx = func.newValue(SsaOp.phi, I64, block_idx, line, col)
-    func.addValueToBlock(cap_phi_idx, block_idx)
+    const cap_phi = func.newValue(SsaOp.phi, I64, block_idx, line, col)
+    func.addValueToBlock(cap_phi, block_idx)
 
     // For each arg of the original phi, extract ptr, len, cap
     for ai in 0..val.args.count {
-        const arg_idx = val.args.get(ai)
-        const arg_val = func.getValue(arg_idx)
-        const arg_block = arg_val.block
+        const arg = val.args.get(ai)
+        const arg_block = arg.block
 
         // Create slice_ptr(arg) and add to ptr_phi
         const ptr_extract = func.newValue(SsaOp.slice_ptr, I64, arg_block, line, col)
-        var pe = func.getValue(ptr_extract)
-        pe.addArg(arg_idx)
-        func.setValue(ptr_extract, pe)
+        ptr_extract.addArg(arg)
         func.addValueToBlock(ptr_extract, arg_block)
-        var pp = func.getValue(ptr_phi_idx)
-        pp.addArg(ptr_extract)
-        func.setValue(ptr_phi_idx, pp)
+        ptr_phi.addArg(ptr_extract)
 
         // Create slice_len(arg) and add to len_phi
         const len_extract = func.newValue(SsaOp.slice_len, I64, arg_block, line, col)
-        var le = func.getValue(len_extract)
-        le.addArg(arg_idx)
-        func.setValue(len_extract, le)
+        len_extract.addArg(arg)
         func.addValueToBlock(len_extract, arg_block)
-        var lp = func.getValue(len_phi_idx)
-        lp.addArg(len_extract)
-        func.setValue(len_phi_idx, lp)
+        len_phi.addArg(len_extract)
 
         // Create slice_cap(arg) and add to cap_phi
         const cap_extract = func.newValue(SsaOp.slice_cap, I64, arg_block, line, col)
-        var ce = func.getValue(cap_extract)
-        ce.addArg(arg_idx)
-        func.setValue(cap_extract, ce)
+        cap_extract.addArg(arg)
         func.addValueToBlock(cap_extract, arg_block)
-        var cp = func.getValue(cap_phi_idx)
-        cp.addArg(cap_extract)
-        func.setValue(cap_phi_idx, cp)
+        cap_phi.addArg(cap_extract)
     }
 
     // Create result = slice_make(ptr_phi, len_phi, cap_phi)
-    const result_idx = func.newValue(SsaOp.slice_make, val.type_idx, block_idx, line, col)
-    var result = func.getValue(result_idx)
-    result.addArg3(ptr_phi_idx, len_phi_idx, cap_phi_idx)
-    func.setValue(result_idx, result)
-    func.addValueToBlock(result_idx, block_idx)
+    const result = func.newValue(SsaOp.slice_make, val.type_idx, block_idx, line, col)
+    result.addArg3(ptr_phi, len_phi, cap_phi)
+    func.addValueToBlock(result, block_idx)
 
     // Replace original phi with copy of result
-    copyOf(func, val_idx, result_idx)
+    copyOf(val, result)
 
     return true
 }
@@ -156,56 +137,44 @@ fn decomposeSlicePhi(func: *SsaFunc, block_idx: int, val_idx: int) bool {
 /// After:  ptr_phi = phi(string_ptr(s1), string_ptr(s2))
 ///         len_phi = phi(string_len(s1), string_len(s2))
 ///         result = string_make(ptr_phi, len_phi)
-fn decomposeStringPhi(func: *SsaFunc, block_idx: int, val_idx: int) bool {
-    const val = func.getValue(val_idx)
+fn decomposeStringPhi(func: *SsaFunc, block_idx: int, val: *SsaValue) bool {
     if (val.args.count == 0) { return false }
 
     const line = val.pos_line
     const col = val.pos_col
 
     // Create component phis
-    const ptr_phi_idx = func.newValue(SsaOp.phi, I64, block_idx, line, col)
-    func.addValueToBlock(ptr_phi_idx, block_idx)
+    const ptr_phi = func.newValue(SsaOp.phi, I64, block_idx, line, col)
+    func.addValueToBlock(ptr_phi, block_idx)
 
-    const len_phi_idx = func.newValue(SsaOp.phi, I64, block_idx, line, col)
-    func.addValueToBlock(len_phi_idx, block_idx)
+    const len_phi = func.newValue(SsaOp.phi, I64, block_idx, line, col)
+    func.addValueToBlock(len_phi, block_idx)
 
     // For each arg of the original phi, extract ptr and len
     for ai in 0..val.args.count {
-        const arg_idx = val.args.get(ai)
-        const arg_val = func.getValue(arg_idx)
-        const arg_block = arg_val.block
+        const arg = val.args.get(ai)
+        const arg_block = arg.block
 
         // Create string_ptr(arg) and add to ptr_phi
         const ptr_extract = func.newValue(SsaOp.string_ptr, I64, arg_block, line, col)
-        var pe = func.getValue(ptr_extract)
-        pe.addArg(arg_idx)
-        func.setValue(ptr_extract, pe)
+        ptr_extract.addArg(arg)
         func.addValueToBlock(ptr_extract, arg_block)
-        var pp = func.getValue(ptr_phi_idx)
-        pp.addArg(ptr_extract)
-        func.setValue(ptr_phi_idx, pp)
+        ptr_phi.addArg(ptr_extract)
 
         // Create string_len(arg) and add to len_phi
         const len_extract = func.newValue(SsaOp.string_len, I64, arg_block, line, col)
-        var le = func.getValue(len_extract)
-        le.addArg(arg_idx)
-        func.setValue(len_extract, le)
+        len_extract.addArg(arg)
         func.addValueToBlock(len_extract, arg_block)
-        var lp = func.getValue(len_phi_idx)
-        lp.addArg(len_extract)
-        func.setValue(len_phi_idx, lp)
+        len_phi.addArg(len_extract)
     }
 
     // Create result = string_make(ptr_phi, len_phi)
-    const result_idx = func.newValue(SsaOp.string_make, STRING, block_idx, line, col)
-    var result = func.getValue(result_idx)
-    result.addArg2(ptr_phi_idx, len_phi_idx)
-    func.setValue(result_idx, result)
-    func.addValueToBlock(result_idx, block_idx)
+    const result = func.newValue(SsaOp.string_make, STRING, block_idx, line, col)
+    result.addArg2(ptr_phi, len_phi)
+    func.addValueToBlock(result, block_idx)
 
     // Replace original phi with copy of result
-    copyOf(func, val_idx, result_idx)
+    copyOf(val, result)
 
     return true
 }
@@ -222,19 +191,15 @@ fn isSliceType(type_idx: int) bool {
 }
 
 /// Make val become a copy of src (Go's v.copyOf).
-fn copyOf(func: *SsaFunc, val_idx: int, src_idx: int) void {
-    var val = func.getValue(val_idx)
+fn copyOf(val: *SsaValue, src: *SsaValue) void {
     val.op = SsaOp.copy
     val.aux_int = 0
     val.aux = SsaAux.none
     val.args.clear()
-    val.args.append(src_idx)
-    func.setValue(val_idx, val)
+    val.args.append(src)
 
     // Increment uses on src
-    var src = func.getValue(src_idx)
     src.uses += 1
-    func.setValue(src_idx, src)
 }
 
 // ============================================================================
@@ -250,26 +215,23 @@ test "decompose string phi" {
     const merge = func.newBlock(SsaBlockKind.plain)
 
     // Create string_make values in each block
-    const sm0 = func.newValue(SsaOp.string_make, STRING, b0, 0, 0)
-    func.addValueToBlock(sm0, b0)
+    const sm0 = func.newValue(SsaOp.string_make, STRING, b0.idx, 0, 0)
+    func.addValueToBlock(sm0, b0.idx)
 
-    const sm1 = func.newValue(SsaOp.string_make, STRING, b1, 0, 0)
-    func.addValueToBlock(sm1, b1)
+    const sm1 = func.newValue(SsaOp.string_make, STRING, b1.idx, 0, 0)
+    func.addValueToBlock(sm1, b1.idx)
 
     // Create phi in merge block
-    const phi_idx = func.newValue(SsaOp.phi, STRING, merge, 0, 0)
-    var phi_val = func.getValue(phi_idx)
+    const phi_val = func.newValue(SsaOp.phi, STRING, merge.idx, 0, 0)
     phi_val.addArg2(sm0, sm1)
-    func.setValue(phi_idx, phi_val)
-    func.addValueToBlock(phi_idx, merge)
+    func.addValueToBlock(phi_val, merge.idx)
 
     // Run decompose
     decompose(&func)
 
     // Verify: phi should become copy
-    const result = func.getValue(phi_idx)
-    @assertEq(result.op == SsaOp.copy, true)
-    @assertEq(result.args.count, 1)
+    @assertEq(phi_val.op == SsaOp.copy, true)
+    @assertEq(phi_val.args.count, 1)
 }
 
 test "decompose ignores non-compound phi" {
@@ -277,13 +239,12 @@ test "decompose ignores non-compound phi" {
     const b0 = func.newBlock(SsaBlockKind.first)
 
     // Create i64 phi — should NOT be decomposed
-    const phi_idx = func.newValue(SsaOp.phi, I64, b0, 0, 0)
-    func.addValueToBlock(phi_idx, b0)
+    const phi_val = func.newValue(SsaOp.phi, I64, b0.idx, 0, 0)
+    func.addValueToBlock(phi_val, b0.idx)
 
     decompose(&func)
 
-    const result = func.getValue(phi_idx)
-    @assertEq(result.op == SsaOp.phi, true)
+    @assertEq(phi_val.op == SsaOp.phi, true)
 }
 
 test "decompose slice phi" {
@@ -296,23 +257,20 @@ test "decompose slice phi" {
     // Use a high type index for slice (not a basic type)
     const SLICE_TYPE: int = 100
 
-    const sm0 = func.newValue(SsaOp.slice_make, SLICE_TYPE, b0, 0, 0)
-    func.addValueToBlock(sm0, b0)
+    const sm0 = func.newValue(SsaOp.slice_make, SLICE_TYPE, b0.idx, 0, 0)
+    func.addValueToBlock(sm0, b0.idx)
 
-    const sm1 = func.newValue(SsaOp.slice_make, SLICE_TYPE, b1, 0, 0)
-    func.addValueToBlock(sm1, b1)
+    const sm1 = func.newValue(SsaOp.slice_make, SLICE_TYPE, b1.idx, 0, 0)
+    func.addValueToBlock(sm1, b1.idx)
 
-    const phi_idx = func.newValue(SsaOp.phi, SLICE_TYPE, merge, 0, 0)
-    var phi_val = func.getValue(phi_idx)
+    const phi_val = func.newValue(SsaOp.phi, SLICE_TYPE, merge.idx, 0, 0)
     phi_val.addArg2(sm0, sm1)
-    func.setValue(phi_idx, phi_val)
-    func.addValueToBlock(phi_idx, merge)
+    func.addValueToBlock(phi_val, merge.idx)
 
     decompose(&func)
 
     // Verify: phi should become copy
-    const result = func.getValue(phi_idx)
-    @assertEq(result.op == SsaOp.copy, true)
+    @assertEq(phi_val.op == SsaOp.copy, true)
 }
 
 test "decompose empty phi" {
@@ -320,11 +278,10 @@ test "decompose empty phi" {
     const b0 = func.newBlock(SsaBlockKind.first)
 
     // String phi with no args — should not decompose
-    const phi_idx = func.newValue(SsaOp.phi, STRING, b0, 0, 0)
-    func.addValueToBlock(phi_idx, b0)
+    const phi_val = func.newValue(SsaOp.phi, STRING, b0.idx, 0, 0)
+    func.addValueToBlock(phi_val, b0.idx)
 
     decompose(&func)
 
-    const result = func.getValue(phi_idx)
-    @assertEq(result.op == SsaOp.phi, true)
+    @assertEq(phi_val.op == SsaOp.phi, true)
 }
