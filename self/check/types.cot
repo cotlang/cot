@@ -221,6 +221,8 @@ struct StructField {
     name: string,
     type_idx: int,
     offset: int,
+    bit_offset: int,    // bit position within backing integer (0-63, for bitfields)
+    bit_width: int,     // field width in bits (0 = full type size, 1-63 = bitfield)
     default_value: int,
 }
 
@@ -231,6 +233,7 @@ struct StructType {
     size: int,
     alignment: int,
     layout: int,
+    backing_int: int,   // for packed struct: backing integer type index (0 = none)
 
     fn getField(idx: int) *StructField {
         return @intToPtr(*StructField, self.fields + idx * @sizeOf(StructField))
@@ -511,6 +514,58 @@ struct TypeRegistry {
             return self.name_map.get(n)
         }
         return -1
+    }
+
+    /// Resolve arbitrary-width integer type name (u1-u63, i1-i63) for packed struct fields.
+    /// Returns the containing standard type index, or -1 if not a bitfield type name.
+    /// Only called from resolveNamedType for type expressions, not general identifier lookup.
+    /// Zig reference: types.zig lookupByName — packed struct fields can be any uN/iN.
+    fn lookupBitfieldType(n: string) int {
+        if (n.len >= 2 and n.len <= 3 and (n[0] == 'u' or n[0] == 'i')) {
+            var width: int = 0
+            var valid = true
+            for ci in 1..n.len {
+                const c = n[ci]
+                if (c >= '0' and c <= '9') {
+                    width = width * 10 + (c - '0')
+                } else {
+                    valid = false
+                    break
+                }
+            }
+            if (valid and width >= 1 and width <= 64) {
+                if (n[0] == 'i') {
+                    if (width <= 8) { return I8 }
+                    if (width <= 16) { return I16 }
+                    if (width <= 32) { return I32 }
+                    return I64
+                } else {
+                    if (width <= 8) { return U8 }
+                    if (width <= 16) { return U16 }
+                    if (width <= 32) { return U32 }
+                    return U64
+                }
+            }
+        }
+        return -1
+    }
+
+    /// Parse bit width from type name (u1-u64, i1-i64). Returns 0 if not a bitfield type.
+    /// Zig reference: types.zig parseBitWidth
+    fn parseBitWidth(n: string) int {
+        if (n.len >= 2 and n.len <= 3 and (n[0] == 'u' or n[0] == 'i')) {
+            var width: int = 0
+            for ci in 1..n.len {
+                const c = n[ci]
+                if (c >= '0' and c <= '9') {
+                    width = width * 10 + (c - '0')
+                } else {
+                    return 0
+                }
+            }
+            if (width >= 1 and width <= 64) { return width }
+        }
+        return 0
     }
 
     /// Add a type to the registry. Returns its index.

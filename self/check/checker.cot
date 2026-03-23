@@ -524,7 +524,7 @@ struct Checker {
             // Zig reference: checker.zig:451-456
             // Pass 1: Register placeholder (empty struct) so self-references resolve.
             const placeholder = self.types.add(Type.struct_type(StructType {
-                name: name, field_count: 0, fields: 0, size: 0, alignment: 8, layout: 0,
+                name: name, field_count: 0, fields: 0, size: 0, alignment: 8, layout: 0, backing_int: 0,
             }))
             self.defineSymbol(makeTypeSymbol(name, placeholder, idx))
             self.types.registerNamed(name, placeholder)
@@ -563,7 +563,7 @@ struct Checker {
                 const qualified = "${parent_name}_${sd.name}"
                 // Placeholder pattern (same as collectStructDecl)
                 const ph = self.types.add(Type.struct_type(StructType {
-                    name: qualified, field_count: 0, fields: 0, size: 0, alignment: 8, layout: 0,
+                    name: qualified, field_count: 0, fields: 0, size: 0, alignment: 8, layout: 0, backing_int: 0,
                 }))
                 self.defineSymbol(makeTypeSymbol(qualified, ph, nested_idx))
                 self.types.registerNamed(qualified, ph)
@@ -2574,7 +2574,7 @@ struct Checker {
     /// Extracted from checkFieldAccess to avoid stack frame corruption in large functions.
     fn checkStructFieldAccess(idx: int, base_type: int, field_name: string) int {
         const base = self.types.get(base_type)
-        const st = switch (base) { Type.struct_type |s| => s, else => StructType { name: "", field_count: 0, fields: 0, size: 0, alignment: 0, layout: 0 } }
+        const st = switch (base) { Type.struct_type |s| => s, else => StructType { name: "", field_count: 0, fields: 0, size: 0, alignment: 0, layout: 0, backing_int: 0 } }
         // Search fields
         for fi in 0..st.field_count {
             const sf = st.getField(fi)
@@ -2655,7 +2655,7 @@ struct Checker {
     fn validateStructFields(idx: int, struct_type_idx: int, fields: List(int)) void {
         const st_t = self.types.get(struct_type_idx)
         if (st_t.tag != TAG_STRUCT) { return }
-        const st = switch (st_t) { Type.struct_type |s| => s, else => StructType { name: "", field_count: 0, fields: 0, size: 0, alignment: 0, layout: 0 } }
+        const st = switch (st_t) { Type.struct_type |s| => s, else => StructType { name: "", field_count: 0, fields: 0, size: 0, alignment: 0, layout: 0, backing_int: 0 } }
         const fi_count = fields.count
 
         // Check each field initializer: name exists and value type matches
@@ -3687,7 +3687,7 @@ struct Checker {
         }
         const st = switch (info) {
             Type.struct_type |s| => s,
-            else => StructType { name: "", field_count: 0, fields: 0, size: 0, alignment: 0, layout: 0 },
+            else => StructType { name: "", field_count: 0, fields: 0, size: 0, alignment: 0, layout: 0, backing_int: 0 },
         }
         for fi in 0..st.field_count {
             const sf = st.getField(fi)
@@ -3738,7 +3738,7 @@ struct Checker {
         }
         const st = switch (info) {
             Type.struct_type |s| => s,
-            else => StructType { name: "", field_count: 0, fields: 0, size: 0, alignment: 0, layout: 0 },
+            else => StructType { name: "", field_count: 0, fields: 0, size: 0, alignment: 0, layout: 0, backing_int: 0 },
         }
         var found = false
         for fi in 0..st.field_count {
@@ -4114,8 +4114,10 @@ struct Checker {
             if (sym.is_type and sym.type_idx != invalid_type) { return sym.type_idx }
         }
         const type_idx = self.types.lookupByName(name)
-
         if (type_idx >= 0) { return type_idx }
+        // Fallback: resolve arbitrary-width integer types (u3, i5, etc.) for packed struct fields
+        const bf_type = self.types.lookupBitfieldType(name)
+        if (bf_type >= 0) { return bf_type }
         const type_suggestion = self.findSimilarType(name)
         if (type_suggestion) |ts| {
             self.reportError(idx, ErrorCode.e301, "undefined type '${name}', did you mean '${ts}'?")
@@ -4234,13 +4236,50 @@ struct Checker {
         const fields_ptr = @intCast(i64, alloc_raw(fields_count * @sizeOf(StructField)))
         const result = self.buildStructFields(sd_fields, fields_count, fields_ptr, is_packed)
 
-        // Final padding: packed=1, extern=max field align, auto=8
+        // Check if any field has bitfield width — if so, recompute as bit-packed layout
+        // Zig reference: checker.zig:4214-4246
+        var has_bitfields = false
+        for fi in 0..fields_count {
+            const f = @intToPtr(*StructField, fields_ptr + fi * @sizeOf(StructField))
+            if (f.bit_width > 0) { has_bitfields = true; break }
+        }
+        var backing_int: int = 0
+        var total_size = result.0
+        if (has_bitfields and is_packed) {
+            // Bit-packed mode: recompute all field offsets in bits
+            var bit_pos: int = 0
+            for fi in 0..fields_count {
+                const f = @intToPtr(*StructField, fields_ptr + fi * @sizeOf(StructField))
+                f.bit_offset = bit_pos
+                if (f.bit_width > 0) {
+                    bit_pos = bit_pos + f.bit_width
+                } else {
+                    // Standard-width field in bitfield struct: use full type bit size
+                    f.bit_width = self.types.sizeOf(f.type_idx) * 8
+                    bit_pos = bit_pos + f.bit_width
+                }
+                f.offset = 0  // All fields at byte offset 0 (single backing integer)
+            }
+            // Determine backing integer from total bit width
+            if (bit_pos <= 8) {
+                total_size = 1; backing_int = U8
+            } else if (bit_pos <= 16) {
+                total_size = 2; backing_int = U16
+            } else if (bit_pos <= 32) {
+                total_size = 4; backing_int = U32
+            } else if (bit_pos <= 64) {
+                total_size = 8; backing_int = U64
+            } else {
+                total_size = 8; backing_int = U64
+            }
+        }
+
+        // Final padding: packed=1 (or backing int size for bitfields), extern=max field align, auto=8
         const alignment = switch (sd_layout) {
-            StructLayout.@"packed" => 1,
+            StructLayout.@"packed" => if (has_bitfields) { total_size } else { 1 },
             StructLayout.@"extern" => result.1,
             else => 8,
         }
-        var total_size = result.0
         if (!is_packed and alignment > 1) {
             total_size = (total_size + alignment - 1) & ~(alignment - 1)
         }
@@ -4252,6 +4291,7 @@ struct Checker {
             size: total_size,
             alignment: alignment,
             layout: sd_layout,
+            backing_int: backing_int,
         }))
     }
 
@@ -4266,6 +4306,7 @@ struct Checker {
     }
 
     /// Build a single struct field. Writes to fields_ptr and updates offset/max_align.
+    /// Zig reference: checker.zig:4164-4193 — packed struct bitfield detection.
     fn buildStructField(field_idx: int, fields_ptr: int, fi: int, is_packed: bool, offset: *int, max_align: *int) void {
         var fname = ""
         var ftype_n = null_node
@@ -4273,6 +4314,31 @@ struct Checker {
         switch (self.ast.getNode(field_idx)) { Node.expr |e| => switch (e) { Expr.field_def |fd| => { fname = fd.name; ftype_n = fd.type_expr; fdefault = fd.default_value }, else => {} }, else => {} }
         const ftype = self.resolveTypeExpr(ftype_n)
         const fsize = self.types.sizeOf(ftype)
+
+        // Detect sub-byte bitfield types (u1-u7, u9-u15, etc.) for packed structs
+        var bit_width: int = 0
+        if (is_packed) {
+            // Extract type name from type expression AST node
+            var type_name = ""
+            switch (self.ast.getNode(ftype_n)) { Node.expr |e| => switch (e) {
+                Expr.type_expr |te| => {
+                    if (te.kind == TYPE_NAMED and te.data1 != null_node) {
+                        switch (self.ast.getNode(te.data1)) { Node.expr |e2| => switch (e2) {
+                            Expr.ident |id| => { type_name = id.name },
+                            else => {},
+                        }, else => {} }
+                    }
+                },
+                Expr.ident |id| => { type_name = id.name },
+                else => {},
+            }, else => {} }
+            if (type_name.len > 0) {
+                const bw = self.types.parseBitWidth(type_name)
+                if (bw > 0 and bw != 8 and bw != 16 and bw != 32 and bw != 64) {
+                    bit_width = bw
+                }
+            }
+        }
 
         if (!is_packed) {
             const field_align = self.types.alignmentOf(ftype)
@@ -4286,8 +4352,14 @@ struct Checker {
         sf.name = fname
         sf.type_idx = ftype
         sf.offset = offset.*
+        sf.bit_offset = 0
+        sf.bit_width = bit_width
         sf.default_value = fdefault
-        offset.* = offset.* + fsize
+        if (is_packed and bit_width > 0) {
+            // Bitfield: don't advance byte offset (handled by bit packing in buildStructType)
+        } else {
+            offset.* = offset.* + fsize
+        }
     }
 
     fn buildEnumType(idx: int) int {
@@ -5529,7 +5601,7 @@ struct Checker {
             if (ti != invalid_type) {
                 const t = self.types.get(ti)
                 if (t.tag == TAG_STRUCT) {
-                    const st = switch (t) { Type.struct_type |s| => s, else => StructType { name: "", field_count: 0, fields: 0, size: 0, alignment: 0, layout: 0 } }
+                    const st = switch (t) { Type.struct_type |s| => s, else => StructType { name: "", field_count: 0, fields: 0, size: 0, alignment: 0, layout: 0, backing_int: 0 } }
                     const fs = self.evalConstString(bc_args.get(0))
                     if (fs.0 != 0) {
                         for fi in 0..st.field_count {
@@ -6103,7 +6175,7 @@ struct Checker {
     fn findSimilarField(name: string, struct_type_idx: int) ?string {
         const t = self.types.get(struct_type_idx)
         if (t.tag != TAG_STRUCT) { return null }
-        const st = switch (t) { Type.struct_type |s| => s, else => StructType { name: "", field_count: 0, fields: 0, size: 0, alignment: 0, layout: 0 } }
+        const st = switch (t) { Type.struct_type |s| => s, else => StructType { name: "", field_count: 0, fields: 0, size: 0, alignment: 0, layout: 0, backing_int: 0 } }
         var best: ?string = null
         var best_dist = 999
         for fi in 0..st.field_count {
@@ -6511,7 +6583,7 @@ test "checker safe wrap type" {
 
     // In safe mode — should wrap struct to pointer
     c.safe_mode = true
-    const st = types.add(Type.struct_type(StructType { name: "Foo", field_count: 0, fields: 0, size: 0, alignment: 0, layout: 0 }))
+    const st = types.add(Type.struct_type(StructType { name: "Foo", field_count: 0, fields: 0, size: 0, alignment: 0, layout: 0, backing_int: 0 }))
     const wrapped = c.safeWrapType(st)
     @assert(wrapped != st)  // Should be different (pointer type)
 

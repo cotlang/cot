@@ -260,10 +260,13 @@ pub const TypeRegistry = struct {
 
     pub fn lookupByName(self: *const TypeRegistry, n: []const u8) ?TypeIndex {
         if (self.name_map.get(n)) |idx| return idx;
-        // Support arbitrary-width integers: u1-u63, i1-i63
-        // These map to the smallest standard type that contains them,
-        // with bit_width set during packed struct field resolution.
-        // Zig reference: Type.zig — packed struct fields can be any uN/iN.
+        return null;
+    }
+
+    /// Resolve arbitrary-width integer type name (u1-u63, i1-i63) for packed struct fields.
+    /// Only called from type resolution contexts, not general identifier lookup.
+    /// Zig reference: Type.zig — packed struct fields can be any uN/iN.
+    pub fn lookupBitfieldType(_: *const TypeRegistry, n: []const u8) ?TypeIndex {
         if (n.len >= 2 and n.len <= 3 and (n[0] == 'u' or n[0] == 'i')) {
             var width: u32 = 0;
             var valid = true;
@@ -276,7 +279,6 @@ pub const TypeRegistry = struct {
                 }
             }
             if (valid and width >= 1 and width <= 64) {
-                // Map to smallest containing standard type (signed or unsigned)
                 if (n[0] == 'i') {
                     if (width <= 8) return I8;
                     if (width <= 16) return I16;

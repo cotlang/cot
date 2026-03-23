@@ -3725,6 +3725,8 @@ pub const Checker = struct {
                 if (sub.get(expr.ident.name)) |substituted| return substituted;
             }
             if (self.resolveTypeByName(expr.ident.name)) |tidx| return tidx;
+            // Fallback: resolve arbitrary-width integer types (u3, i5, etc.) for packed struct fields
+            if (self.types.lookupBitfieldType(expr.ident.name)) |tidx| return tidx;
             self.errWithSuggestion(expr.ident.span.start, "undefined type", self.findSimilarType(expr.ident.name));
             return invalid_type;
         }
@@ -3748,6 +3750,7 @@ pub const Checker = struct {
                 // exist in scope as .constant (not .type_name) before checkVarDecl runs.
                 // Return invalid_type silently in that case (resolved later during checking).
                 if (self.resolveTypeByName(n)) |tidx| break :blk tidx;
+                if (self.types.lookupBitfieldType(n)) |tidx| break :blk tidx;
                 if (self.scope.lookup(n) != null) break :blk invalid_type;
                 self.errWithSuggestion(te.span.start, "undefined type", self.findSimilarType(n));
                 break :blk invalid_type;

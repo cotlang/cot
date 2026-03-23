@@ -1301,6 +1301,51 @@ struct Lowerer {
 
         // Direct struct field assignment (value type in local)
         if (type_info.tag == TAG_STRUCT) {
+            // Bitfield packed struct write: read-modify-write pattern
+            // Zig reference: lower.zig lowerFieldAssign backing_int path
+            const st_info = switch (type_info) { Type.struct_type |s| => s, else => StructType { name: "", field_count: 0, fields: 0, size: 0, alignment: 0, layout: 0, backing_int: 0 } }
+            if (st_info.backing_int != 0) {
+                for fi in 0..st_info.field_count {
+                    const field = st_info.getField(fi)
+                    if (field.name == fa.field and field.bit_width > 0) {
+                        const val = self.lowerExprNode(a.value)
+                        if (val == null_node) { return }
+                        const backing_type = st_info.backing_int
+
+                        // Mask the new value to bit_width bits
+                        var masked_val = val
+                        if (field.bit_width < 64) {
+                            const mask_val = (1 << field.bit_width) - 1
+                            const mask = fb.emitConstInt(mask_val, I64, a.span)
+                            masked_val = fb.emitBinary(BinaryOp.bit_and, val, mask, I64, a.span)
+                        }
+
+                        // Shift the masked value to its bit position
+                        var shifted_val = masked_val
+                        if (field.bit_offset > 0) {
+                            const shift = fb.emitConstInt(field.bit_offset, I64, a.span)
+                            shifted_val = fb.emitBinary(BinaryOp.shl, masked_val, shift, I64, a.span)
+                        }
+
+                        // Build the clear mask: ~(field_mask << bit_offset)
+                        const field_mask = (1 << field.bit_width) - 1
+                        const clear_mask = ~(field_mask << field.bit_offset)
+
+                        if (self.extractIdentName(fa.base)) |base_name| {
+                            if (fb.lookupLocal(base_name)) |local_idx| {
+                                var backing_val = fb.emitLoadLocal(local_idx, backing_type, a.span)
+                                const clear = fb.emitConstInt(clear_mask, I64, a.span)
+                                backing_val = fb.emitBinary(BinaryOp.bit_and, backing_val, clear, I64, a.span)
+                                backing_val = fb.emitBinary(BinaryOp.bit_or, backing_val, shifted_val, I64, a.span)
+                                fb.emitStoreLocal(local_idx, backing_val, a.span)
+                            }
+                        }
+                        return
+                    }
+                }
+                return
+            }
+
             const field_idx = self.findStructFieldIdx(base_type, fa.field)
             if (field_idx >= 0) {
                 if (self.getStructField(base_type, field_idx)) |field| {
@@ -2783,19 +2828,78 @@ struct Lowerer {
     /// Struct field access — checks for local ident base optimization.
     fn lowerStructFieldAccess(fa: FieldAccessExpr, struct_type: int) int {
         const fb = self.builder.func() orelse return null_node
+        const struct_info = self.types.get(struct_type)
+        if (struct_info.tag != TAG_STRUCT) { return null_node }
+        const st = switch (struct_info) { Type.struct_type |s| => s, else => StructType { name: "", field_count: 0, fields: 0, size: 0, alignment: 0, layout: 0, backing_int: 0 } }
+
         const field_idx = self.findStructFieldIdx(struct_type, fa.field)
         if (field_idx < 0) { return null_node }
         if (self.getStructField(struct_type, field_idx)) |field| {
+            // Bitfield access: load backing integer → shift right → mask
+            // Zig reference: lower.zig:5814-5857
+            if (field.bit_width > 0 and st.backing_int != 0) {
+                const backing_type = st.backing_int
+
+                // Load the entire backing integer
+                var backing_val = null_node
+                if (self.extractIdentName(fa.base)) |base_name| {
+                    if (fb.lookupLocal(base_name)) |local_idx| {
+                        backing_val = fb.emitLoadLocal(local_idx, backing_type, fa.span)
+                    }
+                }
+                if (backing_val == null_node) {
+                    backing_val = self.lowerExprNode(fa.base)
+                }
+
+                // Shift right by bit_offset
+                if (field.bit_offset > 0) {
+                    const shift_amount = fb.emitConstInt(field.bit_offset, I64, fa.span)
+                    backing_val = fb.emitBinary(BinaryOp.shr, backing_val, shift_amount, I64, fa.span)
+                }
+
+                // Mask to bit_width
+                if (field.bit_width < 64) {
+                    const mask_val = (1 << field.bit_width) - 1
+                    const mask = fb.emitConstInt(mask_val, I64, fa.span)
+                    backing_val = fb.emitBinary(BinaryOp.bit_and, backing_val, mask, I64, fa.span)
+                }
+
+                // Sign extension for signed bitfield types (iN)
+                // Zig reference: SHL(64-width) → SHR_S(64-width)
+                // IR .shr maps to SSA .sar (arithmetic shift right)
+                const field_type_info = self.types.get(field.type_idx)
+                if (field_type_info.tag == TAG_BASIC) {
+                    const bk = switch (field_type_info) { Type.basic |b| => b, else => BasicKind.void_type }
+                    if (bk.isSigned() and field.bit_width < 64) {
+                        const shift_amount = 64 - field.bit_width
+                        const shift_const = fb.emitConstInt(shift_amount, I64, fa.span)
+                        backing_val = fb.emitBinary(BinaryOp.shl, backing_val, shift_const, I64, fa.span)
+                        backing_val = fb.emitBinary(BinaryOp.shr, backing_val, shift_const, I64, fa.span)
+                    }
+                }
+
+                return backing_val
+            }
+
+            // When loading a field that is itself a packed struct with backing_int,
+            // use the backing_int type for proper integer typing (enables chained access).
+            var effective_type = field.type_idx
+            const fti = self.types.get(field.type_idx)
+            if (fti.tag == TAG_STRUCT) {
+                const fst = switch (fti) { Type.struct_type |s| => s, else => st }
+                if (fst.backing_int != 0) { effective_type = fst.backing_int }
+            }
+
             if (self.extractIdentName(fa.base)) |base_name| {
                 if (fb.lookupLocal(base_name)) |local_idx| {
-                    return fb.emitFieldLocal(local_idx, field_idx, field.offset, field.type_idx, fa.span)
+                    return fb.emitFieldLocal(local_idx, field_idx, field.offset, effective_type, fa.span)
                 }
             }
 
             // Expression base — use emitFieldValue
             const base = self.lowerExprNode(fa.base)
             if (base == null_node) { return null_node }
-            return fb.emitFieldValue(base, field_idx, field.offset, field.type_idx, fa.span)
+            return fb.emitFieldValue(base, field_idx, field.offset, effective_type, fa.span)
         }
         return null_node
     }
@@ -5709,6 +5813,41 @@ struct Lowerer {
         const type_info = self.types.get(struct_type_idx)
         if (type_info.tag != TAG_STRUCT) { return null_node }
 
+        // Bitfield packed struct expr: build backing integer from shifted field values
+        // Zig reference: lower.zig lowerStructInitExpr bitfield path
+        switch (type_info) { Type.struct_type |st| => {
+            if (st.backing_int != 0) {
+                var result = fb.emitConstInt(0, st.backing_int, si.span)
+                for fi in 0..si.fields.count {
+                    const field_init_idx = si.fields.get(fi)
+                    var fi_name = ""
+                    var fi_value = null_node
+                    switch (self.tree.getNode(field_init_idx)) { Node.expr |e| => switch (e) {
+                        Expr.field_init_node |fnode| => { fi_name = fnode.name; fi_value = fnode.value },
+                        else => {},
+                    }, else => {} }
+                    for j in 0..st.field_count {
+                        const field = st.getField(j)
+                        if (field.name == fi_name) {
+                            var fval = self.lowerExprNode(fi_value)
+                            if (field.bit_width > 0 and field.bit_width < 64) {
+                                const mask_val = (1 << field.bit_width) - 1
+                                const mask = fb.emitConstInt(mask_val, I64, si.span)
+                                fval = fb.emitBinary(BinaryOp.bit_and, fval, mask, I64, si.span)
+                            }
+                            if (field.bit_offset > 0) {
+                                const shift = fb.emitConstInt(field.bit_offset, I64, si.span)
+                                fval = fb.emitBinary(BinaryOp.shl, fval, shift, I64, si.span)
+                            }
+                            result = fb.emitBinary(BinaryOp.bit_or, result, fval, I64, si.span)
+                            break
+                        }
+                    }
+                }
+                return result
+            }
+        }, else => {} }
+
         const size = self.types.sizeOf(struct_type_idx)
         const temp_idx = fb.addLocalWithSize("__struct_tmp", struct_type_idx, true, size)
 
@@ -5801,6 +5940,42 @@ struct Lowerer {
                 if (type_info.tag != TAG_STRUCT) { return }
 
                 switch (type_info) { Type.struct_type |st| => {
+                    // Bitfield packed struct: build backing integer from shifted field values
+                    // Zig reference: lower.zig:2688-2715
+                    if (st.backing_int != 0) {
+                        var result = fb.emitConstInt(0, st.backing_int, span)
+                        for fi in 0..si.fields.count {
+                            const field_init_idx = si.fields.get(fi)
+                            var fi_name = ""
+                            var fi_value = null_node
+                            switch (self.tree.getNode(field_init_idx)) { Node.expr |e2| => switch (e2) {
+                                Expr.field_init_node |fnode| => { fi_name = fnode.name; fi_value = fnode.value },
+                                else => {},
+                            }, else => {} }
+                            for j in 0..st.field_count {
+                                const field = st.getField(j)
+                                if (field.name == fi_name) {
+                                    var fval = self.lowerExprNode(fi_value)
+                                    // Mask value to bit_width (handles signed values)
+                                    if (field.bit_width > 0 and field.bit_width < 64) {
+                                        const mask_val = (1 << field.bit_width) - 1
+                                        const mask = fb.emitConstInt(mask_val, I64, span)
+                                        fval = fb.emitBinary(BinaryOp.bit_and, fval, mask, I64, span)
+                                    }
+                                    // Shift left by bit_offset
+                                    if (field.bit_offset > 0) {
+                                        const shift = fb.emitConstInt(field.bit_offset, I64, span)
+                                        fval = fb.emitBinary(BinaryOp.shl, fval, shift, I64, span)
+                                    }
+                                    result = fb.emitBinary(BinaryOp.bit_or, result, fval, I64, span)
+                                    break
+                                }
+                            }
+                        }
+                        fb.emitStoreLocal(local_idx, result, span)
+                        return
+                    }
+
                     // Store each explicitly provided field
                     for fi in 0..si.fields.count {
                         const field_init_idx = si.fields.get(fi)
