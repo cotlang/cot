@@ -480,8 +480,9 @@ struct GenState {
                 self.builder.appendFrom(As.i32_const, constAddr(v.aux_int))
             },
             SsaOp.wasm_f64_const, SsaOp.const_float => {
+                // Float constants stay as f64 — float locals are f64
+                // Zig gen.zig:366-369
                 self.builder.appendFrom(As.f64_const, floatAddr(@bitCast(float, v.aux_int)))
-                self.builder.append(As.i64_reinterpret_f64)
             },
             SsaOp.const_bool => {
                 if (v.aux_int != 0) {
@@ -956,152 +957,105 @@ struct GenState {
     fn emitFloatOp(val_idx: int) void {
         const v = self.ssa_func.getValue(val_idx)
         switch (v.op) {
-            // f64 arithmetic — all locals are i64, so reinterpret i64→f64 before
-            // each float input and f64→i64 after each float output (Go pattern).
+            // f64 arithmetic — float locals are f64, no reinterpret needed.
+            // Zig gen.zig:609-667
             SsaOp.wasm_f64_add => {
                 self.getValue64(v.args.get(0))
-                self.builder.append(As.f64_reinterpret_i64)
                 self.getValue64(v.args.get(1))
-                self.builder.append(As.f64_reinterpret_i64)
                 self.builder.append(As.f64_add)
-                self.builder.append(As.i64_reinterpret_f64)
             },
             SsaOp.wasm_f64_sub => {
                 self.getValue64(v.args.get(0))
-                self.builder.append(As.f64_reinterpret_i64)
                 self.getValue64(v.args.get(1))
-                self.builder.append(As.f64_reinterpret_i64)
                 self.builder.append(As.f64_sub)
-                self.builder.append(As.i64_reinterpret_f64)
             },
             SsaOp.wasm_f64_mul => {
                 self.getValue64(v.args.get(0))
-                self.builder.append(As.f64_reinterpret_i64)
                 self.getValue64(v.args.get(1))
-                self.builder.append(As.f64_reinterpret_i64)
                 self.builder.append(As.f64_mul)
-                self.builder.append(As.i64_reinterpret_f64)
             },
             SsaOp.wasm_f64_div => {
                 self.getValue64(v.args.get(0))
-                self.builder.append(As.f64_reinterpret_i64)
                 self.getValue64(v.args.get(1))
-                self.builder.append(As.f64_reinterpret_i64)
                 self.builder.append(As.f64_div)
-                self.builder.append(As.i64_reinterpret_f64)
             },
             SsaOp.wasm_f64_neg => {
                 self.getValue64(v.args.get(0))
-                self.builder.append(As.f64_reinterpret_i64)
                 self.builder.append(As.f64_neg)
-                self.builder.append(As.i64_reinterpret_f64)
             },
             SsaOp.wasm_f64_abs => {
                 self.getValue64(v.args.get(0))
-                self.builder.append(As.f64_reinterpret_i64)
                 self.builder.append(As.f64_abs)
-                self.builder.append(As.i64_reinterpret_f64)
             },
             SsaOp.wasm_f64_ceil => {
                 self.getValue64(v.args.get(0))
-                self.builder.append(As.f64_reinterpret_i64)
                 self.builder.append(As.f64_ceil)
-                self.builder.append(As.i64_reinterpret_f64)
             },
             SsaOp.wasm_f64_floor => {
                 self.getValue64(v.args.get(0))
-                self.builder.append(As.f64_reinterpret_i64)
                 self.builder.append(As.f64_floor)
-                self.builder.append(As.i64_reinterpret_f64)
             },
             SsaOp.wasm_f64_trunc => {
                 self.getValue64(v.args.get(0))
-                self.builder.append(As.f64_reinterpret_i64)
                 self.builder.append(As.f64_trunc)
-                self.builder.append(As.i64_reinterpret_f64)
             },
             SsaOp.wasm_f64_nearest => {
                 self.getValue64(v.args.get(0))
-                self.builder.append(As.f64_reinterpret_i64)
                 self.builder.append(As.f64_nearest)
-                self.builder.append(As.i64_reinterpret_f64)
             },
             SsaOp.wasm_f64_sqrt => {
                 self.getValue64(v.args.get(0))
-                self.builder.append(As.f64_reinterpret_i64)
                 self.builder.append(As.f64_sqrt)
-                self.builder.append(As.i64_reinterpret_f64)
             },
             SsaOp.wasm_f64_min => {
                 self.getValue64(v.args.get(0))
-                self.builder.append(As.f64_reinterpret_i64)
                 self.getValue64(v.args.get(1))
-                self.builder.append(As.f64_reinterpret_i64)
                 self.builder.append(As.f64_min)
-                self.builder.append(As.i64_reinterpret_f64)
             },
             SsaOp.wasm_f64_max => {
                 self.getValue64(v.args.get(0))
-                self.builder.append(As.f64_reinterpret_i64)
                 self.getValue64(v.args.get(1))
-                self.builder.append(As.f64_reinterpret_i64)
                 self.builder.append(As.f64_max)
-                self.builder.append(As.i64_reinterpret_f64)
             },
             SsaOp.wasm_f64_copysign => {
                 self.getValue64(v.args.get(0))
-                self.builder.append(As.f64_reinterpret_i64)
                 self.getValue64(v.args.get(1))
-                self.builder.append(As.f64_reinterpret_i64)
                 self.builder.append(As.f64_copysign)
-                self.builder.append(As.i64_reinterpret_f64)
             },
 
-            // f64 comparisons (produce i32) — inputs need reinterpret, output is i32
+            // f64 comparisons (produce i32) — inputs are f64, output is i32
             SsaOp.wasm_f64_eq => {
                 self.getValue64(v.args.get(0))
-                self.builder.append(As.f64_reinterpret_i64)
                 self.getValue64(v.args.get(1))
-                self.builder.append(As.f64_reinterpret_i64)
                 self.builder.append(As.f64_eq)
             },
             SsaOp.wasm_f64_ne => {
                 self.getValue64(v.args.get(0))
-                self.builder.append(As.f64_reinterpret_i64)
                 self.getValue64(v.args.get(1))
-                self.builder.append(As.f64_reinterpret_i64)
                 self.builder.append(As.f64_ne)
             },
             SsaOp.wasm_f64_lt => {
                 self.getValue64(v.args.get(0))
-                self.builder.append(As.f64_reinterpret_i64)
                 self.getValue64(v.args.get(1))
-                self.builder.append(As.f64_reinterpret_i64)
                 self.builder.append(As.f64_lt)
             },
             SsaOp.wasm_f64_le => {
                 self.getValue64(v.args.get(0))
-                self.builder.append(As.f64_reinterpret_i64)
                 self.getValue64(v.args.get(1))
-                self.builder.append(As.f64_reinterpret_i64)
                 self.builder.append(As.f64_le)
             },
             SsaOp.wasm_f64_gt => {
                 self.getValue64(v.args.get(0))
-                self.builder.append(As.f64_reinterpret_i64)
                 self.getValue64(v.args.get(1))
-                self.builder.append(As.f64_reinterpret_i64)
                 self.builder.append(As.f64_gt)
             },
             SsaOp.wasm_f64_ge => {
                 self.getValue64(v.args.get(0))
-                self.builder.append(As.f64_reinterpret_i64)
                 self.getValue64(v.args.get(1))
-                self.builder.append(As.f64_reinterpret_i64)
                 self.builder.append(As.f64_ge)
             },
 
-            // f32 arithmetic — locals are i64, so: i64→i32→f32 before, f32→i32→i64 after
+            // f32 arithmetic — f32 locals stored in i64 locals, need reinterpret
             SsaOp.wasm_f32_add => {
                 self.getValue64(v.args.get(0))
                 self.builder.append(As.i32_wrap_i64)

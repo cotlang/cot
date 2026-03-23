@@ -470,6 +470,8 @@ fn addParamType(params: *List(int), param: Local, types: *TypeRegistry) void {
     const is_compound_opt = param_type.tag == TAG_OPTIONAL and types.get(switch (param_type) { Type.optional |o| => o.elem, else => 0 }).tag != TAG_POINTER
     const is_large_struct = (param_type.tag == TAG_STRUCT or param_type.tag == TAG_UNION or param_type.tag == TAG_TUPLE or is_compound_opt) and type_size > 8
 
+    const is_float = param.type_idx == F64 or param.type_idx == F32
+
     if (is_string_or_slice) {
         params.append(VT_I64)
         params.append(VT_I64)
@@ -480,8 +482,11 @@ fn addParamType(params: *List(int), param: Local, types: *TypeRegistry) void {
             params.append(VT_I64)
             k += 1
         }
+    } else if (is_float) {
+        // Float params declared as f64 in Wasm type section — matches f64 locals
+        // Zig driver.zig:6456-6458
+        params.append(VT_F64)
     } else {
-        // All values stored as i64 (Go's all-i64 approach) — floats are bit-cast to i64
         params.append(VT_I64)
     }
 }
@@ -492,12 +497,16 @@ fn buildFuncResults(results: *List(int), ir_func: Func, types: *TypeRegistry) vo
 
     const ret_type_info = types.get(ir_func.return_type)
     const ret_is_compound = ir_func.return_type == STRING or ret_type_info.tag == TAG_SLICE
+    const ret_is_float = ir_func.return_type == F64 or ir_func.return_type == F32
 
     if (ret_is_compound) {
         results.append(VT_I64)
         results.append(VT_I64)
+    } else if (ret_is_float) {
+        // Float returns declared as f64 — matches f64 locals in body
+        // Zig driver.zig:6480-6481
+        results.append(VT_F64)
     } else {
-        // All values stored as i64 (Go's all-i64 approach) — floats are bit-cast to i64
         results.append(VT_I64)
     }
 }
