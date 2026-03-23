@@ -1318,7 +1318,11 @@ struct Checker {
             }
 
             const target_type = self.checkExpr(asgn.target)
+            // Set expected type so `.{}` resolves to target type (Zig RLS pattern)
+            const saved_expected = self.expected_type
+            self.expected_type = target_type
             const value_type = self.checkExpr(asgn.value)
+            self.expected_type = saved_expected
 
             // Check mutability for identifier targets
             if (target_tag == "ident") {

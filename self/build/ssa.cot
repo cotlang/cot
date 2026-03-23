@@ -9,6 +9,7 @@
 import "std/list"
 import "std/map"
 import "std/string"
+import "std/sys"
 import "../check/types"
 
 // ============================================================================
@@ -375,25 +376,43 @@ struct SsaFunc {
         }
     }
 
+    /// Allocate with ARC header but set refcount to MAX so it's never freed.
+    /// This makes the pointer safe with List's @arcRetain/@arcRelease — they
+    /// increment/decrement the refcount but it never reaches 0 from MAX.
+    /// Matches Zig's arena pattern: SSA values are freed all at once by func.free().
+    fn arenaAlloc(size: int) i64 {
+        // ARC header is 16 bytes before the user data: [refcount: i64, size: i64]
+        const total = 16 + size
+        const raw = alloc_raw(total)
+        const base = @intCast(i64, raw)
+        // Set refcount to MAX_INT so retain/release never free this
+        var rc_ptr = @intToPtr(*i64, base)
+        rc_ptr.* = 9223372036854775807
+        // Set size field
+        var sz_ptr = @intToPtr(*i64, base + 8)
+        sz_ptr.* = size
+        // Return pointer to user data (after header)
+        return base + 16
+    }
+
     /// Create a new heap-allocated SSA value. Returns pointer.
     fn newValue(op: SsaOp, type_idx: int, block: int, line: int, col: int) *SsaValue {
         const id = self.next_value_id
         self.next_value_id += 1
-        var args: List(*SsaValue) = .{}
-        var val = new SsaValue {
-            id: id,
-            op: op,
-            type_idx: type_idx,
-            aux_int: 0,
-            aux_float: 0.0,
-            aux: SsaAux.none,
-            args: args,
-            block: block,
-            pos_line: line,
-            pos_col: col,
-            uses: 0,
-            in_cache: false,
-        }
+        var val = @intToPtr(*SsaValue, self.arenaAlloc(@sizeOf(SsaValue)))
+        val.id = id
+        val.op = op
+        val.type_idx = type_idx
+        val.aux_int = 0
+        val.aux_float = 0.0
+        val.aux = SsaAux.none
+        var empty_args: List(*SsaValue) = .{}
+        val.args = empty_args
+        val.block = block
+        val.pos_line = line
+        val.pos_col = col
+        val.uses = 0
+        val.in_cache = false
         self.values.append(val)
         return val
     }
@@ -402,22 +421,20 @@ struct SsaFunc {
     fn newBlock(kind: SsaBlockKind) *SsaBlock {
         const id = self.next_block_id
         self.next_block_id += 1
-        var succs: List(SsaEdge) = .{}
-        var preds: List(SsaEdge) = .{}
-        var controls: List(*SsaValue) = .{}
-        var values: List(*SsaValue) = .{}
-        const idx = self.blocks.count
-        var blk = new SsaBlock {
-            id: id,
-            idx: idx,
-            kind: kind,
-            succs: succs,
-            preds: preds,
-            controls: controls,
-            values: values,
-            pos_line: 0,
-            pos_col: 0,
-        }
+        var blk = @intToPtr(*SsaBlock, self.arenaAlloc(@sizeOf(SsaBlock)))
+        blk.id = id
+        blk.idx = self.blocks.count
+        blk.kind = kind
+        var empty_succs: List(SsaEdge) = .{}
+        var empty_preds: List(SsaEdge) = .{}
+        var empty_controls: List(*SsaValue) = .{}
+        var empty_values: List(*SsaValue) = .{}
+        blk.succs = empty_succs
+        blk.preds = empty_preds
+        blk.controls = empty_controls
+        blk.values = empty_values
+        blk.pos_line = 0
+        blk.pos_col = 0
         self.blocks.append(blk)
         return blk
     }

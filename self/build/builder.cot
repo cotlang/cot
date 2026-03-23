@@ -228,7 +228,18 @@ struct SSABuilder {
     }
 
     fn takeFunc() SsaFunc {
-        return self.func
+        const f = self.func
+        // Move semantics: zero builder's Lists so they don't share backing
+        // arrays with the returned SsaFunc. Cot's List is a plain struct
+        // (no copy-on-write like Swift's Array), so both copies would share
+        // the same items pointer — ARC releases on one corrupt the other.
+        self.func.blocks = .{}
+        self.func.values = .{}
+        self.func.local_sizes = .{}
+        self.func.local_offsets = .{}
+        self.func.string_literals = .{}
+        self.func.block_order = .{}
+        return f
     }
 
     /// Free all builder-owned memory (does NOT free the SsaFunc — caller owns that after build()).
@@ -491,14 +502,10 @@ struct SSABuilder {
 
     fn convertRet(r: Return) *SsaValue {
         const cur = self.cur_block
-        // Convert return value BEFORE reading the block — convertNode may
-        // add values to the current block (e.g. constants, loads).
-        // Reading the block first then overwriting it erases those values.
         var ret_val = null_val
         if (r.value != null_node) {
             ret_val = self.convertNode(r.value)
         }
-        // Now read the block (captures any values convertNode added)
         var blk = self.func.blocks.get(cur)
         blk.kind = SsaBlockKind.ret
         if (ret_val != null_val) {
@@ -1869,6 +1876,9 @@ struct SSABuilder {
     }
 
     fn reorderPhis() void {
+        // Reorder block values so phis come first, without using clear()/append()
+        // which trigger ARC release/retain and can free values prematurely.
+        // Instead, collect into temp lists and write directly to backing array.
         for i in 0..self.func.blocks.count {
             var blk = self.func.blocks.get(i)
             var phis: List(*SsaValue) = .{}
@@ -1883,9 +1893,20 @@ struct SSABuilder {
                 }
             }
 
-            blk.values.clear()
-            for j in 0..phis.count { blk.values.append(phis.get(j)) }
-            for j in 0..non_phis.count { blk.values.append(non_phis.get(j)) }
+            if (phis.count == 0) { continue }
+
+            // Write reordered values directly to the backing array (no ARC)
+            var wi = 0
+            for j in 0..phis.count {
+                var ptr = @intToPtr(**SsaValue, blk.values.items + wi * @sizeOf(*SsaValue))
+                ptr.* = phis.get(j)
+                wi += 1
+            }
+            for j in 0..non_phis.count {
+                var ptr = @intToPtr(**SsaValue, blk.values.items + wi * @sizeOf(*SsaValue))
+                ptr.* = non_phis.get(j)
+                wi += 1
+            }
         }
     }
 

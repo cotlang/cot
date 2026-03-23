@@ -3477,7 +3477,11 @@ pub const Checker = struct {
         }
 
         const target_type = try self.checkExpr(as_stmt.target);
+        // Set expected type so `.{}` resolves to the target type (like `var x: T = .{}`)
+        const old_expected = self.expected_type;
+        self.expected_type = target_type;
         const value_type = try self.checkExpr(as_stmt.value);
+        self.expected_type = old_expected;
         switch (target) {
             .ident => |id| if (self.scope.lookup(id.name)) |sym| if (!sym.mutable) { self.err.errorWithCode(as_stmt.span.start, .e300, "cannot assign to constant"); return; },
             .index, .field_access, .deref => {},
