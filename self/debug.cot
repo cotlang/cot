@@ -10,8 +10,8 @@
 ///   import "../debug"  (from optimize/ or emit/wasm/)
 ///   import "debug"     (from self/ root)
 ///
-///   debug_log(.codegen, "=== Pass for '${name}' ===")
-///   debug_log(.ssa, "built ${blocks} blocks, ${values} values")
+///   debug(.codegen, "=== Pass for '${name}' ===")
+///   debug(.ssa, "built ${blocks} blocks, ${values} values")
 
 import "std/os"
 import "std/string"
@@ -124,7 +124,7 @@ fn phaseEnabled(phase: Phase) bool {
 
 /// Log a message if the phase is enabled.
 /// Format: [phase] message — matches Zig compiler output exactly.
-fn debug_log(phase: Phase, msg: string) void {
+fn debug(phase: Phase, msg: string) void {
     if (!phaseEnabled(phase)) { return }
     const name = @tagName(phase)
     eprintln("[${name}] ${msg}")
@@ -132,7 +132,7 @@ fn debug_log(phase: Phase, msg: string) void {
 
 /// Log a message with elapsed time in microseconds.
 /// Reference: Go compile.go — f.LogStat("TIME(ns)", elapsed)
-fn debug_log_timed(phase: Phase, msg: string, elapsed_ns: i64) void {
+fn debug_timed(phase: Phase, msg: string, elapsed_ns: i64) void {
     if (!phaseEnabled(phase)) { return }
     const us = elapsed_ns / 1000
     const name = @tagName(phase)
@@ -186,7 +186,7 @@ test "phaseEnabled returns false when not set" {
 
 test "debug_log with tagName" {
     g_all = true
-    debug_log(.codegen, "=== test pass ===")
-    debug_log(.check, "type checking")
+    debug(.codegen, "=== test pass ===")
+    debug(.check, "type checking")
     g_all = false
 }

@@ -27,7 +27,7 @@ fn copyelim(func: *SsaFunc) void {
             if (v.op == SsaOp.phi) { total_phis += 1 }
         }
     }
-    debug_log(.copyelim, "=== Copyelim pass for '${func.name}' (${total_values} values, ${total_copies} copies, ${total_phis} phis) ===")
+    debug(.copyelim, "=== Copyelim pass for '${func.name}' (${total_values} values, ${total_copies} copies, ${total_phis} phis) ===")
 
     phielim(func)
 
@@ -46,7 +46,7 @@ fn copyelim(func: *SsaFunc) void {
         }
     }
 
-    debug_log(.copyelim, "=== Copyelim complete for '${func.name}': ${ctrl_rewrites} control rewrites ===")
+    debug(.copyelim, "=== Copyelim complete for '${func.name}': ${ctrl_rewrites} control rewrites ===")
 }
 
 /// Follow a copy chain to its ultimate source.

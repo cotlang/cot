@@ -15,7 +15,7 @@ import "../debug"
 fn cse(func: *SsaFunc) void {
     var total_values: i64 = 0
     for bi in 0..func.blocks.count { total_values += func.blocks.get(bi).values.count }
-    debug_log(.codegen, "=== CSE pass for '${func.name}' (${func.blocks.count} blocks, ${total_values} values) ===")
+    debug(.codegen, "=== CSE pass for '${func.name}' (${func.blocks.count} blocks, ${total_values} values) ===")
 
     // Build a hash for each value and look for duplicates within the same block.
     // rewrite[val.id] = *SsaValue means "replace val with that value"
@@ -54,7 +54,7 @@ fn cse(func: *SsaFunc) void {
     }
 
     if (rewrite.count == 0) {
-        debug_log(.codegen, "=== CSE complete for '${func.name}': 0 rewrites ===")
+        debug(.codegen, "=== CSE complete for '${func.name}': 0 rewrites ===")
         rewrite.free()
         return
     }
@@ -89,7 +89,7 @@ fn cse(func: *SsaFunc) void {
         bi += 1
     }
 
-    debug_log(.codegen, "=== CSE complete for '${func.name}': ${rewrite.count} rewrites ===")
+    debug(.codegen, "=== CSE complete for '${func.name}': ${rewrite.count} rewrites ===")
     rewrite.free()
 }
 

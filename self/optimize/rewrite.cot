@@ -27,7 +27,7 @@ fn rewrite(func: *SsaFunc, string_offsets: *Map(string, int)) void {
             if (blk.values.get(vi).op == SsaOp.const_string) { const_strings += 1 }
         }
     }
-    debug_log(.codegen, "=== Rewritegeneric pass for '${func.name}' (${func.blocks.count} blocks, ${total_values} values, ${const_strings} const_strings) ===")
+    debug(.codegen, "=== Rewritegeneric pass for '${func.name}' (${func.blocks.count} blocks, ${total_values} values, ${const_strings} const_strings) ===")
 
     var rewritten: int = 0
 
@@ -53,7 +53,7 @@ fn rewrite(func: *SsaFunc, string_offsets: *Map(string, int)) void {
         to_rewrite.free()
     }
 
-    debug_log(.codegen, "=== Rewritegeneric complete for '${func.name}': ${rewritten} const_strings rewritten ===")
+    debug(.codegen, "=== Rewritegeneric complete for '${func.name}': ${rewritten} const_strings rewritten ===")
 }
 
 /// Rewrite const_string to string_make(const_64[offset], const_64[len]).

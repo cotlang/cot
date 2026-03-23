@@ -15,7 +15,7 @@ import "../debug"
 /// Reorder blocks to minimize jumps.
 /// Uses indegree-based scheduling (Go pattern from layout.go).
 fn layout(func: *SsaFunc) void {
-    debug_log(.codegen, "=== Layout pass for '${func.name}' (${func.blocks.count} blocks) ===")
+    debug(.codegen, "=== Layout pass for '${func.name}' (${func.blocks.count} blocks) ===")
     const num_blocks = func.blocks.count
     if (num_blocks <= 1) { return }
 

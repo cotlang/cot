@@ -2078,7 +2078,7 @@ struct GenState {
     // ========================================================================
 
     fn generate() Symbol {
-        debug_log(.codegen, "wasm/gen: generating '${self.ssa_func.name}' (${self.ssa_func.blocks.count} blocks)")
+        debug(.codegen, "wasm/gen: generating '${self.ssa_func.name}' (${self.ssa_func.blocks.count} blocks)")
 
         // Compute use counts (self-hosted SSA doesn't auto-track)
         self.computeUses()
@@ -2145,7 +2145,7 @@ struct GenState {
         sym.gc_ref_locals = self.gc_ref_locals
         sym.text = self.builder.progs
 
-        debug_log(.codegen, "wasm/gen: generated ${self.builder.count} instructions, ${self.branches.count} branches, frame_size=${self.frame_size}")
+        debug(.codegen, "wasm/gen: generated ${self.builder.count} instructions, ${self.branches.count} branches, frame_size=${self.frame_size}")
 
         return sym
     }

@@ -77,7 +77,7 @@ struct CompileOptions {
 /// Generate a complete Wasm binary from IR functions, globals, and type registry.
 /// Returns the binary as List(int) (byte values).
 fn generateWasmCode(ir: IR, types: *TypeRegistry, opts: CompileOptions) List(int) {
-    debug_log(.codegen, "driver: generating Wasm for ${ir.funcs.count} functions")
+    debug(.codegen, "driver: generating Wasm for ${ir.funcs.count} functions")
     var linker = Linker.init()
 
     // Configure memory: 256 pages = 16MB
@@ -372,6 +372,7 @@ fn generateAndAddFunc(linker: *Linker, ir_func: Func, ir: IR, types: *TypeRegist
     // Build SSA from IR
     var builder = SSABuilder.init(ir_func, ir.globals, types)
     var ssa_func = builder.build()
+    debug(.codegen, "gen: ${ir_func.name}")
 
     // Record the function's return type so gen can use it for compound returns
     ssa_func.type_idx = ir_func.return_type
@@ -381,43 +382,43 @@ fn generateAndAddFunc(linker: *Linker, ir_func: Func, ir: IR, types: *TypeRegist
     // Zig reference: driver.zig lines 6158-6167
     var t = debug_timestamp()
     copyelim(ssa_func)
-    debug_log_timed(.copyelim, "  pass copyelim", debug_timestamp() - t)
+    debug_timed(.copyelim, "  pass copyelim", debug_timestamp() - t)
 
     t = debug_timestamp()
     passRewriteGeneric(ssa_func, string_offsets)
-    debug_log_timed(.codegen, "  pass rewritegeneric", debug_timestamp() - t)
+    debug_timed(.codegen, "  pass rewritegeneric", debug_timestamp() - t)
 
     t = debug_timestamp()
     decompose(ssa_func)
-    debug_log_timed(.codegen, "  pass decompose", debug_timestamp() - t)
+    debug_timed(.codegen, "  pass decompose", debug_timestamp() - t)
 
     t = debug_timestamp()
     passRewriteDec(ssa_func)
-    debug_log_timed(.codegen, "  pass rewritedec", debug_timestamp() - t)
+    debug_timed(.codegen, "  pass rewritedec", debug_timestamp() - t)
 
     t = debug_timestamp()
     copyelim(ssa_func)
-    debug_log_timed(.copyelim, "  pass copyelim2", debug_timestamp() - t)
+    debug_timed(.copyelim, "  pass copyelim2", debug_timestamp() - t)
 
     t = debug_timestamp()
     cse(ssa_func)
-    debug_log_timed(.codegen, "  pass cse", debug_timestamp() - t)
+    debug_timed(.codegen, "  pass cse", debug_timestamp() - t)
 
     t = debug_timestamp()
     deadcode(ssa_func)
-    debug_log_timed(.deadcode, "  pass deadcode", debug_timestamp() - t)
+    debug_timed(.deadcode, "  pass deadcode", debug_timestamp() - t)
 
     t = debug_timestamp()
     schedule(ssa_func)
-    debug_log_timed(.schedule, "  pass schedule", debug_timestamp() - t)
+    debug_timed(.schedule, "  pass schedule", debug_timestamp() - t)
 
     t = debug_timestamp()
     layout(ssa_func)
-    debug_log_timed(.codegen, "  pass layout", debug_timestamp() - t)
+    debug_timed(.codegen, "  pass layout", debug_timestamp() - t)
 
     t = debug_timestamp()
     lower(ssa_func)
-    debug_log_timed(.codegen, "  pass lower_wasm", debug_timestamp() - t)
+    debug_timed(.codegen, "  pass lower_wasm", debug_timestamp() - t)
 
     // Determine function type
     const type_idx = registerFuncType(linker, ir_func, types)

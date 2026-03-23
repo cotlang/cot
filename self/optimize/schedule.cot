@@ -62,13 +62,13 @@ fn isLoadOp(op: SsaOp) bool {
 fn schedule(func: *SsaFunc) void {
     var total_values: i64 = 0
     for bi in 0..func.blocks.count { total_values += func.blocks.get(bi).values.count }
-    debug_log(.schedule, "=== Schedule pass for '${func.name}' (${func.blocks.count} blocks, ${total_values} values) ===")
+    debug(.schedule, "=== Schedule pass for '${func.name}' (${func.blocks.count} blocks, ${total_values} values) ===")
 
     for bi in 0..func.blocks.count {
         scheduleBlock(func, bi)
     }
 
-    debug_log(.schedule, "=== Schedule complete for '${func.name}' ===")
+    debug(.schedule, "=== Schedule complete for '${func.name}' ===")
 }
 
 /// Schedule a single block using priority-based topological sort.

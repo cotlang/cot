@@ -16,7 +16,7 @@ import "../debug"
 fn deadcode(func: *SsaFunc) void {
     var total_values: i64 = 0
     for bi in 0..func.blocks.count { total_values += func.blocks.get(bi).values.count }
-    debug_log(.deadcode, "=== Deadcode pass for '${func.name}' (${func.blocks.count} blocks, ${total_values} values) ===")
+    debug(.deadcode, "=== Deadcode pass for '${func.name}' (${func.blocks.count} blocks, ${total_values} values) ===")
 
     // 1. Find reachable blocks via BFS from entry.
     var reachable: Map(int, bool) = .{}
@@ -78,7 +78,7 @@ fn deadcode(func: *SsaFunc) void {
 
     var remaining_values: i64 = 0
     for bi2 in 0..func.blocks.count { remaining_values += func.blocks.get(bi2).values.count }
-    debug_log(.deadcode, "=== Deadcode complete for '${func.name}': ${func.blocks.count} blocks, ${remaining_values} values remaining ===")
+    debug(.deadcode, "=== Deadcode complete for '${func.name}': ${func.blocks.count} blocks, ${remaining_values} values remaining ===")
 
     reachable.free()
     live.free()

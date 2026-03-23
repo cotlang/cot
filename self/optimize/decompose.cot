@@ -37,7 +37,7 @@ fn decompose(func: *SsaFunc) void {
             if (blk.values.get(vi).op == SsaOp.phi) { total_phis += 1 }
         }
     }
-    debug_log(.codegen, "=== Decompose pass for '${func.name}' (${func.blocks.count} blocks, ${total_values} values, ${total_phis} phis) ===")
+    debug(.codegen, "=== Decompose pass for '${func.name}' (${func.blocks.count} blocks, ${total_values} values, ${total_phis} phis) ===")
 
     var decomposed: int = 0
 
@@ -53,7 +53,7 @@ fn decompose(func: *SsaFunc) void {
         }
     }
 
-    debug_log(.codegen, "=== Decompose complete for '${func.name}': ${decomposed} phis decomposed ===")
+    debug(.codegen, "=== Decompose complete for '${func.name}': ${decomposed} phis decomposed ===")
 }
 
 /// Decompose a phi node if it's a compound builtin type.

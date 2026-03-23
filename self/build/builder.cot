@@ -360,7 +360,7 @@ struct SSABuilder {
         const f = self.takeFunc()
         var total_values: i64 = 0
         for bi in 0..f.blocks.count { total_values += f.blocks.get(bi).values.count }
-        debug_log(.ssa, "=== SSA built for '${f.name}': ${f.blocks.count} blocks, ${total_values} values, ${f.local_sizes.count} locals ===")
+        debug(.ssa, "=== SSA built for '${f.name}': ${f.blocks.count} blocks, ${total_values} values, ${f.local_sizes.count} locals ===")
         return f
     }
 

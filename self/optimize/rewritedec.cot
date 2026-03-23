@@ -25,7 +25,7 @@ import "../check/types"
 fn rewrite(func: *SsaFunc) void {
     var total_values: i64 = 0
     for bi in 0..func.blocks.count { total_values += func.blocks.get(bi).values.count }
-    debug_log(.codegen, "=== Rewritedec pass for '${func.name}' (${func.blocks.count} blocks, ${total_values} values) ===")
+    debug(.codegen, "=== Rewritedec pass for '${func.name}' (${func.blocks.count} blocks, ${total_values} values) ===")
 
     var rewritten: int = 0
     var iterations: int = 0
@@ -49,7 +49,7 @@ fn rewrite(func: *SsaFunc) void {
         if (!changed) { break }
     }
 
-    debug_log(.codegen, "=== Rewritedec complete for '${func.name}': ${rewritten} rewrites in ${iterations} iterations ===")
+    debug(.codegen, "=== Rewritedec complete for '${func.name}': ${rewritten} rewrites in ${iterations} iterations ===")
 }
 
 /// Rewrite a single value if applicable.

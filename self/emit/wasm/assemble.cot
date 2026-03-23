@@ -74,7 +74,7 @@ struct RegVar {
 
 /// Assemble a Symbol's text (List(Prog)) into a List(int) of Wasm bytes.
 fn assemble(sym: *Symbol) List(int) {
-    debug_log(.codegen, "assemble: '${sym.name}'")
+    debug(.codegen, "assemble: '${sym.name}'")
     var w: List(int) = .{}
 
     // ========================================================================
@@ -201,7 +201,7 @@ fn assemble(sym: *Symbol) List(int) {
     // End opcode
     w.append(0x0B)
 
-    debug_log(.codegen, "  assembled ${w.count} bytes")
+    debug(.codegen, "  assembled ${w.count} bytes")
     return w
 }
 
