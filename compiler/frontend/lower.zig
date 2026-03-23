@@ -5761,6 +5761,11 @@ pub const Lowerer = struct {
                     const array_addr = try fb.emitAddrLocal(local_idx, array_ptr_type, fa.span);
                     const elem_ptr_type = self.type_reg.makePointer(elem_type) catch TypeRegistry.VOID;
                     const elem_addr = try fb.emitAddrIndex(array_addr, index_node, elem_size, elem_ptr_type, fa.span);
+                    // If element is a pointer, load the pointer first, then access field through it
+                    if (self.type_reg.get(elem_type) == .pointer) {
+                        const ptr_val = try fb.emitPtrLoadValue(elem_addr, elem_type, fa.span);
+                        return try fb.emitFieldValue(ptr_val, field_idx, field_offset, field_type, fa.span);
+                    }
                     return try fb.emitFieldValue(elem_addr, field_idx, field_offset, field_type, fa.span);
                 }
                 if (self.builder.lookupGlobal(idx_base_expr.ident.name)) |g| {
