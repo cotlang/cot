@@ -4639,101 +4639,27 @@ pub const Lowerer = struct {
             return try fb.emitCall("retain", &args, false, type_idx, span);
         }
 
-        // List(T) and Map(K,V): value types with heap backing.
-        // Copy = retain each ARC element (the backing array is shared on copy).
-        // This matches the retain semantics — the elements get an extra refcount
-        // so that when the copy is destroyed, the releases balance out.
-        if (info == .list) {
-            const elem_type = info.list.elem;
-            if (!self.type_reg.isTrivial(elem_type)) {
-                const elem_size: i64 = @intCast(self.type_reg.sizeOf(elem_type));
-                const list_size = self.type_reg.sizeOf(type_idx);
-                const tmp = try fb.addLocalWithSize("__copy_list", type_idx, false, list_size);
-                _ = try fb.emitStoreLocal(tmp, value, span);
-                const items_ptr = try fb.emitFieldLocal(tmp, 0, 0, TypeRegistry.I64, span);
-                const count = try fb.emitFieldLocal(tmp, 1, 8, TypeRegistry.I64, span);
-                const cond_blk = try fb.newBlock("copy_list.cond");
-                const body_blk = try fb.newBlock("copy_list.body");
-                const done_blk = try fb.newBlock("copy_list.done");
-                const counter = try fb.addLocal(.{ .name = "__copy_list_i", .type_idx = TypeRegistry.I64, .mutable = true, .size = 8, .is_param = false });
-                const zero = try fb.emitConstInt(0, TypeRegistry.I64, span);
-                _ = try fb.emitStoreLocal(counter, zero, span);
-                _ = try fb.emitJump(cond_blk, span);
-                fb.setBlock(cond_blk);
-                const idx = try fb.emitLoadLocal(counter, TypeRegistry.I64, span);
-                const cond = try fb.emitBinary(.lt, idx, count, TypeRegistry.BOOL, span);
-                _ = try fb.emitBranch(cond, body_blk, done_blk, span);
-                fb.setBlock(body_blk);
-                const offset = try fb.emitBinary(.mul, idx, try fb.emitConstInt(elem_size, TypeRegistry.I64, span), TypeRegistry.I64, span);
-                const elem_addr = try fb.emitBinary(.add, items_ptr, offset, TypeRegistry.I64, span);
-                const elem_val = try fb.emitPtrLoadValue(elem_addr, elem_type, span);
-                _ = try self.emitCopyValue(fb, elem_val, elem_type, span);
-                const one = try fb.emitConstInt(1, TypeRegistry.I64, span);
-                const next = try fb.emitBinary(.add, idx, one, TypeRegistry.I64, span);
-                _ = try fb.emitStoreLocal(counter, next, span);
-                _ = try fb.emitJump(cond_blk, span);
-                fb.setBlock(done_blk);
-            }
-            return value;
-        }
-
-        // Map(K,V): retain all occupied keys and values
-        if (info == .map) {
-            const key_type = info.map.key;
-            const val_type = info.map.value;
-            const keys_arc = !self.type_reg.isTrivial(key_type);
-            const vals_arc = !self.type_reg.isTrivial(val_type);
-            if (keys_arc or vals_arc) {
-                const key_size: i64 = @intCast(self.type_reg.sizeOf(key_type));
-                const val_size: i64 = @intCast(self.type_reg.sizeOf(val_type));
-                const map_size = self.type_reg.sizeOf(type_idx);
-                const tmp = try fb.addLocalWithSize("__copy_map", type_idx, false, map_size);
-                _ = try fb.emitStoreLocal(tmp, value, span);
-                const keys_ptr = try fb.emitFieldLocal(tmp, 0, 0, TypeRegistry.I64, span);
-                const vals_ptr = try fb.emitFieldLocal(tmp, 1, 8, TypeRegistry.I64, span);
-                const states_ptr = try fb.emitFieldLocal(tmp, 2, 16, TypeRegistry.I64, span);
-                const capacity = try fb.emitFieldLocal(tmp, 4, 32, TypeRegistry.I64, span);
-                const cond_blk = try fb.newBlock("copy_map.cond");
-                const body_blk = try fb.newBlock("copy_map.body");
-                const done_blk = try fb.newBlock("copy_map.done");
-                const counter = try fb.addLocal(.{ .name = "__copy_map_i", .type_idx = TypeRegistry.I64, .mutable = true, .size = 8, .is_param = false });
-                const zero = try fb.emitConstInt(0, TypeRegistry.I64, span);
-                _ = try fb.emitStoreLocal(counter, zero, span);
-                _ = try fb.emitJump(cond_blk, span);
-                fb.setBlock(cond_blk);
-                const idx = try fb.emitLoadLocal(counter, TypeRegistry.I64, span);
-                const cond = try fb.emitBinary(.lt, idx, capacity, TypeRegistry.BOOL, span);
-                _ = try fb.emitBranch(cond, body_blk, done_blk, span);
-                fb.setBlock(body_blk);
-                const state_addr = try fb.emitBinary(.add, states_ptr, idx, TypeRegistry.I64, span);
-                const state_val = try fb.emitPtrLoadValue(state_addr, TypeRegistry.U8, span);
-                const two = try fb.emitConstInt(2, TypeRegistry.I64, span);
-                const state_i64 = try fb.emitConvert(state_val, TypeRegistry.U8, TypeRegistry.I64, span);
-                const is_occupied = try fb.emitBinary(.eq, state_i64, two, TypeRegistry.BOOL, span);
-                const retain_blk = try fb.newBlock("copy_map.retain");
-                const next_blk = try fb.newBlock("copy_map.next");
-                _ = try fb.emitBranch(is_occupied, retain_blk, next_blk, span);
-                fb.setBlock(retain_blk);
-                if (keys_arc) {
-                    const ko = try fb.emitBinary(.mul, idx, try fb.emitConstInt(key_size, TypeRegistry.I64, span), TypeRegistry.I64, span);
-                    const ka = try fb.emitBinary(.add, keys_ptr, ko, TypeRegistry.I64, span);
-                    const kv = try fb.emitPtrLoadValue(ka, key_type, span);
-                    _ = try self.emitCopyValue(fb, kv, key_type, span);
-                }
-                if (vals_arc) {
-                    const vo = try fb.emitBinary(.mul, idx, try fb.emitConstInt(val_size, TypeRegistry.I64, span), TypeRegistry.I64, span);
-                    const va = try fb.emitBinary(.add, vals_ptr, vo, TypeRegistry.I64, span);
-                    const vv = try fb.emitPtrLoadValue(va, val_type, span);
-                    _ = try self.emitCopyValue(fb, vv, val_type, span);
-                }
-                _ = try fb.emitJump(next_blk, span);
-                fb.setBlock(next_blk);
-                const one = try fb.emitConstInt(1, TypeRegistry.I64, span);
-                const next = try fb.emitBinary(.add, idx, one, TypeRegistry.I64, span);
-                _ = try fb.emitStoreLocal(counter, next, span);
-                _ = try fb.emitJump(cond_blk, span);
-                fb.setBlock(done_blk);
-            }
+        // List(T) and Map(K,V): Swift COW value types with refcounted buffer.
+        // Copy = retain(buf). The buf field is at offset 0 in the struct.
+        // COW ensures mutations copy the buffer if shared, so elements
+        // are safe — no per-element retain needed on copy.
+        // Swift ref: _ContiguousArrayBuffer copy = swift_retain(storage).
+        if (info == .list or info == .map) {
+            const coll_size = self.type_reg.sizeOf(type_idx);
+            const tmp = try fb.addLocalWithSize("__copy_coll", type_idx, false, coll_size);
+            _ = try fb.emitStoreLocal(tmp, value, span);
+            const buf_ptr = try fb.emitFieldLocal(tmp, 0, 0, TypeRegistry.I64, span);
+            // Only retain if buf is non-null (empty collection has buf=0)
+            const zero = try fb.emitConstInt(0, TypeRegistry.I64, span);
+            const is_non_null = try fb.emitBinary(.ne, buf_ptr, zero, TypeRegistry.BOOL, span);
+            const retain_blk = try fb.newBlock("copy_coll.retain");
+            const done_blk = try fb.newBlock("copy_coll.done");
+            _ = try fb.emitBranch(is_non_null, retain_blk, done_blk, span);
+            fb.setBlock(retain_blk);
+            var args = [_]ir.NodeIndex{buf_ptr};
+            _ = try fb.emitCall("retain", &args, false, TypeRegistry.I64, span);
+            _ = try fb.emitJump(done_blk, span);
+            fb.setBlock(done_blk);
             return value;
         }
 
@@ -4946,136 +4872,24 @@ pub const Lowerer = struct {
             return;
         }
 
-        // List(T): value type with heap-allocated backing array.
-        // Inline destruction: release each ARC element, then dealloc backing array.
-        // Swift equivalent: Array.deinit releases elements via value witness destroy.
-        if (info == .list) {
-            const elem_type = info.list.elem;
-            const elem_size: i64 = @intCast(self.type_reg.sizeOf(elem_type));
-            // Store list to temp so we can access fields
-            const list_size = self.type_reg.sizeOf(type_idx);
-            const tmp = try fb.addLocalWithSize("__destroy_list", type_idx, false, list_size);
+        // List(T) and Map(K,V): Swift COW value types with refcounted buffer.
+        // Destroy = release(buf). The buf's deinit method handles element cleanup
+        // when the refcount hits 0 (via maybeRegisterScopeDestroy calling deinit).
+        // Swift ref: Array.deinit → swift_release(storage) → storage.deinit releases elements.
+        if (info == .list or info == .map) {
+            const coll_size = self.type_reg.sizeOf(type_idx);
+            const tmp = try fb.addLocalWithSize("__destroy_coll", type_idx, false, coll_size);
             _ = try fb.emitStoreLocal(tmp, value, span);
-            // Load items ptr and count
-            const items_ptr = try fb.emitFieldLocal(tmp, 0, 0, TypeRegistry.I64, span);
-            const count = try fb.emitFieldLocal(tmp, 1, 8, TypeRegistry.I64, span);
-
-            // If elements are ARC-managed, release each one
-            if (!self.type_reg.isTrivial(elem_type)) {
-                const cond_blk = try fb.newBlock("destroy_list.cond");
-                const body_blk = try fb.newBlock("destroy_list.body");
-                const dealloc_blk = try fb.newBlock("destroy_list.dealloc");
-                const counter = try fb.addLocal(.{ .name = "__list_i", .type_idx = TypeRegistry.I64, .mutable = true, .size = 8, .is_param = false });
-                const zero = try fb.emitConstInt(0, TypeRegistry.I64, span);
-                _ = try fb.emitStoreLocal(counter, zero, span);
-                _ = try fb.emitJump(cond_blk, span);
-                fb.setBlock(cond_blk);
-                const idx = try fb.emitLoadLocal(counter, TypeRegistry.I64, span);
-                const cond = try fb.emitBinary(.lt, idx, count, TypeRegistry.BOOL, span);
-                _ = try fb.emitBranch(cond, body_blk, dealloc_blk, span);
-                fb.setBlock(body_blk);
-                const elem_offset = try fb.emitBinary(.mul, idx, try fb.emitConstInt(elem_size, TypeRegistry.I64, span), TypeRegistry.I64, span);
-                const elem_addr = try fb.emitBinary(.add, items_ptr, elem_offset, TypeRegistry.I64, span);
-                const elem_val = try fb.emitPtrLoadValue(elem_addr, elem_type, span);
-                try self.emitDestroyValue(fb, elem_val, elem_type, span);
-                const one = try fb.emitConstInt(1, TypeRegistry.I64, span);
-                const next = try fb.emitBinary(.add, idx, one, TypeRegistry.I64, span);
-                _ = try fb.emitStoreLocal(counter, next, span);
-                _ = try fb.emitJump(cond_blk, span);
-                fb.setBlock(dealloc_blk);
-            }
-
-            // Dealloc backing array if capacity > 0
-            const capacity = try fb.emitFieldLocal(tmp, 2, 16, TypeRegistry.I64, span);
-            const zero_cap = try fb.emitConstInt(0, TypeRegistry.I64, span);
-            const has_backing = try fb.emitBinary(.gt, capacity, zero_cap, TypeRegistry.BOOL, span);
-            const free_blk = try fb.newBlock("destroy_list.free");
-            const done_blk = try fb.newBlock("destroy_list.done");
-            _ = try fb.emitBranch(has_backing, free_blk, done_blk, span);
-            fb.setBlock(free_blk);
-            var dealloc_args = [_]ir.NodeIndex{items_ptr};
-            _ = try fb.emitCall("dealloc_raw", &dealloc_args, false, TypeRegistry.VOID, span);
-            _ = try fb.emitJump(done_blk, span);
-            fb.setBlock(done_blk);
-            return;
-        }
-
-        // Map(K,V): value type with heap-allocated backing arrays.
-        // Inline destruction: release each ARC key/value, then dealloc backing arrays.
-        if (info == .map) {
-            // Map layout: keys_ptr(0), values_ptr(8), states_ptr(16), count(24), capacity(32)
-            const key_type = info.map.key;
-            const val_type = info.map.value;
-            const key_size: i64 = @intCast(self.type_reg.sizeOf(key_type));
-            const val_size: i64 = @intCast(self.type_reg.sizeOf(val_type));
-            const map_size = self.type_reg.sizeOf(type_idx);
-            const tmp = try fb.addLocalWithSize("__destroy_map", type_idx, false, map_size);
-            _ = try fb.emitStoreLocal(tmp, value, span);
-            const keys_ptr = try fb.emitFieldLocal(tmp, 0, 0, TypeRegistry.I64, span);
-            const vals_ptr = try fb.emitFieldLocal(tmp, 1, 8, TypeRegistry.I64, span);
-            const states_ptr = try fb.emitFieldLocal(tmp, 2, 16, TypeRegistry.I64, span);
-            const capacity = try fb.emitFieldLocal(tmp, 4, 32, TypeRegistry.I64, span);
-
-            // If keys or values are ARC, iterate occupied slots and release
-            const keys_arc = !self.type_reg.isTrivial(key_type);
-            const vals_arc = !self.type_reg.isTrivial(val_type);
-            if (keys_arc or vals_arc) {
-                const cond_blk = try fb.newBlock("destroy_map.cond");
-                const body_blk = try fb.newBlock("destroy_map.body");
-                const dealloc_blk = try fb.newBlock("destroy_map.dealloc");
-                const counter = try fb.addLocal(.{ .name = "__map_i", .type_idx = TypeRegistry.I64, .mutable = true, .size = 8, .is_param = false });
-                const zero = try fb.emitConstInt(0, TypeRegistry.I64, span);
-                _ = try fb.emitStoreLocal(counter, zero, span);
-                _ = try fb.emitJump(cond_blk, span);
-                fb.setBlock(cond_blk);
-                const idx = try fb.emitLoadLocal(counter, TypeRegistry.I64, span);
-                const cond = try fb.emitBinary(.lt, idx, capacity, TypeRegistry.BOOL, span);
-                _ = try fb.emitBranch(cond, body_blk, dealloc_blk, span);
-                fb.setBlock(body_blk);
-                // Check state[i] == 2 (occupied) — states are u8
-                const state_addr = try fb.emitBinary(.add, states_ptr, idx, TypeRegistry.I64, span);
-                const state_val = try fb.emitPtrLoadValue(state_addr, TypeRegistry.U8, span);
-                const two = try fb.emitConstInt(2, TypeRegistry.I64, span);
-                const state_i64 = try fb.emitConvert(state_val, TypeRegistry.U8, TypeRegistry.I64, span);
-                const is_occupied = try fb.emitBinary(.eq, state_i64, two, TypeRegistry.BOOL, span);
-                const release_blk = try fb.newBlock("destroy_map.release");
-                const next_blk = try fb.newBlock("destroy_map.next");
-                _ = try fb.emitBranch(is_occupied, release_blk, next_blk, span);
-                fb.setBlock(release_blk);
-                if (keys_arc) {
-                    const key_offset = try fb.emitBinary(.mul, idx, try fb.emitConstInt(key_size, TypeRegistry.I64, span), TypeRegistry.I64, span);
-                    const key_addr = try fb.emitBinary(.add, keys_ptr, key_offset, TypeRegistry.I64, span);
-                    const key_val = try fb.emitPtrLoadValue(key_addr, key_type, span);
-                    try self.emitDestroyValue(fb, key_val, key_type, span);
-                }
-                if (vals_arc) {
-                    const val_offset = try fb.emitBinary(.mul, idx, try fb.emitConstInt(val_size, TypeRegistry.I64, span), TypeRegistry.I64, span);
-                    const val_addr = try fb.emitBinary(.add, vals_ptr, val_offset, TypeRegistry.I64, span);
-                    const v = try fb.emitPtrLoadValue(val_addr, val_type, span);
-                    try self.emitDestroyValue(fb, v, val_type, span);
-                }
-                _ = try fb.emitJump(next_blk, span);
-                fb.setBlock(next_blk);
-                const one = try fb.emitConstInt(1, TypeRegistry.I64, span);
-                const next = try fb.emitBinary(.add, idx, one, TypeRegistry.I64, span);
-                _ = try fb.emitStoreLocal(counter, next, span);
-                _ = try fb.emitJump(cond_blk, span);
-                fb.setBlock(dealloc_blk);
-            }
-
-            // Dealloc backing arrays
-            const zero_cap = try fb.emitConstInt(0, TypeRegistry.I64, span);
-            const has_backing = try fb.emitBinary(.gt, capacity, zero_cap, TypeRegistry.BOOL, span);
-            const free_blk = try fb.newBlock("destroy_map.free");
-            const done_blk = try fb.newBlock("destroy_map.done");
-            _ = try fb.emitBranch(has_backing, free_blk, done_blk, span);
-            fb.setBlock(free_blk);
-            var dk = [_]ir.NodeIndex{keys_ptr};
-            _ = try fb.emitCall("dealloc_raw", &dk, false, TypeRegistry.VOID, span);
-            var dv = [_]ir.NodeIndex{vals_ptr};
-            _ = try fb.emitCall("dealloc_raw", &dv, false, TypeRegistry.VOID, span);
-            var ds = [_]ir.NodeIndex{states_ptr};
-            _ = try fb.emitCall("dealloc_raw", &ds, false, TypeRegistry.VOID, span);
+            const buf_ptr = try fb.emitFieldLocal(tmp, 0, 0, TypeRegistry.I64, span);
+            // Only release if buf is non-null
+            const zero = try fb.emitConstInt(0, TypeRegistry.I64, span);
+            const is_non_null = try fb.emitBinary(.ne, buf_ptr, zero, TypeRegistry.BOOL, span);
+            const release_blk = try fb.newBlock("destroy_coll.release");
+            const done_blk = try fb.newBlock("destroy_coll.done");
+            _ = try fb.emitBranch(is_non_null, release_blk, done_blk, span);
+            fb.setBlock(release_blk);
+            var args = [_]ir.NodeIndex{buf_ptr};
+            _ = try fb.emitCall("release", &args, false, TypeRegistry.VOID, span);
             _ = try fb.emitJump(done_blk, span);
             fb.setBlock(done_blk);
             return;
