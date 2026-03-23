@@ -1372,17 +1372,17 @@ struct GenState {
         const v = self.ssa_func.getValue(val_idx)
         switch (v.op) {
             SsaOp.wasm_f64_load => {
+                // Zig gen.zig:725-729
                 self.getValue64(v.args.get(0))
                 self.builder.append(As.i32_wrap_i64)
-                // Load as i64 directly — all locals are i64, no reinterpret needed
-                self.builder.appendFrom(As.i64_load, constAddr(v.aux_int))
+                self.builder.appendFrom(As.f64_load, constAddr(v.aux_int))
             },
             SsaOp.wasm_f64_store => {
+                // Zig gen.zig:731-737
                 self.getValue64(v.args.get(0))
                 self.builder.append(As.i32_wrap_i64)
                 self.getValue64(v.args.get(1))
-                // Value is already i64 in local — store directly
-                self.builder.appendTo(As.i64_store, constAddr(v.aux_int))
+                self.builder.appendTo(As.f64_store, constAddr(v.aux_int))
             },
             SsaOp.wasm_f32_load => {
                 self.getValue64(v.args.get(0))
@@ -1438,7 +1438,12 @@ struct GenState {
                 for ai in 0..v.args.count {
                     const arg_idx = v.args.get(ai)
                     self.getValue64(arg_idx)
-                    // All locals are i64 — no float reinterpret needed for call ABI
+                    // Float args in f64 locals need reinterpret to i64 for Wasm call ABI
+                    // Zig gen.zig:934-937
+                    const arg = self.ssa_func.getValue(arg_idx)
+                    if (isFloatType(arg.type_idx)) {
+                        self.builder.append(As.i64_reinterpret_f64)
+                    }
                 }
                 const func_idx = self.resolveCallIndex(v)
                 self.builder.appendTo(As.call, constAddr(func_idx))
@@ -1447,6 +1452,10 @@ struct GenState {
                 for ai in 0..v.args.count {
                     const arg_idx = v.args.get(ai)
                     self.getValue64(arg_idx)
+                    const arg = self.ssa_func.getValue(arg_idx)
+                    if (isFloatType(arg.type_idx)) {
+                        self.builder.append(As.i64_reinterpret_f64)
+                    }
                 }
                 const rc_func_idx = self.resolveCallIndex(v)
                 self.builder.appendTo(As.return_call, constAddr(rc_func_idx))
@@ -1455,6 +1464,10 @@ struct GenState {
                 for ai in 0..v.args.count {
                     const arg_idx = v.args.get(ai)
                     self.getValue64(arg_idx)
+                    const arg = self.ssa_func.getValue(arg_idx)
+                    if (isFloatType(arg.type_idx)) {
+                        self.builder.append(As.i64_reinterpret_f64)
+                    }
                 }
                 const sc_func_idx = self.resolveCallIndex(v)
                 self.builder.appendTo(As.call, constAddr(sc_func_idx))
@@ -1465,7 +1478,12 @@ struct GenState {
                 self.builder.appendTo(As.global_set, constAddr(1))
                 // Push function arguments (args[2..])
                 for ai in 2..v.args.count {
-                    self.getValue64(v.args.get(ai))
+                    const arg_idx = v.args.get(ai)
+                    self.getValue64(arg_idx)
+                    const arg = self.ssa_func.getValue(arg_idx)
+                    if (isFloatType(arg.type_idx)) {
+                        self.builder.append(As.i64_reinterpret_f64)
+                    }
                 }
                 // Push callee table index — must be i32 for call_indirect
                 self.getValue64(v.args.get(0))
@@ -1475,7 +1493,12 @@ struct GenState {
             SsaOp.wasm_lowered_inter_call => {
                 // Push function arguments (skip arg[0])
                 for ai in 1..v.args.count {
-                    self.getValue64(v.args.get(ai))
+                    const arg_idx = v.args.get(ai)
+                    self.getValue64(arg_idx)
+                    const arg = self.ssa_func.getValue(arg_idx)
+                    if (isFloatType(arg.type_idx)) {
+                        self.builder.append(As.i64_reinterpret_f64)
+                    }
                 }
                 // Push callee (table index) — must be i32
                 self.getValue64(v.args.get(0))
@@ -1499,8 +1522,8 @@ struct GenState {
     fn emitConvertOp(val_idx: int) void {
         const v = self.ssa_func.getValue(val_idx)
         switch (v.op) {
-            // Type conversion (Zig gen.zig lines 1062-1107)
-            // All locals are i64 — reinterpret around float conversions.
+            // Type conversion — Zig gen.zig:1243-1288
+            // Float locals are f64, no reinterpret needed for f64 values.
             SsaOp.convert => {
                 const from_type = v.aux_int
                 const to_type = v.type_idx
@@ -1511,16 +1534,13 @@ struct GenState {
                 const to_is_32 = (to_type == 4)
                 if (from_is_float and to_is_float) {
                     if (to_type == 10) {
-                        // f64→f32→f64 rounding: i64→f64, demote, promote, f64→i64
-                        self.builder.append(As.f64_reinterpret_i64)
+                        // f64→f32 precision: demote then promote (round-trip loses precision)
                         self.builder.append(As.f32_demote_f64)
                         self.builder.append(As.f64_promote_f32)
-                        self.builder.append(As.i64_reinterpret_f64)
                     }
-                    // else: f64→f64 is identity (already i64)
+                    // f32→f64 or same type: no-op (values are already f64 on stack)
                 } else if (from_is_float and !to_is_float) {
-                    // float→int: reinterpret i64→f64 first, then truncate
-                    self.builder.append(As.f64_reinterpret_i64)
+                    // f64→int: saturating truncate
                     if (to_is_32) {
                         self.builder.append(As.i32_trunc_sat_f64_s)
                         self.builder.append(As.i64_extend_i32_s)
@@ -1528,9 +1548,8 @@ struct GenState {
                         self.builder.append(As.i64_trunc_sat_f64_s)
                     }
                 } else if (!from_is_float and to_is_float) {
-                    // int→float: convert, then reinterpret f64→i64 for storage
+                    // int→f64: convert signed integer to float
                     self.builder.append(As.f64_convert_i64_s)
-                    self.builder.append(As.i64_reinterpret_f64)
                 } else if (!from_is_32 and to_is_32) {
                     self.builder.append(As.i32_wrap_i64)
                     self.builder.append(As.i64_extend_i32_s)
@@ -1552,18 +1571,16 @@ struct GenState {
                 self.builder.append(As.i32_wrap_i64)
                 self.builder.append(As.i64_extend_i32_u)
             },
-            // Truncation: f64→i64 (input is i64-as-f64, output is i64)
+            // Truncation: f64→i64 (input is f64, output is i64)
             SsaOp.wasm_i64_trunc_f64_s => {
                 self.getValue64(v.args.get(0))
-                self.builder.append(As.f64_reinterpret_i64)
                 self.builder.append(As.i64_trunc_f64_s)
             },
             SsaOp.wasm_i64_trunc_f64_u => {
                 self.getValue64(v.args.get(0))
-                self.builder.append(As.f64_reinterpret_i64)
                 self.builder.append(As.i64_trunc_f64_u)
             },
-            // Truncation: f32→i64 (input is i64-as-f32, output is i64)
+            // Truncation: f32→i64 (f32 stored in i64 locals)
             SsaOp.wasm_i64_trunc_f32_s => {
                 self.getValue64(v.args.get(0))
                 self.builder.append(As.i32_wrap_i64)
@@ -1576,18 +1593,16 @@ struct GenState {
                 self.builder.append(As.f32_reinterpret_i32)
                 self.builder.append(As.i64_trunc_f32_u)
             },
-            // Truncation: f64→i32 (input is i64-as-f64, output is i32)
+            // Truncation: f64→i32 (input is f64, output is i32)
             SsaOp.wasm_i32_trunc_f64_s => {
                 self.getValue64(v.args.get(0))
-                self.builder.append(As.f64_reinterpret_i64)
                 self.builder.append(As.i32_trunc_f64_s)
             },
             SsaOp.wasm_i32_trunc_f64_u => {
                 self.getValue64(v.args.get(0))
-                self.builder.append(As.f64_reinterpret_i64)
                 self.builder.append(As.i32_trunc_f64_u)
             },
-            // Truncation: f32→i32 (input is i64-as-f32, output is i32)
+            // Truncation: f32→i32 (f32 stored in i64 locals)
             SsaOp.wasm_i32_trunc_f32_s => {
                 self.getValue64(v.args.get(0))
                 self.builder.append(As.i32_wrap_i64)
@@ -1600,31 +1615,27 @@ struct GenState {
                 self.builder.append(As.f32_reinterpret_i32)
                 self.builder.append(As.i32_trunc_f32_u)
             },
-            // Conversion: i64→f64 (input is i64, output is i64-as-f64)
+            // Conversion: i64→f64 (input is i64, output is f64)
             SsaOp.wasm_f64_convert_i64_s => {
                 self.getValue64(v.args.get(0))
                 self.builder.append(As.f64_convert_i64_s)
-                self.builder.append(As.i64_reinterpret_f64)
             },
             SsaOp.wasm_f64_convert_i64_u => {
                 self.getValue64(v.args.get(0))
                 self.builder.append(As.f64_convert_i64_u)
-                self.builder.append(As.i64_reinterpret_f64)
             },
-            // Conversion: i32→f64 (input is i64-as-i32, output is i64-as-f64)
+            // Conversion: i32→f64 (input is i64-as-i32, output is f64)
             SsaOp.wasm_f64_convert_i32_s => {
                 self.getValue64(v.args.get(0))
                 self.builder.append(As.i32_wrap_i64)
                 self.builder.append(As.f64_convert_i32_s)
-                self.builder.append(As.i64_reinterpret_f64)
             },
             SsaOp.wasm_f64_convert_i32_u => {
                 self.getValue64(v.args.get(0))
                 self.builder.append(As.i32_wrap_i64)
                 self.builder.append(As.f64_convert_i32_u)
-                self.builder.append(As.i64_reinterpret_f64)
             },
-            // Conversion: i64→f32 (input is i64, output is i64-as-f32)
+            // Conversion: i64→f32 (f32 stored in i64 locals)
             SsaOp.wasm_f32_convert_i64_s => {
                 self.getValue64(v.args.get(0))
                 self.builder.append(As.f32_convert_i64_s)
@@ -1637,7 +1648,7 @@ struct GenState {
                 self.builder.append(As.i32_reinterpret_f32)
                 self.builder.append(As.i64_extend_i32_u)
             },
-            // Conversion: i32→f32 (input is i64-as-i32, output is i64-as-f32)
+            // Conversion: i32→f32 (f32 stored in i64 locals)
             SsaOp.wasm_f32_convert_i32_s => {
                 self.getValue64(v.args.get(0))
                 self.builder.append(As.i32_wrap_i64)
@@ -1652,36 +1663,33 @@ struct GenState {
                 self.builder.append(As.i32_reinterpret_f32)
                 self.builder.append(As.i64_extend_i32_u)
             },
-            // Promotion: f32→f64 (input is i64-as-f32, output is i64-as-f64)
+            // Promotion: f32→f64 (f32 in i64 local → f64)
             SsaOp.wasm_f64_promote_f32 => {
                 self.getValue64(v.args.get(0))
                 self.builder.append(As.i32_wrap_i64)
                 self.builder.append(As.f32_reinterpret_i32)
                 self.builder.append(As.f64_promote_f32)
-                self.builder.append(As.i64_reinterpret_f64)
             },
-            // Demotion: f64→f32 (input is i64-as-f64, output is i64-as-f32)
+            // Demotion: f64→f32 (f64 → f32 in i64 local)
             SsaOp.wasm_f32_demote_f64 => {
                 self.getValue64(v.args.get(0))
-                self.builder.append(As.f64_reinterpret_i64)
                 self.builder.append(As.f32_demote_f64)
                 self.builder.append(As.i32_reinterpret_f32)
                 self.builder.append(As.i64_extend_i32_u)
             },
-            // Reinterpret ops — identity since all locals are i64
-            // wasm_i64_reinterpret_f64: input is i64 (f64 bits), output is i64 — no-op
+            // Reinterpret ops — now emit actual instructions since locals are properly typed
             SsaOp.wasm_i64_reinterpret_f64 => {
                 self.getValue64(v.args.get(0))
+                self.builder.append(As.i64_reinterpret_f64)
             },
-            // wasm_f64_reinterpret_i64: input is i64, output is i64 (f64 bits) — no-op
             SsaOp.wasm_f64_reinterpret_i64 => {
                 self.getValue64(v.args.get(0))
+                self.builder.append(As.f64_reinterpret_i64)
             },
-            // wasm_i32_reinterpret_f32: input is i64 (f32 bits), output is i64 (i32 bits) — identity
+            // f32 reinterpret — f32 still in i64 locals, these are identity
             SsaOp.wasm_i32_reinterpret_f32 => {
                 self.getValue64(v.args.get(0))
             },
-            // wasm_f32_reinterpret_i32: input is i64 (i32 bits), output is i64 (f32 bits) — identity
             SsaOp.wasm_f32_reinterpret_i32 => {
                 self.getValue64(v.args.get(0))
             },
@@ -1957,9 +1965,17 @@ struct GenState {
                 }
             },
 
-            // Copy — all locals are i64, no reinterpret needed
+            // Copy — reinterpret if crossing float↔int boundary
+            // Zig gen.zig:899-910
             SsaOp.copy => {
                 self.getValue64(v.args.get(0))
+                const src = self.ssa_func.getValue(v.args.get(0))
+                if (isFloatType(src.type_idx) and !isFloatType(v.type_idx)) {
+                    self.builder.append(As.i64_reinterpret_f64)
+                }
+                if (!isFloatType(src.type_idx) and isFloatType(v.type_idx)) {
+                    self.builder.append(As.f64_reinterpret_i64)
+                }
             },
 
             // Phi — load from local (populated by emitPhiMoves)
