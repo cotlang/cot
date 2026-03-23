@@ -2548,6 +2548,40 @@ struct Lowerer {
 
     fn lowerFieldAccess(fa: FieldAccessExpr, idx: int) int {
         const fb = self.builder.func() orelse return null_node
+
+        // Shorthand enum variant: .variant (base == null_node, resolved by checker)
+        // Zig lower.zig:5554-5578
+        if (fa.base == null_node) {
+            // In switch context: resolve against the switch expression's enum type
+            if (self.current_switch_enum_type != invalid_type) {
+                const enum_info = self.types.get(self.current_switch_enum_type)
+                if (enum_info.tag == TAG_ENUM) {
+                    const et = switch (enum_info) { Type.enum_type |e| => e, else => EnumType { name: "", variant_count: 0, variants: 0, backing_type: 0 } }
+                    for vi in 0..et.variant_count {
+                        const ev = et.getVariant(vi)
+                        if (ev.name == fa.field) {
+                            return fb.emitConstInt(ev.value, self.current_switch_enum_type, fa.span)
+                        }
+                    }
+                }
+            }
+            // Outside switch: checker already resolved the type, use inferExprType
+            const inferred = self.inferExprType(idx)
+            if (inferred > 0 and inferred < self.types.types.count) {
+                const inferred_info = self.types.get(inferred)
+                if (inferred_info.tag == TAG_ENUM) {
+                    const et = switch (inferred_info) { Type.enum_type |e| => e, else => EnumType { name: "", variant_count: 0, variants: 0, backing_type: 0 } }
+                    for vi in 0..et.variant_count {
+                        const ev = et.getVariant(vi)
+                        if (ev.name == fa.field) {
+                            return fb.emitConstInt(ev.value, inferred, fa.span)
+                        }
+                    }
+                }
+            }
+            return null_node
+        }
+
         const base_type = self.inferExprType(fa.base)
         const type_info = self.types.get(base_type)
 
