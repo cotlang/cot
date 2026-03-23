@@ -4161,9 +4161,35 @@ pub const Checker = struct {
             const field_type = try self.resolveTypeExpr(field.type_expr);
             switch (layout) {
                 .@"packed" => {
-                    // Packed: no alignment, contiguous fields
-                    try struct_fields.append(self.allocator, .{ .name = field.name, .type_idx = field_type, .offset = offset, .default_value = field.default_value });
-                    offset += self.types.sizeOf(field_type);
+                    // Packed: no alignment, contiguous fields.
+                    // Check for sub-byte bitfield types (u1-u7, u9-u15, u17-u31, u33-u63).
+                    // These resolve to the containing standard type (u8/u16/u32/u64)
+                    // but carry a bit_width for packed struct layout.
+                    var bit_width: u8 = 0;
+                    if (self.tree.getNode(field.type_expr)) |type_node| {
+                        if (type_node.asExpr()) |expr| {
+                            if (expr == .type_expr and expr.type_expr.kind == .named) {
+                                if (types.TypeRegistry.parseBitWidth(expr.type_expr.kind.named)) |bw| {
+                                    if (bw != 8 and bw != 16 and bw != 32 and bw != 64) {
+                                        bit_width = bw;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    try struct_fields.append(self.allocator, .{
+                        .name = field.name,
+                        .type_idx = field_type,
+                        .offset = offset,
+                        .bit_offset = 0,
+                        .bit_width = bit_width,
+                        .default_value = field.default_value,
+                    });
+                    if (bit_width > 0) {
+                        // Bitfield: don't advance byte offset (handled by bit packing below)
+                    } else {
+                        offset += self.types.sizeOf(field_type);
+                    }
                 },
                 .@"extern" => {
                     // Extern: C ABI layout, align each field to its natural alignment
@@ -4182,9 +4208,45 @@ pub const Checker = struct {
                 },
             }
         }
+        // Check if any field has bitfield width — if so, recompute as bit-packed layout
+        // Zig reference: Type.zig:3550-3578 — packed struct bit layout computation
+        var has_bitfields = false;
+        for (struct_fields.items) |f| {
+            if (f.bit_width > 0) { has_bitfields = true; break; }
+        }
+        var backing_int: TypeIndex = 0;
+        if (has_bitfields and layout == .@"packed") {
+            // Bit-packed mode: recompute all field offsets in bits
+            var bit_pos: u32 = 0;
+            for (struct_fields.items) |*f| {
+                f.bit_offset = @intCast(bit_pos);
+                if (f.bit_width > 0) {
+                    bit_pos += f.bit_width;
+                } else {
+                    // Standard-width field in bitfield struct: use full type bit size
+                    f.bit_width = @intCast(self.types.sizeOf(f.type_idx) * 8);
+                    bit_pos += f.bit_width;
+                }
+                f.offset = 0; // All fields at byte offset 0 (single backing integer)
+            }
+            // Determine backing integer from total bit width
+            if (bit_pos <= 8) {
+                offset = 1; backing_int = TypeRegistry.U8;
+            } else if (bit_pos <= 16) {
+                offset = 2; backing_int = TypeRegistry.U16;
+            } else if (bit_pos <= 32) {
+                offset = 4; backing_int = TypeRegistry.U32;
+            } else if (bit_pos <= 64) {
+                offset = 8; backing_int = TypeRegistry.U64;
+            } else {
+                self.err.errorWithCode(fields[0].span.start, .e302, "packed struct total bit width exceeds 64");
+                offset = 8; backing_int = TypeRegistry.U64;
+            }
+        }
+
         // Final padding: packed = none, extern = align to max field alignment, auto = 8-byte
         const alignment: u8 = switch (layout) {
-            .@"packed" => 1,
+            .@"packed" => if (has_bitfields) @intCast(offset) else 1,
             .@"extern" => @intCast(max_align),
             .auto => 8,
         };
@@ -4192,7 +4254,14 @@ pub const Checker = struct {
             const a = @as(u32, alignment);
             offset = (offset + a - 1) & ~(a - 1);
         }
-        return try self.types.add(.{ .struct_type = .{ .name = name, .fields = try self.allocator.dupe(types.StructField, struct_fields.items), .size = offset, .alignment = alignment, .layout = layout } });
+        return try self.types.add(.{ .struct_type = .{
+            .name = name,
+            .fields = try self.allocator.dupe(types.StructField, struct_fields.items),
+            .size = offset,
+            .alignment = alignment,
+            .layout = layout,
+            .backing_int = backing_int,
+        } });
     }
 
     fn buildEnumType(self: *Checker, e: ast.EnumDecl) CheckError!TypeIndex {

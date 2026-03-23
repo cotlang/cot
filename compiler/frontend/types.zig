@@ -76,9 +76,23 @@ pub const FutureType = struct { result_type: TypeIndex };
 pub const DistinctType = struct { name: []const u8, underlying: TypeIndex };
 
 // Aggregate types
-pub const StructField = struct { name: []const u8, type_idx: TypeIndex, offset: u32, default_value: @import("ast.zig").NodeIndex = @import("ast.zig").null_node };
+pub const StructField = struct {
+    name: []const u8,
+    type_idx: TypeIndex,
+    offset: u32, // byte offset from struct base
+    bit_offset: u8 = 0, // bit position within the backing integer (0-63, for bitfields)
+    bit_width: u8 = 0, // field width in bits (0 = full type size, 1-63 = bitfield)
+    default_value: @import("ast.zig").NodeIndex = @import("ast.zig").null_node,
+};
 pub const StructLayout = @import("ast.zig").StructLayout;
-pub const StructType = struct { name: []const u8, fields: []const StructField, size: u32, alignment: u8, layout: StructLayout = .auto };
+pub const StructType = struct {
+    name: []const u8,
+    fields: []const StructField,
+    size: u32,
+    alignment: u8,
+    layout: StructLayout = .auto,
+    backing_int: TypeIndex = 0, // for packed struct(uN): the backing integer type (0 = none)
+};
 pub const EnumVariant = struct { name: []const u8, value: i64 };
 pub const EnumType = struct { name: []const u8, variants: []const EnumVariant, backing_type: TypeIndex };
 pub const UnionVariant = struct { name: []const u8, payload_type: TypeIndex };
@@ -230,7 +244,47 @@ pub const TypeRegistry = struct {
         return self.types.items[idx];
     }
 
-    pub fn lookupByName(self: *const TypeRegistry, n: []const u8) ?TypeIndex { return self.name_map.get(n); }
+    /// Parse a type name like "u3", "u29" and return the bit width, or null if not a uN type.
+    pub fn parseBitWidth(n: []const u8) ?u8 {
+        if (n.len >= 2 and n.len <= 3 and n[0] == 'u') {
+            var width: u32 = 0;
+            for (n[1..]) |c| {
+                if (c >= '0' and c <= '9') {
+                    width = width * 10 + (c - '0');
+                } else return null;
+            }
+            if (width >= 1 and width <= 64) return @intCast(width);
+        }
+        return null;
+    }
+
+    pub fn lookupByName(self: *const TypeRegistry, n: []const u8) ?TypeIndex {
+        if (self.name_map.get(n)) |idx| return idx;
+        // Support arbitrary-width unsigned integers: u1, u2, u3, ..., u63
+        // These map to the smallest standard type that contains them,
+        // with bit_width set during packed struct field resolution.
+        // Zig reference: Type.zig — packed struct fields can be any uN.
+        if (n.len >= 2 and n.len <= 3 and n[0] == 'u') {
+            var width: u32 = 0;
+            var valid = true;
+            for (n[1..]) |c| {
+                if (c >= '0' and c <= '9') {
+                    width = width * 10 + (c - '0');
+                } else {
+                    valid = false;
+                    break;
+                }
+            }
+            if (valid and width >= 1 and width <= 64) {
+                // Map to smallest containing standard type
+                if (width <= 8) return U8;
+                if (width <= 16) return U16;
+                if (width <= 32) return U32;
+                return U64;
+            }
+        }
+        return null;
+    }
 
     /// Returns the display name of a type for diagnostics and trait bound validation.
     /// Rust: ty::TyKind::to_string(). Go 1.18: types2.Type.String().
