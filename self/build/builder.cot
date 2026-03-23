@@ -948,7 +948,7 @@ struct SSABuilder {
                 BinaryOp.lt_u => SsaOp.ult, BinaryOp.le_u => SsaOp.ule,
                 BinaryOp.gt_u => SsaOp.ugt, BinaryOp.ge_u => SsaOp.uge,
                 BinaryOp.bit_and => SsaOp.and_, BinaryOp.bit_or => SsaOp.or_,
-                BinaryOp.bit_xor => SsaOp.xor, BinaryOp.shl => SsaOp.shl, BinaryOp.shr => SsaOp.shr,
+                BinaryOp.bit_xor => SsaOp.xor, BinaryOp.shl => SsaOp.shl, BinaryOp.shr => SsaOp.sar, // >> is arithmetic (Zig parity: signed int)
                 BinaryOp.fmin => SsaOp.wasm_f64_min, BinaryOp.fmax => SsaOp.wasm_f64_max,
                 BinaryOp.atomic_store => SsaOp.atomic_store64,
                 BinaryOp.atomic_add => SsaOp.atomic_add64,
