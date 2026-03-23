@@ -183,14 +183,6 @@ fn layout(func: *SsaFunc) void {
         func.entry = old_to_new.get(func.entry)
     }
     func.block_order = order
-    old_to_new.free()
-
-    // Free per-function temporaries
-    scheduled.free()
-    indegree.free()
-    zerodegree.free()
-    succs_list.free()
-    is_exit.free()
 }
 
 // ============================================================================

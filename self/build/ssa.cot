@@ -255,8 +255,8 @@ struct SsaValue {
         self.args.count = 0
     }
 
-    fn free() void {
-        self.args.free()
+    fn deinit() void {
+        self.args.deinit()
     }
 }
 
@@ -311,11 +311,11 @@ struct SsaBlock {
         }
     }
 
-    fn free() void {
-        self.succs.free()
-        self.preds.free()
-        self.controls.free()
-        self.values.free()
+    fn deinit() void {
+        self.succs.deinit()
+        self.preds.deinit()
+        self.controls.deinit()
+        self.values.deinit()
     }
 
     fn addEdgeTo(target_idx: int, blocks: List(*SsaBlock)) void {
@@ -441,27 +441,27 @@ struct SsaFunc {
     }
 
     /// Free all memory owned by this function.
-    fn free() void {
+    fn deinit() void {
         // Free each value's args list
         var i = 0
         while (i < self.values.count) {
-            self.values.get(i).free()
+            self.values.get(i).deinit()
             i += 1
         }
         // Free each block's internal lists
         i = 0
         while (i < self.blocks.count) {
-            self.blocks.get(i).free()
+            self.blocks.get(i).deinit()
             i += 1
         }
         // Free the top-level containers
-        self.values.free()
-        self.blocks.free()
-        self.local_sizes.free()
-        self.local_offsets.free()
-        self.string_literals.free()
-        self.constants.free()
-        self.block_order.free()
+        self.values.deinit()
+        self.blocks.deinit()
+        self.local_sizes.deinit()
+        self.local_offsets.deinit()
+        self.string_literals.deinit()
+        self.constants.deinit()
+        self.block_order.deinit()
     }
 }
 

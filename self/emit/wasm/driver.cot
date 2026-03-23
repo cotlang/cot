@@ -428,10 +428,6 @@ fn generateAndAddFunc(linker: *Linker, ir_func: Func, ir: IR, types: *TypeRegist
     preprocess(&sym)
     const body = assemble(&sym)
 
-    // Free all per-function SSA data — mirrors Zig compiler's arena.deinit() pattern
-    ssa_func.free()
-    builder.free()
-
     // Add to linker
     linker.addFunc(WasmFunc.init(ir_func.name, type_idx, body, true))
 }
@@ -446,8 +442,6 @@ fn registerFuncType(linker: *Linker, ir_func: Func, types: *TypeRegistry) int {
     buildFuncResults(&results, ir_func, types)
 
     const idx = linker.addType(params, results)
-    params.free()
-    results.free()
     return idx
 }
 

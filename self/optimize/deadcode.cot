@@ -80,8 +80,6 @@ fn deadcode(func: *SsaFunc) void {
     for bi2 in 0..func.blocks.count { remaining_values += func.blocks.get(bi2).values.count }
     debug(.deadcode, "=== Deadcode complete for '${func.name}': ${func.blocks.count} blocks, ${remaining_values} values remaining ===")
 
-    reachable.free()
-    live.free()
 }
 
 /// BFS from entry block to find all reachable blocks.
@@ -108,7 +106,6 @@ fn reachableBlocks(func: *SsaFunc, reachable: *Map(int, bool)) void {
             }
         }
     }
-    worklist.free()
 }
 
 /// Mark live values via transitive closure from roots.
@@ -152,7 +149,6 @@ fn liveValues(func: *SsaFunc, reachable: *Map(int, bool), live: *Map(int, bool))
             }
         }
     }
-    q.free()
 }
 
 /// Remove predecessor edge pointing to block_idx from blk.

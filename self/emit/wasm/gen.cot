@@ -94,11 +94,11 @@ struct GenState {
 
     /// Free Maps/Lists NOT transferred to the returned Symbol.
     /// builder.progs and gc_ref_locals are aliased by the Symbol — do NOT free them here.
-    fn free() void {
-        self.value_to_local.free()
-        self.branches.free()
-        self.bstart.free()
-        self.compound_len_locals.free()
+    fn deinit() void {
+        self.value_to_local.deinit()
+        self.branches.deinit()
+        self.bstart.deinit()
+        self.compound_len_locals.deinit()
     }
 
     static fn init(func: *SsaFunc) GenState {
@@ -2523,7 +2523,7 @@ fn generateFunc(func: *SsaFunc, func_indices: *Map(string, int), string_offsets:
     gen.setStringOffsets(string_offsets)
     gen.setFuncTableIndices(func_table_indices)
     const sym = gen.generate()
-    gen.free()
+    gen.deinit()
     return sym
 }
 

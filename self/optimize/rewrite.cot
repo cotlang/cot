@@ -50,7 +50,6 @@ fn rewrite(func: *SsaFunc, string_offsets: *Map(string, int)) void {
                 rewritten += 1
             }
         }
-        to_rewrite.free()
     }
 
     debug(.codegen, "=== Rewritegeneric complete for '${func.name}': ${rewritten} const_strings rewritten ===")

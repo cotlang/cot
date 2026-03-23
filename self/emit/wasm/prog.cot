@@ -217,8 +217,8 @@ struct ProgBuilder {
         }
     }
 
-    fn free() void {
-        self.progs.free()
+    fn deinit() void {
+        self.progs.deinit()
     }
 
     fn append(instr: As) int {

@@ -49,13 +49,11 @@ fn cse(func: *SsaFunc) void {
             vi += 1
         }
 
-        seen.free()
         bi += 1
     }
 
     if (rewrite.count == 0) {
         debug(.codegen, "=== CSE complete for '${func.name}': 0 rewrites ===")
-        rewrite.free()
         return
     }
 
@@ -90,7 +88,6 @@ fn cse(func: *SsaFunc) void {
     }
 
     debug(.codegen, "=== CSE complete for '${func.name}': ${rewrite.count} rewrites ===")
-    rewrite.free()
 }
 
 /// Check if an op can be CSE'd (pure, no side effects).

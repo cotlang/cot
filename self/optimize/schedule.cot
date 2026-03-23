@@ -211,16 +211,6 @@ fn scheduleBlock(func: *SsaFunc, block_idx: int) void {
         blk.values.append(result.get(ri))
     }
 
-    // Free per-block temporaries
-    scores.free()
-    orig_pos.free()
-    in_edges.free()
-    edge_from.free()
-    edge_to.free()
-    control_set.free()
-    in_block.free()
-    ready.free()
-    result.free()
 }
 
 // ============================================================================
