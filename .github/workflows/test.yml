@@ -38,12 +38,12 @@ jobs:
 
       - name: Cot tests (wasm - features)
         if: always()
-        run: ./zig-out/bin/cot test test/e2e/features.cot --target=wasm32
+        run: ./zig-out/bin/cot test test/e2e/features.cot --target=wasm
 
       - name: Cot tests (wasm - full suite)
         if: always()
         continue-on-error: true
-        run: ./test/run_all.sh --target=wasm32
+        run: ./test/run_all.sh --target=wasm
 
   test-linux:
     runs-on: ubuntu-latest
@@ -72,8 +72,8 @@ jobs:
           wasmtime --version
 
       - name: Cot tests (wasm - features)
-        run: ./zig-out/bin/cot test test/e2e/features.cot --target=wasm32
+        run: ./zig-out/bin/cot test test/e2e/features.cot --target=wasm
 
       - name: Cot tests (wasm - full suite)
         continue-on-error: true
-        run: ./test/run_all.sh --target=wasm32
+        run: ./test/run_all.sh --target=wasm
