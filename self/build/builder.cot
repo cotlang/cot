@@ -682,11 +682,15 @@ struct SSABuilder {
         const load_type = self.type_reg.get(type_idx)
         const addr_val = self.emitLocalAddr(local_idx, VOID)
 
-        if (load_type.tag == TAG_SLICE) {
-            // Slice: load ptr, len, cap separately, combine with slice_make
+        // String/slice compound load: decompose into ptr+len(+cap) loads, combine with slice_make/string_make.
+        // Zig SSA builder: type_registry.get(STRING) == .slice, so STRING enters this branch.
+        // Selfcot: STRING is not TAG_SLICE, so we check explicitly.
+        if (load_type.tag == TAG_SLICE or type_idx == STRING) {
             const ptr_load = self.emitNewValueWithArg(SsaOp.load, I64, addr_val)
             const len_addr = self.emitOffPtr(addr_val, 8)
             const len_load = self.emitNewValueWithArg(SsaOp.load, I64, len_addr)
+
+            // Both strings and slices: load cap from offset 16 (Zig treats STRING as SLICE)
             const cap_addr = self.emitOffPtr(addr_val, 16)
             const cap_load = self.emitNewValueWithArg(SsaOp.load, I64, cap_addr)
 
