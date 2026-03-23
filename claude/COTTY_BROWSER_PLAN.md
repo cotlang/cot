@@ -1,8 +1,25 @@
 # Cotty Browser — WebGPU Canvas Terminal + Editor in Wasm
 
 **Date:** 2026-03-23
-**Status:** Planning
+**Status:** Planning — prerequisite: `cot-js` library (zig-js port)
 **Goal:** Run Cotty in the browser via Wasm + WebGPU, with native desktop via WKWebView/WebKitGTK
+
+## Prerequisite: cot-js Library
+
+Before Cotty Browser can be built, we need `cot-js` — a port of [mitchellh/zig-js](https://github.com/mitchellh/zig-js) to Cot. This is the JS interop layer that Ghostty uses for all browser communication (Canvas 2D, DOM, events).
+
+**Repo:** `~/cot-land/cot-js` (see `cot-js/CLAUDE.md` for porting plan)
+**Reference:** `cot-js/references/zig-js/` (734 lines Zig + 287 lines TypeScript)
+**Provides:** `JsObject.get()`, `.set()`, `.call()`, `js.string()`, NaN-encoded refs
+
+This is the same pattern Ghostty uses — NOT raw extern fns. The library handles:
+- NaN-encoded reference IDs for JS values
+- Property get/set via string names
+- Method calls with automatic type conversion
+- String passing (ptr+len ↔ JS string)
+- Reference counting / GC via deinit()
+
+Ghostty's `font/face/web_canvas.zig` (561 lines) and `font/shaper/web_canvas.zig` (305 lines) depend entirely on this library for Canvas 2D interaction.
 
 ---
 
