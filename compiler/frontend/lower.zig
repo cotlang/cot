@@ -2400,12 +2400,30 @@ pub const Lowerer = struct {
                 try self.lowerSliceInit(local_idx, var_stmt.value, type_idx, var_stmt.span);
             } else if (is_array) {
                 try self.lowerArrayInit(local_idx, var_stmt.value, var_stmt.span);
+                // Register ARC release cleanup for arrays with ARC elements
+                if (!self.target.isWasm() and self.type_reg.couldBeARC(type_idx)) {
+                    const loaded = try fb.emitLoadLocal(local_idx, type_idx, var_stmt.span);
+                    const cleanup = arc.Cleanup.initForLocal(.release, loaded, type_idx, local_idx);
+                    _ = try self.cleanup_stack.push(cleanup);
+                }
             } else if (is_struct_literal) {
                 try self.lowerStructInit(local_idx, var_stmt.value, var_stmt.span);
-                // Register scope_destroy for struct literals with free()
+                // Register scope_destroy for struct literals with deinit()
                 try self.maybeRegisterScopeDestroy(local_idx, type_idx);
+                // Register ARC release cleanup for structs with ARC fields (covers structs without deinit)
+                if (!self.target.isWasm() and self.type_reg.couldBeARC(type_idx)) {
+                    const loaded = try fb.emitLoadLocal(local_idx, type_idx, var_stmt.span);
+                    const cleanup = arc.Cleanup.initForLocal(.release, loaded, type_idx, local_idx);
+                    _ = try self.cleanup_stack.push(cleanup);
+                }
             } else if (is_tuple_literal) {
                 try self.lowerTupleInit(local_idx, var_stmt.value, var_stmt.span);
+                // Register ARC release cleanup for tuples with ARC elements
+                if (!self.target.isWasm() and self.type_reg.couldBeARC(type_idx)) {
+                    const loaded = try fb.emitLoadLocal(local_idx, type_idx, var_stmt.span);
+                    const cleanup = arc.Cleanup.initForLocal(.release, loaded, type_idx, local_idx);
+                    _ = try self.cleanup_stack.push(cleanup);
+                }
             } else if (self.type_reg.get(type_idx) == .union_type) {
                 try self.lowerUnionInit(local_idx, var_stmt.value, type_idx, var_stmt.span);
             } else if (self.type_reg.get(type_idx) == .optional and !self.isPtrLikeOptional(type_idx)) {
@@ -4615,10 +4633,108 @@ pub const Lowerer = struct {
         // String: no ARC (string data is not refcounted in Cot)
         if (type_idx == TypeRegistry.STRING) return value;
 
-        // Collections (List, Map) and futures: heap-allocated ARC objects, retain directly.
-        if (info == .list or info == .map or info == .future) {
+        // Future: heap-allocated ARC object, retain directly.
+        if (info == .future) {
             var args = [_]ir.NodeIndex{value};
             return try fb.emitCall("retain", &args, false, type_idx, span);
+        }
+
+        // List(T) and Map(K,V): value types with heap backing.
+        // Copy = retain each ARC element (the backing array is shared on copy).
+        // This matches the retain semantics — the elements get an extra refcount
+        // so that when the copy is destroyed, the releases balance out.
+        if (info == .list) {
+            const elem_type = info.list.elem;
+            if (!self.type_reg.isTrivial(elem_type)) {
+                const elem_size: i64 = @intCast(self.type_reg.sizeOf(elem_type));
+                const list_size = self.type_reg.sizeOf(type_idx);
+                const tmp = try fb.addLocalWithSize("__copy_list", type_idx, false, list_size);
+                _ = try fb.emitStoreLocal(tmp, value, span);
+                const items_ptr = try fb.emitFieldLocal(tmp, 0, 0, TypeRegistry.I64, span);
+                const count = try fb.emitFieldLocal(tmp, 1, 8, TypeRegistry.I64, span);
+                const cond_blk = try fb.newBlock("copy_list.cond");
+                const body_blk = try fb.newBlock("copy_list.body");
+                const done_blk = try fb.newBlock("copy_list.done");
+                const counter = try fb.addLocal(.{ .name = "__copy_list_i", .type_idx = TypeRegistry.I64, .mutable = true, .size = 8, .is_param = false });
+                const zero = try fb.emitConstInt(0, TypeRegistry.I64, span);
+                _ = try fb.emitStoreLocal(counter, zero, span);
+                _ = try fb.emitJump(cond_blk, span);
+                fb.setBlock(cond_blk);
+                const idx = try fb.emitLoadLocal(counter, TypeRegistry.I64, span);
+                const cond = try fb.emitBinary(.lt, idx, count, TypeRegistry.BOOL, span);
+                _ = try fb.emitBranch(cond, body_blk, done_blk, span);
+                fb.setBlock(body_blk);
+                const offset = try fb.emitBinary(.mul, idx, try fb.emitConstInt(elem_size, TypeRegistry.I64, span), TypeRegistry.I64, span);
+                const elem_addr = try fb.emitBinary(.add, items_ptr, offset, TypeRegistry.I64, span);
+                const elem_val = try fb.emitPtrLoadValue(elem_addr, elem_type, span);
+                _ = try self.emitCopyValue(fb, elem_val, elem_type, span);
+                const one = try fb.emitConstInt(1, TypeRegistry.I64, span);
+                const next = try fb.emitBinary(.add, idx, one, TypeRegistry.I64, span);
+                _ = try fb.emitStoreLocal(counter, next, span);
+                _ = try fb.emitJump(cond_blk, span);
+                fb.setBlock(done_blk);
+            }
+            return value;
+        }
+
+        // Map(K,V): retain all occupied keys and values
+        if (info == .map) {
+            const key_type = info.map.key;
+            const val_type = info.map.value;
+            const keys_arc = !self.type_reg.isTrivial(key_type);
+            const vals_arc = !self.type_reg.isTrivial(val_type);
+            if (keys_arc or vals_arc) {
+                const key_size: i64 = @intCast(self.type_reg.sizeOf(key_type));
+                const val_size: i64 = @intCast(self.type_reg.sizeOf(val_type));
+                const map_size = self.type_reg.sizeOf(type_idx);
+                const tmp = try fb.addLocalWithSize("__copy_map", type_idx, false, map_size);
+                _ = try fb.emitStoreLocal(tmp, value, span);
+                const keys_ptr = try fb.emitFieldLocal(tmp, 0, 0, TypeRegistry.I64, span);
+                const vals_ptr = try fb.emitFieldLocal(tmp, 1, 8, TypeRegistry.I64, span);
+                const states_ptr = try fb.emitFieldLocal(tmp, 2, 16, TypeRegistry.I64, span);
+                const capacity = try fb.emitFieldLocal(tmp, 4, 32, TypeRegistry.I64, span);
+                const cond_blk = try fb.newBlock("copy_map.cond");
+                const body_blk = try fb.newBlock("copy_map.body");
+                const done_blk = try fb.newBlock("copy_map.done");
+                const counter = try fb.addLocal(.{ .name = "__copy_map_i", .type_idx = TypeRegistry.I64, .mutable = true, .size = 8, .is_param = false });
+                const zero = try fb.emitConstInt(0, TypeRegistry.I64, span);
+                _ = try fb.emitStoreLocal(counter, zero, span);
+                _ = try fb.emitJump(cond_blk, span);
+                fb.setBlock(cond_blk);
+                const idx = try fb.emitLoadLocal(counter, TypeRegistry.I64, span);
+                const cond = try fb.emitBinary(.lt, idx, capacity, TypeRegistry.BOOL, span);
+                _ = try fb.emitBranch(cond, body_blk, done_blk, span);
+                fb.setBlock(body_blk);
+                const state_addr = try fb.emitBinary(.add, states_ptr, idx, TypeRegistry.I64, span);
+                const state_val = try fb.emitPtrLoadValue(state_addr, TypeRegistry.U8, span);
+                const two = try fb.emitConstInt(2, TypeRegistry.I64, span);
+                const state_i64 = try fb.emitConvert(state_val, TypeRegistry.U8, TypeRegistry.I64, span);
+                const is_occupied = try fb.emitBinary(.eq, state_i64, two, TypeRegistry.BOOL, span);
+                const retain_blk = try fb.newBlock("copy_map.retain");
+                const next_blk = try fb.newBlock("copy_map.next");
+                _ = try fb.emitBranch(is_occupied, retain_blk, next_blk, span);
+                fb.setBlock(retain_blk);
+                if (keys_arc) {
+                    const ko = try fb.emitBinary(.mul, idx, try fb.emitConstInt(key_size, TypeRegistry.I64, span), TypeRegistry.I64, span);
+                    const ka = try fb.emitBinary(.add, keys_ptr, ko, TypeRegistry.I64, span);
+                    const kv = try fb.emitPtrLoadValue(ka, key_type, span);
+                    _ = try self.emitCopyValue(fb, kv, key_type, span);
+                }
+                if (vals_arc) {
+                    const vo = try fb.emitBinary(.mul, idx, try fb.emitConstInt(val_size, TypeRegistry.I64, span), TypeRegistry.I64, span);
+                    const va = try fb.emitBinary(.add, vals_ptr, vo, TypeRegistry.I64, span);
+                    const vv = try fb.emitPtrLoadValue(va, val_type, span);
+                    _ = try self.emitCopyValue(fb, vv, val_type, span);
+                }
+                _ = try fb.emitJump(next_blk, span);
+                fb.setBlock(next_blk);
+                const one = try fb.emitConstInt(1, TypeRegistry.I64, span);
+                const next = try fb.emitBinary(.add, idx, one, TypeRegistry.I64, span);
+                _ = try fb.emitStoreLocal(counter, next, span);
+                _ = try fb.emitJump(cond_blk, span);
+                fb.setBlock(done_blk);
+            }
+            return value;
         }
 
         // Struct with non-trivial fields: recursive field copy.
@@ -4700,6 +4816,57 @@ pub const Lowerer = struct {
             return value;
         }
 
+        // Array types: element-wise retain for non-trivial elements.
+        // Swift: ArrayTypeLowering delegates to element type lowering.
+        if (info == .array) {
+            const arr = info.array;
+            if (!self.type_reg.isTrivial(arr.elem)) {
+                const arr_size = self.type_reg.sizeOf(type_idx);
+                const elem_size = self.type_reg.sizeOf(arr.elem);
+                const aligned_elem_size: u32 = ((elem_size + 7) / 8) * 8;
+                const tmp = try fb.addLocalWithSize("__copy_arr", type_idx, false, arr_size);
+                _ = try fb.emitStoreLocal(tmp, value, span);
+                for (0..arr.length) |i| {
+                    const offset: i64 = @intCast(i * aligned_elem_size);
+                    const elem_val = try fb.emitFieldLocal(tmp, @intCast(i), offset, arr.elem, span);
+                    _ = try self.emitCopyValue(fb, elem_val, arr.elem, span);
+                }
+            }
+            return value;
+        }
+
+        // Slice types: element-wise retain via ptr+len iteration.
+        if (info == .slice) {
+            if (!self.type_reg.isTrivial(info.slice.elem)) {
+                const elem_size = self.type_reg.sizeOf(info.slice.elem);
+                const aligned_elem_size: i64 = @intCast(((elem_size + 7) / 8) * 8);
+                const slice_ptr = try fb.emitSlicePtr(value, TypeRegistry.I64, span);
+                const slice_len = try fb.emitSliceLen(value, span);
+                const cond_blk = try fb.newBlock("copy_slice.cond");
+                const body_blk = try fb.newBlock("copy_slice.body");
+                const done_blk = try fb.newBlock("copy_slice.done");
+                const counter_local = try fb.addLocal(.{ .name = "__copy_slice_i", .type_idx = TypeRegistry.I64, .mutable = true, .size = 8, .is_param = false });
+                const zero = try fb.emitConstInt(0, TypeRegistry.I64, span);
+                _ = try fb.emitStoreLocal(counter_local, zero, span);
+                _ = try fb.emitJump(cond_blk, span);
+                fb.setBlock(cond_blk);
+                const idx = try fb.emitLoadLocal(counter_local, TypeRegistry.I64, span);
+                const cond = try fb.emitBinary(.lt, idx, slice_len, TypeRegistry.BOOL, span);
+                _ = try fb.emitBranch(cond, body_blk, done_blk, span);
+                fb.setBlock(body_blk);
+                const offset = try fb.emitBinary(.mul, idx, try fb.emitConstInt(aligned_elem_size, TypeRegistry.I64, span), TypeRegistry.I64, span);
+                const elem_addr = try fb.emitBinary(.add, slice_ptr, offset, TypeRegistry.I64, span);
+                const elem_val = try fb.emitPtrLoadValue(elem_addr, info.slice.elem, span);
+                _ = try self.emitCopyValue(fb, elem_val, info.slice.elem, span);
+                const one = try fb.emitConstInt(1, TypeRegistry.I64, span);
+                const next_idx = try fb.emitBinary(.add, idx, one, TypeRegistry.I64, span);
+                _ = try fb.emitStoreLocal(counter_local, next_idx, span);
+                _ = try fb.emitJump(cond_blk, span);
+                fb.setBlock(done_blk);
+            }
+            return value;
+        }
+
         // Error union: copy elem if success (tag=0)
         if (info == .error_union) {
             // Error unions have tag at offset 0, payload at offset 8
@@ -4772,10 +4939,145 @@ pub const Lowerer = struct {
         // String: not refcounted
         if (type_idx == TypeRegistry.STRING) return;
 
-        // Collections (List, Map) and futures: heap-allocated ARC objects, release directly.
-        if (info == .list or info == .map or info == .future) {
+        // Future: heap-allocated ARC object, release directly.
+        if (info == .future) {
             var args = [_]ir.NodeIndex{value};
             _ = try fb.emitCall("release", &args, false, TypeRegistry.VOID, span);
+            return;
+        }
+
+        // List(T): value type with heap-allocated backing array.
+        // Inline destruction: release each ARC element, then dealloc backing array.
+        // Swift equivalent: Array.deinit releases elements via value witness destroy.
+        if (info == .list) {
+            const elem_type = info.list.elem;
+            const elem_size: i64 = @intCast(self.type_reg.sizeOf(elem_type));
+            // Store list to temp so we can access fields
+            const list_size = self.type_reg.sizeOf(type_idx);
+            const tmp = try fb.addLocalWithSize("__destroy_list", type_idx, false, list_size);
+            _ = try fb.emitStoreLocal(tmp, value, span);
+            // Load items ptr and count
+            const items_ptr = try fb.emitFieldLocal(tmp, 0, 0, TypeRegistry.I64, span);
+            const count = try fb.emitFieldLocal(tmp, 1, 8, TypeRegistry.I64, span);
+
+            // If elements are ARC-managed, release each one
+            if (!self.type_reg.isTrivial(elem_type)) {
+                const cond_blk = try fb.newBlock("destroy_list.cond");
+                const body_blk = try fb.newBlock("destroy_list.body");
+                const dealloc_blk = try fb.newBlock("destroy_list.dealloc");
+                const counter = try fb.addLocal(.{ .name = "__list_i", .type_idx = TypeRegistry.I64, .mutable = true, .size = 8, .is_param = false });
+                const zero = try fb.emitConstInt(0, TypeRegistry.I64, span);
+                _ = try fb.emitStoreLocal(counter, zero, span);
+                _ = try fb.emitJump(cond_blk, span);
+                fb.setBlock(cond_blk);
+                const idx = try fb.emitLoadLocal(counter, TypeRegistry.I64, span);
+                const cond = try fb.emitBinary(.lt, idx, count, TypeRegistry.BOOL, span);
+                _ = try fb.emitBranch(cond, body_blk, dealloc_blk, span);
+                fb.setBlock(body_blk);
+                const elem_offset = try fb.emitBinary(.mul, idx, try fb.emitConstInt(elem_size, TypeRegistry.I64, span), TypeRegistry.I64, span);
+                const elem_addr = try fb.emitBinary(.add, items_ptr, elem_offset, TypeRegistry.I64, span);
+                const elem_val = try fb.emitPtrLoadValue(elem_addr, elem_type, span);
+                try self.emitDestroyValue(fb, elem_val, elem_type, span);
+                const one = try fb.emitConstInt(1, TypeRegistry.I64, span);
+                const next = try fb.emitBinary(.add, idx, one, TypeRegistry.I64, span);
+                _ = try fb.emitStoreLocal(counter, next, span);
+                _ = try fb.emitJump(cond_blk, span);
+                fb.setBlock(dealloc_blk);
+            }
+
+            // Dealloc backing array if capacity > 0
+            const capacity = try fb.emitFieldLocal(tmp, 2, 16, TypeRegistry.I64, span);
+            const zero_cap = try fb.emitConstInt(0, TypeRegistry.I64, span);
+            const has_backing = try fb.emitBinary(.gt, capacity, zero_cap, TypeRegistry.BOOL, span);
+            const free_blk = try fb.newBlock("destroy_list.free");
+            const done_blk = try fb.newBlock("destroy_list.done");
+            _ = try fb.emitBranch(has_backing, free_blk, done_blk, span);
+            fb.setBlock(free_blk);
+            var dealloc_args = [_]ir.NodeIndex{items_ptr};
+            _ = try fb.emitCall("dealloc_raw", &dealloc_args, false, TypeRegistry.VOID, span);
+            _ = try fb.emitJump(done_blk, span);
+            fb.setBlock(done_blk);
+            return;
+        }
+
+        // Map(K,V): value type with heap-allocated backing arrays.
+        // Inline destruction: release each ARC key/value, then dealloc backing arrays.
+        if (info == .map) {
+            // Map layout: keys_ptr(0), values_ptr(8), states_ptr(16), count(24), capacity(32)
+            const key_type = info.map.key;
+            const val_type = info.map.value;
+            const key_size: i64 = @intCast(self.type_reg.sizeOf(key_type));
+            const val_size: i64 = @intCast(self.type_reg.sizeOf(val_type));
+            const map_size = self.type_reg.sizeOf(type_idx);
+            const tmp = try fb.addLocalWithSize("__destroy_map", type_idx, false, map_size);
+            _ = try fb.emitStoreLocal(tmp, value, span);
+            const keys_ptr = try fb.emitFieldLocal(tmp, 0, 0, TypeRegistry.I64, span);
+            const vals_ptr = try fb.emitFieldLocal(tmp, 1, 8, TypeRegistry.I64, span);
+            const states_ptr = try fb.emitFieldLocal(tmp, 2, 16, TypeRegistry.I64, span);
+            const capacity = try fb.emitFieldLocal(tmp, 4, 32, TypeRegistry.I64, span);
+
+            // If keys or values are ARC, iterate occupied slots and release
+            const keys_arc = !self.type_reg.isTrivial(key_type);
+            const vals_arc = !self.type_reg.isTrivial(val_type);
+            if (keys_arc or vals_arc) {
+                const cond_blk = try fb.newBlock("destroy_map.cond");
+                const body_blk = try fb.newBlock("destroy_map.body");
+                const dealloc_blk = try fb.newBlock("destroy_map.dealloc");
+                const counter = try fb.addLocal(.{ .name = "__map_i", .type_idx = TypeRegistry.I64, .mutable = true, .size = 8, .is_param = false });
+                const zero = try fb.emitConstInt(0, TypeRegistry.I64, span);
+                _ = try fb.emitStoreLocal(counter, zero, span);
+                _ = try fb.emitJump(cond_blk, span);
+                fb.setBlock(cond_blk);
+                const idx = try fb.emitLoadLocal(counter, TypeRegistry.I64, span);
+                const cond = try fb.emitBinary(.lt, idx, capacity, TypeRegistry.BOOL, span);
+                _ = try fb.emitBranch(cond, body_blk, dealloc_blk, span);
+                fb.setBlock(body_blk);
+                // Check state[i] == 2 (occupied) — states are u8
+                const state_addr = try fb.emitBinary(.add, states_ptr, idx, TypeRegistry.I64, span);
+                const state_val = try fb.emitPtrLoadValue(state_addr, TypeRegistry.U8, span);
+                const two = try fb.emitConstInt(2, TypeRegistry.I64, span);
+                const state_i64 = try fb.emitConvert(state_val, TypeRegistry.U8, TypeRegistry.I64, span);
+                const is_occupied = try fb.emitBinary(.eq, state_i64, two, TypeRegistry.BOOL, span);
+                const release_blk = try fb.newBlock("destroy_map.release");
+                const next_blk = try fb.newBlock("destroy_map.next");
+                _ = try fb.emitBranch(is_occupied, release_blk, next_blk, span);
+                fb.setBlock(release_blk);
+                if (keys_arc) {
+                    const key_offset = try fb.emitBinary(.mul, idx, try fb.emitConstInt(key_size, TypeRegistry.I64, span), TypeRegistry.I64, span);
+                    const key_addr = try fb.emitBinary(.add, keys_ptr, key_offset, TypeRegistry.I64, span);
+                    const key_val = try fb.emitPtrLoadValue(key_addr, key_type, span);
+                    try self.emitDestroyValue(fb, key_val, key_type, span);
+                }
+                if (vals_arc) {
+                    const val_offset = try fb.emitBinary(.mul, idx, try fb.emitConstInt(val_size, TypeRegistry.I64, span), TypeRegistry.I64, span);
+                    const val_addr = try fb.emitBinary(.add, vals_ptr, val_offset, TypeRegistry.I64, span);
+                    const v = try fb.emitPtrLoadValue(val_addr, val_type, span);
+                    try self.emitDestroyValue(fb, v, val_type, span);
+                }
+                _ = try fb.emitJump(next_blk, span);
+                fb.setBlock(next_blk);
+                const one = try fb.emitConstInt(1, TypeRegistry.I64, span);
+                const next = try fb.emitBinary(.add, idx, one, TypeRegistry.I64, span);
+                _ = try fb.emitStoreLocal(counter, next, span);
+                _ = try fb.emitJump(cond_blk, span);
+                fb.setBlock(dealloc_blk);
+            }
+
+            // Dealloc backing arrays
+            const zero_cap = try fb.emitConstInt(0, TypeRegistry.I64, span);
+            const has_backing = try fb.emitBinary(.gt, capacity, zero_cap, TypeRegistry.BOOL, span);
+            const free_blk = try fb.newBlock("destroy_map.free");
+            const done_blk = try fb.newBlock("destroy_map.done");
+            _ = try fb.emitBranch(has_backing, free_blk, done_blk, span);
+            fb.setBlock(free_blk);
+            var dk = [_]ir.NodeIndex{keys_ptr};
+            _ = try fb.emitCall("dealloc_raw", &dk, false, TypeRegistry.VOID, span);
+            var dv = [_]ir.NodeIndex{vals_ptr};
+            _ = try fb.emitCall("dealloc_raw", &dv, false, TypeRegistry.VOID, span);
+            var ds = [_]ir.NodeIndex{states_ptr};
+            _ = try fb.emitCall("dealloc_raw", &ds, false, TypeRegistry.VOID, span);
+            _ = try fb.emitJump(done_blk, span);
+            fb.setBlock(done_blk);
             return;
         }
 
@@ -4862,6 +5164,63 @@ pub const Lowerer = struct {
                         try self.emitDestroyValue(fb, elem_val, et, span);
                     }
                 }
+            }
+            return;
+        }
+
+        // Array types: element-wise destroy for non-trivial elements.
+        // Swift: ArrayTypeLowering delegates to element type lowering for each element.
+        if (info == .array) {
+            const arr = info.array;
+            if (!self.type_reg.isTrivial(arr.elem)) {
+                const arr_size = self.type_reg.sizeOf(type_idx);
+                const elem_size = self.type_reg.sizeOf(arr.elem);
+                const aligned_elem_size: u32 = ((elem_size + 7) / 8) * 8;
+                const tmp = try fb.addLocalWithSize("__destroy_arr", type_idx, false, arr_size);
+                _ = try fb.emitStoreLocal(tmp, value, span);
+                // Destroy in reverse index order (LIFO, matching Swift)
+                var i: u32 = @intCast(arr.length);
+                while (i > 0) {
+                    i -= 1;
+                    const offset: i64 = @intCast(i * aligned_elem_size);
+                    const elem_val = try fb.emitFieldLocal(tmp, @intCast(i), offset, arr.elem, span);
+                    try self.emitDestroyValue(fb, elem_val, arr.elem, span);
+                }
+            }
+            return;
+        }
+
+        // Slice types: element-wise destroy via ptr+len iteration.
+        // Only for slices that OWN their elements (e.g. returned from functions).
+        if (info == .slice) {
+            if (!self.type_reg.isTrivial(info.slice.elem)) {
+                const elem_size = self.type_reg.sizeOf(info.slice.elem);
+                const aligned_elem_size: i64 = @intCast(((elem_size + 7) / 8) * 8);
+                // Load ptr and len from the slice value
+                const slice_ptr = try fb.emitSlicePtr(value, TypeRegistry.I64, span);
+                const slice_len = try fb.emitSliceLen(value, span);
+                // Loop: for i in 0..len, destroy element at ptr + i * elem_size
+                const cond_blk = try fb.newBlock("destroy_slice.cond");
+                const body_blk = try fb.newBlock("destroy_slice.body");
+                const done_blk = try fb.newBlock("destroy_slice.done");
+                const counter_local = try fb.addLocal(.{ .name = "__slice_i", .type_idx = TypeRegistry.I64, .mutable = true, .size = 8, .is_param = false });
+                const zero = try fb.emitConstInt(0, TypeRegistry.I64, span);
+                _ = try fb.emitStoreLocal(counter_local, zero, span);
+                _ = try fb.emitJump(cond_blk, span);
+                fb.setBlock(cond_blk);
+                const idx = try fb.emitLoadLocal(counter_local, TypeRegistry.I64, span);
+                const cond = try fb.emitBinary(.lt, idx, slice_len, TypeRegistry.BOOL, span);
+                _ = try fb.emitBranch(cond, body_blk, done_blk, span);
+                fb.setBlock(body_blk);
+                const offset = try fb.emitBinary(.mul, idx, try fb.emitConstInt(aligned_elem_size, TypeRegistry.I64, span), TypeRegistry.I64, span);
+                const elem_addr = try fb.emitBinary(.add, slice_ptr, offset, TypeRegistry.I64, span);
+                const elem_val = try fb.emitPtrLoadValue(elem_addr, info.slice.elem, span);
+                try self.emitDestroyValue(fb, elem_val, info.slice.elem, span);
+                const one = try fb.emitConstInt(1, TypeRegistry.I64, span);
+                const next_idx = try fb.emitBinary(.add, idx, one, TypeRegistry.I64, span);
+                _ = try fb.emitStoreLocal(counter_local, next_idx, span);
+                _ = try fb.emitJump(cond_blk, span);
+                fb.setBlock(done_blk);
             }
             return;
         }
