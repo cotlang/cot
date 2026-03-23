@@ -2650,6 +2650,9 @@ test "extern struct i64 field access" {
 
 packed struct PackedSmall { a: u8, b: u32, c: u8 }
 packed struct PackedTwo { x: i64, y: i64 }
+packed struct Ref { id: u32, type_id: u3, head: u29 }
+packed struct SignedBits { a: i3, b: u5 }
+packed struct CrossByte { lo: u6, hi: u10 }
 
 test "packed struct size" {
     @assertEq(@sizeOf(PackedSmall), 6)
@@ -2659,6 +2662,82 @@ test "packed struct i64 field access" {
     var p = PackedTwo { .x = 10, .y = 20 }
     @assertEq(p.x, 10)
     @assertEq(p.y, 20)
+}
+
+test "packed struct bitfield read" {
+    var r = Ref { .id = 42, .type_id = 2, .head = 0 }
+    @assertEq(r.id, 42)
+    @assertEq(r.type_id, 2)
+    @assertEq(r.head, 0)
+    @assertEq(@sizeOf(Ref), 8)
+}
+
+test "packed struct bitfield write" {
+    var r = Ref { .id = 42, .type_id = 2, .head = 100 }
+    @assertEq(r.type_id, 2)
+    r.type_id = 5
+    @assertEq(r.type_id, 5)
+    @assertEq(r.id, 42)
+    @assertEq(r.head, 100)
+}
+
+test "packed struct bitfield write first field" {
+    var r = Ref { .id = 42, .type_id = 2, .head = 100 }
+    r.id = 99
+    @assertEq(r.id, 99)
+    @assertEq(r.type_id, 2)
+    @assertEq(r.head, 100)
+}
+
+test "packed struct signed bitfield" {
+    var s = SignedBits { .a = -2, .b = 15 }
+    @assertEq(s.a, -2)
+    @assertEq(s.b, 15)
+}
+
+test "packed struct signed bitfield write" {
+    var s = SignedBits { .a = 1, .b = 10 }
+    s.a = -3
+    @assertEq(s.a, -3)
+    @assertEq(s.b, 10)
+}
+
+test "packed struct cross-byte field" {
+    var c = CrossByte { .lo = 33, .hi = 512 }
+    @assertEq(c.lo, 33)
+    @assertEq(c.hi, 512)
+    @assertEq(@sizeOf(CrossByte), 2)
+}
+
+test "packed struct bitCast to integer" {
+    var r = Ref { .id = 42, .type_id = 2, .head = 0 }
+    const raw = @bitCast(u64, r)
+    @assertEq(raw & 0xFFFFFFFF, 42)
+}
+
+test "packed struct bitCast roundtrip" {
+    var s = SignedBits { .a = -2, .b = 15 }
+    const raw = @bitCast(u8, s)
+    const s2 = @bitCast(SignedBits, raw)
+    @assertEq(s2.a, -2)
+    @assertEq(s2.b, 15)
+}
+
+packed struct InnerPacked { a: u3, b: u5 }
+packed struct OuterPacked { x: u16, inner: InnerPacked }
+
+test "nested packed struct chained access" {
+    var o = OuterPacked { .x = 42, .inner = InnerPacked { .a = 3, .b = 10 } }
+    @assertEq(o.inner.a, 3)
+    @assertEq(o.inner.b, 10)
+    @assertEq(o.x, 42)
+}
+
+test "nested packed struct via variable" {
+    var o = OuterPacked { .x = 99, .inner = InnerPacked { .a = 7, .b = 20 } }
+    var i = o.inner
+    @assertEq(i.a, 7)
+    @assertEq(i.b, 20)
 }
 
 // ============================================================================

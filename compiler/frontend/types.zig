@@ -246,7 +246,7 @@ pub const TypeRegistry = struct {
 
     /// Parse a type name like "u3", "u29" and return the bit width, or null if not a uN type.
     pub fn parseBitWidth(n: []const u8) ?u8 {
-        if (n.len >= 2 and n.len <= 3 and n[0] == 'u') {
+        if (n.len >= 2 and n.len <= 3 and (n[0] == 'u' or n[0] == 'i')) {
             var width: u32 = 0;
             for (n[1..]) |c| {
                 if (c >= '0' and c <= '9') {
@@ -260,11 +260,11 @@ pub const TypeRegistry = struct {
 
     pub fn lookupByName(self: *const TypeRegistry, n: []const u8) ?TypeIndex {
         if (self.name_map.get(n)) |idx| return idx;
-        // Support arbitrary-width unsigned integers: u1, u2, u3, ..., u63
+        // Support arbitrary-width integers: u1-u63, i1-i63
         // These map to the smallest standard type that contains them,
         // with bit_width set during packed struct field resolution.
-        // Zig reference: Type.zig — packed struct fields can be any uN.
-        if (n.len >= 2 and n.len <= 3 and n[0] == 'u') {
+        // Zig reference: Type.zig — packed struct fields can be any uN/iN.
+        if (n.len >= 2 and n.len <= 3 and (n[0] == 'u' or n[0] == 'i')) {
             var width: u32 = 0;
             var valid = true;
             for (n[1..]) |c| {
@@ -276,11 +276,18 @@ pub const TypeRegistry = struct {
                 }
             }
             if (valid and width >= 1 and width <= 64) {
-                // Map to smallest containing standard type
-                if (width <= 8) return U8;
-                if (width <= 16) return U16;
-                if (width <= 32) return U32;
-                return U64;
+                // Map to smallest containing standard type (signed or unsigned)
+                if (n[0] == 'i') {
+                    if (width <= 8) return I8;
+                    if (width <= 16) return I16;
+                    if (width <= 32) return I32;
+                    return I64;
+                } else {
+                    if (width <= 8) return U8;
+                    if (width <= 16) return U16;
+                    if (width <= 32) return U32;
+                    return U64;
+                }
             }
         }
         return null;

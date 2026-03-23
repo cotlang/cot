@@ -2692,6 +2692,12 @@ pub const Lowerer = struct {
                 for (struct_type.fields) |struct_field| {
                     if (std.mem.eql(u8, struct_field.name, field_init.name)) {
                         var fval = try self.lowerExprNode(field_init.value);
+                        // Mask value to bit_width (handles signed values with high bits set)
+                        if (struct_field.bit_width > 0 and struct_field.bit_width < 64) {
+                            const mask_val: i64 = (@as(i64, 1) << @intCast(struct_field.bit_width)) - 1;
+                            const mask = try fb.emitConstInt(mask_val, TypeRegistry.I64, span);
+                            fval = try fb.emitBinary(.bit_and, fval, mask, TypeRegistry.I64, span);
+                        }
                         // Shift left by bit_offset
                         if (struct_field.bit_offset > 0) {
                             const shift = try fb.emitConstInt(@intCast(struct_field.bit_offset), TypeRegistry.I64, span);
@@ -3308,6 +3314,69 @@ pub const Lowerer = struct {
             },
             else => return,
         };
+
+        // Bitfield packed struct write: read-modify-write pattern
+        // Zig reference: load backing int, clear field bits, OR in new value, store back
+        if (struct_type.backing_int != 0) {
+            for (struct_type.fields) |field| {
+                if (std.mem.eql(u8, field.name, fa.field)) {
+                    if (field.bit_width > 0) {
+                        const backing_type = struct_type.backing_int;
+                        const base_node = self.tree.getNode(fa.base) orelse return;
+                        const base_expr = base_node.asExpr() orelse return;
+
+                        // Mask the new value to bit_width bits
+                        var masked_val = value_node;
+                        if (field.bit_width < 64) {
+                            const mask_val: i64 = (@as(i64, 1) << @intCast(field.bit_width)) - 1;
+                            const mask = try fb.emitConstInt(mask_val, TypeRegistry.I64, span);
+                            masked_val = try fb.emitBinary(.bit_and, value_node, mask, TypeRegistry.I64, span);
+                        }
+
+                        // Shift the masked value to its bit position
+                        var shifted_val = masked_val;
+                        if (field.bit_offset > 0) {
+                            const shift = try fb.emitConstInt(@intCast(field.bit_offset), TypeRegistry.I64, span);
+                            shifted_val = try fb.emitBinary(.shl, masked_val, shift, TypeRegistry.I64, span);
+                        }
+
+                        // Build the clear mask: ~(field_mask << bit_offset)
+                        const field_mask: i64 = (@as(i64, 1) << @intCast(field.bit_width)) - 1;
+                        const clear_mask: i64 = ~(field_mask << @intCast(field.bit_offset));
+
+                        if (base_type == .pointer) {
+                            // Pointer path: load via pointer, RMW, store back
+                            const ptr_val = try self.lowerExprNode(fa.base);
+                            var backing_val = try fb.emitFieldValue(ptr_val, 0, 0, backing_type, span);
+                            const clear = try fb.emitConstInt(clear_mask, TypeRegistry.I64, span);
+                            backing_val = try fb.emitBinary(.bit_and, backing_val, clear, TypeRegistry.I64, span);
+                            backing_val = try fb.emitBinary(.bit_or, backing_val, shifted_val, TypeRegistry.I64, span);
+                            _ = try fb.emitStoreFieldValue(ptr_val, 0, 0, backing_val, span);
+                        } else if (base_expr == .ident) {
+                            if (fb.lookupLocal(base_expr.ident.name)) |local_idx| {
+                                // Local path: load local, RMW, store back
+                                var backing_val = try fb.emitLoadLocal(local_idx, backing_type, span);
+                                const clear = try fb.emitConstInt(clear_mask, TypeRegistry.I64, span);
+                                backing_val = try fb.emitBinary(.bit_and, backing_val, clear, TypeRegistry.I64, span);
+                                backing_val = try fb.emitBinary(.bit_or, backing_val, shifted_val, TypeRegistry.I64, span);
+                                _ = try fb.emitStoreLocal(local_idx, backing_val, span);
+                            } else if (self.builder.lookupGlobal(base_expr.ident.name)) |g| {
+                                // Global path: load via global addr, RMW, store back
+                                const ptr_type = self.type_reg.makePointer(base_type_idx) catch TypeRegistry.VOID;
+                                const global_addr = try fb.emitAddrGlobal(g.idx, base_expr.ident.name, ptr_type, span);
+                                var backing_val = try fb.emitFieldValue(global_addr, 0, 0, backing_type, span);
+                                const clear = try fb.emitConstInt(clear_mask, TypeRegistry.I64, span);
+                                backing_val = try fb.emitBinary(.bit_and, backing_val, clear, TypeRegistry.I64, span);
+                                backing_val = try fb.emitBinary(.bit_or, backing_val, shifted_val, TypeRegistry.I64, span);
+                                _ = try fb.emitStoreFieldValue(global_addr, 0, 0, backing_val, span);
+                            }
+                        }
+                    }
+                    return;
+                }
+            }
+            return;
+        }
 
         // WasmGC path: use gc_struct_set instead of offset-based stores
         if (self.target.isWasmGC()) {
@@ -5504,6 +5573,19 @@ pub const Lowerer = struct {
             // Find the field and emit addr+offset
             for (struct_type_info.fields) |field| {
                 if (std.mem.eql(u8, field.name, fa.field)) {
+                    // Packed struct bitfield: cannot take address of non-byte-aligned field
+                    // Zig reference: requires PackedOffset pointer type metadata
+                    if (struct_type_info.backing_int != 0 and field.bit_width > 0) {
+                        if (field.bit_offset != 0 or (field.bit_width % 8) != 0) {
+                            self.err.errorAt(addr.span.start, "cannot take address of packed struct bitfield");
+                            return ir.null_node;
+                        }
+                        // Byte-aligned bitfield: can take address at byte offset
+                        const byte_offset: i64 = @intCast(field.bit_offset / 8);
+                        const field_ptr_type = self.type_reg.makePointer(field.type_idx) catch TypeRegistry.VOID;
+                        if (byte_offset == 0) return base_addr;
+                        return try fb.emitAddrOffset(base_addr, byte_offset, field_ptr_type, addr.span);
+                    }
                     const field_ptr_type = self.type_reg.makePointer(field.type_idx) catch TypeRegistry.VOID;
                     if (field.offset == 0) return base_addr;
                     return try fb.emitAddrOffset(base_addr, @intCast(field.offset), field_ptr_type, addr.span);
@@ -5759,6 +5841,18 @@ pub const Lowerer = struct {
                 backing_val = try fb.emitBinary(.bit_and, backing_val, mask, TypeRegistry.I64, fa.span);
             }
 
+            // Sign extension for signed bitfield types (iN)
+            // Zig reference: arithmetic right shift to propagate sign bit
+            // Pattern: (value << (64 - bit_width)) >>s (64 - bit_width)
+            // IR .shr maps to SSA .sar (arithmetic shift right) — correct for sign extension
+            const field_type_info = self.type_reg.get(field_type);
+            if (field_type_info == .basic and field_type_info.basic.isSigned() and field_bit_width < 64) {
+                const shift_amount: i64 = 64 - @as(i64, field_bit_width);
+                const shift_const = try fb.emitConstInt(shift_amount, TypeRegistry.I64, fa.span);
+                backing_val = try fb.emitBinary(.shl, backing_val, shift_const, TypeRegistry.I64, fa.span);
+                backing_val = try fb.emitBinary(.shr, backing_val, shift_const, TypeRegistry.I64, fa.span);
+            }
+
             return backing_val;
         }
 
@@ -5780,12 +5874,23 @@ pub const Lowerer = struct {
         const base_node = self.tree.getNode(fa.base) orelse return ir.null_node;
         const base_expr = base_node.asExpr() orelse return ir.null_node;
 
+        // When loading a field that is itself a packed struct with backing_int,
+        // use the backing_int type for the load so the value is integer-typed.
+        // This ensures chained access (outer.inner.a) gets a proper integer for bitfield extraction.
+        const effective_field_type = blk: {
+            const fti = self.type_reg.get(field_type);
+            if (fti == .struct_type and fti.struct_type.backing_int != 0) {
+                break :blk fti.struct_type.backing_int;
+            }
+            break :blk field_type;
+        };
+
         if (base_expr == .ident and !base_is_pointer) {
-            if (fb.lookupLocal(base_expr.ident.name)) |local_idx| return try fb.emitFieldLocal(local_idx, field_idx, field_offset, field_type, fa.span);
+            if (fb.lookupLocal(base_expr.ident.name)) |local_idx| return try fb.emitFieldLocal(local_idx, field_idx, field_offset, effective_field_type, fa.span);
             if (self.builder.lookupGlobal(base_expr.ident.name)) |g| {
                 const ptr_type = self.type_reg.makePointer(g.global.type_idx) catch TypeRegistry.VOID;
                 const global_addr = try fb.emitAddrGlobal(g.idx, base_expr.ident.name, ptr_type, fa.span);
-                return try fb.emitFieldValue(global_addr, field_idx, field_offset, field_type, fa.span);
+                return try fb.emitFieldValue(global_addr, field_idx, field_offset, effective_field_type, fa.span);
             }
         }
 
@@ -5797,10 +5902,10 @@ pub const Lowerer = struct {
             if (operand_type == .pointer and self.type_reg.get(operand_type.pointer.elem) == .pointer) {
                 const outer_ptr = try self.lowerExprNode(base_expr.deref.operand);
                 const inner_ptr = try fb.emitPtrLoadValue(outer_ptr, operand_type.pointer.elem, fa.span);
-                return try fb.emitFieldValue(inner_ptr, field_idx, field_offset, field_type, fa.span);
+                return try fb.emitFieldValue(inner_ptr, field_idx, field_offset, effective_field_type, fa.span);
             }
             const ptr_val = try self.lowerExprNode(base_expr.deref.operand);
-            return try fb.emitFieldValue(ptr_val, field_idx, field_offset, field_type, fa.span);
+            return try fb.emitFieldValue(ptr_val, field_idx, field_offset, effective_field_type, fa.span);
         }
 
         if (base_expr == .index) {
@@ -5851,7 +5956,7 @@ pub const Lowerer = struct {
         if (base_expr == .field_access and !base_is_pointer) {
             const base_addr = try self.resolveStructFieldAddr(fa.base);
             if (base_addr != ir.null_node) {
-                return try fb.emitFieldValue(base_addr, field_idx, field_offset, field_type, fa.span);
+                return try fb.emitFieldValue(base_addr, field_idx, field_offset, effective_field_type, fa.span);
             }
         }
 
@@ -5864,10 +5969,10 @@ pub const Lowerer = struct {
             const type_size = self.type_reg.sizeOf(base_type_idx);
             const tmp_local = try fb.addLocalWithSize("__field_tmp", base_type_idx, false, @intCast(type_size));
             _ = try fb.emitStoreLocal(tmp_local, base_val, fa.span);
-            return try fb.emitFieldLocal(tmp_local, field_idx, field_offset, field_type, fa.span);
+            return try fb.emitFieldLocal(tmp_local, field_idx, field_offset, effective_field_type, fa.span);
         }
 
-        return try fb.emitFieldValue(base_val, field_idx, field_offset, field_type, fa.span);
+        return try fb.emitFieldValue(base_val, field_idx, field_offset, effective_field_type, fa.span);
     }
 
     fn lowerIndex(self: *Lowerer, idx: ast.Index) Error!ir.NodeIndex {
@@ -6228,6 +6333,33 @@ pub const Lowerer = struct {
                 }
             }
             return try self.emitGcStructNewExpanded(type_name, struct_type, field_values, struct_type_idx, si.span);
+        }
+
+        // Bitfield packed struct expr: build backing integer from shifted field values
+        // Must match lowerStructInit's bitfield path exactly
+        if (struct_type.backing_int != 0) {
+            var result = try fb.emitConstInt(0, struct_type.backing_int, si.span);
+            for (si.fields) |field_init| {
+                for (struct_type.fields) |struct_field| {
+                    if (std.mem.eql(u8, struct_field.name, field_init.name)) {
+                        var fval = try self.lowerExprNode(field_init.value);
+                        // Mask value to bit_width (handles signed values)
+                        if (struct_field.bit_width > 0 and struct_field.bit_width < 64) {
+                            const mask_val: i64 = (@as(i64, 1) << @intCast(struct_field.bit_width)) - 1;
+                            const mask = try fb.emitConstInt(mask_val, TypeRegistry.I64, si.span);
+                            fval = try fb.emitBinary(.bit_and, fval, mask, TypeRegistry.I64, si.span);
+                        }
+                        // Shift left by bit_offset
+                        if (struct_field.bit_offset > 0) {
+                            const shift = try fb.emitConstInt(@intCast(struct_field.bit_offset), TypeRegistry.I64, si.span);
+                            fval = try fb.emitBinary(.shl, fval, shift, TypeRegistry.I64, si.span);
+                        }
+                        result = try fb.emitBinary(.bit_or, result, fval, TypeRegistry.I64, si.span);
+                        break;
+                    }
+                }
+            }
+            return result;
         }
 
         const size = self.type_reg.sizeOf(struct_type_idx);
@@ -10727,6 +10859,18 @@ pub const Lowerer = struct {
                 {
                     // f64 → i64: Wasm i64.reinterpret_f64 (0xBD)
                     return fb.emit(ir.Node.init(.{ .unary = .{ .op = .i64_reinterpret_f64, .operand = value } }, TypeRegistry.I64, bc.span));
+                }
+                // Packed struct ↔ integer: no-op reinterpret (same backing representation)
+                // Zig reference: InternPool.zig backing_int_ty — packed struct IS its backing int
+                if (source_info == .struct_type and source_info.struct_type.backing_int != 0 and
+                    target_info == .basic and target_info.basic.isInteger())
+                {
+                    return value;
+                }
+                if (target_info == .struct_type and target_info.struct_type.backing_int != 0 and
+                    source_info == .basic and source_info.basic.isInteger())
+                {
+                    return value;
                 }
                 // For same-size integer types, identity operation
                 return value;
