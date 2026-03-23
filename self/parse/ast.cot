@@ -647,7 +647,7 @@ struct Ast {
     }
 
     fn addNode(n: Node) int {
-        const idx = self.nodes.count
+        const idx = self.nodes.len()
         self.nodes.append(n)
         return idx
     }
@@ -665,7 +665,7 @@ struct Ast {
     }
 
     fn addSelectCase(sc: SelectCase) int {
-        const idx = self.select_cases.count
+        const idx = self.select_cases.len()
         self.select_cases.append(sc)
         return idx
     }
@@ -681,12 +681,12 @@ struct Ast {
     /// Get node at index, returning null for null_node or out-of-bounds indices.
     fn getNodeOpt(idx: int) ?Node {
         if (idx == null_node) { return null }
-        if (idx < 0 or idx >= self.nodes.count) { return null }
+        if (idx < 0 or idx >= self.nodes.len()) { return null }
         return self.nodes.get(idx)
     }
 
     fn nodeCount() int {
-        return self.nodes.count
+        return self.nodes.len()
     }
 
     /// Check if node at idx is a Decl.
@@ -722,7 +722,7 @@ struct Ast {
 
     fn getImports() List(string) {
         var imports: List(string) = .{}
-        for i in 0..self.file_decls.count {
+        for i in 0..self.file_decls.len() {
             const decl_idx = self.file_decls.get(i)
             const node = self.getNode(decl_idx)
             switch (node) {
@@ -1422,7 +1422,7 @@ test "Ast addStmt block" {
     switch (node) {
         Node.stmt |st| => {
             switch (st) {
-                Stmt.block_stmt |b| => @assertEq(b.stmts.count, 2),
+                Stmt.block_stmt |b| => @assertEq(b.stmts.len(), 2),
                 else => @assert(false),
             }
         },
@@ -1437,7 +1437,7 @@ test "Ast file_decls" {
     const test_n = ast.addDecl(Decl.test_decl(TestDecl { .name = "basic", .body = null_node, .span = s }))
     ast.file_decls.append(imp)
     ast.file_decls.append(test_n)
-    @assertEq(ast.file_decls.count, 2)
+    @assertEq(ast.file_decls.len(), 2)
     @assertEq(ast.file_decls.get(0), imp)
     @assertEq(ast.file_decls.get(1), test_n)
 }

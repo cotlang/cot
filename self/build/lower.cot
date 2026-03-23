@@ -267,19 +267,19 @@ struct Lowerer {
 
     /// Lower all root declarations into the builder.
     fn lowerToBuilder() void {
-        debug(.lower, "=== Lowering AST to IR (${self.tree.file_decls.count} declarations) ===")
-        for i in 0..self.tree.file_decls.count {
+        debug(.lower, "=== Lowering AST to IR (${self.tree.file_decls.len()} declarations) ===")
+        for i in 0..self.tree.file_decls.len() {
             const decl_idx = self.tree.file_decls.get(i)
             self.lowerDecl(decl_idx)
         }
         self.lowerQueuedGenericFunctions()
         self.emitPendingAutoDeinits()
-        debug(.lower, "=== Lowering complete: ${self.builder.funcs.count} IR functions generated ===")
+        debug(.lower, "=== Lowering complete: ${self.builder.funcs.len()} IR functions generated ===")
     }
 
     /// Generate test runner: main() that calls each test and reports pass/fail.
     fn generateTestRunner() void {
-        if (self.test_names.count == 0) { return }
+        if (self.test_names.len() == 0) { return }
         const span = Span.zero()
         self.builder.startFunc("main", VOID, I64, span)
         if (self.builder.func()) |fb| {
@@ -300,7 +300,7 @@ struct Lowerer {
             const pass_count = fb.addLocalWithSize("__pass_count", I64, true, 8)
             fb.emitStoreLocal(pass_count, zero_init, span)
 
-            for i in 0..self.test_names.count {
+            for i in 0..self.test_names.len() {
                 const test_name = self.test_names.get(i)
                 const display_name = self.test_display_names.get(i)
 
@@ -382,7 +382,7 @@ struct Lowerer {
 
     /// Generate bench runner: main() that warms up, calibrates, and measures each benchmark.
     fn generateBenchRunner() void {
-        if (self.bench_names.count == 0) { return }
+        if (self.bench_names.len() == 0) { return }
         const span = Span.zero()
         self.builder.startFunc("main", VOID, I64, span)
         if (self.builder.func()) |fb| {
@@ -396,7 +396,7 @@ struct Lowerer {
             const discard_local = fb.addLocalWithSize("__bench_discard", I64, true, 8)
             const loop_counter = fb.addLocalWithSize("__bench_i", I64, true, 8)
 
-            for i in 0..self.bench_names.count {
+            for i in 0..self.bench_names.len() {
                 const bench_name = self.bench_names.get(i)
                 const display_name = self.bench_display_names.get(i)
 
@@ -462,7 +462,7 @@ struct Lowerer {
             }
 
             // Summary
-            const bench_count = fb.emitConstInt(self.bench_names.count, I64, span)
+            const bench_count = fb.emitConstInt(self.bench_names.len(), I64, span)
             var sum_args: List(int) = .{}
             sum_args.append(bench_count)
             fb.emitCall("__bench_summary", sum_args, false, VOID, span)
@@ -483,10 +483,10 @@ struct Lowerer {
         self.builder.startFunc(name, VOID, VOID, span)
         if (self.builder.func()) |fb| {
             self.clearPerFunctionState()
-            for i in 0..self.pending_global_inits.count {
+            for i in 0..self.pending_global_inits.len() {
                 const gi = self.pending_global_inits.get(i)
                 // Skip invalid node indices (can happen with cross-file generic globals)
-                if (gi.value_node < 0 or gi.value_node >= self.tree.nodes.count) { continue }
+                if (gi.value_node < 0 or gi.value_node >= self.tree.nodes.len()) { continue }
                 const node = self.tree.getNode(gi.value_node)
                 switch (node) { Node.expr |e| => {
                     const value = self.lowerExpr(e, gi.value_node)
@@ -529,10 +529,10 @@ struct Lowerer {
 
     fn lowerFnDecl(fn_decl: FnDecl) void {
         if (fn_decl.is_extern) { return }
-        if (fn_decl.type_params.count > 0) { return }  // Generic — lowered on demand
+        if (fn_decl.type_params.len() > 0) { return }  // Generic — lowered on demand
         if ((self.test_mode or self.bench_mode) and fn_decl.name == "main") { return }
 
-        debug(.lower, "  lower fn '${fn_decl.name}' (${fn_decl.params.count} params, async=${fn_decl.is_async}, export=${fn_decl.is_export})")
+        debug(.lower, "  lower fn '${fn_decl.name}' (${fn_decl.params.len()} params, async=${fn_decl.is_async}, export=${fn_decl.is_export})")
 
         // Async functions get special lowering (native fiber pattern)
         if (fn_decl.is_async) {
@@ -562,7 +562,7 @@ struct Lowerer {
             }
 
             // Add regular parameters
-            for i in 0..fn_decl.params.count {
+            for i in 0..fn_decl.params.len() {
                 const param_idx = fn_decl.params.get(i)
                 self.addParamFromNode(param_idx)
             }
@@ -606,7 +606,7 @@ struct Lowerer {
             if (uses_sret) {
                 fb.addParam("__sret", I64, 8)
             }
-            for i in 0..fn_decl.params.count {
+            for i in 0..fn_decl.params.len() {
                 const param_idx = fn_decl.params.get(i)
                 self.addParamFromNode(param_idx)
             }
@@ -632,7 +632,7 @@ struct Lowerer {
     // ========================================================================
 
     fn lowerStructDecl(struct_decl: StructDecl) void {
-        if (struct_decl.type_params.count > 0) { return }  // Generic — instantiated on demand
+        if (struct_decl.type_params.len() > 0) { return }  // Generic — instantiated on demand
         const struct_type_idx = self.types.lookupByName(struct_decl.name)
         if (struct_type_idx < 0) {
             self.builder.addStruct(StructDef { name: struct_decl.name, type_idx: 0, span: struct_decl.span })
@@ -641,7 +641,7 @@ struct Lowerer {
         }
 
         // Nested declarations (inferred impl)
-        for i in 0..struct_decl.nested_decls.count {
+        for i in 0..struct_decl.nested_decls.len() {
             const nested_idx = struct_decl.nested_decls.get(i)
             switch (self.tree.getNode(nested_idx)) {
                 Node.decl |nd| => switch (nd) {
@@ -667,7 +667,7 @@ struct Lowerer {
     fn lowerEnumDecl(ed: EnumDecl) void {
         // Enum variants don't generate code — registered during checking
         // But nested fn_decl methods (inferred impl) do
-        for i in 0..ed.nested_decls.count {
+        for i in 0..ed.nested_decls.len() {
             const nested_idx = ed.nested_decls.get(i)
             switch (self.tree.getNode(nested_idx)) {
                 Node.decl |nd| => switch (nd) {
@@ -683,8 +683,8 @@ struct Lowerer {
     }
 
     fn lowerImplBlock(impl_block: ImplBlock) void {
-        if (impl_block.type_params.count > 0) { return }  // Generic — lowered via queue
-        for i in 0..impl_block.methods.count {
+        if (impl_block.type_params.len() > 0) { return }  // Generic — lowered via queue
+        for i in 0..impl_block.methods.len() {
             const method_idx = impl_block.methods.get(i)
             switch (self.tree.getNode(method_idx)) {
                 Node.decl |d| => switch (d) {
@@ -700,7 +700,7 @@ struct Lowerer {
     }
 
     fn lowerImplTraitBlock(impl_trait: ImplTraitBlock) void {
-        for i in 0..impl_trait.methods.count {
+        for i in 0..impl_trait.methods.len() {
             const method_idx = impl_trait.methods.get(i)
             switch (self.tree.getNode(method_idx)) {
                 Node.decl |d| => switch (d) {
@@ -823,7 +823,7 @@ struct Lowerer {
         }
 
         const type_size = self.types.sizeOf(type_idx)
-        const global_idx = self.builder.globals.count
+        const global_idx = self.builder.globals.len()
         self.builder.addGlobal(Global.initWithSize(var_decl.name, type_idx, var_decl.is_const, var_decl.span, type_size))
 
         // Queue non-folded initializers for __cot_init_globals
@@ -864,7 +864,7 @@ struct Lowerer {
                     if (self.builder.func()) |fb| {
                         const scope_depth = fb.markScopeEntry()
                         var terminated = false
-                        for i in 0..be.stmts.count {
+                        for i in 0..be.stmts.len() {
                             const stmt_idx = be.stmts.get(i)
                             const stmt_node = self.tree.getNode(stmt_idx)
                             const inner_stmt = asStmt(stmt_node)
@@ -923,9 +923,9 @@ struct Lowerer {
             },
             Stmt.block_stmt |block| => {
                 if (self.builder.func()) |fb| {
-                    const cleanup_depth = self.cleanup_stack.count
+                    const cleanup_depth = self.cleanup_stack.len()
                     const scope_depth = fb.markScopeEntry()
-                    for i in 0..block.stmts.count {
+                    for i in 0..block.stmts.len() {
                         const stmt_idx = block.stmts.get(i)
                         const stmt_node = self.tree.getNode(stmt_idx)
                         const inner_stmt = asStmt(stmt_node)
@@ -1632,7 +1632,7 @@ struct Lowerer {
             self.loop_stack.append(LoopContext {
                 cond_block: cont_block,
                 exit_block: exit_block,
-                cleanup_depth: self.cleanup_stack.count,
+                cleanup_depth: self.cleanup_stack.len(),
                 label: w.label,
             })
 
@@ -1691,7 +1691,7 @@ struct Lowerer {
 
                 self.loop_stack.append(LoopContext {
                     cond_block: cont_block, exit_block: exit_block,
-                    cleanup_depth: self.cleanup_stack.count, label: w.label,
+                    cleanup_depth: self.cleanup_stack.len(), label: w.label,
                 })
                 fb.setBlock(body_block)
                 const scope_depth = fb.markScopeEntry()
@@ -1739,7 +1739,7 @@ struct Lowerer {
 
             self.loop_stack.append(LoopContext {
                 cond_block: cont_block, exit_block: exit_block,
-                cleanup_depth: self.cleanup_stack.count, label: w.label,
+                cleanup_depth: self.cleanup_stack.len(), label: w.label,
             })
             fb.setBlock(body_block)
             const scope_depth = fb.markScopeEntry()
@@ -1851,7 +1851,7 @@ struct Lowerer {
             self.loop_stack.append(LoopContext {
                 cond_block: incr_block,
                 exit_block: exit_block,
-                cleanup_depth: self.cleanup_stack.count,
+                cleanup_depth: self.cleanup_stack.len(),
                 label: f.label,
             })
 
@@ -1940,7 +1940,7 @@ struct Lowerer {
         self.loop_stack.append(LoopContext {
             cond_block: incr_block,
             exit_block: exit_block,
-            cleanup_depth: self.cleanup_stack.count,
+            cleanup_depth: self.cleanup_stack.len(),
             label: f.label,
         })
 
@@ -2076,7 +2076,7 @@ struct Lowerer {
         self.loop_stack.append(LoopContext {
             cond_block: incr_block,
             exit_block: exit_block,
-            cleanup_depth: self.cleanup_stack.count,
+            cleanup_depth: self.cleanup_stack.len(),
             label: f.label,
         })
 
@@ -2133,7 +2133,7 @@ struct Lowerer {
         if (self.builder.func()) |fb| {
             // Check labeled block stack first (break :label value)
             if (label != "") {
-                var bi = self.labeled_block_stack.count - 1
+                var bi = self.labeled_block_stack.len() - 1
                 while (bi >= 0) {
                     const blk_ctx = self.labeled_block_stack.get(bi)
                     if (blk_ctx.label == label) {
@@ -2153,9 +2153,9 @@ struct Lowerer {
             }
 
             // Fall through to loop break handling
-            if (self.loop_stack.count == 0) { return }
+            if (self.loop_stack.len() == 0) { return }
             // Find matching loop context
-            var i = self.loop_stack.count - 1
+            var i = self.loop_stack.len() - 1
             while (i >= 0) {
                 const ctx = self.loop_stack.get(i)
                 if (label == "" or label == ctx.label) {
@@ -2171,8 +2171,8 @@ struct Lowerer {
 
     fn lowerContinue(label: string) void {
         if (self.builder.func()) |fb| {
-            if (self.loop_stack.count == 0) { return }
-            var i = self.loop_stack.count - 1
+            if (self.loop_stack.len() == 0) { return }
+            var i = self.loop_stack.len() - 1
             while (i >= 0) {
                 const ctx = self.loop_stack.get(i)
                 if (label == "" or label == ctx.label) {
@@ -2199,7 +2199,7 @@ struct Lowerer {
             fb.emitStoreLocal(tmp, value, ds.span)
 
             // Bind each destructured name to the corresponding field
-            for i in 0..ds.bindings.count {
+            for i in 0..ds.bindings.len() {
                 const binding_idx = ds.bindings.get(i)
                 const binding_node = self.tree.getNode(binding_idx)
                 var bind_name = ""
@@ -2481,10 +2481,10 @@ struct Lowerer {
             const left_type_idx = self.inferExprType(bin.left)
             if (self.chk.hasTypeSubstitution()) {
                 // Check if left type matches any substituted type param
-                for si in 0..self.chk.type_sub_vals.count {
+                for si in 0..self.chk.type_sub_vals.len() {
                     if (self.chk.type_sub_vals.get(si) == left_type_idx) {
                         // Find matching dict entry for this binary op (entry.op is Token value)
-                        for di in 0..self.current_dict_entries.count {
+                        for di in 0..self.current_dict_entries.len() {
                             const entry = self.current_dict_entries.get(di)
                             if (entry.kind == DICT_BINARY_OP and entry.op == bin.op) {
                                 const fn_ptr = fb.emitLoadLocal(self.current_dict_params.get(di), I64, bin.span)
@@ -2615,7 +2615,7 @@ struct Lowerer {
             // from the call parameter type, assignment target, etc.
             // Look up the field name in all known enum types.
             // Zig lower.zig:5568-5576
-            for ti in 0..self.types.types.count {
+            for ti in 0..self.types.types.len() {
                 const t = self.types.get(ti)
                 if (t.tag == TAG_ENUM) {
                     const et = switch (t) { Type.enum_type |e| => e, else => EnumType { name: "", variant_count: 0, variants: 0, backing_type: 0 } }
@@ -2757,7 +2757,7 @@ struct Lowerer {
             }
         }
 
-        // List .count (common pattern)
+        // List .count field access (legacy pattern)
         if (type_info.tag == TAG_LIST and fa.field == "count") {
             const base = self.lowerExprNode(fa.base)
             if (base == null_node) { return null_node }
@@ -2938,7 +2938,7 @@ struct Lowerer {
                     // Try comptime index first (direct element emission)
                     if (self.chk.evalComptimeValue(ie.idx)) |iv| {
                         if (iv.asInt()) |i_val| {
-                            if (i_val >= 0 and i_val < base_cv.array.elements.count) {
+                            if (i_val >= 0 and i_val < base_cv.array.elements.len()) {
                                 const elem = base_cv.array.elements.get(i_val)
                                 return self.emitComptimeValue(elem, ie.span)
                             }
@@ -2949,7 +2949,7 @@ struct Lowerer {
                     const index_node = self.lowerExprNode(ie.idx)
                     var ct_elem_size = 8
                     var ct_elem_type = I64
-                    if (base_cv.array.elements.count > 0) {
+                    if (base_cv.array.elements.len() > 0) {
                         const first = base_cv.array.elements.get(0)
                         if (first.tag == CV_STRING) {
                             ct_elem_size = self.types.sizeOf(STRING)
@@ -3315,15 +3315,15 @@ struct Lowerer {
 
     fn lowerArrayLiteral(al: ArrayLiteral, idx: int) int {
         const fb = self.builder.func() orelse return null_node
-        if (al.elements.count == 0) { return null_node }
+        if (al.elements.len() == 0) { return null_node }
 
         const first_elem_type = self.inferExprType(al.elements.get(0))
         const elem_size = self.types.sizeOf(first_elem_type)
-        const array_type = self.types.makeArray(first_elem_type, al.elements.count)
+        const array_type = self.types.makeArray(first_elem_type, al.elements.len())
         const array_size = self.types.sizeOf(array_type)
 
         const local_idx = fb.addLocalWithSize("__arr", array_type, false, array_size)
-        for i in 0..al.elements.count {
+        for i in 0..al.elements.len() {
             const elem_idx = al.elements.get(i)
             const elem = self.lowerExprNode(elem_idx)
             if (elem != null_node) {
@@ -3348,7 +3348,7 @@ struct Lowerer {
             const type_idx = self.types.lookupByName(ident_name)
             if (type_idx >= 0) {
                 const type_info = self.types.get(type_idx)
-                if (type_info.tag == TAG_DISTINCT and c.args.count == 1) {
+                if (type_info.tag == TAG_DISTINCT and c.args.len() == 1) {
                     return self.lowerExprNode(c.args.get(0))
                 }
             }
@@ -3444,7 +3444,7 @@ struct Lowerer {
         const func_type_info = self.types.get(func_type_idx)
         const param_count = switch (func_type_info) { Type.func |ft| => ft.param_count, else => 0 }
 
-        for i in 0..c.args.count {
+        for i in 0..c.args.len() {
             const arg_idx = c.args.get(i)
 
             // Determine parameter type for ABI decomposition
@@ -3615,7 +3615,7 @@ struct Lowerer {
         const ft_info = self.types.get(method_info.func_type)
         const m_param_count = switch (ft_info) { Type.func |ft| => ft.param_count, else => 0 }
 
-        for i in 0..call.args.count {
+        for i in 0..call.args.len() {
             const arg_idx = call.args.get(i)
 
             var param_is_pointer = false
@@ -3693,7 +3693,7 @@ struct Lowerer {
         if (self.has_dict_context) {
             const recv_type = self.inferExprType(fa.base)
             if (self.chk.hasTypeSubstitution()) {
-                for si in 0..self.chk.type_sub_vals.count {
+                for si in 0..self.chk.type_sub_vals.len() {
                     const sub_type = self.chk.type_sub_vals.get(si)
                     // Check if receiver is T or *T
                     var is_match = (sub_type == recv_type)
@@ -3701,7 +3701,7 @@ struct Lowerer {
                         is_match = (sub_type == self.types.pointerElem(recv_type))
                     }
                     if (is_match) {
-                        for di in 0..self.current_dict_entries.count {
+                        for di in 0..self.current_dict_entries.len() {
                             const entry = self.current_dict_entries.get(di)
                             if (entry.kind == DICT_METHOD_CALL and entry.method_name == fa.field) {
                                 const fn_ptr = fb.emitLoadLocal(self.current_dict_params.get(di), I64, call.span)
@@ -3711,7 +3711,7 @@ struct Lowerer {
                                     const sret_addr = fb.emitAddrLocal(sret_local, I64, call.span)
                                     var sret_args: List(int) = .{}
                                     sret_args.append(sret_addr)
-                                    for ai in 0..args.count {
+                                    for ai in 0..args.len() {
                                         sret_args.append(args.get(ai))
                                     }
                                     fb.emitCallIndirect(fn_ptr, sret_args, VOID, call.span)
@@ -3764,7 +3764,7 @@ struct Lowerer {
             const tmp = fb.addLocalWithSize("__union_tmp", union_type_idx, false, union_size)
             const tag_val = fb.emitConstInt(variant_idx, I64, fa.span)
             fb.emitStoreLocalField(tmp, 0, 0, tag_val, fa.span)
-            if (call.args.count > 0) {
+            if (call.args.len() > 0) {
                 const payload_val = self.lowerExprNode(call.args.get(0))
                 if (payload_val != null_node) {
                     fb.emitStoreLocalField(tmp, 1, 8, payload_val, fa.span)
@@ -3775,7 +3775,7 @@ struct Lowerer {
 
         // Single-word union
         var payload = null_node
-        if (call.args.count > 0) {
+        if (call.args.len() > 0) {
             payload = self.lowerExprNode(call.args.get(0))
         }
         return fb.emitUnionInit(variant_idx, payload, union_type_idx, fa.span)
@@ -3805,7 +3805,7 @@ struct Lowerer {
 
         // Build the concrete key: "funcName(typeIdx1;typeIdx2)"
         var key = gen_name ++ "("
-        for i in 0..inner_call.args.count {
+        for i in 0..inner_call.args.len() {
             const arg_node_idx = inner_call.args.get(i)
             const resolved = self.resolveTypeNode(arg_node_idx)
             if (i > 0) { key = key ++ ";" }
@@ -3827,7 +3827,7 @@ struct Lowerer {
         const cfunc_info_raw = self.types.get(if (concrete_func_type >= 0) { concrete_func_type } else { VOID })
         const c_param_count = switch (cfunc_info_raw) { Type.func |ft| => ft.param_count, else => 0 }
 
-        for i in 0..call.args.count {
+        for i in 0..call.args.len() {
             const arg_idx = call.args.get(i)
             var arg_node = self.lowerExprNode(arg_idx)
             if (arg_node == null_node) { continue }
@@ -3869,7 +3869,7 @@ struct Lowerer {
         const sret_addr = fb.emitAddrLocal(sret_local, I64, span)
         var sret_args: List(int) = .{}
         sret_args.append(sret_addr)
-        for i in 0..args.count {
+        for i in 0..args.len() {
             sret_args.append(args.get(i))
         }
         fb.emitCall(func_name, sret_args, false, VOID, span)
@@ -3970,7 +3970,7 @@ struct Lowerer {
 
     fn lowerBuiltinLen(call: Call) int {
         const fb = self.builder.func() orelse return null_node
-        if (call.args.count != 1) { return null_node }
+        if (call.args.len() != 1) { return null_node }
         const arg_idx = call.args.get(0)
 
         // Check if arg is a string literal — compile-time length
@@ -4029,7 +4029,7 @@ struct Lowerer {
 
     fn lowerBuiltinStringMake(call: Call) int {
         const fb = self.builder.func() orelse return null_node
-        if (call.args.count != 2) { return null_node }
+        if (call.args.len() != 2) { return null_node }
         const ptr_val = self.lowerExprNode(call.args.get(0))
         const len_val = self.lowerExprNode(call.args.get(1))
         if (ptr_val == null_node or len_val == null_node) { return null_node }
@@ -4047,7 +4047,7 @@ struct Lowerer {
 
     fn lowerBuiltinPrint(call: Call, is_println: bool, fd: int) int {
         const fb = self.builder.func() orelse return null_node
-        if (call.args.count != 1) { return null_node }
+        if (call.args.len() != 1) { return null_node }
         const arg_type = self.inferExprType(call.args.get(0))
         const type_info = self.types.get(arg_type)
         const is_integer = (type_info.tag == TAG_ENUM or
@@ -4094,7 +4094,7 @@ struct Lowerer {
 
     fn lowerBuiltinAppend(call: Call) int {
         const fb = self.builder.func() orelse return null_node
-        if (call.args.count != 2) { return null_node }
+        if (call.args.len() != 2) { return null_node }
 
         // Infer element type from slice
         const slice_type_idx = self.inferExprType(call.args.get(0))
@@ -4331,7 +4331,7 @@ struct Lowerer {
         // Reference: Zig compiler lower.zig lowerStringInterp (lines 2903-2993)
 
         var result = null_node
-        for i in 0..si.segments.count {
+        for i in 0..si.segments.len() {
             const seg_idx = si.segments.get(i)
             const seg_node = self.tree.getNode(seg_idx)
 
@@ -4460,7 +4460,7 @@ struct Lowerer {
             kind == BuiltinKind.enum_from_int or kind == BuiltinKind.int_from_bool or
             kind == BuiltinKind.align_cast or kind == BuiltinKind.const_cast or
             kind == BuiltinKind.type_of or kind == BuiltinKind.compile_error) {
-            if (bc.args.count > 0) {
+            if (bc.args.len() > 0) {
                 return self.lowerExprNode(bc.args.get(0))
             }
             return null_node
@@ -4487,7 +4487,7 @@ struct Lowerer {
         }
         if (kind == BuiltinKind.offset_of) {
             // @offsetOf(Type, "field") — compile-time offset
-            if (bc.args.count >= 1) {
+            if (bc.args.len() >= 1) {
                 const type_arg = self.resolveTypeNode(bc.type_arg)
                 // Get field name from first arg (should be a string literal)
                 var field_name = ""
@@ -4508,7 +4508,7 @@ struct Lowerer {
 
         // Cast/convert builtins
         if (kind == BuiltinKind.int_cast or kind == BuiltinKind.truncate) {
-            if (bc.args.count > 0) {
+            if (bc.args.len() > 0) {
                 const operand = self.lowerExprNode(bc.args.get(0))
                 if (operand == null_node) { return null_node }
                 const target_type = self.resolveTypeNode(bc.type_arg)
@@ -4517,7 +4517,7 @@ struct Lowerer {
             return null_node
         }
         if (kind == BuiltinKind.float_cast) {
-            if (bc.args.count > 0) {
+            if (bc.args.len() > 0) {
                 const operand = self.lowerExprNode(bc.args.get(0))
                 if (operand == null_node) { return null_node }
                 const target_type = self.resolveTypeNode(bc.type_arg)
@@ -4526,7 +4526,7 @@ struct Lowerer {
             return null_node
         }
         if (kind == BuiltinKind.float_from_int) {
-            if (bc.args.count > 0) {
+            if (bc.args.len() > 0) {
                 const operand = self.lowerExprNode(bc.args.get(0))
                 if (operand == null_node) { return null_node }
                 const target_type = self.resolveTypeNode(bc.type_arg)
@@ -4535,7 +4535,7 @@ struct Lowerer {
             return null_node
         }
         if (kind == BuiltinKind.int_from_float) {
-            if (bc.args.count > 0) {
+            if (bc.args.len() > 0) {
                 const operand = self.lowerExprNode(bc.args.get(0))
                 if (operand == null_node) { return null_node }
                 const target_type = self.resolveTypeNode(bc.type_arg)
@@ -4544,7 +4544,7 @@ struct Lowerer {
             return null_node
         }
         if (kind == BuiltinKind.ptr_cast) {
-            if (bc.args.count > 0) {
+            if (bc.args.len() > 0) {
                 const operand = self.lowerExprNode(bc.args.get(0))
                 if (operand == null_node) { return null_node }
                 const target_type = self.resolveTypeNode(bc.type_arg)
@@ -4553,7 +4553,7 @@ struct Lowerer {
             return null_node
         }
         if (kind == BuiltinKind.int_to_ptr) {
-            if (bc.args.count > 0) {
+            if (bc.args.len() > 0) {
                 const operand = self.lowerExprNode(bc.args.get(0))
                 if (operand == null_node) { return null_node }
                 const target_type = self.resolveTypeNode(bc.type_arg)
@@ -4562,7 +4562,7 @@ struct Lowerer {
             return null_node
         }
         if (kind == BuiltinKind.ptr_to_int) {
-            if (bc.args.count > 0) {
+            if (bc.args.len() > 0) {
                 const operand = self.lowerExprNode(bc.args.get(0))
                 if (operand == null_node) { return null_node }
                 const target_type = self.resolveTypeNode(bc.type_arg)
@@ -4571,7 +4571,7 @@ struct Lowerer {
             return null_node
         }
         if (kind == BuiltinKind.bit_cast) {
-            if (bc.args.count > 0) {
+            if (bc.args.len() > 0) {
                 return self.lowerExprNode(bc.args.get(0))  // identity at IR level
             }
             return null_node
@@ -4580,7 +4580,7 @@ struct Lowerer {
         // Math intrinsics (unary)
         if (kind == BuiltinKind.abs or kind == BuiltinKind.ceil or kind == BuiltinKind.floor or
             kind == BuiltinKind.trunc or kind == BuiltinKind.round or kind == BuiltinKind.sqrt) {
-            if (bc.args.count > 0) {
+            if (bc.args.len() > 0) {
                 const operand = self.lowerExprNode(bc.args.get(0))
                 if (operand == null_node) { return null_node }
                 const result_type = self.inferExprType(idx)
@@ -4597,7 +4597,7 @@ struct Lowerer {
 
         // Math intrinsics (binary)
         if (kind == BuiltinKind.fmin or kind == BuiltinKind.fmax) {
-            if (bc.args.count >= 2) {
+            if (bc.args.len() >= 2) {
                 const left = self.lowerExprNode(bc.args.get(0))
                 const right = self.lowerExprNode(bc.args.get(1))
                 if (left == null_node or right == null_node) { return null_node }
@@ -4610,7 +4610,7 @@ struct Lowerer {
 
         // @min / @max — store to locals before branch (br_table pattern)
         if (kind == BuiltinKind.min or kind == BuiltinKind.max) {
-            if (bc.args.count >= 2) {
+            if (bc.args.len() >= 2) {
                 const left = self.lowerExprNode(bc.args.get(0))
                 const right = self.lowerExprNode(bc.args.get(1))
                 if (left == null_node or right == null_node) { return null_node }
@@ -4633,7 +4633,7 @@ struct Lowerer {
 
         // Bit manipulation
         if (kind == BuiltinKind.ctz or kind == BuiltinKind.clz or kind == BuiltinKind.pop_count) {
-            if (bc.args.count > 0) {
+            if (bc.args.len() > 0) {
                 const operand = self.lowerExprNode(bc.args.get(0))
                 if (operand == null_node) { return null_node }
                 const result_type = self.inferExprType(idx)
@@ -4648,7 +4648,7 @@ struct Lowerer {
         // Memory/string builtins
         if (kind == BuiltinKind.@"string") {
             // @string(ptr, len) → string compound
-            if (bc.args.count >= 2) {
+            if (bc.args.len() >= 2) {
                 const ptr_val = self.lowerExprNode(bc.args.get(0))
                 const len_val = self.lowerExprNode(bc.args.get(1))
                 if (ptr_val == null_node or len_val == null_node) { return null_node }
@@ -4660,7 +4660,7 @@ struct Lowerer {
             return null_node
         }
         if (kind == BuiltinKind.ptr_of) {
-            if (bc.args.count > 0) {
+            if (bc.args.len() > 0) {
                 const val = self.lowerExprNode(bc.args.get(0))
                 if (val == null_node) { return null_node }
                 return fb.emitSlicePtr(val, I64, bc.span)
@@ -4668,7 +4668,7 @@ struct Lowerer {
             return null_node
         }
         if (kind == BuiltinKind.len_of) {
-            if (bc.args.count > 0) {
+            if (bc.args.len() > 0) {
                 const val = self.lowerExprNode(bc.args.get(0))
                 if (val == null_node) { return null_node }
                 return fb.emitSliceLen(val, bc.span)
@@ -4679,7 +4679,7 @@ struct Lowerer {
         // ARC management
         if (kind == BuiltinKind.arc_retain) {
             // Wasm uses bump allocator, no ARC — return arg directly (matches Zig line 10635)
-            if (bc.args.count > 0) {
+            if (bc.args.len() > 0) {
                 return self.lowerExprNode(bc.args.get(0))
             }
             return null_node
@@ -4691,7 +4691,7 @@ struct Lowerer {
 
         // Atomics
         if (kind == BuiltinKind.atomic_load) {
-            if (bc.args.count > 0) {
+            if (bc.args.len() > 0) {
                 const ptr = self.lowerExprNode(bc.args.get(0))
                 if (ptr == null_node) { return null_node }
                 const result_type = self.inferExprType(idx)
@@ -4700,7 +4700,7 @@ struct Lowerer {
             return null_node
         }
         if (kind == BuiltinKind.atomic_store) {
-            if (bc.args.count >= 2) {
+            if (bc.args.len() >= 2) {
                 const ptr = self.lowerExprNode(bc.args.get(0))
                 const val = self.lowerExprNode(bc.args.get(1))
                 if (ptr == null_node or val == null_node) { return null_node }
@@ -4709,7 +4709,7 @@ struct Lowerer {
             return null_node
         }
         if (kind == BuiltinKind.atomic_add) {
-            if (bc.args.count >= 2) {
+            if (bc.args.len() >= 2) {
                 const ptr = self.lowerExprNode(bc.args.get(0))
                 const val = self.lowerExprNode(bc.args.get(1))
                 if (ptr == null_node or val == null_node) { return null_node }
@@ -4718,7 +4718,7 @@ struct Lowerer {
             return null_node
         }
         if (kind == BuiltinKind.atomic_exchange) {
-            if (bc.args.count >= 2) {
+            if (bc.args.len() >= 2) {
                 const ptr = self.lowerExprNode(bc.args.get(0))
                 const val = self.lowerExprNode(bc.args.get(1))
                 if (ptr == null_node or val == null_node) { return null_node }
@@ -4727,7 +4727,7 @@ struct Lowerer {
             return null_node
         }
         if (kind == BuiltinKind.atomic_cas) {
-            if (bc.args.count >= 3) {
+            if (bc.args.len() >= 3) {
                 // CAS: ptr, expected, desired → old value
                 const ptr = self.lowerExprNode(bc.args.get(0))
                 const expected = self.lowerExprNode(bc.args.get(1))
@@ -4754,7 +4754,7 @@ struct Lowerer {
 
         // @assert — branch, test context → error EU return, else trap
         if (kind == BuiltinKind.assert) {
-            if (bc.args.count > 0) {
+            if (bc.args.len() > 0) {
                 const cond = self.lowerExprNode(bc.args.get(0))
                 if (cond == null_node) { return null_node }
 
@@ -4779,7 +4779,7 @@ struct Lowerer {
 
         // @assertEq — compare, then handle failure
         if (kind == BuiltinKind.assert_eq) {
-            if (bc.args.count >= 2) {
+            if (bc.args.len() >= 2) {
                 const left = self.lowerExprNode(bc.args.get(0))
                 const right = self.lowerExprNode(bc.args.get(1))
                 if (left == null_node or right == null_node) { return null_node }
@@ -4825,7 +4825,7 @@ struct Lowerer {
 
         // @panic — write message + trap
         if (kind == BuiltinKind.panic) {
-            if (bc.args.count > 0) {
+            if (bc.args.len() > 0) {
                 const msg = self.lowerExprNode(bc.args.get(0))
                 if (msg != null_node) {
                     const ptr = fb.emitSlicePtr(msg, I64, bc.span)
@@ -4858,7 +4858,7 @@ struct Lowerer {
 
         // @has_field — comptime check
         if (kind == BuiltinKind.has_field) {
-            if (bc.args.count >= 1) {
+            if (bc.args.len() >= 1) {
                 const type_arg = self.resolveTypeNode(bc.type_arg)
                 var field_name = ""
                 switch (self.tree.getNode(bc.args.get(0))) { Node.expr |e| => switch (e) {
@@ -4884,7 +4884,7 @@ struct Lowerer {
 
         // @embed_file — compile-time file read
         if (kind == BuiltinKind.embed_file) {
-            if (bc.args.count > 0) {
+            if (bc.args.len() > 0) {
                 // Extract path from string literal argument
                 var raw_path = ""
                 var found_path = false
@@ -4980,7 +4980,7 @@ struct Lowerer {
     /// @tag_name: enum value → string name via if-chain
     fn lowerTagName(bc: BuiltinCallExpr) int {
         const fb = self.builder.func() orelse return null_node
-        if (bc.args.count == 0) { return null_node }
+        if (bc.args.len() == 0) { return null_node }
         const val = self.lowerExprNode(bc.args.get(0))
         if (val == null_node) { return null_node }
 
@@ -5033,7 +5033,7 @@ struct Lowerer {
     /// Note: Map iteration not yet available in Cot — use runtime call instead
     fn lowerErrorName(bc: BuiltinCallExpr) int {
         const fb = self.builder.func() orelse return null_node
-        if (bc.args.count == 0) { return null_node }
+        if (bc.args.len() == 0) { return null_node }
         const val = self.lowerExprNode(bc.args.get(0))
         if (val == null_node) { return null_node }
 
@@ -5079,7 +5079,7 @@ struct Lowerer {
 
     /// Conservative check: do any switch arms potentially have side effects?
     fn switchArmsHaveCalls(se: SwitchExpr) bool {
-        for i in 0..se.cases.count {
+        for i in 0..se.cases.len() {
             const case_idx = se.cases.get(i)
             if (self.exprMayHaveSideEffects(case_idx)) { return true }
         }
@@ -5139,7 +5139,7 @@ struct Lowerer {
         }
 
         // Build nested selects in reverse case order
-        var i = se.cases.count
+        var i = se.cases.len()
         while (i > 0) {
             i = i - 1
             const case_idx = se.cases.get(i)
@@ -5153,7 +5153,7 @@ struct Lowerer {
 
             var case_cond = null_node
 
-            if (sc.is_range and sc.patterns.count >= 2) {
+            if (sc.is_range and sc.patterns.len() >= 2) {
                 // Range pattern in expression form
                 const range_start = self.lowerExprNode(sc.patterns.get(0))
                 const range_end = self.lowerExprNode(sc.patterns.get(1))
@@ -5161,7 +5161,7 @@ struct Lowerer {
                 const le_cond = fb.emitBinary(BinaryOp.le, subject, range_end, BOOL, se.span)
                 case_cond = fb.emitBinary(BinaryOp.@"and", ge_cond, le_cond, BOOL, se.span)
             } else {
-                for p in 0..sc.patterns.count {
+                for p in 0..sc.patterns.len() {
                     const pat_idx = sc.patterns.get(p)
                     const pattern_val = self.lowerExprNode(pat_idx)
                     if (pattern_val == null_node) { continue }
@@ -5220,7 +5220,7 @@ struct Lowerer {
 
         const merge_block = fb.newBlock("switch.end")
 
-        for i in 0..se.cases.count {
+        for i in 0..se.cases.len() {
             const case_idx = se.cases.get(i)
             var sc: SwitchCaseNode = undefined
             var found = false
@@ -5233,7 +5233,7 @@ struct Lowerer {
             const case_block = fb.newBlock("switch.case")
             // Match Zig compiler: last case reuses merge_block (or else_block) instead of creating extra block
             var next_block = merge_block
-            if (i + 1 < se.cases.count) {
+            if (i + 1 < se.cases.len()) {
                 next_block = fb.newBlock("switch.next")
             } else if (se.else_body != null_node) {
                 next_block = fb.newBlock("switch.else")
@@ -5241,7 +5241,7 @@ struct Lowerer {
 
             // Build condition: OR of all pattern matches
             var case_cond = null_node
-            for p in 0..sc.patterns.count {
+            for p in 0..sc.patterns.len() {
                 const pat_idx = sc.patterns.get(p)
                 const pat_val = self.lowerExprNode(pat_idx)
                 if (pat_val == null_node) { continue }
@@ -5329,7 +5329,7 @@ struct Lowerer {
 
         const merge_block = fb.newBlock("switch.end")
 
-        for i in 0..se.cases.count {
+        for i in 0..se.cases.len() {
             const case_idx = se.cases.get(i)
             var sc: SwitchCaseNode = undefined
             var found = false
@@ -5342,7 +5342,7 @@ struct Lowerer {
             const case_block = fb.newBlock("union.case")
             // Match Zig compiler: last case reuses merge_block (or else_block) instead of creating extra block
             var next_block = merge_block
-            if (i + 1 < se.cases.count) {
+            if (i + 1 < se.cases.len()) {
                 next_block = fb.newBlock("union.next")
             } else if (se.else_body != null_node) {
                 next_block = fb.newBlock("union.else")
@@ -5350,7 +5350,7 @@ struct Lowerer {
 
             // Match on tag value — find variant index from pattern
             var case_cond = null_node
-            for p in 0..sc.patterns.count {
+            for p in 0..sc.patterns.len() {
                 // Pattern is typically an ident or field_access — resolve to variant index
                 const pat_idx = sc.patterns.get(p)
                 const variant_idx = self.resolveUnionVariantIndex(subject_type, pat_idx)
@@ -5449,7 +5449,7 @@ struct Lowerer {
         // Get union type info
         const ut_info = self.types.get(subject_type)
 
-        for i in 0..se.cases.count {
+        for i in 0..se.cases.len() {
             const case_idx = se.cases.get(i)
             var sc: SwitchCaseNode = undefined
             var found = false
@@ -5462,7 +5462,7 @@ struct Lowerer {
             const case_block = fb.newBlock("union.gc.case")
             // Match Zig compiler: last case reuses merge_block (or else_block) instead of creating extra block
             var next_block = merge_block
-            if (i + 1 < se.cases.count) {
+            if (i + 1 < se.cases.len()) {
                 next_block = fb.newBlock("union.gc.next")
             } else if (se.else_body != null_node) {
                 next_block = fb.newBlock("union.gc.else")
@@ -5470,7 +5470,7 @@ struct Lowerer {
 
             // Match using ref.test for each pattern
             var case_cond = null_node
-            for p in 0..sc.patterns.count {
+            for p in 0..sc.patterns.len() {
                 const pat_idx = sc.patterns.get(p)
                 const variant_idx = self.resolveUnionVariantIndex(subject_type, pat_idx)
                 if (variant_idx >= 0) {
@@ -5573,7 +5573,7 @@ struct Lowerer {
         const result_local = fb.addLocalWithSize("__switch_result", result_type, true, self.types.sizeOf(result_type))
         const merge_block = fb.newBlock("switch.end")
 
-        for i in 0..se.cases.count {
+        for i in 0..se.cases.len() {
             const case_idx = se.cases.get(i)
             var sc: SwitchCaseNode = undefined
             var found = false
@@ -5586,14 +5586,14 @@ struct Lowerer {
             const case_block = fb.newBlock("switch.case")
             // Match Zig compiler: last case reuses merge_block (or else_block) instead of creating extra block
             var next_block = merge_block
-            if (i + 1 < se.cases.count) {
+            if (i + 1 < se.cases.len()) {
                 next_block = fb.newBlock("switch.next")
             } else if (se.else_body != null_node) {
                 next_block = fb.newBlock("switch.else")
             }
 
             var case_cond = null_node
-            for p in 0..sc.patterns.count {
+            for p in 0..sc.patterns.len() {
                 const pat_idx = sc.patterns.get(p)
                 const pat_val = self.lowerExprNode(pat_idx)
                 if (pat_val == null_node) { continue }
@@ -5690,7 +5690,7 @@ struct Lowerer {
             }
             if (has_arc_fields and self.types.lookupMethod(metadata_name, "deinit") < 0) {
                 var already_queued = false
-                for qi in 0..self.pending_auto_deinits.count {
+                for qi in 0..self.pending_auto_deinits.len() {
                     if (self.pending_auto_deinits.get(qi) == metadata_name) {
                         already_queued = true
                         break
@@ -5716,7 +5716,7 @@ struct Lowerer {
         fb.emitStoreLocal(ptr_local, ptr, ne.span)
 
         // Initialize fields
-        for i in 0..ne.fields.count {
+        for i in 0..ne.fields.len() {
             const field_init_idx = ne.fields.get(i)
             var fi_name = ""
             var fi_value = null_node
@@ -5753,12 +5753,12 @@ struct Lowerer {
         }
 
         // Constructor sugar: call init() after allocation
-        if (ne.is_constructor and ne.constructor_args.count > 0) {
+        if (ne.is_constructor and ne.constructor_args.len() > 0) {
             const init_name = ne.type_name ++ "_init"
             var init_args: List(int) = .{}
             const self_ptr = fb.emitLoadLocal(ptr_local, I64, ne.span)
             init_args.append(self_ptr)
-            for i in 0..ne.constructor_args.count {
+            for i in 0..ne.constructor_args.len() {
                 const arg = self.lowerExprNode(ne.constructor_args.get(i))
                 if (arg != null_node) { init_args.append(arg) }
             }
@@ -5774,14 +5774,14 @@ struct Lowerer {
 
     fn lowerTupleLiteral(tl: TupleLiteral, idx: int) int {
         const fb = self.builder.func() orelse return null_node
-        if (tl.elements.count == 0) { return null_node }
+        if (tl.elements.len() == 0) { return null_node }
 
         const tuple_type = self.inferExprType(idx)
         const tuple_size = self.types.sizeOf(tuple_type)
         const tmp = fb.addLocalWithSize("__tuple", tuple_type, false, tuple_size)
 
         var offset = 0
-        for i in 0..tl.elements.count {
+        for i in 0..tl.elements.len() {
             const elem_idx = tl.elements.get(i)
             const elem = self.lowerExprNode(elem_idx)
             if (elem != null_node) {
@@ -5818,7 +5818,7 @@ struct Lowerer {
         switch (type_info) { Type.struct_type |st| => {
             if (st.backing_int != 0) {
                 var result = fb.emitConstInt(0, st.backing_int, si.span)
-                for fi in 0..si.fields.count {
+                for fi in 0..si.fields.len() {
                     const field_init_idx = si.fields.get(fi)
                     var fi_name = ""
                     var fi_value = null_node
@@ -5853,7 +5853,7 @@ struct Lowerer {
 
         // Store each explicitly provided field
         switch (type_info) { Type.struct_type |st| => {
-            for fi in 0..si.fields.count {
+            for fi in 0..si.fields.len() {
                 const field_init_idx = si.fields.get(fi)
                 var fi_name = ""
                 var fi_value = null_node
@@ -5892,7 +5892,7 @@ struct Lowerer {
                 const field = st.getField(di)
                 if (field.default_value == null_node) { continue }
                 var provided = false
-                for fi in 0..si.fields.count {
+                for fi in 0..si.fields.len() {
                     const field_init_idx = si.fields.get(fi)
                     switch (self.tree.getNode(field_init_idx)) { Node.expr |e| => switch (e) {
                         Expr.field_init_node |fnode| => { if (fnode.name == field.name) { provided = true } },
@@ -5944,7 +5944,7 @@ struct Lowerer {
                     // Zig reference: lower.zig:2688-2715
                     if (st.backing_int != 0) {
                         var result = fb.emitConstInt(0, st.backing_int, span)
-                        for fi in 0..si.fields.count {
+                        for fi in 0..si.fields.len() {
                             const field_init_idx = si.fields.get(fi)
                             var fi_name = ""
                             var fi_value = null_node
@@ -5977,7 +5977,7 @@ struct Lowerer {
                     }
 
                     // Store each explicitly provided field
-                    for fi in 0..si.fields.count {
+                    for fi in 0..si.fields.len() {
                         const field_init_idx = si.fields.get(fi)
                         var fi_name = ""
                         var fi_value = null_node
@@ -6016,7 +6016,7 @@ struct Lowerer {
                         const field = st.getField(di)
                         if (field.default_value == null_node) { continue }
                         var provided = false
-                        for fi in 0..si.fields.count {
+                        for fi in 0..si.fields.len() {
                             const field_init_idx = si.fields.get(fi)
                             switch (self.tree.getNode(field_init_idx)) { Node.expr |e2| => switch (e2) {
                                 Expr.field_init_node |fnode| => { if (fnode.name == field.name) { provided = true } },
@@ -6057,7 +6057,7 @@ struct Lowerer {
         const fb = self.builder.func() orelse return null_node
         switch (self.tree.getNode(value_idx)) { Node.expr |e| => switch (e) {
             Expr.array_literal |al| => {
-                if (al.elements.count == 0) { return }
+                if (al.elements.len() == 0) { return }
                 const local = fb.locals.get(local_idx)
                 var elem_type = self.inferExprType(al.elements.get(0))
                 const local_info = self.types.get(local.type_idx)
@@ -6065,7 +6065,7 @@ struct Lowerer {
                     switch (local_info) { Type.array |a| => { elem_type = a.elem }, else => {} }
                 }
                 const elem_size = self.types.sizeOf(elem_type)
-                for i in 0..al.elements.count {
+                for i in 0..al.elements.len() {
                     const elem_idx = al.elements.get(i)
                     const elem_node = self.lowerExprNode(elem_idx)
                     const idx_node = fb.emitConstInt(i, I64, span)
@@ -6111,7 +6111,7 @@ struct Lowerer {
         switch (self.tree.getNode(value_idx)) { Node.expr |e| => switch (e) {
             Expr.tuple_literal |tl| => {
                 const tuple_type_idx = self.inferExprType(value_idx)
-                for i in 0..tl.elements.count {
+                for i in 0..tl.elements.len() {
                     const elem_idx = tl.elements.get(i)
                     const value_ir = self.lowerExprNode(elem_idx)
                     const offset = self.types.tupleElementOffset(tuple_type_idx, i)
@@ -6145,7 +6145,7 @@ struct Lowerer {
                                 if (v.name == fa.field) {
                                     const tag_val = fb.emitConstInt(i, I64, span)
                                     fb.emitStoreLocalField(local_idx, 0, 0, tag_val, span)
-                                    if (call.args.count > 0) {
+                                    if (call.args.len() > 0) {
                                         const payload_val = self.lowerExprNode(call.args.get(0))
                                         fb.emitStoreLocalField(local_idx, 1, 8, payload_val, span)
                                     }
@@ -6191,7 +6191,7 @@ struct Lowerer {
                                 const v = ut.getVariant(i)
                                 if (v.name == fa.field) {
                                     const variant_name = "__union_" ++ ut.name ++ "_" ++ v.name
-                                    if (call.args.count > 0 and v.payload_type != VOID) {
+                                    if (call.args.len() > 0 and v.payload_type != VOID) {
                                         const payload_val = self.lowerExprNode(call.args.get(0))
                                         var field_values: List(int) = .{}
                                         field_values.append(payload_val)
@@ -6251,7 +6251,7 @@ struct Lowerer {
         const result_len = left_len + right_len
         const result_type = self.types.makeArray(elem_type, result_len)
         const result_size = self.types.sizeOf(result_type)
-        const temp_name = "__cat_" ++ intToString(fb.locals.count)
+        const temp_name = "__cat_" ++ intToString(fb.locals.len())
         const local_idx = fb.addLocalWithSize(temp_name, result_type, false, result_size)
 
         // Copy left array elements
@@ -6351,7 +6351,7 @@ struct Lowerer {
     // ========================================================================
 
     fn findLabeledLoop(target_label: string) ?LoopContext {
-        var i = self.loop_stack.count - 1
+        var i = self.loop_stack.len() - 1
         while (i >= 0) {
             const ctx = self.loop_stack.get(i)
             if (ctx.label == target_label) { return ctx }
@@ -6380,7 +6380,7 @@ struct Lowerer {
 
     /// Check if any switch case has a capture variable.
     fn hasCapture(se: SwitchExpr) bool {
-        for i in 0..se.cases.count {
+        for i in 0..se.cases.len() {
             const case_idx = se.cases.get(i)
             switch (self.tree.getNode(case_idx)) { Node.expr |e| => switch (e) {
                 Expr.switch_case_node |sc| => {
@@ -6460,7 +6460,7 @@ struct Lowerer {
             self.clearPerFunctionState()
 
             // Add declared params
-            for pi in 0..ce.params.count {
+            for pi in 0..ce.params.len() {
                 const param_idx = ce.params.get(pi)
                 const p_node = self.tree.getNode(param_idx)
                 var pname = ""
@@ -6474,9 +6474,9 @@ struct Lowerer {
             }
 
             // At function start: read captures from CTXT global
-            if (captures.count > 0) {
+            if (captures.len() > 0) {
                 const ctxt_ptr = closure_fb.emitWasmGlobalRead(1, I64, ce.span)
-                for i in 0..captures.count {
+                for i in 0..captures.len() {
                     const cap = captures.get(i)
                     const offset = (i + 1) * 8
                     const cap_addr = closure_fb.emitAddrOffset(ctxt_ptr, offset, I64, ce.span)
@@ -6501,7 +6501,7 @@ struct Lowerer {
         self.builder.current_func_ptr = saved_builder_func
 
         // Now in parent function: allocate closure struct [table_idx][cap0][cap1]...
-        const num_captures = captures.count
+        const num_captures = captures.len()
         const payload_size = (1 + num_captures) * 8
         const total_size = 16 + payload_size  // 16 = heap header
 
@@ -6522,7 +6522,7 @@ struct Lowerer {
         fb.emitPtrStoreValue(ptr_node, table_idx_node, ce.span)
 
         // Store each capture at offset 8, 16, ...
-        for i in 0..captures.count {
+        for i in 0..captures.len() {
             const cap = captures.get(i)
             const offset = (i + 1) * 8
             const reload_ptr = fb.emitLoadLocal(temp_idx, I64, ce.span)
@@ -6544,11 +6544,11 @@ struct Lowerer {
                 Expr.ident |id| => {
                     if (parent_fb.lookupLocal(id.name)) |local_idx| {
                         // Don't add duplicates
-                        for i in 0..captures.count {
+                        for i in 0..captures.len() {
                             if (captures.get(i).name == id.name) { return }
                         }
                         var cap_type = I64
-                        if (local_idx < parent_fb.locals.count) {
+                        if (local_idx < parent_fb.locals.len()) {
                             cap_type = parent_fb.locals.get(local_idx).type_idx
                         }
                         captures.append(CaptureInfo { name: id.name, local_idx: local_idx, type_idx: cap_type })
@@ -6561,7 +6561,7 @@ struct Lowerer {
                 Expr.unary |un| => { self.detectCaptures(un.operand, parent_fb, captures) },
                 Expr.call |c| => {
                     self.detectCaptures(c.callee, parent_fb, captures)
-                    for i in 0..c.args.count {
+                    for i in 0..c.args.len() {
                         self.detectCaptures(c.args.get(i), parent_fb, captures)
                     }
                 },
@@ -6579,14 +6579,14 @@ struct Lowerer {
                     self.detectCaptures(fa.base, parent_fb, captures)
                 },
                 Expr.block_expr |b| => {
-                    for i in 0..b.stmts.count {
+                    for i in 0..b.stmts.len() {
                         self.detectCaptures(b.stmts.get(i), parent_fb, captures)
                     }
                     if (b.result_expr != null_node) { self.detectCaptures(b.result_expr, parent_fb, captures) }
                 },
                 Expr.spawn_expr |se| => { self.detectCaptures(se.body, parent_fb, captures) },
                 Expr.select_expr |se| => {
-                    for i in 0..se.cases.count {
+                    for i in 0..se.cases.len() {
                         const sc = self.tree.getSelectCase(se.cases.get(i))
                         self.detectCaptures(sc.channel, parent_fb, captures)
                         if (sc.send_value != null_node) { self.detectCaptures(sc.send_value, parent_fb, captures) }
@@ -6630,7 +6630,7 @@ struct Lowerer {
                     self.detectCaptures(fs.body, parent_fb, captures)
                 },
                 Stmt.block_stmt |bs| => {
-                    for i in 0..bs.stmts.count {
+                    for i in 0..bs.stmts.len() {
                         self.detectCaptures(bs.stmts.get(i), parent_fb, captures)
                     }
                 },
@@ -6669,9 +6669,9 @@ struct Lowerer {
             const env_param_idx = spawn_fb.addParam("__env_ptr", I64, 8)
 
             // Load captures from env_ptr
-            if (captures.count > 0) {
+            if (captures.len() > 0) {
                 const env_ptr = spawn_fb.emitLoadLocal(env_param_idx, I64, se.span)
-                for i in 0..captures.count {
+                for i in 0..captures.len() {
                     const cap = captures.get(i)
                     const offset = i * 8
                     const cap_addr = spawn_fb.emitAddrOffset(env_ptr, offset, I64, se.span)
@@ -6696,10 +6696,10 @@ struct Lowerer {
         self.builder.current_func_ptr = saved_builder_func
 
         // In parent function: allocate env struct and fill captures, then call sched_spawn
-        if (captures.count > 0) {
+        if (captures.len() > 0) {
             // Allocate env struct
             const metadata_node = fb.emitConstInt(0, I64, se.span)
-            const size_node = fb.emitConstInt(captures.count * 8, I64, se.span)
+            const size_node = fb.emitConstInt(captures.len() * 8, I64, se.span)
             var alloc_args: List(int) = .{}
             alloc_args.append(metadata_node)
             alloc_args.append(size_node)
@@ -6711,7 +6711,7 @@ struct Lowerer {
             fb.emitStoreLocal(temp_idx, alloc_result, se.span)
 
             // Fill captures
-            for i in 0..captures.count {
+            for i in 0..captures.len() {
                 const cap = captures.get(i)
                 const offset = i * 8
                 const reload_ptr = fb.emitLoadLocal(temp_idx, I64, se.span)
@@ -6743,7 +6743,7 @@ struct Lowerer {
     /// Lower select expression: Go-style channel select.
     /// Copied from lower.zig:6112-6130
     fn lowerSelectExpr(se: SelectExpr) int {
-        if (se.cases.count == 0) {
+        if (se.cases.len() == 0) {
             // Empty select with just default
             if (se.default_body != null_node) {
                 return self.lowerExprNode(se.default_body)
@@ -6752,7 +6752,7 @@ struct Lowerer {
         }
 
         // Simple path: 1 case + default
-        if (se.cases.count == 1 and se.default_body != null_node) {
+        if (se.cases.len() == 1 and se.default_body != null_node) {
             const sc = self.tree.getSelectCase(se.cases.get(0))
             return self.lowerSelectSimple(sc, se.default_body, se.span)
         }
@@ -6890,7 +6890,7 @@ struct Lowerer {
     /// Copied from lower.zig:6277-6397
     fn lowerSelectGeneral(se: SelectExpr) int {
         const fb = self.builder.func() orelse return null_node
-        const num_cases = se.cases.count
+        const num_cases = se.cases.len()
 
         // Allocate cases array: each entry 24 bytes (channel_ptr, kind, value_ptr)
         const cases_size = num_cases * 24
@@ -7028,7 +7028,7 @@ struct Lowerer {
                 Expr.unary |u| => { count = count + self.countAwaitPoints(u.operand) },
                 Expr.call |c| => {
                     count = count + self.countAwaitPoints(c.callee)
-                    for i in 0..c.args.count {
+                    for i in 0..c.args.len() {
                         count = count + self.countAwaitPoints(c.args.get(i))
                     }
                 },
@@ -7038,7 +7038,7 @@ struct Lowerer {
                     if (ie.else_branch != null_node) { count = count + self.countAwaitPoints(ie.else_branch) }
                 },
                 Expr.block_expr |be| => {
-                    for i in 0..be.stmts.count {
+                    for i in 0..be.stmts.len() {
                         count = count + self.countAwaitPoints(be.stmts.get(i))
                     }
                     if (be.result_expr != null_node) { count = count + self.countAwaitPoints(be.result_expr) }
@@ -7066,7 +7066,7 @@ struct Lowerer {
                     count = count + self.countAwaitPoints(ws.body)
                 },
                 Stmt.block_stmt |bs| => {
-                    for i in 0..bs.stmts.count {
+                    for i in 0..bs.stmts.len() {
                         count = count + self.countAwaitPoints(bs.stmts.get(i))
                     }
                 },
@@ -7129,7 +7129,7 @@ struct Lowerer {
         if (self.builder.func()) |body_fb| {
             self.clearPerFunctionState()
 
-            for i in 0..fn_decl.params.count {
+            for i in 0..fn_decl.params.len() {
                 const param_idx = fn_decl.params.get(i)
                 self.addParamFromNode(param_idx)
             }
@@ -7150,7 +7150,7 @@ struct Lowerer {
             self.clearPerFunctionState()
 
             // Add params matching declared signature
-            for i in 0..fn_decl.params.count {
+            for i in 0..fn_decl.params.len() {
                 const param_idx = fn_decl.params.get(i)
                 self.addParamFromNode(param_idx)
             }
@@ -7172,7 +7172,7 @@ struct Lowerer {
 
             // Call body function with same args — eager evaluation
             var body_args: List(int) = .{}
-            for i in 0..fn_decl.params.count {
+            for i in 0..fn_decl.params.len() {
                 const param_idx = fn_decl.params.get(i)
                 var pname = ""
                 switch (self.tree.getNode(param_idx)) { Node.expr |e| => switch (e) {
@@ -7314,7 +7314,7 @@ struct Lowerer {
     /// Returns the index or -1.
     /// Copied from lower.zig:7864-7869
     fn typeParamIndex(type_param_types: List(int), ty: int) int {
-        for i in 0..type_param_types.count {
+        for i in 0..type_param_types.len() {
             if (type_param_types.get(i) == ty) { return i }
         }
         return -1
@@ -7324,22 +7324,22 @@ struct Lowerer {
     /// Returns STENCIL_SHAPE_ONLY, STENCIL_DICT, or STENCIL_NOT_STENCILABLE.
     /// Copied from lower.zig:7825-7860
     fn analyzeStencilability(body_node: int, type_param_types: List(int)) int {
-        if (type_param_types.count == 0) { return STENCIL_NOT_STENCILABLE }
+        if (type_param_types.len() == 0) { return STENCIL_NOT_STENCILABLE }
 
         var collector: List(DictEntry) = .{}
         const ok = self.collectNodeDictEntries(body_node, type_param_types, &collector)
         if (!ok) { return STENCIL_NOT_STENCILABLE }
-        if (collector.count == 0) {
-            self.stencil_dict_entries.count = 0
+        if (collector.len() == 0) {
+            self.stencil_dict_entries.clear()
             return STENCIL_SHAPE_ONLY
         }
 
         // Deduplicate and store in stencil_dict_entries
-        self.stencil_dict_entries.count = 0
-        for i in 0..collector.count {
+        self.stencil_dict_entries.clear()
+        for i in 0..collector.len() {
             const entry = collector.get(i)
             var found = false
-            for j in 0..self.stencil_dict_entries.count {
+            for j in 0..self.stencil_dict_entries.len() {
                 const existing = self.stencil_dict_entries.get(j)
                 if (existing.kind == entry.kind and existing.op == entry.op
                     and existing.type_param_idx == entry.type_param_idx
@@ -7414,7 +7414,7 @@ struct Lowerer {
                 else => {},
             }, else => {} }
             if (!self.collectNodeDictEntries(callee_n, tpt, collector)) { return false }
-            for i in 0..call_args.count {
+            for i in 0..call_args.len() {
                 if (!self.collectNodeDictEntries(call_args.get(i), tpt, collector)) { return false }
             }
             return true
@@ -7434,7 +7434,7 @@ struct Lowerer {
             var stmts: List(int) = .{}
             var result_n = null_node
             switch (expr) { Expr.block_expr |be| => { stmts = be.stmts; result_n = be.result_expr }, else => {} }
-            for i in 0..stmts.count {
+            for i in 0..stmts.len() {
                 if (!self.collectNodeDictEntries(stmts.get(i), tpt, collector)) { return false }
             }
             return self.collectNodeDictEntries(result_n, tpt, collector)
@@ -7579,7 +7579,7 @@ struct Lowerer {
         if (tag == "block_stmt") {
             var ok = true
             switch (stmt) { Stmt.block_stmt |bs| => {
-                for i in 0..bs.stmts.count {
+                for i in 0..bs.stmts.len() {
                     if (!self.collectNodeDictEntries(bs.stmts.get(i), tpt, collector)) { ok = false }
                 }
             }, else => {} }
@@ -7599,10 +7599,10 @@ struct Lowerer {
     /// Generate all dict helpers for a generic instance.
     /// Copied from lower.zig:8395-8408
     fn generateDictHelpers(type_args: List(int), dict_entries: List(DictEntry)) void {
-        for i in 0..dict_entries.count {
+        for i in 0..dict_entries.len() {
             const entry = dict_entries.get(i)
             var concrete_type = 0
-            if (entry.type_param_idx < type_args.count) {
+            if (entry.type_param_idx < type_args.len()) {
                 concrete_type = type_args.get(entry.type_param_idx)
             }
             const helper_name = self.dictHelperName(concrete_type, entry)
@@ -7638,10 +7638,10 @@ struct Lowerer {
 
         // Build comma-separated helper names
         var result = ""
-        for i in 0..dict_entries.count {
+        for i in 0..dict_entries.len() {
             const entry = dict_entries.get(i)
             var concrete_type = 0
-            if (entry.type_param_idx < type_args.count) {
+            if (entry.type_param_idx < type_args.len()) {
                 concrete_type = type_args.get(entry.type_param_idx)
             }
             const helper_name = self.dictHelperName(concrete_type, entry)
@@ -7674,7 +7674,7 @@ struct Lowerer {
         var nstart = 0
         for ci in 0..param_names_str.len {
             if (param_names_str[ci] == 59) {
-                if (arg_idx < args.count) {
+                if (arg_idx < args.len()) {
                     const name = substring(param_names_str, nstart, ci)
                     self.chk.pushTypeSub(name, args.get(arg_idx))
                 }
@@ -7682,7 +7682,7 @@ struct Lowerer {
                 nstart = ci + 1
             }
         }
-        if (nstart < param_names_str.len and arg_idx < args.count) {
+        if (nstart < param_names_str.len and arg_idx < args.len()) {
             const name = substring(param_names_str, nstart, param_names_str.len)
             self.chk.pushTypeSub(name, args.get(arg_idx))
         }
@@ -7977,7 +7977,7 @@ struct Lowerer {
 
     /// Emit cleanup stack entries that are errdefer only.
     fn emitCleanupsErrorPath(target_depth: int) void {
-        var i = self.cleanup_stack.count - 1
+        var i = self.cleanup_stack.len() - 1
         while (i >= target_depth) {
             const entry = self.cleanup_stack.get(i)
             if (entry.kind == CLEANUP_ERRDEFER) {
@@ -8035,7 +8035,7 @@ struct Lowerer {
 
     /// Resolve the payload type of a union variant matched by patterns.
     fn resolveUnionPayloadType(union_type_idx: int, patterns: List(int)) int {
-        if (patterns.count == 0) { return I64 }
+        if (patterns.len() == 0) { return I64 }
         const pat_idx = patterns.get(0)
         var variant_name = ""
         switch (self.tree.getNode(pat_idx)) { Node.expr |e| => switch (e) {
@@ -8075,7 +8075,7 @@ struct Lowerer {
         }
         // Regular block: lower contents, return result
         const scope_depth = fb.markScopeEntry()
-        for i in 0..be.stmts.count {
+        for i in 0..be.stmts.len() {
             const stmt_idx = be.stmts.get(i)
             const maybe_stmt = asStmt(self.tree.getNode(stmt_idx))
             if (maybe_stmt) |s| {
@@ -8111,11 +8111,11 @@ struct Lowerer {
             .exit_block = exit_block,
             .result_local = result_local,
             .result_type = result_type,
-            .cleanup_depth = self.cleanup_stack.count,
+            .cleanup_depth = self.cleanup_stack.len(),
         })
 
         const scope_depth = fb.markScopeEntry()
-        for i in 0..be.stmts.count {
+        for i in 0..be.stmts.len() {
             const stmt_idx = be.stmts.get(i)
             const maybe_stmt = asStmt(self.tree.getNode(stmt_idx))
             if (maybe_stmt) |s| {
@@ -8155,7 +8155,7 @@ struct Lowerer {
             iter_count += 1
             var pending: List(string) = .{}
             const all_keys = self.chk.generic_inst_by_name.keys()
-            for i in 0..all_keys.count {
+            for i in 0..all_keys.len() {
                 const key = all_keys.get(i)
                 if (!self.lowered_generics.contains(key)) { continue }
                 if (self.builder.hasFunc(key)) { continue }
@@ -8163,7 +8163,7 @@ struct Lowerer {
             }
             if (iter_count > 100) { return }  // Safety: prevent infinite loops
             // Process collected snapshot (safe — no iterator active)
-            for i in 0..pending.count {
+            for i in 0..pending.len() {
                 const name = pending.get(i)
                 if (self.builder.hasFunc(name)) { continue }
                 self.lowerGenericFnInstance(name)
@@ -8210,7 +8210,7 @@ struct Lowerer {
 
         // Set up type substitution in checker from type_args_str + type_param_names
         // Both are semicolon-separated: "5;17" and "K;V"
-        const saved_sub_count = self.chk.type_sub_keys.count
+        const saved_sub_count = self.chk.type_sub_keys.len()
         const type_args = inst.type_args_str
         const param_names = inst.type_param_names
         self.parseAndPushTypeSubs(type_args, param_names)
@@ -8258,7 +8258,7 @@ struct Lowerer {
             // Dict-stenciled functions disabled (shape stenciling off)
 
             // Add params
-            for pi in 0..fn_d.params.count {
+            for pi in 0..fn_d.params.len() {
                 const param_idx = fn_d.params.get(pi)
                 const p_node = self.tree.getNode(param_idx)
                 var pname = ""
@@ -8295,13 +8295,13 @@ struct Lowerer {
         }
         // Clear dict context
         self.has_dict_context = false
-        self.current_dict_entries.count = 0
-        self.current_dict_params.count = 0
+        self.current_dict_entries.clear()
+        self.current_dict_params.clear()
         self.builder.endFunc()
 
         // Restore type substitution, checker AST, expr_types, and tree
-        self.chk.type_sub_keys.count = saved_sub_count
-        self.chk.type_sub_vals.count = saved_sub_count
+        self.chk.type_sub_keys.resize(saved_sub_count)
+        self.chk.type_sub_vals.resize(saved_sub_count)
         self.chk.expr_types = saved_expr_types
         self.chk.ast = saved_chk_ast
         self.tree = saved_tree
@@ -8365,7 +8365,7 @@ struct Lowerer {
     /// Find a labeled block by name in the labeled_block_stack.
     /// Zig reference: lower.zig:4108-4116
     fn findLabeledBlock(target_label: string) ?LabeledBlockCtx {
-        var i = self.labeled_block_stack.count
+        var i = self.labeled_block_stack.len()
         while (i > 0) {
             i = i - 1
             const blk_ctx = self.labeled_block_stack.get(i)
@@ -8415,7 +8415,7 @@ struct Lowerer {
     /// Zig reference: lower.zig:10075-10088
     fn resolveGenericTypeName(base_name: string, type_args: List(int)) int {
         var buf = base_name ++ "("
-        for i in 0..type_args.count {
+        for i in 0..type_args.len() {
             if (i > 0) { buf = buf ++ ";" }
             const arg_type = self.resolveTypeArgNode(type_args.get(i))
             buf = buf ++ intToString(arg_type)
@@ -8523,7 +8523,7 @@ struct Lowerer {
     /// Ref: lower.zig:10832-10870 (emitComptimeArray).
     fn emitComptimeArray(arr: ComptimeValue_ComptimeArray, span: Span) int {
         const fb = self.builder.func() orelse return null_node
-        const elem_count = arr.elements.count
+        const elem_count = arr.elements.len()
         if (elem_count == 0) { return fb.emitConstInt(0, I64, span) }
 
         // Determine element size from first element
@@ -8708,7 +8708,7 @@ struct Lowerer {
     /// Check if any active cleanup is a defer, errdefer, or scope_destroy.
     /// Reference: lower.zig:1982-1987
     fn hasDeferCleanups() bool {
-        for i in 0..self.cleanup_stack.count {
+        for i in 0..self.cleanup_stack.len() {
             const cleanup = self.cleanup_stack.get(i)
             if (cleanup.kind == CLEANUP_DEFER or cleanup.kind == CLEANUP_ERRDEFER or cleanup.kind == CLEANUP_SCOPE_DESTROY) {
                 return true
@@ -8727,7 +8727,7 @@ struct Lowerer {
                 if (self.builder.func()) |fb| {
                     if (fb.lookupLocal(id.name)) |local_idx| {
                         // Check if any cleanup targets this local
-                        for j in 0..self.cleanup_stack.count {
+                        for j in 0..self.cleanup_stack.len() {
                             const cleanup = self.cleanup_stack.get(j)
                             if (cleanup.local_idx == local_idx) { return true }
                         }
@@ -8774,7 +8774,7 @@ struct Lowerer {
             })
         } else {
             // ARC Phase 4: Check for auto-generated deinit
-            for i in 0..self.pending_auto_deinits.count {
+            for i in 0..self.pending_auto_deinits.len() {
                 const auto_name = self.pending_auto_deinits.get(i)
                 if (auto_name == struct_name) {
                     const qualified_type = self.qualifyTypeName(struct_name)
@@ -8810,7 +8810,7 @@ struct Lowerer {
     fn emitCleanupsImpl(target_depth: int, is_error_path: bool, pop: bool) void {
         if (self.builder.func()) |fb| {
             // Process in reverse order (LIFO)
-            var i = self.cleanup_stack.count
+            var i = self.cleanup_stack.len()
             while (i > target_depth) {
                 i = i - 1
                 const cleanup = self.cleanup_stack.get(i)
@@ -8850,7 +8850,7 @@ struct Lowerer {
 
             // Pop the cleanups we just emitted
             if (pop) {
-                self.cleanup_stack.count = target_depth
+                self.cleanup_stack.resize(target_depth)
             }
         }
     }
@@ -8888,7 +8888,7 @@ struct Lowerer {
     /// Ref: lower.zig:1991-2026
     fn emitPendingAutoDeinits() void {
         const fb = self.builder.func() orelse return null_node
-        for i in 0..self.pending_auto_deinits.count {
+        for i in 0..self.pending_auto_deinits.len() {
             const type_name = self.pending_auto_deinits.get(i)
             const struct_type_idx = self.types.lookupByName(type_name)
             if (struct_type_idx < 0) { continue }
@@ -9596,7 +9596,7 @@ test "lowerer init" {
     lower.bench_mode = false
     lower.builder = Builder.init()
     @assertEq(lower.temp_counter, 0)
-    @assertEq(lower.builder.funcs.count, 0)
+    @assertEq(lower.builder.funcs.len(), 0)
 }
 
 test "lowerer set modes" {
@@ -9636,8 +9636,8 @@ test "lowerer empty lower produces empty IR" {
     initLowererLists(&lower)
     initLowererMaps(&lower)
     const result = lower.lower()
-    @assertEq(result.funcs.count, 0)
-    @assertEq(result.globals.count, 0)
+    @assertEq(result.funcs.len(), 0)
+    @assertEq(result.globals.len(), 0)
 }
 
 test "sanitizeName" {
@@ -9712,9 +9712,9 @@ test "clearPerFunctionState" {
         local_idx: null_local,
         func_name: "",
     })
-    @assertEq(lower.cleanup_stack.count, 1)
+    @assertEq(lower.cleanup_stack.len(), 1)
     lower.clearPerFunctionState()
-    @assertEq(lower.cleanup_stack.count, 0)
+    @assertEq(lower.cleanup_stack.len(), 0)
 }
 
 test "tokenToBinaryOp arithmetic" {

@@ -18,9 +18,9 @@ fn copyelim(func: *SsaFunc) void {
     var total_values: i64 = 0
     var total_copies: i64 = 0
     var total_phis: i64 = 0
-    for bi in 0..func.blocks.count {
+    for bi in 0..func.blocks.len() {
         const blk = func.blocks.get(bi)
-        for vi in 0..blk.values.count {
+        for vi in 0..blk.values.len() {
             const v = blk.values.get(vi)
             total_values += 1
             if (v.op == SsaOp.copy) { total_copies += 1 }
@@ -34,11 +34,11 @@ fn copyelim(func: *SsaFunc) void {
     // Update block control values — replace copy controls with their sources.
     // Zig reference: copyelim.zig:24-36
     var ctrl_rewrites: i64 = 0
-    for bi in 0..func.blocks.count {
+    for bi in 0..func.blocks.len() {
         const blk = func.blocks.get(bi)
-        for ci in 0..blk.controls.count {
+        for ci in 0..blk.controls.len() {
             const ctrl = blk.controls.get(ci)
-            if (ctrl.op == SsaOp.copy and ctrl.args.count > 0) {
+            if (ctrl.op == SsaOp.copy and ctrl.args.len() > 0) {
                 const src = followCopyChain(func, ctrl)
                 blk.controls.set(ci, src)
                 ctrl_rewrites += 1
@@ -56,7 +56,7 @@ fn followCopyChain(func: *SsaFunc, val: *SsaValue) *SsaValue {
     var cur = val
     var steps = 0
     while (steps < 1000) {
-        if (cur.op != SsaOp.copy or cur.args.count == 0) { return cur }
+        if (cur.op != SsaOp.copy or cur.args.len() == 0) { return cur }
         cur = cur.args.get(0)
         steps += 1
     }
@@ -67,7 +67,7 @@ fn followCopyChain(func: *SsaFunc, val: *SsaValue) *SsaValue {
 /// Zig reference: copyelim.zig copyelimValue() — in-place setArg.
 fn replaceCopyArgs(func: *SsaFunc, val: *SsaValue) void {
     var ai = 0
-    while (ai < val.args.count) {
+    while (ai < val.args.len()) {
         const arg = val.args.get(ai)
         if (arg.op == SsaOp.copy) {
             val.setArg(ai, followCopyChain(func, arg))
@@ -84,10 +84,10 @@ fn phielim(func: *SsaFunc) void {
     while (changed) {
         changed = false
         var bi = 0
-        while (bi < func.blocks.count) {
+        while (bi < func.blocks.len()) {
             const blk = func.blocks.get(bi)
             var vi = 0
-            while (vi < blk.values.count) {
+            while (vi < blk.values.len()) {
                 const val = blk.values.get(vi)
                 // Eliminate copy args first (matching Go's combined pass).
                 // Zig reference: copyelim.zig:97 — copyelimValue(v) for EVERY value.
@@ -110,7 +110,7 @@ fn phielimValue(func: *SsaFunc, val: *SsaValue) bool {
     // Find the single non-self argument
     var w: *SsaValue = null_val
     var ai = 0
-    while (ai < val.args.count) {
+    while (ai < val.args.len()) {
         const arg = val.args.get(ai)
         if (arg.id == val.id) { ai += 1; continue }  // skip self-references
         if (w != null_val and arg.id == w.id) { ai += 1; continue }  // skip duplicates of w
@@ -123,7 +123,7 @@ fn phielimValue(func: *SsaFunc, val: *SsaValue) bool {
 
     // Convert phi to copy(w)
     val.op = SsaOp.copy
-    val.args.count = 0
+    val.args.clear()
     val.addArg(w)
     return true
 }
@@ -149,7 +149,7 @@ test "phielim redundant phi" {
     copyelim(&func)
 
     @assertEq(v1.op == SsaOp.copy, true)
-    @assertEq(v1.args.count, 1)
+    @assertEq(v1.args.len(), 1)
     @assertEq(v1.args.get(0).id, v0.id)
 }
 

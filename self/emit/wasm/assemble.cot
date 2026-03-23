@@ -84,7 +84,7 @@ fn assemble(sym: *Symbol) List(int) {
     var max_local_idx = 0
     var has_dispatch_loop = false
     var scan_i = 0
-    while (scan_i < sym.text.count) {
+    while (scan_i < sym.text.len()) {
         const p = sym.text.get(scan_i)
         switch (p.instr) {
             As.local_get => {
@@ -118,7 +118,7 @@ fn assemble(sym: *Symbol) List(int) {
 
     const param_count = sym.param_count
     const float_count = sym.float_local_count
-    const gc_ref_count = sym.gc_ref_locals.count
+    const gc_ref_count = sym.gc_ref_locals.len()
 
     // Calculate value locals (after PC_B, minus floats and GC refs)
     var total_value_locals = 0
@@ -192,7 +192,7 @@ fn assemble(sym: *Symbol) List(int) {
     // ========================================================================
 
     var prog_i = 0
-    while (prog_i < sym.text.count) {
+    while (prog_i < sym.text.len()) {
         const p = sym.text.get(prog_i)
         encodeInstruction(&w, p, sym.param_count)
         prog_i += 1
@@ -201,7 +201,7 @@ fn assemble(sym: *Symbol) List(int) {
     // End opcode
     w.append(0x0B)
 
-    debug(.codegen, "  assembled ${w.count} bytes")
+    debug(.codegen, "  assembled ${w.len()} bytes")
     return w
 }
 
@@ -273,9 +273,9 @@ fn encodeInstruction(w: *List(int), p: Prog, param_count: int) void {
             w.append(0x0E)  // br_table opcode
             switch (p.to.val) {
                 AddrVal.br_table |idxs| => {
-                    writeULEB128(w, idxs.count - 1)
+                    writeULEB128(w, idxs.len() - 1)
                     var bt_i = 0
-                    while (bt_i < idxs.count) {
+                    while (bt_i < idxs.len()) {
                         writeULEB128(w, idxs.get(bt_i))
                         bt_i += 1
                     }
@@ -717,23 +717,23 @@ fn f64BitsToF32Bits(f64_bits: int) int {
 test "ULEB128 encoding" {
     var w: List(int) = .{}
     writeULEB128(&w, 0)
-    @assertEq(w.count, 1)
+    @assertEq(w.len(), 1)
     @assertEq(w.get(0), 0x00)
 
     w.clear()
     writeULEB128(&w, 127)
-    @assertEq(w.count, 1)
+    @assertEq(w.len(), 1)
     @assertEq(w.get(0), 0x7F)
 
     w.clear()
     writeULEB128(&w, 128)
-    @assertEq(w.count, 2)
+    @assertEq(w.len(), 2)
     @assertEq(w.get(0), 0x80)
     @assertEq(w.get(1), 0x01)
 
     w.clear()
     writeULEB128(&w, 624485)
-    @assertEq(w.count, 3)
+    @assertEq(w.len(), 3)
     @assertEq(w.get(0), 0xE5)
     @assertEq(w.get(1), 0x8E)
     @assertEq(w.get(2), 0x26)
@@ -742,22 +742,22 @@ test "ULEB128 encoding" {
 test "SLEB128 encoding" {
     var w: List(int) = .{}
     writeSLEB128(&w, 0)
-    @assertEq(w.count, 1)
+    @assertEq(w.len(), 1)
     @assertEq(w.get(0), 0x00)
 
     w.clear()
     writeSLEB128(&w, -1)
-    @assertEq(w.count, 1)
+    @assertEq(w.len(), 1)
     @assertEq(w.get(0), 0x7F)
 
     w.clear()
     writeSLEB128(&w, 42)
-    @assertEq(w.count, 1)
+    @assertEq(w.len(), 1)
     @assertEq(w.get(0), 42)
 
     w.clear()
     writeSLEB128(&w, -128)
-    @assertEq(w.count, 2)
+    @assertEq(w.len(), 2)
     @assertEq(w.get(0), 0x80)
     @assertEq(w.get(1), 0x7F)
 }
@@ -778,9 +778,9 @@ test "assemble empty function" {
 
     const bytes = assemble(&sym)
     // Should have at least local declarations (0 groups) + end opcode
-    @assert(bytes.count >= 2)
+    @assert(bytes.len() >= 2)
     @assertEq(bytes.get(0), 0x00)  // 0 local groups
-    @assertEq(bytes.get(bytes.count - 1), 0x0B)  // end
+    @assertEq(bytes.get(bytes.len() - 1), 0x0B)  // end
 }
 
 test "assemble i64 const" {
@@ -796,7 +796,7 @@ test "assemble i64 const" {
     @assertEq(bytes.get(0), 0x00)
     @assertEq(bytes.get(1), 0x42)  // i64.const opcode
     @assertEq(bytes.get(2), 42)
-    @assertEq(bytes.get(bytes.count - 1), 0x0B)
+    @assertEq(bytes.get(bytes.len() - 1), 0x0B)
 }
 
 test "assemble local get/set" {
@@ -818,7 +818,7 @@ test "assemble local get/set" {
     var found_get = false
     var found_set = false
     var bi = 0
-    while (bi < bytes.count) {
+    while (bi < bytes.len()) {
         if (bytes.get(bi) == 0x20) { found_get = true }
         if (bytes.get(bi) == 0x21) { found_set = true }
         bi += 1
@@ -841,7 +841,7 @@ test "assemble register get/set (SP)" {
     var found_gget = false
     var found_gset = false
     var bi = 0
-    while (bi < bytes.count) {
+    while (bi < bytes.len()) {
         if (bytes.get(bi) == 0x23) { found_gget = true }
         if (bytes.get(bi) == 0x24) { found_gset = true }
         bi += 1
@@ -866,7 +866,7 @@ test "assemble block/br structure" {
     var found_block = false
     var found_br = false
     var bi = 0
-    while (bi < bytes.count) {
+    while (bi < bytes.len()) {
         if (bytes.get(bi) == 0x02) { found_block = true }
         if (bytes.get(bi) == 0x0C) { found_br = true }
         bi += 1
@@ -888,7 +888,7 @@ test "assemble call instruction" {
     // Should contain call (0x10) + funcidx 5
     var found_call = false
     var bi = 0
-    while (bi < bytes.count - 1) {
+    while (bi < bytes.len() - 1) {
         if (bytes.get(bi) == 0x10 and bytes.get(bi + 1) == 5) {
             found_call = true
         }
@@ -911,7 +911,7 @@ test "assemble load/store with alignment" {
     // Should contain i64.load (0x29) + align(3) + offset(8)
     var found_load = false
     var bi = 0
-    while (bi < bytes.count - 2) {
+    while (bi < bytes.len() - 2) {
         if (bytes.get(bi) == 0x29 and bytes.get(bi + 1) == 3 and bytes.get(bi + 2) == 8) {
             found_load = true
         }

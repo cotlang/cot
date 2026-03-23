@@ -77,7 +77,7 @@ struct CompileOptions {
 /// Generate a complete Wasm binary from IR functions, globals, and type registry.
 /// Returns the binary as List(int) (byte values).
 fn generateWasmCode(ir: IR, types: *TypeRegistry, opts: CompileOptions) List(int) {
-    debug(.codegen, "driver: generating Wasm for ${ir.funcs.count} functions")
+    debug(.codegen, "driver: generating Wasm for ${ir.funcs.len()} functions")
     var linker = Linker.init()
 
     // Configure memory: 256 pages = 16MB
@@ -137,7 +137,7 @@ fn generateWasmCode(ir: IR, types: *TypeRegistry, opts: CompileOptions) List(int
 fn addAllRuntimeFunctions(linker: *Linker, heap_ptr_global: int, opts: CompileOptions) RuntimeIndices {
     // WASI host imports MUST be registered FIRST — Wasm requires imports at
     // indices 0..N-1, module functions at N onwards. addFunc() returns
-    // imports.count + funcs.count, so imports must exist before any addFunc call.
+    // imports.len() + funcs.len(), so imports must exist before any addFunc call.
     const ws = addWasiRuntime(linker, opts.is_wasi)
     const mem = addMemRuntime(linker, heap_ptr_global)
     const sl = addSliceRuntime(linker, heap_ptr_global)
@@ -294,7 +294,7 @@ fn populateBenchIndices(m: *Map(string, int), f: *BenchFunctions) void {
 /// Add user function names to func_indices (offset by runtime count).
 fn populateUserFuncIndicesFromIR(func_indices: *Map(string, int), ir: IR, runtime_func_count: int) void {
     var i = 0
-    while (i < ir.funcs.count) {
+    while (i < ir.funcs.len()) {
         const f = ir.funcs.get(i)
         func_indices.set(f.name, i + runtime_func_count)
         i += 1
@@ -308,7 +308,7 @@ fn populateUserFuncIndicesFromIR(func_indices: *Map(string, int), ir: IR, runtim
 /// Add all user functions to the indirect call table, building table index map.
 fn addUserTableEntries(linker: *Linker, ir: IR, runtime_func_count: int, func_table_indices: *Map(string, int)) void {
     var i = 0
-    while (i < ir.funcs.count) {
+    while (i < ir.funcs.len()) {
         const func_idx = i + runtime_func_count
         const table_idx = linker.addTableFunc(func_idx)
         func_table_indices.set(ir.funcs.get(i).name, table_idx)
@@ -323,10 +323,10 @@ fn addUserTableEntries(linker: *Linker, ir: IR, runtime_func_count: int, func_ta
 /// Collect all string literals from IR functions, dedup, add to linker data segments.
 fn collectAllStringLiterals(linker: *Linker, string_offsets: *Map(string, int), ir: IR) void {
     var i = 0
-    while (i < ir.funcs.count) {
+    while (i < ir.funcs.len()) {
         const f = ir.funcs.get(i)
         var j = 0
-        while (j < f.string_literals.count) {
+        while (j < f.string_literals.len()) {
             const s = f.string_literals.get(j)
             if (!string_offsets.contains(s)) {
                 const data = stringToData(s)
@@ -360,7 +360,7 @@ fn stringToData(s: string) List(int) {
 /// Generate code for all IR functions and add them to the linker.
 fn generateAllFunctions(linker: *Linker, ir: IR, types: *TypeRegistry, func_indices: *Map(string, int), string_offsets: *Map(string, int), func_table_indices: *Map(string, int), runtime_func_count: int) void {
     var i = 0
-    while (i < ir.funcs.count) {
+    while (i < ir.funcs.len()) {
         const ir_func = ir.funcs.get(i)
         generateAndAddFunc(linker, ir_func, ir, types, func_indices, string_offsets, func_table_indices)
         i += 1
@@ -449,7 +449,7 @@ fn registerFuncType(linker: *Linker, ir_func: Func, types: *TypeRegistry) int {
 /// Decompose compound types: string/slice → 2xi64, large struct → Nxi64.
 fn buildFuncParams(params: *List(int), ir_func: Func, types: *TypeRegistry) void {
     var i = 0
-    while (i < ir_func.params.count) {
+    while (i < ir_func.params.len()) {
         const param = ir_func.params.get(i)
         addParamType(params, param, types)
         i += 1
@@ -517,7 +517,7 @@ fn addStartWrapper(linker: *Linker, func_indices: *Map(string, int), ir: IR, typ
     var main_name: string = ""
     var main_returns_value = false
     var i = 0
-    while (i < ir.funcs.count) {
+    while (i < ir.funcs.len()) {
         const f = ir.funcs.get(i)
         if (f.name == "main" or endsWith(f.name, ".main")) {
             main_name = f.name
@@ -560,7 +560,7 @@ fn addStartWrapper(linker: *Linker, func_indices: *Map(string, int), ir: IR, typ
 
 test "stringToData converts string bytes" {
     const data = stringToData("ABC")
-    @assertEq(data.count, 3)
+    @assertEq(data.len(), 3)
     @assertEq(data.get(0), 65)
     @assertEq(data.get(1), 66)
     @assertEq(data.get(2), 67)
@@ -568,7 +568,7 @@ test "stringToData converts string bytes" {
 
 test "stringToData empty string" {
     const data = stringToData("")
-    @assertEq(data.count, 0)
+    @assertEq(data.len(), 0)
 }
 
 test "buildFuncResults void returns nothing" {
@@ -576,7 +576,7 @@ test "buildFuncResults void returns nothing" {
     var results: List(int) = .{}
     const f = makeDriverTestFunc("void_fn", VOID)
     buildFuncResults(&results, f, &types)
-    @assertEq(results.count, 0)
+    @assertEq(results.len(), 0)
 }
 
 test "buildFuncResults int returns i64" {
@@ -584,7 +584,7 @@ test "buildFuncResults int returns i64" {
     var results: List(int) = .{}
     const f = makeDriverTestFunc("int_fn", INT)
     buildFuncResults(&results, f, &types)
-    @assertEq(results.count, 1)
+    @assertEq(results.len(), 1)
     @assertEq(results.get(0), VT_I64)
 }
 
@@ -593,7 +593,7 @@ test "buildFuncResults float returns f64" {
     var results: List(int) = .{}
     const f = makeDriverTestFunc("float_fn", F64)
     buildFuncResults(&results, f, &types)
-    @assertEq(results.count, 1)
+    @assertEq(results.len(), 1)
     @assertEq(results.get(0), VT_F64)
 }
 
@@ -602,7 +602,7 @@ test "buildFuncParams empty params" {
     var params: List(int) = .{}
     const f = makeDriverTestFunc("empty_fn", VOID)
     buildFuncParams(&params, f, &types)
-    @assertEq(params.count, 0)
+    @assertEq(params.len(), 0)
 }
 
 test "buildFuncParams int param produces i64" {
@@ -611,7 +611,7 @@ test "buildFuncParams int param produces i64" {
     var f = makeDriverTestFunc("int_fn", VOID)
     f.params.append(Local.initParam("x", INT, 0, 8))
     buildFuncParams(&params, f, &types)
-    @assertEq(params.count, 1)
+    @assertEq(params.len(), 1)
     @assertEq(params.get(0), VT_I64)
 }
 
@@ -621,7 +621,7 @@ test "buildFuncParams string param produces 2xi64" {
     var f = makeDriverTestFunc("str_fn", VOID)
     f.params.append(Local.initParam("s", STRING, 0, 16))
     buildFuncParams(&params, f, &types)
-    @assertEq(params.count, 2)
+    @assertEq(params.len(), 2)
     @assertEq(params.get(0), VT_I64)
     @assertEq(params.get(1), VT_I64)
 }

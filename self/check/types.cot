@@ -502,7 +502,7 @@ struct TypeRegistry {
     }
     /// Look up a type by index. Returns invalid type for out-of-bounds.
     fn get(idx: int) Type {
-        if (idx == invalid_type or idx >= self.types.count) {
+        if (idx == invalid_type or idx >= self.types.len()) {
             return Type.basic(BasicKind.invalid)
         }
         return self.types.get(idx)
@@ -570,7 +570,7 @@ struct TypeRegistry {
 
     /// Add a type to the registry. Returns its index.
     fn add(t: Type) int {
-        const idx = self.types.count
+        const idx = self.types.len()
         self.types.append(t)
         return idx
     }
@@ -578,8 +578,8 @@ struct TypeRegistry {
     /// Update a type entry in-place (for placeholder pattern).
     /// Zig reference: checker.zig:456 — update placeholder with real struct type.
     fn updateAt(idx: int, t: Type) void {
-        if (idx >= 0 and idx < self.types.count) {
-            @intToPtr(*Type, self.types.items + idx * @sizeOf(Type)).* = t
+        if (idx >= 0 and idx < self.types.len()) {
+            self.types.set(idx, t)
         }
     }
 
@@ -650,7 +650,7 @@ struct TypeRegistry {
         const pointee = self.get(elem)
         const is_managed = pointee.tag == TAG_STRUCT or pointee.tag == TAG_ENUM or pointee.tag == TAG_UNION
         // Dedup: check for existing matching pointer type (Zig types.zig:258-265)
-        for i in FIRST_USER_TYPE..self.types.count {
+        for i in FIRST_USER_TYPE..self.types.len() {
             const t = self.get(i)
             if (t.tag == TAG_POINTER) {
                 const p = switch (t) { Type.pointer |p| => p, else => PointerType { elem: 0, managed: false } }
@@ -662,7 +662,7 @@ struct TypeRegistry {
 
     fn makeRawPointer(elem: int) int {
         // Dedup: check for existing matching raw pointer type
-        for i in FIRST_USER_TYPE..self.types.count {
+        for i in FIRST_USER_TYPE..self.types.len() {
             const t = self.get(i)
             if (t.tag == TAG_POINTER) {
                 const p = switch (t) { Type.pointer |p| => p, else => PointerType { elem: 0, managed: false } }
@@ -674,7 +674,7 @@ struct TypeRegistry {
 
     fn makeOptional(elem: int) int {
         // Dedup: check for existing matching optional type
-        for i in FIRST_USER_TYPE..self.types.count {
+        for i in FIRST_USER_TYPE..self.types.len() {
             const t = self.get(i)
             if (t.tag == TAG_OPTIONAL) {
                 const o = switch (t) { Type.optional |o| => o, else => OptionalType { elem: 0 } }
@@ -686,7 +686,7 @@ struct TypeRegistry {
 
     fn makeErrorUnion(elem: int) int {
         // Dedup: check for existing matching error union type
-        for i in FIRST_USER_TYPE..self.types.count {
+        for i in FIRST_USER_TYPE..self.types.len() {
             const t = self.get(i)
             if (t.tag == TAG_ERROR_UNION) {
                 const eu = switch (t) { Type.error_union |eu| => eu, else => ErrorUnionType { elem: 0, error_set: 0 } }
@@ -698,7 +698,7 @@ struct TypeRegistry {
 
     fn makeErrorUnionWithSet(elem: int, error_set: int) int {
         // Dedup: check for existing matching error union with set
-        for i in FIRST_USER_TYPE..self.types.count {
+        for i in FIRST_USER_TYPE..self.types.len() {
             const t = self.get(i)
             if (t.tag == TAG_ERROR_UNION) {
                 const eu = switch (t) { Type.error_union |eu| => eu, else => ErrorUnionType { elem: 0, error_set: 0 } }
@@ -710,7 +710,7 @@ struct TypeRegistry {
 
     fn makeSlice(elem: int) int {
         // Dedup: check for existing matching slice type
-        for i in FIRST_USER_TYPE..self.types.count {
+        for i in FIRST_USER_TYPE..self.types.len() {
             const t = self.get(i)
             if (t.tag == TAG_SLICE) {
                 const s = switch (t) { Type.slice |s| => s, else => SliceType { elem: 0 } }
@@ -722,7 +722,7 @@ struct TypeRegistry {
 
     fn makeArray(elem: int, length: int) int {
         // Dedup: check for existing matching array type
-        for i in FIRST_USER_TYPE..self.types.count {
+        for i in FIRST_USER_TYPE..self.types.len() {
             const t = self.get(i)
             if (t.tag == TAG_ARRAY) {
                 const a = switch (t) { Type.array |a| => a, else => ArrayType { elem: 0, length: 0 } }
@@ -734,7 +734,7 @@ struct TypeRegistry {
 
     fn makeMap(key: int, value: int) int {
         // Dedup: check for existing matching map type
-        for i in FIRST_USER_TYPE..self.types.count {
+        for i in FIRST_USER_TYPE..self.types.len() {
             const t = self.get(i)
             if (t.tag == TAG_MAP) {
                 const m = switch (t) { Type.map_type |m| => m, else => CotMapType { key: 0, value: 0 } }
@@ -746,7 +746,7 @@ struct TypeRegistry {
 
     fn makeList(elem: int) int {
         // Dedup: check for existing matching list type
-        for i in FIRST_USER_TYPE..self.types.count {
+        for i in FIRST_USER_TYPE..self.types.len() {
             const t = self.get(i)
             if (t.tag == TAG_LIST) {
                 const l = switch (t) { Type.list_type |l| => l, else => CotListType { elem: 0 } }
@@ -757,7 +757,7 @@ struct TypeRegistry {
     }
 
     fn makeTuple(elems: List(int)) int {
-        const count = elems.count
+        const count = elems.len()
         const ptr = alloc_raw(count * 8)
         for i in 0..count {
             @intToPtr(*int, ptr + i * 8).* = elems.get(i)
@@ -766,7 +766,7 @@ struct TypeRegistry {
     }
 
     fn makeFunc(params: List(FuncParam), return_type: int) int {
-        const count = params.count
+        const count = params.len()
         const ptr = alloc_raw(count * @sizeOf(FuncParam))
         for i in 0..count {
             const p = params.get(i)
@@ -1038,7 +1038,7 @@ struct TypeRegistry {
     }
 
     fn lookupMethod(type_name: string, method_name: string) int {
-        for i in 0..self.methods.count {
+        for i in 0..self.methods.len() {
             const entry = self.methods.get(i)
             if (entry.type_name == type_name and entry.info.name == method_name) {
                 return i
@@ -1308,7 +1308,7 @@ struct TypeRegistry {
 
     /// T8: Free raw pointer allocations for tuple elem arrays, func param arrays (Zig types.zig:202-208).
     fn deinit() void {
-        for i in 0..self.types.count {
+        for i in 0..self.types.len() {
             const t = self.get(i)
             if (t.tag == TAG_TUPLE) {
                 const tup = switch (t) { Type.tuple |tup| => tup, else => TupleType { elem_count: 0, elem_types: 0 } }

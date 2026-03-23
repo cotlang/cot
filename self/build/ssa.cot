@@ -248,11 +248,11 @@ struct SsaValue {
     }
 
     fn argsLen() int {
-        return self.args.count
+        return self.args.len()
     }
 
     fn resetArgs() void {
-        self.args.count = 0
+        self.args.clear()
     }
 
     fn deinit() void {
@@ -304,7 +304,7 @@ struct SsaBlock {
     }
 
     fn setControl(val: *SsaValue) void {
-        if (self.controls.count == 0) {
+        if (self.controls.len() == 0) {
             self.controls.append(val)
         } else {
             self.controls.set(0, val)
@@ -325,7 +325,7 @@ struct SsaBlock {
 
         // Add predecessor edge: target ← self
         var target = blocks.get(target_idx)
-        const pred_edge = SsaEdge { block: self.idx, index: target.preds.count }
+        const pred_edge = SsaEdge { block: self.idx, index: target.preds.len() }
         target.preds.append(pred_edge)
         // No blocks.set needed — modified through pointer
     }
@@ -406,7 +406,7 @@ struct SsaFunc {
         var preds: List(SsaEdge) = .{}
         var controls: List(*SsaValue) = .{}
         var values: List(*SsaValue) = .{}
-        const idx = self.blocks.count
+        const idx = self.blocks.len()
         var blk = new SsaBlock {
             id: id,
             idx: idx,
@@ -444,13 +444,13 @@ struct SsaFunc {
     fn deinit() void {
         // Free each value's args list
         var i = 0
-        while (i < self.values.count) {
+        while (i < self.values.len()) {
             self.values.get(i).deinit()
             i += 1
         }
         // Free each block's internal lists
         i = 0
-        while (i < self.blocks.count) {
+        while (i < self.blocks.len()) {
             self.blocks.get(i).deinit()
             i += 1
         }
@@ -496,27 +496,27 @@ test "SsaBlock addValue and setControl" {
     var v2 = func.newValue(SsaOp.add, I64, blk.idx, 0, 0)
     blk.addValue(v1)
     blk.addValue(v2)
-    @assertEq(blk.values.count, 2)
+    @assertEq(blk.values.len(), 2)
     @assertEq(blk.values.get(0).id, v1.id)
 
     // setControl
     blk.setControl(v1)
-    @assertEq(blk.controls.count, 1)
+    @assertEq(blk.controls.len(), 1)
     @assertEq(blk.controls.get(0).id, v1.id)
     blk.setControl(v2)
-    @assertEq(blk.controls.count, 1)
+    @assertEq(blk.controls.len(), 1)
     @assertEq(blk.controls.get(0).id, v2.id)
 }
 
 test "SsaFunc newValue returns pointer" {
     var func = SsaFunc.init("test_ptr")
     var blk = func.newBlock(SsaBlockKind.plain)
-    @assertEq(func.blocks.count, 1)
+    @assertEq(func.blocks.len(), 1)
     @assertEq(blk.idx, 0)
 
     var v0 = func.newValue(SsaOp.const_int, I64, blk.idx, 0, 0)
     @assertEq(v0.id, 0)
-    @assertEq(func.values.count, 1)
+    @assertEq(func.values.len(), 1)
 
     // Direct mutation through pointer — no getValue/setValue needed
     v0.aux_int = 42
@@ -525,7 +525,7 @@ test "SsaFunc newValue returns pointer" {
 
     var v1 = func.newValue(SsaOp.add, I64, blk.idx, 0, 0)
     @assertEq(v1.id, 1)
-    @assertEq(func.values.count, 2)
+    @assertEq(func.values.len(), 2)
 }
 
 test "SsaFunc constInt dedup" {
@@ -551,11 +551,11 @@ test "SsaBlock addEdgeTo" {
     b0.addEdgeTo(b1.idx, func.blocks)
 
     // Verify successor — direct pointer access, no getBlock needed
-    @assertEq(b0.succs.count, 1)
+    @assertEq(b0.succs.len(), 1)
     @assertEq(b0.succs.get(0).block, b1.idx)
 
     // Verify predecessor
-    @assertEq(b1.preds.count, 1)
+    @assertEq(b1.preds.len(), 1)
     @assertEq(b1.preds.get(0).block, b0.idx)
 }
 

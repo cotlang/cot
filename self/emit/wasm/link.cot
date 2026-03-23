@@ -259,7 +259,7 @@ struct Linker {
 
     /// Number of GC types (structs + arrays, offsets function type indices)
     fn gcTypeCount() int {
-        return self.gc_struct_types.count + self.gc_array_types.count
+        return self.gc_struct_types.len() + self.gc_array_types.len()
     }
 
     /// Adjust raw function type index for GC types
@@ -273,14 +273,14 @@ struct Linker {
         if (self.gc_struct_name_map.getOrNull(name)) |existing| {
             return existing
         }
-        const type_idx = self.gc_struct_types.count
-        const field_offset = self.gc_field_storage.count
+        const type_idx = self.gc_struct_types.len()
+        const field_offset = self.gc_field_storage.len()
         var fi = 0
-        while (fi < fields.count) {
+        while (fi < fields.len()) {
             self.gc_field_storage.append(fields.get(fi))
             fi += 1
         }
-        self.gc_struct_types.append(GcStructType.init(name, fields.count, field_offset))
+        self.gc_struct_types.append(GcStructType.init(name, fields.len(), field_offset))
         self.gc_struct_name_map.set(name, type_idx)
         return type_idx
     }
@@ -290,7 +290,7 @@ struct Linker {
         if (self.gc_array_name_map.getOrNull(name)) |existing| {
             return existing
         }
-        const type_idx = self.gc_struct_types.count + self.gc_array_types.count
+        const type_idx = self.gc_struct_types.len() + self.gc_array_types.len()
         self.gc_array_types.append(GcArrayType.init(name, elem_type))
         self.gc_array_name_map.set(name, type_idx)
         return type_idx
@@ -300,24 +300,24 @@ struct Linker {
     /// Zig reference: Linker.addTypeWasm() — store-then-compare with rollback on dedup.
     fn addType(params: List(int), results: List(int)) int {
         // Store into shared type_storage first
-        const params_start = self.type_storage.count
+        const params_start = self.type_storage.len()
         var pi = 0
-        while (pi < params.count) {
+        while (pi < params.len()) {
             self.type_storage.append(params.get(pi))
             pi += 1
         }
-        const results_start = self.type_storage.count
+        const results_start = self.type_storage.len()
         var ri = 0
-        while (ri < results.count) {
+        while (ri < results.len()) {
             self.type_storage.append(results.get(ri))
             ri += 1
         }
 
-        const new_type = FuncType.init(params_start, params.count, results_start, results.count)
+        const new_type = FuncType.init(params_start, params.len(), results_start, results.len())
 
         // Check for duplicate (compare via shared storage)
         var i = 0
-        while (i < self.types.count) {
+        while (i < self.types.len()) {
             if (self.types.get(i).eqlWith(new_type, self.type_storage)) {
                 // Duplicate — rollback type_storage
                 self.type_storage.resize(params_start)
@@ -327,29 +327,29 @@ struct Linker {
         }
 
         self.types.append(new_type)
-        return self.types.count - 1
+        return self.types.len() - 1
     }
 
     /// Add a host import. Returns import function index.
     fn addImport(imp: WasmImport) int {
-        const idx = self.imports.count
+        const idx = self.imports.len()
         self.imports.append(imp)
         return idx
     }
 
     /// Number of imports
     fn numImports() int {
-        return self.imports.count
+        return self.imports.len()
     }
 
     /// Total function count (imports + module funcs) for index offsetting.
     fn funcCount() int {
-        return self.imports.count + self.funcs.count
+        return self.imports.len() + self.funcs.len()
     }
 
     /// Add a global variable. Returns global index.
     fn addGlobal(global: WasmGlobal) int {
-        const idx = self.globals.count
+        const idx = self.globals.len()
         self.globals.append(global)
         return idx
     }
@@ -357,7 +357,7 @@ struct Linker {
     /// Add a function. Returns global function index (imports + module funcs).
     /// Call sites that previously added import_count manually must be updated.
     fn addFunc(func: WasmFunc) int {
-        const idx = self.imports.count + self.funcs.count
+        const idx = self.imports.len() + self.funcs.len()
         self.funcs.append(func)
         return idx
     }
@@ -370,7 +370,7 @@ struct Linker {
 
     /// Add function to indirect call table. Returns table index.
     fn addTableFunc(func_idx: int) int {
-        const table_idx = self.table_funcs.count
+        const table_idx = self.table_funcs.len()
         self.table_funcs.append(func_idx)
         if (table_idx + 1 > self.table_size) {
             self.table_size = table_idx + 1
@@ -389,9 +389,9 @@ struct Linker {
     fn addDataSegment(data: List(int)) int {
         var offset = 0
         var i = 0
-        while (i < self.data_segments.count) {
+        while (i < self.data_segments.len()) {
             const seg = self.data_segments.get(i)
-            const seg_end = seg.offset + seg.data.count
+            const seg_end = seg.offset + seg.data.len()
             if (seg_end > offset) { offset = seg_end }
             i += 1
         }
@@ -436,9 +436,9 @@ struct Linker {
     // ========================================================================
 
     fn emitTypeSection(output: *List(int)) void {
-        const gc_struct_count = self.gc_struct_types.count
-        const gc_array_count = self.gc_array_types.count
-        const func_count = self.types.count
+        const gc_struct_count = self.gc_struct_types.len()
+        const gc_array_count = self.gc_array_types.len()
+        const func_count = self.types.len()
         const total_count = gc_struct_count + gc_array_count + func_count
         if (total_count == 0) { return }
 
@@ -506,12 +506,12 @@ struct Linker {
     }
 
     fn emitImportSection(output: *List(int)) void {
-        if (self.imports.count == 0) { return }
+        if (self.imports.len() == 0) { return }
 
         var buf: List(int) = .{}
-        writeULEB128(&buf, self.imports.count)
+        writeULEB128(&buf, self.imports.len())
         var i = 0
-        while (i < self.imports.count) {
+        while (i < self.imports.len()) {
             const imp = self.imports.get(i)
             writeString(&buf, imp.module)
             writeString(&buf, imp.name)
@@ -523,13 +523,13 @@ struct Linker {
     }
 
     fn emitFunctionSection(output: *List(int)) void {
-        if (self.funcs.count == 0) { return }
+        if (self.funcs.len() == 0) { return }
 
         var buf: List(int) = .{}
-        writeULEB128(&buf, self.funcs.count)
+        writeULEB128(&buf, self.funcs.len())
         const gc_offset = self.gcTypeCount()
         var i = 0
-        while (i < self.funcs.count) {
+        while (i < self.funcs.len()) {
             writeULEB128(&buf, self.funcs.get(i).type_idx + gc_offset)
             i += 1
         }
@@ -563,7 +563,7 @@ struct Linker {
 
     fn emitGlobalSection(output: *List(int)) void {
         var buf: List(int) = .{}
-        const total_globals = 1 + self.globals.count
+        const total_globals = 1 + self.globals.len()
         writeULEB128(&buf, total_globals)
 
         // Global 0: SP (stack pointer)
@@ -575,7 +575,7 @@ struct Linker {
 
         // Dynamic globals
         var i = 0
-        while (i < self.globals.count) {
+        while (i < self.globals.len()) {
             const g = self.globals.get(i)
             buf.append(g.val_type)
             buf.append(if (g.mutable) { GLOBAL_MUTABLE } else { GLOBAL_IMMUTABLE })
@@ -596,16 +596,16 @@ struct Linker {
 
         var export_count = 1  // always export memory
         var ci = 0
-        while (ci < self.funcs.count) {
+        while (ci < self.funcs.len()) {
             if (self.funcs.get(ci).exported) { export_count += 1 }
             ci += 1
         }
         writeULEB128(&buf, export_count)
 
         // Export functions
-        const import_count = self.imports.count
+        const import_count = self.imports.len()
         var i = 0
-        while (i < self.funcs.count) {
+        while (i < self.funcs.len()) {
             const f = self.funcs.get(i)
             if (f.exported) {
                 writeString(&buf, f.name)
@@ -624,7 +624,7 @@ struct Linker {
     }
 
     fn emitElementSection(output: *List(int)) void {
-        if (self.table_funcs.count == 0) { return }
+        if (self.table_funcs.len() == 0) { return }
 
         var buf: List(int) = .{}
         writeULEB128(&buf, 1)
@@ -632,9 +632,9 @@ struct Linker {
         buf.append(0x41)  // i32.const
         writeSLEB128(&buf, 0)
         buf.append(0x0B)  // end
-        writeULEB128(&buf, self.table_funcs.count)
+        writeULEB128(&buf, self.table_funcs.len())
         var i = 0
-        while (i < self.table_funcs.count) {
+        while (i < self.table_funcs.len()) {
             // table_funcs already stores global function indices (imports + module funcs)
             writeULEB128(&buf, self.table_funcs.get(i))
             i += 1
@@ -643,23 +643,23 @@ struct Linker {
     }
 
     fn emitDataCountSection(output: *List(int)) void {
-        if (self.data_segments.count == 0) { return }
+        if (self.data_segments.len() == 0) { return }
         var buf: List(int) = .{}
-        writeULEB128(&buf, self.data_segments.count)
+        writeULEB128(&buf, self.data_segments.len())
         writeSection(output, SECTION_DATA_COUNT, buf)
     }
 
     fn emitCodeSection(output: *List(int)) void {
-        if (self.funcs.count == 0) { return }
+        if (self.funcs.len() == 0) { return }
 
         var buf: List(int) = .{}
-        writeULEB128(&buf, self.funcs.count)
+        writeULEB128(&buf, self.funcs.len())
         var i = 0
-        while (i < self.funcs.count) {
+        while (i < self.funcs.len()) {
             const f = self.funcs.get(i)
-            writeULEB128(&buf, f.code.count)
+            writeULEB128(&buf, f.code.len())
             var ci = 0
-            while (ci < f.code.count) {
+            while (ci < f.code.len()) {
                 buf.append(f.code.get(ci))
                 ci += 1
             }
@@ -669,20 +669,20 @@ struct Linker {
     }
 
     fn emitDataSection(output: *List(int)) void {
-        if (self.data_segments.count == 0) { return }
+        if (self.data_segments.len() == 0) { return }
 
         var buf: List(int) = .{}
-        writeULEB128(&buf, self.data_segments.count)
+        writeULEB128(&buf, self.data_segments.len())
         var i = 0
-        while (i < self.data_segments.count) {
+        while (i < self.data_segments.len()) {
             const seg = self.data_segments.get(i)
             writeULEB128(&buf, 0)  // memory index 0
             buf.append(0x41)  // i32.const
             writeSLEB128(&buf, seg.offset)
             buf.append(0x0B)  // end
-            writeULEB128(&buf, seg.data.count)
+            writeULEB128(&buf, seg.data.len())
             var di = 0
-            while (di < seg.data.count) {
+            while (di < seg.data.len()) {
                 buf.append(seg.data.get(di))
                 di += 1
             }
@@ -698,9 +698,9 @@ struct Linker {
 
 fn writeSection(output: *List(int), section_id: int, content: List(int)) void {
     output.append(section_id)
-    writeULEB128(output, content.count)
+    writeULEB128(output, content.len())
     var i = 0
-    while (i < content.count) {
+    while (i < content.len()) {
         output.append(content.get(i))
         i += 1
     }
@@ -776,7 +776,7 @@ test "linker emit minimal module" {
     @assertEq(output.get(3), 0x6D)
     // Verify version
     @assertEq(output.get(4), 0x01)
-    @assert(output.count > 20)
+    @assert(output.len() > 20)
 }
 
 test "linker gc struct types" {
@@ -838,7 +838,7 @@ test "linker with imports" {
     // Should contain import section (section ID 2)
     var found_import = false
     var i = 8
-    while (i < output.count) {
+    while (i < output.len()) {
         if (output.get(i) == SECTION_IMPORT) {
             found_import = true
         }
@@ -870,7 +870,7 @@ test "linker table and elements" {
     var found_table = false
     var found_element = false
     var i = 8
-    while (i < output.count) {
+    while (i < output.len()) {
         if (output.get(i) == SECTION_TABLE) { found_table = true }
         if (output.get(i) == SECTION_ELEMENT) { found_element = true }
         i += 1
@@ -896,7 +896,7 @@ test "linker globals" {
 
     var found_global = false
     var i = 8
-    while (i < output.count) {
+    while (i < output.len()) {
         if (output.get(i) == SECTION_GLOBAL) { found_global = true }
         i += 1
     }
@@ -934,7 +934,7 @@ test "linker data segments" {
     var found_data = false
     var found_data_count = false
     var i = 8
-    while (i < output.count) {
+    while (i < output.len()) {
         if (output.get(i) == SECTION_DATA) { found_data = true }
         if (output.get(i) == SECTION_DATA_COUNT) { found_data_count = true }
         i += 1

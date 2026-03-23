@@ -622,14 +622,14 @@ struct CodeBuilder {
     /// types: List of ValType values (0x7F=i32, 0x7E=i64, 0x7D=f32, 0x7C=f64)
     /// Each type gets its own declaration group (count=1, type).
     fn declareLocals(types: List(int)) void {
-        writeULEB128(self.buf, types.count)
+        writeULEB128(self.buf, types.len())
         var i = 0
-        while (i < types.count) {
+        while (i < types.len()) {
             writeULEB128(self.buf, 1)
             self.buf.append(types.get(i) as u8)
             i += 1
         }
-        self.local_count = self.local_count + types.count
+        self.local_count = self.local_count + types.len()
         self.locals_declared = true
     }
 
@@ -646,7 +646,7 @@ struct CodeBuilder {
 
         // Copy instruction bytecode
         var i = 0
-        while (i < self.buf.count) {
+        while (i < self.buf.len()) {
             result.append(self.buf.get(i) as int)
             i += 1
         }
@@ -705,7 +705,7 @@ test "CodeBuilder emitI32Const" {
 test "CodeBuilder emitI64Add" {
     var cb = CodeBuilder.init()
     cb.emitI64Add()
-    @assertEq(cb.buf.count, 1)
+    @assertEq(cb.buf.len(), 1)
     @assertEq(cb.buf.get(0) as int, 0x7C)  // i64.add
 }
 

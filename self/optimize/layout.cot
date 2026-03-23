@@ -15,8 +15,8 @@ import "../debug"
 /// Reorder blocks to minimize jumps.
 /// Uses indegree-based scheduling (Go pattern from layout.go).
 fn layout(func: *SsaFunc) void {
-    debug(.codegen, "=== Layout pass for '${func.name}' (${func.blocks.count} blocks) ===")
-    const num_blocks = func.blocks.count
+    debug(.codegen, "=== Layout pass for '${func.name}' (${func.blocks.len()} blocks) ===")
+    const num_blocks = func.blocks.len()
     if (num_blocks <= 1) { return }
 
     // Track scheduled blocks
@@ -50,8 +50,8 @@ fn layout(func: *SsaFunc) void {
     for bi in 0..num_blocks {
         if (is_exit.contains(bi)) { continue }
         const blk = func.blocks.get(bi)
-        indegree.set(bi, blk.preds.count)
-        if (blk.preds.count == 0) {
+        indegree.set(bi, blk.preds.len())
+        if (blk.preds.len() == 0) {
             zerodegree.append(bi)
         }
     }
@@ -62,7 +62,7 @@ fn layout(func: *SsaFunc) void {
         current_idx = func.entry
     }
 
-    while (order.count < num_blocks) {
+    while (order.len() < num_blocks) {
         const blk = func.blocks.get(current_idx)
         order.append(current_idx)
         scheduled.set(current_idx, true)
@@ -71,7 +71,7 @@ fn layout(func: *SsaFunc) void {
         // Traverse in reverse order for better scheduling.
         // Key: ALWAYS decrement indegree, even for exit blocks (allows negative).
         // Exit blocks start at 0, go to -1 when decremented, get added to succs_list.
-        var si = blk.succs.count
+        var si = blk.succs.len()
         while (si > 0) {
             si -= 1
             const succ_edge = blk.succs.get(si)
@@ -97,7 +97,7 @@ fn layout(func: *SsaFunc) void {
         // Pick next block
         // 1. Try first unscheduled non-exit successor
         var found = false
-        for ei in 0..blk.succs.count {
+        for ei in 0..blk.succs.len() {
             const succ_edge = blk.succs.get(ei)
             const succ_idx = succ_edge.block
             if (!scheduled.contains(succ_idx) and !is_exit.contains(succ_idx)) {
@@ -110,8 +110,8 @@ fn layout(func: *SsaFunc) void {
 
         // 2. Try zero-degree blocks (LIFO for depth-first)
         found = false
-        while (zerodegree.count > 0) {
-            const idx = zerodegree.get(zerodegree.count - 1)
+        while (zerodegree.len() > 0) {
+            const idx = zerodegree.get(zerodegree.len() - 1)
             zerodegree.pop()
             if (!scheduled.contains(idx)) {
                 current_idx = idx
@@ -123,8 +123,8 @@ fn layout(func: *SsaFunc) void {
 
         // 3. Try recently seen successors (Go pattern: no is_exit check).
         // Exit blocks get scheduled here after zerodegree is empty.
-        while (succs_list.count > 0) {
-            const idx = succs_list.get(succs_list.count - 1)
+        while (succs_list.len() > 0) {
+            const idx = succs_list.get(succs_list.len() - 1)
             succs_list.pop()
             if (!scheduled.contains(idx)) {
                 current_idx = idx
@@ -147,29 +147,29 @@ fn layout(func: *SsaFunc) void {
 
     // Physically reorder blocks (Zig layout.zig:183-187).
     var old_to_new: Map(int, int) = .{}
-    for ni in 0..order.count {
+    for ni in 0..order.len() {
         old_to_new.set(order.get(ni), ni)
     }
 
     // Build new list in layout order
     var new_blocks: List(*SsaBlock) = .{}
-    for ni in 0..order.count {
+    for ni in 0..order.len() {
         new_blocks.append(func.blocks.get(order.get(ni)))
     }
 
     // Update edge references and block indices
-    for ni in 0..new_blocks.count {
+    for ni in 0..new_blocks.len() {
         const blk = new_blocks.get(ni)
         blk.id = ni
         blk.idx = ni
-        for si in 0..blk.succs.count {
+        for si in 0..blk.succs.len() {
             var edge = blk.succs.get(si)
             if (old_to_new.contains(edge.block)) {
                 edge.block = old_to_new.get(edge.block)
                 blk.succs.set(si, edge)
             }
         }
-        for pi in 0..blk.preds.count {
+        for pi in 0..blk.preds.len() {
             var edge = blk.preds.get(pi)
             if (old_to_new.contains(edge.block)) {
                 edge.block = old_to_new.get(edge.block)
@@ -193,7 +193,7 @@ test "layout single block" {
     var func = SsaFunc.init("single")
     func.newBlock(SsaBlockKind.ret)
     layout(&func)
-    @assertEq(func.blocks.count, 1)
+    @assertEq(func.blocks.len(), 1)
 }
 
 test "layout linear blocks" {
@@ -211,7 +211,7 @@ test "layout linear blocks" {
     layout(&func)
 
     // Should maintain order: b0 → b1 → b2
-    @assertEq(func.blocks.count, 3)
+    @assertEq(func.blocks.len(), 3)
     @assertEq(func.blocks.get(0).id, 0)
     @assertEq(func.blocks.get(1).id, 1)
     @assertEq(func.blocks.get(2).id, 2)
@@ -240,7 +240,7 @@ test "layout diamond" {
     layout(&func)
 
     // b0 should be first, b3 (exit) should be last
-    @assertEq(func.blocks.count, 4)
+    @assertEq(func.blocks.len(), 4)
     @assertEq(func.blocks.get(0).id, 0)
     @assertEq(func.blocks.get(3).id, 3)
 }
@@ -270,7 +270,7 @@ test "layout with loop" {
     layout(&func)
 
     // Entry should be first, exit should be last
-    @assertEq(func.blocks.count, 4)
+    @assertEq(func.blocks.len(), 4)
     @assertEq(func.blocks.get(0).id, 0)
     @assertEq(func.blocks.get(3).id, 3)
 }

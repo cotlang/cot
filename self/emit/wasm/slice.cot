@@ -231,14 +231,14 @@ fn generateGrowSliceBody(heap_ptr_global: int) List(int) {
 
 test "generateNextSliceCapBody produces valid bytecode" {
     const body = generateNextSliceCapBody()
-    @assert(body.count > 10)
-    @assertEq(body.get(body.count - 1), 0x0B)
+    @assert(body.len() > 10)
+    @assertEq(body.get(body.len() - 1), 0x0B)
 }
 
 test "generateGrowSliceBody produces valid bytecode" {
     const body = generateGrowSliceBody(2)
-    @assert(body.count > 10)
-    @assertEq(body.get(body.count - 1), 0x0B)
+    @assert(body.len() > 10)
+    @assertEq(body.get(body.len() - 1), 0x0B)
 }
 
 test "addSliceRuntime registers both functions" {

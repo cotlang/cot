@@ -55,7 +55,7 @@ fn pass1CountResumePoints(sym: *Symbol) (int, List(int)) {
     var tablePC = 0
     var explicitBlockDepth = 0
 
-    for i in 0..sym.text.count {
+    for i in 0..sym.text.len() {
         var p = sym.text.get(i)
 
         if (p.instr == As.block or p.instr == As.loop or p.instr == As.@"if") {
@@ -99,7 +99,7 @@ fn pass1CountResumePoints(sym: *Symbol) (int, List(int)) {
 /// (Zig uses pointer-based targets which are inherently stable; Cot uses
 /// index-based targets which break when insertAfter shifts the list.)
 fn convertBranchTargetsToPc(sym: *Symbol) void {
-    for i in 0..sym.text.count {
+    for i in 0..sym.text.len() {
         var p = sym.text.get(i)
         if (p.instr == As.jmp) {
             if (p.to.branch_target) |tidx| {
@@ -132,7 +132,7 @@ fn pass3Transform(sym: *Symbol) List(int) {
     const framesize = sym.frame_size
 
     var i = 0
-    while (i < sym.text.count) {
+    while (i < sym.text.len()) {
         var p = sym.text.get(i)
 
         if (p.instr == As.jmp) {
@@ -213,7 +213,7 @@ fn transformReturnCall(sym: *Symbol, idx: int, framesize: int) void {
 
 fn pass4AdjustOffsets(sym: *Symbol) void {
     const framesize = sym.frame_size
-    for j in 0..sym.text.count {
+    for j in 0..sym.text.len() {
         var p = sym.text.get(j)
         var changed = false
 
@@ -251,7 +251,7 @@ fn pass5DispatchLoop(sym: *Symbol, numResumePoints: int, tableIdxs: *List(int), 
     var insert_point = 0
     var num_inserted = 0
 
-    if (entryPointLoopBranches.count > 0) {
+    if (entryPointLoopBranches.len() > 0) {
         insert_point = insertAfter(&sym.text, insert_point, Prog.init(As.loop))
         entryPointLoopIdx = insert_point
         num_inserted += 1
@@ -268,7 +268,7 @@ fn pass5DispatchLoop(sym: *Symbol, numResumePoints: int, tableIdxs: *List(int), 
         // br_table with indices — store directly in Prog's AddrVal union
         // (Zig reference: preprocess.zig line 336-340)
         var bt_indices: List(int) = .{}
-        for ti in 0..tableIdxs.count {
+        for ti in 0..tableIdxs.len() {
             bt_indices.append(tableIdxs.get(ti))
         }
         var bt_addr = Addr.init()
@@ -285,7 +285,7 @@ fn pass5DispatchLoop(sym: *Symbol, numResumePoints: int, tableIdxs: *List(int), 
     // Zig uses *Prog pointers (unaffected by list insertions); selfcot uses
     // List indices which become stale after insertAfter shifts elements.
     if (num_inserted > 0) {
-        for b in 0..entryPointLoopBranches.count {
+        for b in 0..entryPointLoopBranches.len() {
             const old_idx = entryPointLoopBranches.get(b)
             entryPointLoopBranches.set(b, old_idx + num_inserted)
         }
@@ -293,7 +293,7 @@ fn pass5DispatchLoop(sym: *Symbol, numResumePoints: int, tableIdxs: *List(int), 
 
     // Zig preprocess.zig:317-320 — set all entry loop branches to target the loop instruction
     if (entryPointLoopIdx) |loop_idx| {
-        for b in 0..entryPointLoopBranches.count {
+        for b in 0..entryPointLoopBranches.len() {
             const br_idx = entryPointLoopBranches.get(b)
             var br_prog = sym.text.get(br_idx)
             br_prog.to.addr_type = AddrType.branch
@@ -302,7 +302,7 @@ fn pass5DispatchLoop(sym: *Symbol, numResumePoints: int, tableIdxs: *List(int), 
         }
     }
 
-    if (entryPointLoopBranches.count > 0) {
+    if (entryPointLoopBranches.len() > 0) {
         sym.text.append(Prog.init(As.end))
     }
 
@@ -320,11 +320,11 @@ fn pass5DispatchLoop(sym: *Symbol, numResumePoints: int, tableIdxs: *List(int), 
 fn pass6ResolveBranches(sym: *Symbol, entryPointLoopIdx: int, entryPointLoopBranches: *List(int)) void {
     var currentDepth = 0
     var blockDepths: List(int) = .{}
-    for n in 0..sym.text.count {
+    for n in 0..sym.text.len() {
         blockDepths.append(-1)
     }
 
-    for j in 0..sym.text.count {
+    for j in 0..sym.text.len() {
         var p = sym.text.get(j)
 
         if (p.instr == As.block or p.instr == As.loop or p.instr == As.@"if") {
@@ -358,12 +358,12 @@ fn pass6ResolveBranches(sym: *Symbol, entryPointLoopIdx: int, entryPointLoopBran
 fn preprocess(sym: *Symbol) void {
     debug(.codegen, "preprocess: '${sym.name}' framesize=${sym.frame_size}")
     if (sym.frame_size < 0) { return }
-    if (sym.text.count == 0) { return }
+    if (sym.text.len() == 0) { return }
 
     const result = pass1CountResumePoints(sym)
     const numResumePoints = result.0
     const tableIdxs = result.1
-    debug(.codegen, "  pass 1 complete: numResumePoints=${numResumePoints}, tableIdxs=${tableIdxs.count}")
+    debug(.codegen, "  pass 1 complete: numResumePoints=${numResumePoints}, tableIdxs=${tableIdxs.len()}")
 
     // Convert index-based branch targets to pc-based BEFORE any insertions
     convertBranchTargetsToPc(sym)
@@ -375,7 +375,7 @@ fn preprocess(sym: *Symbol) void {
     const loopIdx = pass5DispatchLoop(sym, numResumePoints, &tblIdxs, &entryPointLoopBranches)
     pass6ResolveBranches(sym, loopIdx, &entryPointLoopBranches)
 
-    debug(.codegen, "  preprocess complete: ${entryPointLoopBranches.count} branches resolved")
+    debug(.codegen, "  preprocess complete: ${entryPointLoopBranches.len()} branches resolved")
 }
 
 // ============================================================================
@@ -502,8 +502,8 @@ test "preprocess empty function" {
     sym.frame_size = 0
     sym.text.append(Prog.init(As.text))
     preprocess(&sym)
-    @assert(sym.text.count >= 2)
-    const last = sym.text.get(sym.text.count - 1)
+    @assert(sym.text.len() >= 2)
+    const last = sym.text.get(sym.text.len() - 1)
     @assertEq(last.instr == As.@"unreachable", true)
 }
 
@@ -513,7 +513,7 @@ test "preprocess with frame allocation" {
     sym.text.append(Prog.init(As.text))
     sym.text.append(Prog.init(As.@"return"))
     preprocess(&sym)
-    @assert(sym.text.count >= 7)
+    @assert(sym.text.len() >= 7)
     @assertEq(sym.text.get(1).instr == As.get, true)
     @assertEq(sym.text.get(2).instr == As.i32_const, true)
     @assertEq(sym.text.get(2).from.offset, 16)
@@ -526,7 +526,7 @@ test "preprocess ARET becomes return" {
     sym.text.append(Prog.init(As.aret))
     preprocess(&sym)
     var has_return = false
-    for i in 0..sym.text.count {
+    for i in 0..sym.text.len() {
         if (sym.text.get(i).instr == As.@"return") {
             has_return = true
         }
@@ -543,7 +543,7 @@ test "preprocess resume point creates br_table" {
     preprocess(&sym)
     var has_block = false
     var has_br_table = false
-    for i in 0..sym.text.count {
+    for i in 0..sym.text.len() {
         const instr = sym.text.get(i).instr
         if (instr == As.block) { has_block = true }
         if (instr == As.br_table) { has_br_table = true }
@@ -590,7 +590,7 @@ test "transformJmp with entries" {
     sym.text.append(jmp)
     sym.text.append(Prog.init(As.@"return"))
 
-    for i in 0..sym.text.count {
+    for i in 0..sym.text.len() {
         var p = sym.text.get(i)
         p.pc = i
         sym.text.set(i, p)
@@ -598,6 +598,6 @@ test "transformJmp with entries" {
 
     var branches: List(int) = .{}
     transformJmp(&sym, 2, &branches)
-    @assertEq(sym.text.count, 7)
-    @assertEq(branches.count, 1)
+    @assertEq(sym.text.len(), 7)
+    @assertEq(branches.len(), 1)
 }

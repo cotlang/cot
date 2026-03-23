@@ -30,20 +30,20 @@ import "../check/types"
 fn decompose(func: *SsaFunc) void {
     var total_values: i64 = 0
     var total_phis: i64 = 0
-    for bi in 0..func.blocks.count {
+    for bi in 0..func.blocks.len() {
         const blk = func.blocks.get(bi)
-        for vi in 0..blk.values.count {
+        for vi in 0..blk.values.len() {
             total_values += 1
             if (blk.values.get(vi).op == SsaOp.phi) { total_phis += 1 }
         }
     }
-    debug(.codegen, "=== Decompose pass for '${func.name}' (${func.blocks.count} blocks, ${total_values} values, ${total_phis} phis) ===")
+    debug(.codegen, "=== Decompose pass for '${func.name}' (${func.blocks.len()} blocks, ${total_values} values, ${total_phis} phis) ===")
 
     var decomposed: int = 0
 
-    for bi in 0..func.blocks.count {
+    for bi in 0..func.blocks.len() {
         const blk = func.blocks.get(bi)
-        for vi in 0..blk.values.count {
+        for vi in 0..blk.values.len() {
             const val = blk.values.get(vi)
             if (val.op != SsaOp.phi) { continue }
 
@@ -80,7 +80,7 @@ fn decomposeBuiltinPhi(func: *SsaFunc, block_idx: int, val: *SsaValue) bool {
 ///         cap_phi = phi(slice_cap(s1), slice_cap(s2))
 ///         result = slice_make(ptr_phi, len_phi, cap_phi)
 fn decomposeSlicePhi(func: *SsaFunc, block_idx: int, val: *SsaValue) bool {
-    if (val.args.count == 0) { return false }
+    if (val.args.len() == 0) { return false }
 
     const line = val.pos_line
     const col = val.pos_col
@@ -96,7 +96,7 @@ fn decomposeSlicePhi(func: *SsaFunc, block_idx: int, val: *SsaValue) bool {
     func.addValueToBlock(cap_phi, block_idx)
 
     // For each arg of the original phi, extract ptr, len, cap
-    for ai in 0..val.args.count {
+    for ai in 0..val.args.len() {
         const arg = val.args.get(ai)
         const arg_block = arg.block
 
@@ -138,7 +138,7 @@ fn decomposeSlicePhi(func: *SsaFunc, block_idx: int, val: *SsaValue) bool {
 ///         len_phi = phi(string_len(s1), string_len(s2))
 ///         result = string_make(ptr_phi, len_phi)
 fn decomposeStringPhi(func: *SsaFunc, block_idx: int, val: *SsaValue) bool {
-    if (val.args.count == 0) { return false }
+    if (val.args.len() == 0) { return false }
 
     const line = val.pos_line
     const col = val.pos_col
@@ -151,7 +151,7 @@ fn decomposeStringPhi(func: *SsaFunc, block_idx: int, val: *SsaValue) bool {
     func.addValueToBlock(len_phi, block_idx)
 
     // For each arg of the original phi, extract ptr and len
-    for ai in 0..val.args.count {
+    for ai in 0..val.args.len() {
         const arg = val.args.get(ai)
         const arg_block = arg.block
 
@@ -231,7 +231,7 @@ test "decompose string phi" {
 
     // Verify: phi should become copy
     @assertEq(phi_val.op == SsaOp.copy, true)
-    @assertEq(phi_val.args.count, 1)
+    @assertEq(phi_val.args.len(), 1)
 }
 
 test "decompose ignores non-compound phi" {

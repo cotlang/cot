@@ -473,50 +473,50 @@ fn generateBenchSummaryBody(write_func_idx: int, eprint_int_func_idx: int, time_
 
 test "generateBenchPrintNameBody produces valid bytecode" {
     const body = generateBenchPrintNameBody(1, 5, 3, 4)
-    @assert(body.count > 20)
-    @assertEq(body.get(body.count - 1), 0x0B)
+    @assert(body.len() > 20)
+    @assertEq(body.get(body.len() - 1), 0x0B)
 }
 
 test "generateCalibrateStartBody produces valid bytecode" {
     const body = generateCalibrateStartBody(5, 3)
-    @assert(body.count > 2)
-    @assertEq(body.get(body.count - 1), 0x0B)
+    @assert(body.len() > 2)
+    @assertEq(body.get(body.len() - 1), 0x0B)
 }
 
 test "generateCalibrateEndBody auto-calibrate produces valid bytecode" {
     const body = generateCalibrateEndBody(5, 3, 4, -1)
-    @assert(body.count > 20)
-    @assertEq(body.get(body.count - 1), 0x0B)
+    @assert(body.len() > 20)
+    @assertEq(body.get(body.len() - 1), 0x0B)
 }
 
 test "generateCalibrateEndBody user_n produces valid bytecode" {
     const body = generateCalibrateEndBody(5, 3, 4, 1000)
-    @assert(body.count > 2)
-    @assertEq(body.get(body.count - 1), 0x0B)
+    @assert(body.len() > 2)
+    @assertEq(body.get(body.len() - 1), 0x0B)
 }
 
 test "generateMeasureStartBody produces valid bytecode" {
     const body = generateMeasureStartBody(5, 3)
-    @assert(body.count > 2)
-    @assertEq(body.get(body.count - 1), 0x0B)
+    @assert(body.len() > 2)
+    @assertEq(body.get(body.len() - 1), 0x0B)
 }
 
 test "generateMeasureEndBody produces valid bytecode" {
     const body = generateMeasureEndBody(1, 2, 5, 3, 4)
-    @assert(body.count > 20)
-    @assertEq(body.get(body.count - 1), 0x0B)
+    @assert(body.len() > 20)
+    @assertEq(body.get(body.len() - 1), 0x0B)
 }
 
 test "generateGetNBody produces valid bytecode" {
     const body = generateGetNBody(4)
-    @assert(body.count > 2)
-    @assertEq(body.get(body.count - 1), 0x0B)
+    @assert(body.len() > 2)
+    @assertEq(body.get(body.len() - 1), 0x0B)
 }
 
 test "generateBenchSummaryBody produces valid bytecode" {
     const body = generateBenchSummaryBody(1, 2, 5, 4)
-    @assert(body.count > 20)
-    @assertEq(body.get(body.count - 1), 0x0B)
+    @assert(body.len() > 20)
+    @assertEq(body.get(body.len() - 1), 0x0B)
 }
 
 test "addBenchRuntime registers all 7 functions" {

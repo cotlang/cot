@@ -784,46 +784,46 @@ fn generateReleaseBody(destructor_type_idx: int, dealloc_idx: int) List(int) {
 
 test "generateAllocBody produces valid bytecode" {
     const body = generateAllocBody(2)
-    @assert(body.count > 0)
+    @assert(body.len() > 0)
     // Last byte should be END opcode
-    @assertEq(body.get(body.count - 1), 0x0B)
+    @assertEq(body.get(body.len() - 1), 0x0B)
 }
 
 test "generateVoidStubBody produces minimal body" {
     const body = generateVoidStubBody()
     // Should be just the END opcode (possibly with empty local decl)
-    @assert(body.count >= 1)
-    @assertEq(body.get(body.count - 1), 0x0B)
+    @assert(body.len() >= 1)
+    @assertEq(body.get(body.len() - 1), 0x0B)
 }
 
 test "generateReallocBody produces valid bytecode" {
     const body = generateReallocBody(2)
-    @assert(body.count > 0)
-    @assertEq(body.get(body.count - 1), 0x0B)
+    @assert(body.len() > 0)
+    @assertEq(body.get(body.len() - 1), 0x0B)
 }
 
 test "generateMemsetZeroBody produces valid bytecode" {
     const body = generateMemsetZeroBody()
-    @assert(body.count > 10)
-    @assertEq(body.get(body.count - 1), 0x0B)
+    @assert(body.len() > 10)
+    @assertEq(body.get(body.len() - 1), 0x0B)
 }
 
 test "generateMemcpyBody produces valid bytecode" {
     const body = generateMemcpyBody()
-    @assert(body.count > 20)
-    @assertEq(body.get(body.count - 1), 0x0B)
+    @assert(body.len() > 20)
+    @assertEq(body.get(body.len() - 1), 0x0B)
 }
 
 test "generateStringEqBody produces valid bytecode" {
     const body = generateStringEqBody()
-    @assert(body.count > 20)
-    @assertEq(body.get(body.count - 1), 0x0B)
+    @assert(body.len() > 20)
+    @assertEq(body.get(body.len() - 1), 0x0B)
 }
 
 test "generateStringConcatBody produces valid bytecode" {
     const body = generateStringConcatBody(2)
-    @assert(body.count > 20)
-    @assertEq(body.get(body.count - 1), 0x0B)
+    @assert(body.len() > 20)
+    @assertEq(body.get(body.len() - 1), 0x0B)
 }
 
 test "addMemRuntime registers all 7 functions" {

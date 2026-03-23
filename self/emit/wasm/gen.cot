@@ -170,7 +170,7 @@ struct GenState {
         if (blk.kind == SsaBlockKind.plain or blk.kind == SsaBlockKind.first or blk.kind == SsaBlockKind.defer_) {
             // Go: BlockPlain, BlockDefer (lines 171-174)
             // Zig ref: gen.zig lines 187-193
-            if (blk.succs.count > 0) {
+            if (blk.succs.len() > 0) {
                 const succ_edge = blk.succs.get(0)
                 const succ_bi = succ_edge.block
                 if (!has_next or next_bi != succ_bi) {
@@ -180,12 +180,12 @@ struct GenState {
         } else if (blk.kind == SsaBlockKind.if_) {
             // Go: BlockIf (lines 176-198)
             // Zig ref: gen.zig lines 197-224
-            if (blk.succs.count < 2) { return }
+            if (blk.succs.len() < 2) { return }
 
             const succ0_bi = blk.succs.get(0).block  // true branch
             const succ1_bi = blk.succs.get(1).block  // false branch
 
-            if (blk.controls.count > 0) {
+            if (blk.controls.len() > 0) {
                 self.getValue32(blk.controls.get(0))
             }
 
@@ -210,12 +210,12 @@ struct GenState {
         } else if (blk.kind == SsaBlockKind.ret) {
             // Go: BlockRet (lines 200-201)
             // Zig ref: gen.zig lines 228-252
-            if (blk.controls.count > 0) {
+            if (blk.controls.len() > 0) {
                 const ret_val = blk.controls.get(0)
 
                 if (ret_val.op == SsaOp.string_make or ret_val.op == SsaOp.slice_make or ret_val.op == SsaOp.opt_make) {
                     // Compound return: push both components (ptr/tag, len/payload)
-                    if (ret_val.args.count >= 2) {
+                    if (ret_val.args.len() >= 2) {
                         self.getValue64(ret_val.args.get(0))
                         self.getValue64(ret_val.args.get(1))
                     }
@@ -253,14 +253,14 @@ struct GenState {
 
     fn emitPhiMoves(block_idx: int) void {
         const blk = self.ssa_func.blocks.get(block_idx)
-        for si in 0..blk.succs.count {
+        for si in 0..blk.succs.len() {
             const edge = blk.succs.get(si)
             const succ = self.ssa_func.blocks.get(edge.block)
             const pred_idx = edge.index
-            for vi in 0..succ.values.count {
+            for vi in 0..succ.values.len() {
                 const v = succ.values.get(vi)
                 if (v.op != SsaOp.phi) { continue }
-                if (pred_idx >= v.args.count) { continue }
+                if (pred_idx >= v.args.len()) { continue }
                 const arg_val = v.args.get(pred_idx)
                 self.getValue64(arg_val)
                 if (self.value_to_local.contains(v.id)) {
@@ -1418,7 +1418,7 @@ struct GenState {
     fn emitCallOp(v: *SsaValue) void {
         switch (v.op) {
             SsaOp.wasm_call => {
-                for ai in 0..v.args.count {
+                for ai in 0..v.args.len() {
                     const arg = v.args.get(ai)
                     self.getValue64(arg)
                     // Float args in f64 locals need reinterpret to i64 for Wasm call ABI
@@ -1431,7 +1431,7 @@ struct GenState {
                 self.builder.appendTo(As.call, constAddr(func_idx))
             },
             SsaOp.wasm_return_call => {
-                for ai in 0..v.args.count {
+                for ai in 0..v.args.len() {
                     const arg = v.args.get(ai)
                     self.getValue64(arg)
                     if (isFloatType(arg.type_idx)) {
@@ -1442,7 +1442,7 @@ struct GenState {
                 self.builder.appendTo(As.return_call, constAddr(rc_func_idx))
             },
             SsaOp.wasm_lowered_static_call => {
-                for ai in 0..v.args.count {
+                for ai in 0..v.args.len() {
                     const arg = v.args.get(ai)
                     self.getValue64(arg)
                     if (isFloatType(arg.type_idx)) {
@@ -1457,7 +1457,7 @@ struct GenState {
                 self.getValue64(v.args.get(1))
                 self.builder.appendTo(As.global_set, constAddr(1))
                 // Push function arguments (args[2..])
-                for ai in 2..v.args.count {
+                for ai in 2..v.args.len() {
                     const arg = v.args.get(ai)
                     self.getValue64(arg)
                     if (isFloatType(arg.type_idx)) {
@@ -1471,7 +1471,7 @@ struct GenState {
             },
             SsaOp.wasm_lowered_inter_call => {
                 // Push function arguments (skip arg[0])
-                for ai in 1..v.args.count {
+                for ai in 1..v.args.len() {
                     const arg = v.args.get(ai)
                     self.getValue64(arg)
                     if (isFloatType(arg.type_idx)) {
@@ -1484,7 +1484,7 @@ struct GenState {
                 self.builder.appendTo(As.call_indirect, constAddr(v.aux_int))
             },
             SsaOp.wasm_call_indirect => {
-                for ai in 0..v.args.count {
+                for ai in 0..v.args.len() {
                     self.getValue64(v.args.get(ai))
                 }
                 self.builder.appendTo(As.call_indirect, constAddr(v.aux_int))
@@ -1778,7 +1778,7 @@ struct GenState {
     fn emitGcOp(v: *SsaValue) void {
         switch (v.op) {
             SsaOp.wasm_gc_struct_new => {
-                for ai in 0..v.args.count {
+                for ai in 0..v.args.len() {
                     self.getValue64(v.args.get(ai))
                 }
                 const type_name = switch (v.aux) { SsaAux.str |s| => s, else => "" }
@@ -1841,7 +1841,7 @@ struct GenState {
                 self.builder.appendFrom(As.gc_array_new_default, constAddr(gc_type_idx))
             },
             SsaOp.wasm_gc_array_new_fixed => {
-                for ai in 0..v.args.count { self.getValue64(v.args.get(ai)) }
+                for ai in 0..v.args.len() { self.getValue64(v.args.get(ai)) }
                 const pi = self.builder.appendFrom(As.gc_array_new_fixed, constAddr(gc_type_idx))
                 var pp = self.builder.get(pi)
                 pp.to = constAddr(v.aux_int)
@@ -1871,7 +1871,7 @@ struct GenState {
                 self.builder.append(As.gc_array_len)
             },
             SsaOp.wasm_gc_array_copy => {
-                for ai in 0..v.args.count { self.getValue64(v.args.get(ai)) }
+                for ai in 0..v.args.len() { self.getValue64(v.args.get(ai)) }
                 const pi = self.builder.appendFrom(As.gc_array_copy, constAddr(gc_type_idx))
                 var pp = self.builder.get(pi)
                 pp.to = constAddr(v.aux_int)
@@ -1901,11 +1901,11 @@ struct GenState {
                 self.builder.appendFrom(As.ref_func, constAddr(0))
             },
             SsaOp.wasm_gc_call_ref => {
-                for ai in 0..v.args.count { self.getValue64(v.args.get(ai)) }
+                for ai in 0..v.args.len() { self.getValue64(v.args.get(ai)) }
                 self.builder.appendFrom(As.call_ref, constAddr(v.aux_int))
             },
             SsaOp.wasm_gc_return_call_ref => {
-                for ai in 0..v.args.count { self.getValue64(v.args.get(ai)) }
+                for ai in 0..v.args.len() { self.getValue64(v.args.get(ai)) }
                 self.builder.appendFrom(As.return_call_ref, constAddr(v.aux_int))
             },
             SsaOp.wasm_gc_br_on_cast => {
@@ -1997,7 +1997,7 @@ struct GenState {
 
             // Bounds check
             SsaOp.bounds_check => {
-                if (v.args.count >= 2) {
+                if (v.args.len() >= 2) {
                     self.getValue64(v.args.get(0))
                     self.getValue64(v.args.get(1))
                     self.builder.append(As.i64_ge_u)
@@ -2032,7 +2032,7 @@ struct GenState {
                 self.builder.append(As.drop)
             },
             SsaOp.wasm_return => {
-                if (v.args.count > 0) {
+                if (v.args.len() > 0) {
                     self.getValue64(v.args.get(0))
                 }
                 self.builder.append(As.@"return")
@@ -2078,7 +2078,7 @@ struct GenState {
     // ========================================================================
 
     fn generate() Symbol {
-        debug(.codegen, "wasm/gen: generating '${self.ssa_func.name}' (${self.ssa_func.blocks.count} blocks)")
+        debug(.codegen, "wasm/gen: generating '${self.ssa_func.name}' (${self.ssa_func.blocks.len()} blocks)")
 
         // Compute use counts (self-hosted SSA doesn't auto-track)
         self.computeUses()
@@ -2093,10 +2093,10 @@ struct GenState {
         const text_idx = self.builder.appendFrom(As.text, constAddr(self.frame_size))
 
         // Generate code for each block (Zig gen.zig:1346)
-        for iter_i in 0..self.ssa_func.blocks.count {
+        for iter_i in 0..self.ssa_func.blocks.len() {
             const bi = iter_i
             var next_bi = -1
-            if (iter_i + 1 < self.ssa_func.blocks.count) {
+            if (iter_i + 1 < self.ssa_func.blocks.len()) {
                 next_bi = iter_i + 1
             }
             const has_next = next_bi >= 0
@@ -2106,7 +2106,7 @@ struct GenState {
 
             // Generate values
             const blk = self.ssa_func.blocks.get(bi)
-            for vi in 0..blk.values.count {
+            for vi in 0..blk.values.len() {
                 const val = blk.values.get(vi)
                 self.ssaGenValue(val)
             }
@@ -2126,7 +2126,7 @@ struct GenState {
         }
 
         // Resolve branches: patch branch targets to prog indices
-        for i in 0..self.branches.count {
+        for i in 0..self.branches.len() {
             const branch = self.branches.get(i)
             if (self.bstart.contains(branch.target_block_id)) {
                 const target_prog_idx = self.bstart.get(branch.target_block_id)
@@ -2145,7 +2145,7 @@ struct GenState {
         sym.gc_ref_locals = self.gc_ref_locals
         sym.text = self.builder.progs
 
-        debug(.codegen, "wasm/gen: generated ${self.builder.count} instructions, ${self.branches.count} branches, frame_size=${self.frame_size}")
+        debug(.codegen, "wasm/gen: generated ${self.builder.count} instructions, ${self.branches.len()} branches, frame_size=${self.frame_size}")
 
         return sym
     }
@@ -2247,9 +2247,9 @@ struct GenState {
 
     fn allocateLocals() void {
         // Count parameters
-        for bi in 0..self.ssa_func.blocks.count {
+        for bi in 0..self.ssa_func.blocks.len() {
             const blk = self.ssa_func.blocks.get(bi)
-            for vi in 0..blk.values.count {
+            for vi in 0..blk.values.len() {
                 const v = blk.values.get(vi)
                 if (v.op == SsaOp.arg) {
                     const arg_idx = v.aux_int
@@ -2272,9 +2272,9 @@ struct GenState {
         self.next_local = self.param_count + 1
 
         // Pass 1: Allocate i64 locals (non-float values) — Zig gen.zig:1487-1523
-        for bi in 0..self.ssa_func.blocks.count {
+        for bi in 0..self.ssa_func.blocks.len() {
             const blk = self.ssa_func.blocks.get(bi)
-            for vi in 0..blk.values.count {
+            for vi in 0..blk.values.len() {
                 const v = blk.values.get(vi)
                 if (v.op == SsaOp.arg) { continue }
                 if (v.uses == 0 and !hasSideEffects(v)) { continue }
@@ -2314,9 +2314,9 @@ struct GenState {
 
         // Pass 2: Allocate f64 locals (float values - contiguous at end) — Zig gen.zig:1526-1542
         var float_count = 0
-        for bi in 0..self.ssa_func.blocks.count {
+        for bi in 0..self.ssa_func.blocks.len() {
             const blk = self.ssa_func.blocks.get(bi)
-            for vi in 0..blk.values.count {
+            for vi in 0..blk.values.len() {
                 const v = blk.values.get(vi)
                 if (v.op == SsaOp.arg) { continue }
                 if (v.uses == 0 and !hasSideEffects(v)) { continue }
@@ -2333,9 +2333,9 @@ struct GenState {
         self.float_local_count = float_count
 
         // Pass 3: Allocate GC ref locals
-        for bi in 0..self.ssa_func.blocks.count {
+        for bi in 0..self.ssa_func.blocks.len() {
             const blk = self.ssa_func.blocks.get(bi)
-            for vi in 0..blk.values.count {
+            for vi in 0..blk.values.len() {
                 const v = blk.values.get(vi)
                 if (v.op == SsaOp.arg) { continue }
                 if (v.uses == 0) { continue }
@@ -2365,9 +2365,9 @@ struct GenState {
 
     fn computeFrameSize() int {
         var max_slot: int = -1
-        for bi in 0..self.ssa_func.blocks.count {
+        for bi in 0..self.ssa_func.blocks.len() {
             const blk = self.ssa_func.blocks.get(bi)
-            for vi in 0..blk.values.count {
+            for vi in 0..blk.values.len() {
                 const v = blk.values.get(vi)
                 if (v.op == SsaOp.local_addr) {
                     if (v.aux_int > max_slot) {
@@ -2390,33 +2390,33 @@ struct GenState {
         // Without this, uses accumulate across passes, double-counting and
         // preventing dead loads from being identified (uses artificially > 0).
         var vi = 0
-        while (vi < self.ssa_func.values.count) {
+        while (vi < self.ssa_func.values.len()) {
             self.ssa_func.values.get(vi).uses = 0
             vi += 1
         }
 
         // Count uses from block values and controls
-        for bi in 0..self.ssa_func.blocks.count {
+        for bi in 0..self.ssa_func.blocks.len() {
             const blk = self.ssa_func.blocks.get(bi)
-            for vii in 0..blk.values.count {
+            for vii in 0..blk.values.len() {
                 const val = blk.values.get(vii)
-                for ai in 0..val.args.count {
+                for ai in 0..val.args.len() {
                     val.args.get(ai).uses += 1
                 }
             }
-            for ci in 0..blk.controls.count {
+            for ci in 0..blk.controls.len() {
                 const ctrl_val = blk.controls.get(ci)
                 ctrl_val.uses += 1
                 // Also count uses from control value's args — control values
                 // may not be in block.values (e.g. string_make used as return control
                 // but removed from block.values by deadcode after copyelim).
-                for cai in 0..ctrl_val.args.count {
+                for cai in 0..ctrl_val.args.len() {
                     ctrl_val.args.get(cai).uses += 1
                 }
                 // Transitively also count control args' args' uses (2 levels)
-                for cai in 0..ctrl_val.args.count {
+                for cai in 0..ctrl_val.args.len() {
                     const ca_val = ctrl_val.args.get(cai)
-                    for cai2 in 0..ca_val.args.count {
+                    for cai2 in 0..ca_val.args.len() {
                         ca_val.args.get(cai2).uses += 1
                     }
                 }
@@ -2431,9 +2431,9 @@ struct GenState {
     fn countParams() int {
         var max_arg: int = 0
         var has_args = false
-        for bi in 0..self.ssa_func.blocks.count {
+        for bi in 0..self.ssa_func.blocks.len() {
             const blk = self.ssa_func.blocks.get(bi)
-            for vi in 0..blk.values.count {
+            for vi in 0..blk.values.len() {
                 const val = blk.values.get(vi)
                 if (val.op == SsaOp.arg) {
                     has_args = true
@@ -2543,7 +2543,7 @@ test "GenState basic constant" {
     blk.setControl(c)
 
     const sym = genFunc(&func)
-    @assertEq(sym.text.count > 0, true)
+    @assertEq(sym.text.len() > 0, true)
     @assertEq(sym.name, "answer")
 }
 
@@ -2570,7 +2570,7 @@ test "GenState add two args" {
     blk.setControl(add)
 
     const sym = genFunc(&func)
-    @assertEq(sym.text.count > 0, true)
+    @assertEq(sym.text.len() > 0, true)
     @assertEq(sym.param_count, 2)
 }
 

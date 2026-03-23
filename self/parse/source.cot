@@ -92,7 +92,7 @@ struct Source {
 
     /// Free the line_offsets list. Call when done with this source.
     fn deinit() void {
-        self.line_offsets.clearAndFree()
+        self.line_offsets.clear()
     }
 
     /// Return the byte at offset, or null if past end.
@@ -144,7 +144,7 @@ struct Source {
         // Binary search for line containing offset
         var line = 0
         var lo = 0
-        var hi = self.line_offsets.count
+        var hi = self.line_offsets.len()
         while (lo < hi) {
             const mid = lo + (hi - lo) / 2
             if (self.line_offsets.get(mid) <= offset) {
@@ -181,7 +181,7 @@ struct Source {
     /// Return the number of lines in the source.
     fn lineCount() int {
         self.ensureLineOffsets()
-        return self.line_offsets.count
+        return self.line_offsets.len()
     }
 }
 

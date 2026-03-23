@@ -590,21 +590,21 @@ struct FuncBuilder {
     // --- Local management ---
 
     fn addLocal(local: Local) int {
-        const idx = self.locals.count
+        const idx = self.locals.len()
         self.locals.append(local)
         self.local_map.set(local.name, idx)
         return idx
     }
 
     fn addParam(name: string, type_idx: int, size: int) int {
-        const idx = self.locals.count
+        const idx = self.locals.len()
         self.locals.append(Local.initParam(name, type_idx, idx, size))
         self.local_map.set(name, idx)
         return idx
     }
 
     fn addLocalWithSize(name: string, type_idx: int, mutable: bool, size: int) int {
-        const idx = self.locals.count
+        const idx = self.locals.len()
         self.locals.append(Local.initWithSize(name, type_idx, mutable, size))
         self.shadow_stack.append(ShadowEntry { name: name, old_idx: self.local_map.getOrNull(name) })
         self.local_map.set(name, idx)
@@ -622,7 +622,7 @@ struct FuncBuilder {
             self.shared_sret_size = ret_size
             return existing
         }
-        const idx = self.locals.count
+        const idx = self.locals.len()
         self.locals.append(Local.initWithSize("__sret_shared", ret_type, false, ret_size))
         self.shared_sret_local = idx
         self.shared_sret_size = ret_size
@@ -636,11 +636,11 @@ struct FuncBuilder {
     // --- Scope management ---
 
     fn markScopeEntry() int {
-        return self.shadow_stack.count
+        return self.shadow_stack.len()
     }
 
     fn restoreScope(entry_depth: int) void {
-        while (self.shadow_stack.count > entry_depth) {
+        while (self.shadow_stack.len() > entry_depth) {
             const entry = self.shadow_stack.pop()
             if (entry.old_idx) |old| {
                 self.local_map.set(entry.name, old)
@@ -653,7 +653,7 @@ struct FuncBuilder {
     // --- Block management ---
 
     fn newBlock(label: string) int {
-        const idx = self.blocks.count
+        const idx = self.blocks.len()
         var block = Block.init(idx)
         block.label = label
         self.blocks.append(block)
@@ -671,7 +671,7 @@ struct FuncBuilder {
     fn needsTerminator() bool {
         var last = null_node
         var i = 0
-        while (i < self.nodes.count) {
+        while (i < self.nodes.len()) {
             const node = self.nodes.get(i)
             if (node.block == self.current_block) {
                 last = i
@@ -688,13 +688,13 @@ struct FuncBuilder {
 
     fn addStringLiteral(str: string) int {
         var i = 0
-        while (i < self.string_literals.count) {
+        while (i < self.string_literals.len()) {
             if (self.string_literals.get(i) == str) {
                 return i
             }
             i += 1
         }
-        const idx = self.string_literals.count
+        const idx = self.string_literals.len()
         self.string_literals.append(str)
         return idx
     }
@@ -702,12 +702,12 @@ struct FuncBuilder {
     // --- Core emit ---
 
     fn emit(node: Node) int {
-        const idx = self.nodes.count
+        const idx = self.nodes.len()
         var n = node
         n.block = self.current_block
         self.nodes.append(n)
-        if (self.current_block >= self.blocks.count) {
-            eprintln("BUG: emit current_block=${self.current_block} >= blocks.count=${self.blocks.count}")
+        if (self.current_block >= self.blocks.len()) {
+            eprintln("BUG: emit current_block=${self.current_block} >= blocks.len()=${self.blocks.len()}")
             @panic("emit: current_block out of bounds")
         }
         var block = self.blocks.get(self.current_block)
@@ -1014,7 +1014,7 @@ struct FuncBuilder {
         // Extract params
         var params: List(Local) = .{}
         var i = 0
-        while (i < self.locals.count) {
+        while (i < self.locals.len()) {
             const local = self.locals.get(i)
             if (local.is_param) {
                 params.append(local)
@@ -1025,7 +1025,7 @@ struct FuncBuilder {
         // Compute frame layout (alignment + offsets)
         var frame_offset = 0
         i = 0
-        while (i < self.locals.count) {
+        while (i < self.locals.len()) {
             var local = self.locals.get(i)
             const local_align = local.alignment
             const align_mask = local_align - 1
@@ -1082,7 +1082,7 @@ struct IR {
 
     fn getFunc(name: string) ?int {
         var i = 0
-        while (i < self.funcs.count) {
+        while (i < self.funcs.len()) {
             const f = self.funcs.get(i)
             if (f.name == name) {
                 return i
@@ -1094,7 +1094,7 @@ struct IR {
 
     fn getGlobal(name: string) ?int {
         var i = 0
-        while (i < self.globals.count) {
+        while (i < self.globals.len()) {
             const g = self.globals.get(i)
             if (g.name == name) {
                 return i
@@ -1146,7 +1146,7 @@ struct Builder {
 
     fn hasFunc(name: string) bool {
         var i = 0
-        while (i < self.funcs.count) {
+        while (i < self.funcs.len()) {
             if (self.funcs.get(i).name == name) {
                 return true
             }
@@ -1161,7 +1161,7 @@ struct Builder {
 
     fn lookupGlobal(name: string) ?GlobalLookupResult {
         var i = 0
-        while (i < self.globals.count) {
+        while (i < self.globals.len()) {
             const g = self.globals.get(i)
             if (g.name == name) {
                 return GlobalLookupResult { idx: i, global: g }
@@ -1299,21 +1299,21 @@ test "local constructors" {
 test "func builder init" {
     var fb = FuncBuilder.init("test_fn", 0, INT, Span.zero())
     @assertEq(fb.current_block, 0)
-    @assertEq(fb.blocks.count, 1)
+    @assertEq(fb.blocks.len(), 1)
 }
 
 test "func builder add local" {
     var fb = FuncBuilder.init("test_fn", 0, INT, Span.zero())
     const local_idx = fb.addLocal(Local.init("x", INT, true))
     @assertEq(local_idx, 0)
-    @assertEq(fb.locals.count, 1)
+    @assertEq(fb.locals.len(), 1)
 }
 
 test "func builder emit" {
     var fb = FuncBuilder.init("test_fn", 0, INT, Span.zero())
     const idx = fb.emitConstInt(42, INT, Span.zero())
     @assertEq(idx, 0)
-    @assertEq(fb.nodes.count, 1)
+    @assertEq(fb.nodes.len(), 1)
 }
 
 test "func builder build" {
@@ -1333,9 +1333,9 @@ test "func builder two blocks" {
     fb.setBlock(block_idx)
     @assertEq(fb.currentBlock(), 1)
     fb.emitConstInt(42, INT, Span.zero())
-    @assertEq(fb.nodes.count, 1)
+    @assertEq(fb.nodes.len(), 1)
     fb.emitRet(0, Span.zero())
-    @assertEq(fb.nodes.count, 2)
+    @assertEq(fb.nodes.len(), 2)
 }
 
 test "func builder build with blocks" {
@@ -1387,8 +1387,8 @@ test "func struct direct" {
         is_export: false,
     }
     @assertEq(f.name, "test")
-    @assertEq(f.locals.count, 1)
-    @assertEq(f.nodes.count, 1)
+    @assertEq(f.locals.len(), 1)
+    @assertEq(f.nodes.len(), 1)
 }
 
 test "build returns locals" {
@@ -1396,18 +1396,18 @@ test "build returns locals" {
     fb.addLocal(Local.init("x", INT, true))
     fb.emitConstInt(42, INT, Span.zero())
     // Check fb fields directly before build
-    @assertEq(fb.locals.count, 1)
-    @assertEq(fb.nodes.count, 1)
-    @assertEq(fb.blocks.count, 1)
+    @assertEq(fb.locals.len(), 1)
+    @assertEq(fb.nodes.len(), 1)
+    @assertEq(fb.blocks.len(), 1)
     // Now build
     var f = fb.build()
     // Check scalar fields
     @assertEq(f.name, "test_fn")
     @assertEq(f.return_type, INT)
     // Check params (newly created list)
-    @assertEq(f.params.count, 0)
+    @assertEq(f.params.len(), 0)
     // Check locals (from self)
-    @assertEq(f.locals.count, 1)
+    @assertEq(f.locals.len(), 1)
 }
 
 test "func builder params" {
@@ -1424,7 +1424,7 @@ test "func builder params" {
     @assertEq(lookup_b.?, b)
 
     const f = fb.build()
-    @assertEq(f.params.count, 2)
+    @assertEq(f.params.len(), 2)
 }
 
 test "builder workflow" {
@@ -1447,8 +1447,8 @@ test "builder workflow" {
     @assertEq(lookup.?.idx, 0)
 
     const ir = builder.getIR()
-    @assertEq(ir.funcs.count, 1)
-    @assertEq(ir.globals.count, 1)
+    @assertEq(ir.funcs.len(), 1)
+    @assertEq(ir.globals.len(), 1)
 }
 
 test "scope management" {

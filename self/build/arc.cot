@@ -102,14 +102,14 @@ struct CleanupStack {
 
     // Push a new cleanup. Returns the handle index (position in the list).
     fn push(self: *CleanupStack, cleanup: Cleanup) int {
-        const index = self.items.count
+        const index = self.items.len()
         self.items.append(cleanup)
         return index
     }
 
     // Disable a cleanup by handle index (ownership was forwarded).
     fn disable(self: *CleanupStack, handle: int) void {
-        if (handle >= 0 and handle < self.items.count) {
+        if (handle >= 0 and handle < self.items.len()) {
             var c = self.items.get(handle)
             c.state = CleanupState.dead
             self.items.set(handle, c)
@@ -121,7 +121,7 @@ struct CleanupStack {
     // Returns true if a cleanup was found and disabled.
     fn disableForLocal(self: *CleanupStack, local_idx: int) bool {
         var i = 0
-        while (i < self.items.count) {
+        while (i < self.items.len()) {
             var c = self.items.get(i)
             if (c.isActive() and c.local_idx == local_idx) {
                 c.state = CleanupState.dead
@@ -135,7 +135,7 @@ struct CleanupStack {
 
     // Associate a cleanup handle with a local variable.
     fn setLocalForHandle(self: *CleanupStack, handle: int, local_idx: int) void {
-        if (handle >= 0 and handle < self.items.count) {
+        if (handle >= 0 and handle < self.items.len()) {
             var c = self.items.get(handle)
             c.local_idx = local_idx
             self.items.set(handle, c)
@@ -145,7 +145,7 @@ struct CleanupStack {
     // Update the value node for a local's cleanup (called on reassignment).
     fn updateValueForLocal(self: *CleanupStack, local_idx: int, new_value: int) void {
         var i = 0
-        while (i < self.items.count) {
+        while (i < self.items.len()) {
             var c = self.items.get(i)
             if (c.isActive() and c.local_idx != NO_LOCAL and
                 c.local_idx == local_idx and c.kind == CleanupKind.release)
@@ -161,7 +161,7 @@ struct CleanupStack {
     // Check if a local variable has an active ARC cleanup registered.
     fn hasCleanupForLocal(self: *CleanupStack, local_idx: int) bool {
         var i = 0
-        while (i < self.items.count) {
+        while (i < self.items.len()) {
             const c = self.items.get(i)
             if (c.isActive() and c.local_idx == local_idx) {
                 return true
@@ -175,7 +175,7 @@ struct CleanupStack {
     fn activeCount(self: *CleanupStack) int {
         var count = 0
         var i = 0
-        while (i < self.items.count) {
+        while (i < self.items.len()) {
             const c = self.items.get(i)
             if (c.state == CleanupState.active) {
                 count = count + 1
@@ -187,7 +187,7 @@ struct CleanupStack {
 
     // Mark cleanup depth for scope entry.
     fn depth(self: *CleanupStack) int {
-        return self.items.count
+        return self.items.len()
     }
 
     // Mark all cleanups from current depth down to target_depth as dead.
@@ -195,7 +195,7 @@ struct CleanupStack {
     // Caller iterates the returned list to emit the actual cleanup IR.
     fn collectAndMarkDead(self: *CleanupStack, target_depth: int) List(Cleanup) {
         var result: List(Cleanup) = .{}
-        var i = self.items.count
+        var i = self.items.len()
         while (i > target_depth) {
             i = i - 1
             var c = self.items.get(i)
@@ -306,7 +306,7 @@ test "CleanupStack push and disable" {
     const c = makeCleanup(CleanupKind.release, 42, I64)
     const handle = stack.push(c)
     @assertEq(handle, 0)
-    @assertEq(stack.items.count, 1)
+    @assertEq(stack.items.len(), 1)
     const c0 = stack.get(0)
     @assertEq(c0.state == CleanupState.active, true)
     stack.disable(handle)
@@ -319,11 +319,11 @@ test "CleanupStack LIFO order" {
     stack.push(makeCleanup(CleanupKind.release, 1, I64))
     stack.push(makeCleanup(CleanupKind.release, 2, I64))
     stack.push(makeCleanup(CleanupKind.release, 3, I64))
-    @assertEq(stack.items.count, 3)
+    @assertEq(stack.items.len(), 3)
 
     // Collect in LIFO order
     const cleanups = stack.collectAndMarkDead(0)
-    @assertEq(cleanups.count, 3)
+    @assertEq(cleanups.len(), 3)
     @assertEq(cleanups.get(0).value, 3)
     @assertEq(cleanups.get(1).value, 2)
     @assertEq(cleanups.get(2).value, 1)
@@ -357,11 +357,11 @@ test "ArcScope tracks cleanup depth" {
     @assertEq(scope.entry_depth, 2)
 
     stack.push(makeCleanup(CleanupKind.release, 3, I64))
-    @assertEq(stack.items.count, 3)
+    @assertEq(stack.items.len(), 3)
 
     // Exit inner scope — only cleanup 3 should be collected
     const emitted = scope.exit()
-    @assertEq(emitted.count, 1)
+    @assertEq(emitted.len(), 1)
     @assertEq(emitted.get(0).value, 3)
 
     // Cleanup 3 should be dead, 1 and 2 still active
@@ -427,9 +427,9 @@ test "CleanupStack clear" {
     var stack = initCleanupStack()
     stack.push(makeCleanup(CleanupKind.release, 1, I64))
     stack.push(makeCleanup(CleanupKind.release, 2, I64))
-    @assertEq(stack.items.count, 2)
+    @assertEq(stack.items.len(), 2)
     stack.clear()
-    @assertEq(stack.items.count, 0)
+    @assertEq(stack.items.len(), 0)
 }
 
 test "CleanupStack scope destroy" {

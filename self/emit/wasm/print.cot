@@ -993,38 +993,38 @@ fn generateFloatToStringBody() List(int) {
 
 test "generateWriteStubBody produces valid bytecode" {
     const body = generateWriteStubBody()
-    @assert(body.count >= 2)
-    @assertEq(body.get(body.count - 1), 0x0B)
+    @assert(body.len() >= 2)
+    @assertEq(body.get(body.len() - 1), 0x0B)
 }
 
 test "generatePrintIntBody produces valid bytecode" {
     const body = generatePrintIntBody(0, 1)
-    @assert(body.count > 30)
-    @assertEq(body.get(body.count - 1), 0x0B)
+    @assert(body.len() > 30)
+    @assertEq(body.get(body.len() - 1), 0x0B)
 }
 
 test "generateIntToStringBody produces valid bytecode" {
     const body = generateIntToStringBody()
-    @assert(body.count > 20)
-    @assertEq(body.get(body.count - 1), 0x0B)
+    @assert(body.len() > 20)
+    @assertEq(body.get(body.len() - 1), 0x0B)
 }
 
 test "generatePrintFloatBody produces valid bytecode" {
     const body = generatePrintFloatBody(0, 1)
-    @assert(body.count > 30)
-    @assertEq(body.get(body.count - 1), 0x0B)
+    @assert(body.len() > 30)
+    @assertEq(body.get(body.len() - 1), 0x0B)
 }
 
 test "generateFloatToStringBody produces valid bytecode" {
     const body = generateFloatToStringBody()
-    @assert(body.count > 30)
-    @assertEq(body.get(body.count - 1), 0x0B)
+    @assert(body.len() > 30)
+    @assertEq(body.get(body.len() - 1), 0x0B)
 }
 
 test "generateWriteForwardBody produces valid bytecode" {
     const body = generateWriteForwardBody(42)
-    @assert(body.count >= 2)
-    @assertEq(body.get(body.count - 1), 0x0B)
+    @assert(body.len() >= 2)
+    @assertEq(body.get(body.len() - 1), 0x0B)
 }
 
 test "addPrintRuntime registers all 7 functions" {

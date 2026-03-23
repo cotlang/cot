@@ -809,82 +809,82 @@ fn generateStubTrap() List(int) {
 
 test "stub bodies produce valid bytecode" {
     const zero = generateStubReturnsZero()
-    @assert(zero.count >= 2)
-    @assertEq(zero.get(zero.count - 1), 0x0B)
+    @assert(zero.len() >= 2)
+    @assertEq(zero.get(zero.len() - 1), 0x0B)
 
     const neg1 = generateStubReturnsNegOne()
-    @assert(neg1.count >= 2)
-    @assertEq(neg1.get(neg1.count - 1), 0x0B)
+    @assert(neg1.len() >= 2)
+    @assertEq(neg1.get(neg1.len() - 1), 0x0B)
 
     const trap = generateStubTrap()
-    @assert(trap.count >= 2)
-    @assertEq(trap.get(trap.count - 1), 0x0B)
+    @assert(trap.len() >= 2)
+    @assertEq(trap.get(trap.len() - 1), 0x0B)
 
     const enosys = generateFdWriteStubBody()
-    @assert(enosys.count >= 2)
-    @assertEq(enosys.get(enosys.count - 1), 0x0B)
+    @assert(enosys.len() >= 2)
+    @assertEq(enosys.get(enosys.len() - 1), 0x0B)
 }
 
 test "WASI shim bodies produce valid bytecode" {
     const fd_write = generateWasiFdWriteShim(0)
-    @assert(fd_write.count > 5)
-    @assertEq(fd_write.get(fd_write.count - 1), 0x0B)
+    @assert(fd_write.len() > 5)
+    @assertEq(fd_write.get(fd_write.len() - 1), 0x0B)
 
     const write_simple = generateWasiWriteSimpleShim(0)
-    @assert(write_simple.count > 10)
-    @assertEq(write_simple.get(write_simple.count - 1), 0x0B)
+    @assert(write_simple.len() > 10)
+    @assertEq(write_simple.get(write_simple.len() - 1), 0x0B)
 
     const read_simple = generateWasiReadSimpleShim(0)
-    @assert(read_simple.count > 10)
-    @assertEq(read_simple.get(read_simple.count - 1), 0x0B)
+    @assert(read_simple.len() > 10)
+    @assertEq(read_simple.get(read_simple.len() - 1), 0x0B)
 
     const fd_close = generateWasiFdCloseShim(0)
-    @assert(fd_close.count > 3)
-    @assertEq(fd_close.get(fd_close.count - 1), 0x0B)
+    @assert(fd_close.len() > 3)
+    @assertEq(fd_close.get(fd_close.len() - 1), 0x0B)
 
     const fd_seek = generateWasiFdSeekShim(0)
-    @assert(fd_seek.count > 5)
-    @assertEq(fd_seek.get(fd_seek.count - 1), 0x0B)
+    @assert(fd_seek.len() > 5)
+    @assertEq(fd_seek.get(fd_seek.len() - 1), 0x0B)
 
     const path_open = generateWasiPathOpenShim(0)
-    @assert(path_open.count > 10)
-    @assertEq(path_open.get(path_open.count - 1), 0x0B)
+    @assert(path_open.len() > 10)
+    @assertEq(path_open.get(path_open.len() - 1), 0x0B)
 
     const time = generateWasiTimeShim(0)
-    @assert(time.count > 5)
-    @assertEq(time.get(time.count - 1), 0x0B)
+    @assert(time.len() > 5)
+    @assertEq(time.get(time.len() - 1), 0x0B)
 
     const random = generateWasiRandomShim(0)
-    @assert(random.count > 3)
-    @assertEq(random.get(random.count - 1), 0x0B)
+    @assert(random.len() > 3)
+    @assertEq(random.get(random.len() - 1), 0x0B)
 
     const exit = generateWasiExitShim(0)
-    @assert(exit.count > 3)
-    @assertEq(exit.get(exit.count - 1), 0x0B)
+    @assert(exit.len() > 3)
+    @assertEq(exit.get(exit.len() - 1), 0x0B)
 
     const args_count = generateWasiArgsCountShim(0)
-    @assert(args_count.count > 5)
-    @assertEq(args_count.get(args_count.count - 1), 0x0B)
+    @assert(args_count.len() > 5)
+    @assertEq(args_count.get(args_count.len() - 1), 0x0B)
 
     const arg_len = generateWasiArgLenShim(0, 1)
-    @assert(arg_len.count > 20)
-    @assertEq(arg_len.get(arg_len.count - 1), 0x0B)
+    @assert(arg_len.len() > 20)
+    @assertEq(arg_len.get(arg_len.len() - 1), 0x0B)
 
     const arg_ptr = generateWasiArgPtrShim(0, 1)
-    @assert(arg_ptr.count > 10)
-    @assertEq(arg_ptr.get(arg_ptr.count - 1), 0x0B)
+    @assert(arg_ptr.len() > 10)
+    @assertEq(arg_ptr.get(arg_ptr.len() - 1), 0x0B)
 
     const environ_count = generateWasiEnvironCountShim(0)
-    @assert(environ_count.count > 5)
-    @assertEq(environ_count.get(environ_count.count - 1), 0x0B)
+    @assert(environ_count.len() > 5)
+    @assertEq(environ_count.get(environ_count.len() - 1), 0x0B)
 
     const environ_len = generateWasiEnvironLenShim(0, 1)
-    @assert(environ_len.count > 20)
-    @assertEq(environ_len.get(environ_len.count - 1), 0x0B)
+    @assert(environ_len.len() > 20)
+    @assertEq(environ_len.get(environ_len.len() - 1), 0x0B)
 
     const environ_ptr = generateWasiEnvironPtrShim(0, 1)
-    @assert(environ_ptr.count > 10)
-    @assertEq(environ_ptr.get(environ_ptr.count - 1), 0x0B)
+    @assert(environ_ptr.len() > 10)
+    @assertEq(environ_ptr.get(environ_ptr.len() - 1), 0x0B)
 }
 
 test "addNativeStubs registers all functions" {

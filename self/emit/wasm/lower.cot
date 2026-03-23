@@ -17,13 +17,13 @@ import "../../check/types"
 
 /// Lower a function's generic ops to Wasm-specific ops.
 fn lower(func: *SsaFunc) void {
-    for bi in 0..func.blocks.count {
+    for bi in 0..func.blocks.len() {
         const blk = func.blocks.get(bi)
-        for vi in 0..blk.values.count {
+        for vi in 0..blk.values.len() {
             lowerValue(func, blk.values.get(vi))
         }
         // Also lower control values (may not be in values list)
-        for ci in 0..blk.controls.count {
+        for ci in 0..blk.controls.len() {
             lowerValue(func, blk.controls.get(ci))
         }
     }
@@ -231,7 +231,7 @@ fn isFloatType(type_idx: int) bool {
 
 /// Check if a store value's second argument is a float type.
 fn isStoreFloatType(val: *SsaValue) bool {
-    if (val.args.count >= 2) {
+    if (val.args.len() >= 2) {
         return isFloatType(val.args.get(1).type_idx)
     }
     return false
@@ -242,7 +242,7 @@ fn isStoreFloatType(val: *SsaValue) bool {
 /// Kept as stub for parity with lower_wasm.zig.
 fn optimizeTailCalls(func: *SsaFunc) void {
     // TODO: fix native return_call translation before enabling
-    if (func.blocks.count > 0) {}  // suppress unused parameter warning
+    if (func.blocks.len() > 0) {}  // suppress unused parameter warning
 }
 
 // ============================================================================

@@ -243,13 +243,13 @@ struct SharedCheckerState {
         var generic_impl_entries: List(GenericImplEntry) = .{}
         return SharedCheckerState {
             global_scope: newScope(null),
-            generic_structs: new Map(string, *GenericInfo) { keys: 0, values: 0, states: 0, count: 0, capacity: 0 },
-            generic_functions: new Map(string, *GenericInfo) { keys: 0, values: 0, states: 0, count: 0, capacity: 0 },
-            instantiation_cache: new Map(string, int) { keys: 0, values: 0, states: 0, count: 0, capacity: 0 },
-            generic_inst_by_name: new Map(string, *GenericInstInfo) { keys: 0, values: 0, states: 0, count: 0, capacity: 0 },
+            generic_structs: new Map(string, *GenericInfo) { buf: 0 },
+            generic_functions: new Map(string, *GenericInfo) { buf: 0 },
+            instantiation_cache: new Map(string, int) { buf: 0 },
+            generic_inst_by_name: new Map(string, *GenericInstInfo) { buf: 0 },
             generic_impl_entries: generic_impl_entries,
-            trait_defs: new Map(string, int) { keys: 0, values: 0, states: 0, count: 0, capacity: 0 },
-            trait_impls: new Map(string, string) { keys: 0, values: 0, states: 0, count: 0, capacity: 0 },
+            trait_defs: new Map(string, int) { buf: 0 },
+            trait_impls: new Map(string, string) { buf: 0 },
         }
     }
 }
@@ -308,20 +308,20 @@ struct Checker {
             scope: gs,
             global_scope: gs,
             expr_types: expr_types,
-            trait_defs: new Map(string, int) { keys: 0, values: 0, states: 0, count: 0, capacity: 0 },
+            trait_defs: new Map(string, int) { buf: 0 },
             current_return_type: VOID,
             in_loop: false,
             in_labeled_block: 0,
             labeled_block_result_type: invalid_type,
             safe_mode: false,
-            generic_structs: new Map(string, *GenericInfo) { keys: 0, values: 0, states: 0, count: 0, capacity: 0 },
-            generic_functions: new Map(string, *GenericInfo) { keys: 0, values: 0, states: 0, count: 0, capacity: 0 },
+            generic_structs: new Map(string, *GenericInfo) { buf: 0 },
+            generic_functions: new Map(string, *GenericInfo) { buf: 0 },
             generic_impl_entries: generic_impl_entries,
-            instantiation_cache: new Map(string, int) { keys: 0, values: 0, states: 0, count: 0, capacity: 0 },
-            generic_inst_by_name: new Map(string, *GenericInstInfo) { keys: 0, values: 0, states: 0, count: 0, capacity: 0 },
+            instantiation_cache: new Map(string, int) { buf: 0 },
+            generic_inst_by_name: new Map(string, *GenericInstInfo) { buf: 0 },
             type_sub_keys: type_sub_keys,
             type_sub_vals: type_sub_vals,
-            trait_impls: new Map(string, string) { keys: 0, values: 0, states: 0, count: 0, capacity: 0 },
+            trait_impls: new Map(string, string) { buf: 0 },
             expected_type: invalid_type,
             current_switch_enum_type: invalid_type,
             lint_mode: false,
@@ -382,7 +382,7 @@ struct Checker {
     fn copyImportedSymbols(source_scope: *Scope) void {
         const key_list = source_scope.symbols.keys()
         var ki = 0
-        while (ki < key_list.count) {
+        while (ki < key_list.len()) {
             const key = key_list.get(ki)
             self.scope.symbols.set(key, source_scope.symbols.get(key))
             ki += 1
@@ -400,13 +400,13 @@ struct Checker {
     // ---- Type substitution (active during generic instantiation) ----
 
     fn hasTypeSubstitution() bool {
-        return self.type_sub_keys.count > 0
+        return self.type_sub_keys.len() > 0
     }
 
     fn lookupTypeSub(name: string) int {
         // Search in reverse: last-pushed wins (inner generic shadows outer)
         // Matches Zig pattern where each instantiation replaces the entire map
-        var i = self.type_sub_keys.count
+        var i = self.type_sub_keys.len()
         while (i > 0) {
             i -= 1
             if (self.type_sub_keys.get(i) == name) {
@@ -447,25 +447,25 @@ struct Checker {
 
     fn checkFile() void {
         self.safe_mode = self.ast.safe_mode
-        debug(.check, "=== Type checking file (${self.ast.file_decls.count} declarations, safe=${self.safe_mode}) ===")
+        debug(.check, "=== Type checking file (${self.ast.file_decls.len()} declarations, safe=${self.safe_mode}) ===")
 
         // Pass 1: collect type declarations (struct, enum, union, type alias)
-        for i in 0..self.ast.file_decls.count {
+        for i in 0..self.ast.file_decls.len() {
             self.collectTypeDecl(self.ast.file_decls.get(i))
         }
         debug(.check, "  pass 1: type declarations collected")
 
         // Pass 2: collect non-type declarations (fn, var/const, impl)
-        for i in 0..self.ast.file_decls.count {
+        for i in 0..self.ast.file_decls.len() {
             self.collectNonTypeDecl(self.ast.file_decls.get(i))
         }
         debug(.check, "  pass 2: non-type declarations collected")
 
         // Pass 3: check declaration bodies
-        for i in 0..self.ast.file_decls.count {
+        for i in 0..self.ast.file_decls.len() {
             self.checkDecl(self.ast.file_decls.get(i))
         }
-        debug(.check, "=== Type checking complete (${self.types.types.count} types registered) ===")
+        debug(.check, "=== Type checking complete (${self.types.types.len()} types registered) ===")
     }
 
     /// Collect declarations without checking bodies.
@@ -473,10 +473,10 @@ struct Checker {
     /// just need symbol table populated for lookupSymbol during lowering.
     fn collectDecls() void {
         self.safe_mode = self.ast.safe_mode
-        for i in 0..self.ast.file_decls.count {
+        for i in 0..self.ast.file_decls.len() {
             self.collectTypeDecl(self.ast.file_decls.get(i))
         }
-        for i in 0..self.ast.file_decls.count {
+        for i in 0..self.ast.file_decls.len() {
             self.collectNonTypeDecl(self.ast.file_decls.get(i))
         }
     }
@@ -511,7 +511,7 @@ struct Checker {
             }
 
             // Generic structs: store definition, don't build concrete type yet
-            if (sd.type_params.count > 0) {
+            if (sd.type_params.len() > 0) {
                 // Store GenericInfo with AST pointer for cross-file resolution
                 // Zig: self.generics.generic_structs.put(name, .{ .node_idx = idx, .tree = self.tree })
                 var info = new GenericInfo { node_idx: idx, ast_ptr: @ptrToInt(self.ast) }
@@ -532,7 +532,7 @@ struct Checker {
             // Register nested TYPE declarations BEFORE resolving fields, so parent struct
             // fields can reference nested types (e.g. ComptimeValue_ComptimeArray).
             // Matches Zig checker.zig: nested decls registered before buildStructTypeWithLayout.
-            for ni in 0..sd.nested_decls.count {
+            for ni in 0..sd.nested_decls.len() {
                 const nested_idx = sd.nested_decls.get(ni)
                 self.collectNestedDecl(name, nested_idx)
             }
@@ -596,7 +596,7 @@ struct Checker {
     fn collectErrorSetDeclAs(idx: int, qualified_name: string) void {
         const node = self.ast.getNode(idx)
         switch (node) { Node.decl |d| => switch (d) { Decl.error_set_decl |esd| => {
-            const variants_count = esd.variants.count
+            const variants_count = esd.variants.len()
             var variant_names_ptr: int = 0
             if (variants_count > 0) {
                 variant_names_ptr = @intCast(i64, alloc_raw(variants_count * @sizeOf(ErrorVariant)))
@@ -629,7 +629,7 @@ struct Checker {
             self.types.registerNamed(name, enum_type)
 
             // Register nested declarations (inferred impl methods)
-            for ni in 0..ed.nested_decls.count {
+            for ni in 0..ed.nested_decls.len() {
                 const nested_idx = ed.nested_decls.get(ni)
                 self.collectNestedDecl(name, nested_idx)
             }
@@ -680,7 +680,7 @@ struct Checker {
                 return
             }
             // Build error set type with variant names (Zig checker.zig:435-439)
-            const variants_count = esd.variants.count
+            const variants_count = esd.variants.len()
             var variant_names_ptr: int = 0
             if (variants_count > 0) {
                 variant_names_ptr = @intCast(i64, alloc_raw(variants_count * @sizeOf(ErrorVariant)))
@@ -710,7 +710,7 @@ struct Checker {
             }
 
             // Generic functions: store definition, don't build concrete type yet
-            if (f.type_params.count > 0) {
+            if (f.type_params.len() > 0) {
                 // Store GenericInfo with AST pointer for cross-file resolution
                 var info = new GenericInfo { node_idx: idx, ast_ptr: @ptrToInt(self.ast) }
                 self.generic_functions.set(name, info)
@@ -747,26 +747,26 @@ struct Checker {
             const type_name = ib.type_name
 
             // Generic impl blocks: store for deferred instantiation
-            if (ib.type_params.count > 0) {
+            if (ib.type_params.len() > 0) {
 
 
                 self.generic_impl_entries.append(GenericImplEntry {
                     base_name: type_name,
                     node_idx: idx,
-                    tp_count: ib.type_params.count,
-                    methods_count: ib.methods.count,
+                    tp_count: ib.type_params.len(),
+                    methods_count: ib.methods.len(),
                     ast_ptr: @ptrToInt(self.ast),
                 })
                 return
             }
 
-            for mi in 0..ib.methods.count {
+            for mi in 0..ib.methods.len() {
                 self.collectImplMethod(type_name, ib.methods.get(mi))
             }
 
             // Register associated constants: impl Foo { const MAX = 100 }
             // → defines "Foo.MAX" as a const symbol in global scope
-            for ci in 0..ib.consts.count {
+            for ci in 0..ib.consts.len() {
                 self.collectAssociatedConst(type_name, ib.consts.get(ci))
             }
         }, else => {} }, else => {} }
@@ -810,7 +810,7 @@ struct Checker {
 
                 // Detect static (no params or first param not named "self")
                 var is_static = true
-                if (f.params.count > 0) {
+                if (f.params.len() > 0) {
                     const first_param = f.params.get(0)
                     const fp_node = self.ast.getNode(first_param)
                     switch (fp_node) { Node.expr |e| => switch (e) { Expr.field_def |fd| => {
@@ -861,7 +861,7 @@ struct Checker {
             const trait_idx = self.trait_defs.get(trait_name)
             const trait_node = self.ast.getNode(trait_idx)
             switch (trait_node) { Node.decl |td_outer| => switch (td_outer) { Decl.trait_decl |td| => {
-                for ti in 0..td.methods.count {
+                for ti in 0..td.methods.len() {
                     const trait_method_idx = td.methods.get(ti)
                     if (nodeTag(self.ast, trait_method_idx) == "fn_decl") {
                         // Extract required method name
@@ -872,7 +872,7 @@ struct Checker {
                         }, else => {} }, else => {} }
 
                         var found = false
-                        for mi in 0..it.methods.count {
+                        for mi in 0..it.methods.len() {
                             const impl_method_idx = it.methods.get(mi)
                             if (nodeTag(self.ast, impl_method_idx) == "fn_decl") {
                                 const im_node = self.ast.getNode(impl_method_idx)
@@ -896,7 +896,7 @@ struct Checker {
             self.trait_impls.set(impl_key, trait_name)
 
             // Register methods (same pattern as impl_block)
-            for mi in 0..it.methods.count {
+            for mi in 0..it.methods.len() {
                 self.collectImplMethod(target_type, it.methods.get(mi))
             }
         }, else => {} }, else => {} }
@@ -910,7 +910,7 @@ struct Checker {
             const node = self.ast.getNode(idx)
             switch (node) { Node.decl |d| => switch (d) { Decl.fn_decl |f| => {
                 // Skip generic functions
-                if (f.type_params.count > 0) { return }
+                if (f.type_params.len() > 0) { return }
                 self.checkFnDeclBody(idx, f.name)
             }, else => {} }, else => {} }
         }
@@ -925,13 +925,13 @@ struct Checker {
     fn checkStructNestedMethods(idx: int) void {
         const node = self.ast.getNode(idx)
         switch (node) { Node.decl |d| => switch (d) { Decl.struct_decl |sd| => {
-            if (sd.type_params.count > 0) { return }
-            for ni in 0..sd.nested_decls.count {
+            if (sd.type_params.len() > 0) { return }
+            for ni in 0..sd.nested_decls.len() {
                 const nested_idx = sd.nested_decls.get(ni)
                 if (nodeTag(self.ast, nested_idx) == "fn_decl") {
                     const m_node = self.ast.getNode(nested_idx)
                     switch (m_node) { Node.decl |md| => switch (md) { Decl.fn_decl |mf| => {
-                        if (mf.type_params.count > 0) { continue }
+                        if (mf.type_params.len() > 0) { continue }
                         self.checkFnDeclBody(nested_idx, "${sd.name}_${mf.name}")
                     }, else => {} }, else => {} }
                 }
@@ -942,12 +942,12 @@ struct Checker {
     fn checkEnumNestedMethods(idx: int) void {
         const node = self.ast.getNode(idx)
         switch (node) { Node.decl |d| => switch (d) { Decl.enum_decl |ed| => {
-            for ni in 0..ed.nested_decls.count {
+            for ni in 0..ed.nested_decls.len() {
                 const nested_idx = ed.nested_decls.get(ni)
                 if (nodeTag(self.ast, nested_idx) == "fn_decl") {
                     const m_node = self.ast.getNode(nested_idx)
                     switch (m_node) { Node.decl |md| => switch (md) { Decl.fn_decl |mf| => {
-                        if (mf.type_params.count > 0) { continue }
+                        if (mf.type_params.len() > 0) { continue }
                         self.checkFnDeclBody(nested_idx, "${ed.name}_${mf.name}")
                     }, else => {} }, else => {} }
                 }
@@ -959,9 +959,9 @@ struct Checker {
         const node = self.ast.getNode(idx)
         switch (node) { Node.decl |d| => switch (d) { Decl.impl_block |ib| => {
             // Skip generic impl blocks
-            if (ib.type_params.count > 0) { return }
+            if (ib.type_params.len() > 0) { return }
 
-            for mi in 0..ib.methods.count {
+            for mi in 0..ib.methods.len() {
                 const method_idx = ib.methods.get(mi)
                 if (nodeTag(self.ast, method_idx) == "fn_decl") {
                     const m_node = self.ast.getNode(method_idx)
@@ -976,7 +976,7 @@ struct Checker {
     fn checkImplTraitBodies(idx: int) void {
         const node = self.ast.getNode(idx)
         switch (node) { Node.decl |d| => switch (d) { Decl.impl_trait |it| => {
-            for mi in 0..it.methods.count {
+            for mi in 0..it.methods.len() {
                 const method_idx = it.methods.get(mi)
                 if (nodeTag(self.ast, method_idx) == "fn_decl") {
                     const m_node = self.ast.getNode(method_idx)
@@ -1023,7 +1023,7 @@ struct Checker {
 
         // Get return type from func type
         var return_type: int = VOID
-        if (sym.type_idx < 0 or sym.type_idx >= self.types.types.count) {
+        if (sym.type_idx < 0 or sym.type_idx >= self.types.types.len()) {
             // Invalid type_idx — skip re-checking rather than crash
             return
         }
@@ -1045,7 +1045,7 @@ struct Checker {
             self.current_return_type = return_type
 
             // Define parameters in scope (same substitution-aware @safe as buildFuncType)
-            for pi in 0..f.params.count {
+            for pi in 0..f.params.len() {
                 const param_idx = f.params.get(pi)
                 if (nodeTag(self.ast, param_idx) == "field_def") {
                     const p_node = self.ast.getNode(param_idx)
@@ -1572,7 +1572,7 @@ struct Checker {
     /// from a block's statements before checking other statements.
     /// Zig ref: checker.zig:270-281
     fn collectBlockScopedTypes(stmts: List(int)) void {
-        for i in 0..stmts.count {
+        for i in 0..stmts.len() {
             const stmt_idx = stmts.get(i)
             // Block-scoped types are wrapped as expr_stmt(decl_node)
             const inner = nodeExprStmtExpr(self.ast, stmt_idx)
@@ -1598,12 +1598,12 @@ struct Checker {
             }
 
             const tup = switch (val_t) { Type.tuple |t| => t, else => TupleType { elem_count: 0, elem_types: 0 } }
-            if (dts.bindings.count != tup.elem_count) {
+            if (dts.bindings.len() != tup.elem_count) {
                 self.reportError(idx, ErrorCode.e300, "destructuring count mismatch")
                 return
             }
 
-            for i in 0..dts.bindings.count {
+            for i in 0..dts.bindings.len() {
                 const bind_idx = dts.bindings.get(i)
                 const b_node = self.ast.getNode(bind_idx)
                 switch (b_node) { Node.expr |e| => switch (e) { Expr.destructure_bind |db| => {
@@ -1635,7 +1635,7 @@ struct Checker {
         const node = self.ast.getNode(idx)
         switch (node) { Node.expr |e| => switch (e) { Expr.block_expr |be| => {
             self.pushScope()
-            for i in 0..be.stmts.count {
+            for i in 0..be.stmts.len() {
                 self.checkStmt(be.stmts.get(i))
             }
             if (be.result_expr != null_node) {
@@ -2036,7 +2036,7 @@ struct Checker {
         var callee_n = null_node
         var call_args: List(int) = .{}
         switch (self.ast.getNode(idx)) { Node.expr |e| => switch (e) { Expr.call |c| => { callee_n = c.callee; call_args = c.args }, else => {} }, else => {} }
-        const args_count = call_args.count
+        const args_count = call_args.len()
 
         // Check for built-in function calls: print, println, etc.
         if (nodeTag(self.ast, callee_n) == "ident") {
@@ -2356,7 +2356,7 @@ struct Checker {
 
             // Check scope for associated constants and static methods
             // Only match when base_name is a type name (not a variable name)
-            // to avoid false matches like args.count → args_count (extern fn)
+            // to avoid false matches like args.len() → args_count (extern fn)
             // Use scope-first resolution to handle per-file type disambiguation
             var base_type_idx = -1
             if (self.lookupSymbol(base_name)) |base_sym| {
@@ -2614,10 +2614,10 @@ struct Checker {
         var si_fields: List(int) = .{}
         var si_type_args: List(int) = .{}
         switch (self.ast.getNode(idx)) { Node.expr |e| => switch (e) { Expr.struct_init |si| => { type_name = si.type_name; si_fields = si.fields; si_type_args = si.type_args }, else => {} }, else => {} }
-        const fi_count = si_fields.count
+        const fi_count = si_fields.len()
 
         // Check for type arguments (generic struct init)
-        const ta_count = si_type_args.count
+        const ta_count = si_type_args.len()
         if (ta_count > 0) {
             const struct_type_idx = self.resolveGenericStructInit(idx, type_name, fi_count, ta_count, si_type_args)
             self.validateStructFields(idx, struct_type_idx, si_fields)
@@ -2660,7 +2660,7 @@ struct Checker {
         const st_t = self.types.get(struct_type_idx)
         if (st_t.tag != TAG_STRUCT) { return }
         const st = switch (st_t) { Type.struct_type |s| => s, else => StructType { name: "", field_count: 0, fields: 0, size: 0, alignment: 0, layout: 0, backing_int: 0 } }
-        const fi_count = fields.count
+        const fi_count = fields.len()
 
         // Check each field initializer: name exists and value type matches
         for fi in 0..fi_count {
@@ -2735,8 +2735,8 @@ struct Checker {
         var ne_ctor_args: List(int) = .{}
         var is_ctor = false
         switch (self.ast.getNode(idx)) { Node.expr |e| => switch (e) { Expr.new_expr |ne| => { type_name = ne.type_name; ne_fields = ne.fields; ne_type_args = ne.type_args; ne_ctor_args = ne.constructor_args; is_ctor = ne.is_constructor }, else => {} }, else => {} }
-        const fi_count = ne_fields.count
-        const ta_count = ne_type_args.count
+        const fi_count = ne_fields.len()
+        const ta_count = ne_type_args.len()
 
         // Check for type arguments (generic new expr)
         if (ta_count > 0) {
@@ -2764,7 +2764,7 @@ struct Checker {
         // Constructor sugar: new Point(10, 20) calls init()
         // Zig ref: checker.zig:2548-2570
         if (is_ctor) {
-            const ca_count = ne_ctor_args.count
+            const ca_count = ne_ctor_args.len()
             // Check arg expressions first
             var arg_types: List(int) = .{}
             for ci in 0..ca_count {
@@ -2797,7 +2797,7 @@ struct Checker {
     fn checkArrayLiteral(idx: int) int {
         var al_elements: List(int) = .{}
         switch (self.ast.getNode(idx)) { Node.expr |e| => switch (e) { Expr.array_literal |al| => { al_elements = al.elements }, else => {} }, else => {} }
-        const count = al_elements.count
+        const count = al_elements.len()
         if (count == 0) {
             self.reportError(idx, ErrorCode.e300, "cannot infer type of empty array")
             return invalid_type
@@ -2816,7 +2816,7 @@ struct Checker {
     fn checkTupleLiteral(idx: int) int {
         var tl_elements: List(int) = .{}
         switch (self.ast.getNode(idx)) { Node.expr |e| => switch (e) { Expr.tuple_literal |tl| => { tl_elements = tl.elements }, else => {} }, else => {} }
-        const count = tl_elements.count
+        const count = tl_elements.len()
         if (count < 2) {
             self.reportError(idx, ErrorCode.e300, "tuple requires at least 2 elements")
             return invalid_type
@@ -2877,7 +2877,7 @@ struct Checker {
         var sw_cases: List(int) = .{}
         var else_body_n = null_node
         switch (self.ast.getNode(idx)) { Node.expr |e| => switch (e) { Expr.switch_expr |sw| => { subject_n = sw.subject; sw_cases = sw.cases; else_body_n = sw.else_body }, else => {} }, else => {} }
-        const cases_count = sw_cases.count
+        const cases_count = sw_cases.len()
 
         const subject_type = self.checkExpr(subject_n)
         const subject_t = self.types.get(subject_type)
@@ -2901,7 +2901,7 @@ struct Checker {
             var capture = ""
             var guard_n = null_node
             switch (self.ast.getNode(case_idx)) { Node.expr |ce| => switch (ce) { Expr.switch_case_node |sc| => { sc_patterns = sc.patterns; sc_body = sc.body; capture = sc.capture; guard_n = sc.guard }, else => {} }, else => {} }
-            const patterns_count = sc_patterns.count
+            const patterns_count = sc_patterns.len()
             const body_n = sc_body
 
             // Check pattern expressions
@@ -2953,7 +2953,7 @@ struct Checker {
                 var ex_guard = null_node
                 switch (self.ast.getNode(case_idx)) { Node.expr |ce| => switch (ce) { Expr.switch_case_node |sc| => { ex_patterns = sc.patterns; ex_guard = sc.guard }, else => {} }, else => {} }
                 if (ex_guard != null_node) { continue }  // guarded cases don't guarantee coverage
-                const pat_count = ex_patterns.count
+                const pat_count = ex_patterns.len()
                 for pi in 0..pat_count {
                     const pat_idx = ex_patterns.get(pi)
                     if (nodeTag(self.ast, pat_idx) == "field_access") {
@@ -2961,7 +2961,7 @@ struct Checker {
                         switch (self.ast.getNode(pat_idx)) { Node.expr |pe| => switch (pe) { Expr.field_access |fa| => { variant_name = fa.field }, else => {} }, else => {} }
                         // Dedup: only add if not already covered
                         var already_covered = false
-                        for ci2 in 0..covered.count {
+                        for ci2 in 0..covered.len() {
                             if (covered.get(ci2) == variant_name) {
                                 already_covered = true
                             }
@@ -2972,20 +2972,20 @@ struct Checker {
                     }
                 }
             }
-            if (covered.count < et.variant_count) {
+            if (covered.len() < et.variant_count) {
                 // List missing variant names (Zig ref: checker.zig:2695-2714)
                 var missing: List(string) = .{}
                 for vi in 0..et.variant_count {
                     const ev = et.getVariant(vi)
                     var is_covered = false
-                    for ci2 in 0..covered.count {
+                    for ci2 in 0..covered.len() {
                         if (covered.get(ci2) == ev.name) { is_covered = true }
                     }
                     if (!is_covered) { missing.append(ev.name) }
                 }
-                if (missing.count > 0) {
+                if (missing.len() > 0) {
                     var msg = "non-exhaustive switch, missing: "
-                    for mi in 0..missing.count {
+                    for mi in 0..missing.len() {
                         if (mi > 0) { msg = "${msg}, " }
                         msg = "${msg}.${missing.get(mi)}"
                     }
@@ -3011,7 +3011,7 @@ struct Checker {
         // Use first pattern to determine the variant
         var uc_patterns: List(int) = .{}
         switch (self.ast.getNode(case_idx)) { Node.expr |ce| => switch (ce) { Expr.switch_case_node |sc| => { uc_patterns = sc.patterns }, else => {} }, else => {} }
-        if (uc_patterns.count == 0) { return VOID }
+        if (uc_patterns.len() == 0) { return VOID }
         const pat_idx = uc_patterns.get(0)
         if (nodeTag(self.ast, pat_idx) != "field_access") { return VOID }
         var field_name = ""
@@ -3030,7 +3030,7 @@ struct Checker {
         var result_expr = null_node
         var label = ""
         switch (self.ast.getNode(idx)) { Node.expr |e| => switch (e) { Expr.block_expr |blk| => { blk_stmts = blk.stmts; result_expr = blk.result_expr; label = blk.label }, else => {} }, else => {} }
-        const stmts_count = blk_stmts.count
+        const stmts_count = blk_stmts.len()
 
         const has_label = @lenOf(label) > 0
         if (has_label) { self.in_labeled_block = self.in_labeled_block + 1 }
@@ -3105,7 +3105,7 @@ struct Checker {
             else => {},
         }
         const kind = @enumFromInt(bc_kind) as BuiltinKind
-        const argc = args.count
+        const argc = args.len()
 
         // --- Type introspection ---
 
@@ -3761,7 +3761,7 @@ struct Checker {
     fn checkStringInterp(idx: int) int {
         var si_segments: List(int) = .{}
         switch (self.ast.getNode(idx)) { Node.expr |e| => switch (e) { Expr.string_interp |si| => { si_segments = si.segments }, else => {} }, else => {} }
-        const count = si_segments.count
+        const count = si_segments.len()
         for i in 0..count {
             self.checkExpr(si_segments.get(i))
         }
@@ -3811,7 +3811,7 @@ struct Checker {
             // Skip other statements (assignments, inline for, etc.) — comptime evaluation
             // is handled by evalComptimeStmts, not here.
             var result_type: int = VOID
-            for si in 0..stmts.count {
+            for si in 0..stmts.len() {
                 const stmt_idx = stmts.get(si)
                 const stag = nodeTag(self.ast, stmt_idx)
                 if (stag == "var_stmt") {
@@ -3837,7 +3837,7 @@ struct Checker {
             self.pushScope()
             const old_comptime = self.in_comptime
             self.in_comptime = true
-            for si in 0..stmts.count {
+            for si in 0..stmts.len() {
                 self.checkStmt(stmts.get(si))
             }
             var result_type = VOID
@@ -3942,7 +3942,7 @@ struct Checker {
         switch (self.ast.getNode(idx)) { Node.expr |e| => switch (e) { Expr.select_expr |se| => { cases = se.cases; default_body = se.default_body }, else => {} }, else => {} }
 
         var i = 0
-        while (i < cases.count) {
+        while (i < cases.len()) {
             const sc = self.ast.getSelectCase(cases.get(i))
             if (sc.kind == SELECT_RECV) {
                 // Type-check channel expression
@@ -4028,7 +4028,7 @@ struct Checker {
         var ret_type_n = null_node
         var body_n = null_node
         switch (self.ast.getNode(idx)) { Node.expr |e| => switch (e) { Expr.closure_expr |cl| => { cl_params = cl.params; ret_type_n = cl.return_type; body_n = cl.body }, else => {} }, else => {} }
-        const params_count = cl_params.count
+        const params_count = cl_params.len()
 
         // Build function type from closure signature
         const params_ptr = @intCast(i64, alloc_raw(params_count * @sizeOf(FuncParam)))
@@ -4135,7 +4135,7 @@ struct Checker {
     fn resolveTupleType(idx: int) int {
         var elems: List(int) = .{}
         switch (self.ast.getNode(idx)) { Node.expr |e| => switch (e) { Expr.tuple_type |tt| => {
-            for i in 0..tt.elements.count {
+            for i in 0..tt.elements.len() {
                 elems.append(self.resolveTypeExpr(tt.elements.get(i)))
             }
         }, else => {} }, else => {} }
@@ -4233,7 +4233,7 @@ struct Checker {
         var sd_fields: List(int) = .{}
         var sd_layout: int = 0
         switch (self.ast.getNode(idx)) { Node.decl |d| => switch (d) { Decl.struct_decl |sd| => { sd_fields = sd.fields; sd_layout = sd.layout }, else => {} }, else => {} }
-        const fields_count = sd_fields.count
+        const fields_count = sd_fields.len()
         const is_packed = sd_layout == StructLayout.@"packed"
 
         // Build struct fields using raw pointer array
@@ -4373,7 +4373,7 @@ struct Checker {
         switch (self.ast.getNode(idx)) { Node.decl |d| => switch (d) { Decl.enum_decl |ed| => { ed_name = ed.name; ed_backing = ed.backing_type; ed_variants = ed.variants }, else => {} }, else => {} }
         const name = ed_name
         const backing_n = ed_backing
-        const variants_count = ed_variants.count
+        const variants_count = ed_variants.len()
 
         var backing_type: int = I32
         if (backing_n != null_node) {
@@ -4413,7 +4413,7 @@ struct Checker {
         var ud_variants: List(int) = .{}
         switch (self.ast.getNode(idx)) { Node.decl |d| => switch (d) { Decl.union_decl |ud| => { ud_name = ud.name; ud_variants = ud.variants }, else => {} }, else => {} }
         const name = ud_name
-        const variants_count = ud_variants.count
+        const variants_count = ud_variants.len()
 
         const variants_ptr = @intCast(i64, alloc_raw(variants_count * @sizeOf(UnionVariant)))
         for vi in 0..variants_count {
@@ -4464,7 +4464,7 @@ struct Checker {
     /// Build cache key for generic deduplication: "List(5)" or "Pair(5;17)"
     fn buildGenericCacheKey(name: string, type_args: List(int)) string {
         var result = name ++ "("
-        for i in 0..type_args.count {
+        for i in 0..type_args.len() {
             if (i > 0) {
                 result = result ++ ";" ++ intToString(type_args.get(i))
             } else {
@@ -4481,7 +4481,7 @@ struct Checker {
         // NOTE: Use explicit ++ instead of string interpolation to avoid
         // a Zig compiler codegen bug where "${str};${int}" truncates str.
         var ta_str = ""
-        for i in 0..type_args.count {
+        for i in 0..type_args.len() {
             const ta_val_str = intToString(type_args.get(i))
             if (i > 0) {
                 ta_str = ta_str ++ ";" ++ ta_val_str
@@ -4491,7 +4491,7 @@ struct Checker {
         }
         // Serialize type param names: "T" or "K;V"
         var tp_str = ""
-        for i in 0..type_param_names.count {
+        for i in 0..type_param_names.len() {
             if (i > 0) {
                 tp_str = tp_str ++ ";" ++ type_param_names.get(i)
             } else {
@@ -4528,7 +4528,7 @@ struct Checker {
         // Read type args from generic_instance AST (CURRENT file)
         var gi_type_args: List(int) = .{}
         switch (self.ast.getNode(idx)) { Node.expr |e| => switch (e) { Expr.generic_instance |gi| => { gi_type_args = gi.type_args }, else => {} }, else => {} }
-        const ta_count = gi_type_args.count
+        const ta_count = gi_type_args.len()
 
         // Resolve each type argument in caller's context (CURRENT file's AST)
         var resolved_args: List(int) = .{}
@@ -4565,7 +4565,7 @@ struct Checker {
         // Read struct definition from DEFINING file's AST
         var s_tp: List(string) = .{}
         switch (self.ast.getNode(struct_node)) { Node.decl |d| => switch (d) { Decl.struct_decl |sd| => { s_tp = sd.type_params }, else => {} }, else => {} }
-        const tp_count = s_tp.count
+        const tp_count = s_tp.len()
 
         if (ta_count != tp_count) {
 
@@ -4579,7 +4579,7 @@ struct Checker {
         }
 
         // Set up type substitution
-        const old_sub_count = self.type_sub_keys.count
+        const old_sub_count = self.type_sub_keys.len()
         for i in 0..tp_count {
             self.pushTypeSub(s_tp.get(i), resolved_args.get(i))
         }
@@ -4600,8 +4600,8 @@ struct Checker {
         self.instantiateNestedMethods(cache_key, sd_nested, resolved_args, sd_type_params, info.ast_ptr)
 
         // Restore substitution
-        self.type_sub_keys.count = old_sub_count
-        self.type_sub_vals.count = old_sub_count
+        self.type_sub_keys.resize(old_sub_count)
+        self.type_sub_vals.resize(old_sub_count)
 
         // Restore caller's AST and safe_mode
 
@@ -4620,7 +4620,7 @@ struct Checker {
     /// Called during generic struct instantiation while defining file's AST is active.
     fn instantiateNestedMethods(concrete_name: string, nested_decls: List(int), resolved_args: List(int), type_param_names: List(string), ast_ptr: int) void {
         // Pass 1: Register all method signatures
-        for ni in 0..nested_decls.count {
+        for ni in 0..nested_decls.len() {
             const nested_idx = nested_decls.get(ni)
             if (nodeTag(self.ast, nested_idx) != "fn_decl") { continue }
 
@@ -4633,7 +4633,7 @@ struct Checker {
             var is_static = true
             var f_params: List(int) = .{}
             switch (self.ast.getNode(nested_idx)) { Node.decl |d| => switch (d) { Decl.fn_decl |f| => { f_params = f.params }, else => {} }, else => {} }
-            if (f_params.count > 0) {
+            if (f_params.len() > 0) {
                 const first_param = f_params.get(0)
                 if (nodeTag(self.ast, first_param) == "field_def") {
                     var fp_name = ""
@@ -4664,7 +4664,7 @@ struct Checker {
             // Use fn's own type_params if it has any, otherwise struct's type_params
             var fn_tp: List(string) = .{}
             switch (self.ast.getNode(nested_idx)) { Node.decl |d| => switch (d) { Decl.fn_decl |f| => { fn_tp = f.type_params }, else => {} }, else => {} }
-            if (fn_tp.count > 0) {
+            if (fn_tp.len() > 0) {
                 self.registerGenericInst(synth_name, nested_idx, resolved_args, fn_tp, ast_ptr, 0)
             } else {
                 self.registerGenericInst(synth_name, nested_idx, resolved_args, type_param_names, ast_ptr, 0)
@@ -4681,10 +4681,10 @@ struct Checker {
     /// Cross-file: swaps self.ast to defining file's AST for each impl entry.
     /// Also isolates expr_types to avoid NodeIndex collision (Zig lines 3433-3442).
     fn instantiateGenericImplMethods(base_name: string, concrete_name: string, resolved_args: List(int)) void {
-        for ei in 0..self.generic_impl_entries.count {
-            const entry = @intToPtr(*GenericImplEntry, self.generic_impl_entries.items + ei * @sizeOf(GenericImplEntry))
+        for ei in 0..self.generic_impl_entries.len() {
+            const entry = self.generic_impl_entries.elemPtr(ei)
             if (entry.base_name != base_name) { continue }
-            if (entry.tp_count != resolved_args.count) { continue }
+            if (entry.tp_count != resolved_args.len()) { continue }
 
             const impl_idx = entry.node_idx
 
@@ -4702,7 +4702,7 @@ struct Checker {
             var impl_methods: List(int) = .{}
             var impl_tp: List(string) = .{}
             switch (self.ast.getNode(impl_idx)) { Node.decl |d| => switch (d) { Decl.impl_block |ib| => { impl_methods = ib.methods; impl_tp = ib.type_params }, else => {} }, else => {} }
-            const methods_count = impl_methods.count
+            const methods_count = impl_methods.len()
 
             // Cross-file expr_types isolation (Zig lines 3433-3442):
             // Foreign AST NodeIndexes collide with host file's NodeIndex space.
@@ -4715,7 +4715,7 @@ struct Checker {
             }
 
             // Set up type substitution from DEFINING file's AST
-            const old_sub_count = self.type_sub_keys.count
+            const old_sub_count = self.type_sub_keys.len()
             for i in 0..entry.tp_count {
                 const tp_name = impl_tp.get(i)
                 self.pushTypeSub(tp_name, resolved_args.get(i))
@@ -4765,8 +4765,8 @@ struct Checker {
             }
 
             // Restore substitution
-            self.type_sub_keys.count = old_sub_count
-            self.type_sub_vals.count = old_sub_count
+            self.type_sub_keys.resize(old_sub_count)
+            self.type_sub_vals.resize(old_sub_count)
 
             // Restore expr_types for cross-file
             if (is_cross_file) {
@@ -4794,7 +4794,7 @@ struct Checker {
         // Read call args from CURRENT file's AST
         var call_args: List(int) = .{}
         switch (self.ast.getNode(idx)) { Node.expr |e| => switch (e) { Expr.call |c| => { call_args = c.args }, else => {} }, else => {} }
-        const call_args_count = call_args.count
+        const call_args_count = call_args.len()
 
         // Resolve each type argument from CURRENT file's AST
         var resolved_args: List(int) = .{}
@@ -4833,8 +4833,8 @@ struct Checker {
         var fn_tp: List(string) = .{}
         var fn_tp_bounds: List(string) = .{}
         switch (self.ast.getNode(fn_node)) { Node.decl |d| => switch (d) { Decl.fn_decl |fd| => { fn_params = fd.params; fn_tp = fd.type_params; fn_tp_bounds = fd.type_param_bounds }, else => {} }, else => {} }
-        const params_count = fn_params.count
-        const tp_count = fn_tp.count
+        const params_count = fn_params.len()
+        const tp_count = fn_tp.len()
 
         if (call_args_count != tp_count) {
 
@@ -4848,7 +4848,7 @@ struct Checker {
         }
 
         // Validate trait bounds (Zig lines 3460-3474)
-        const bounds_count = fn_tp_bounds.count
+        const bounds_count = fn_tp_bounds.len()
         if (bounds_count > 0) {
             for bi in 0..bounds_count {
                 const bound_name = fn_tp_bounds.get(bi)
@@ -4880,7 +4880,7 @@ struct Checker {
         }
 
         // Set up type substitution from DEFINING file's AST
-        const old_sub_count = self.type_sub_keys.count
+        const old_sub_count = self.type_sub_keys.len()
         for i in 0..tp_count {
             const tp_name = fn_tp.get(i)
             self.pushTypeSub(tp_name, resolved_args.get(i))
@@ -4914,8 +4914,8 @@ struct Checker {
         }
 
         // Restore substitution
-        self.type_sub_keys.count = old_sub_count
-        self.type_sub_vals.count = old_sub_count
+        self.type_sub_keys.resize(old_sub_count)
+        self.type_sub_vals.resize(old_sub_count)
 
         // Restore caller's AST and safe_mode
 
@@ -4961,8 +4961,8 @@ struct Checker {
         var s_fields: List(int) = .{}
         var s_tp: List(string) = .{}
         switch (self.ast.getNode(struct_node)) { Node.decl |d| => switch (d) { Decl.struct_decl |sd| => { s_fields = sd.fields; s_tp = sd.type_params }, else => {} }, else => {} }
-        const s_fields_count = s_fields.count
-        const tp_count = s_tp.count
+        const s_fields_count = s_fields.len()
+        const tp_count = s_tp.len()
 
         if (ta_count != tp_count) {
 
@@ -4987,7 +4987,7 @@ struct Checker {
         }
 
         // Set up substitution from DEFINING file's AST
-        const old_sub_count = self.type_sub_keys.count
+        const old_sub_count = self.type_sub_keys.len()
         for i in 0..tp_count {
             const tp_name = s_tp.get(i)
             self.pushTypeSub(tp_name, resolved_args.get(i))
@@ -5005,8 +5005,8 @@ struct Checker {
         switch (self.ast.getNode(struct_node)) { Node.decl |d| => switch (d) { Decl.struct_decl |sd| => { sd_nested2 = sd.nested_decls; sd_tp2 = sd.type_params }, else => {} }, else => {} }
         self.instantiateNestedMethods(cache_key, sd_nested2, resolved_args, sd_tp2, info.ast_ptr)
 
-        self.type_sub_keys.count = old_sub_count
-        self.type_sub_vals.count = old_sub_count
+        self.type_sub_keys.resize(old_sub_count)
+        self.type_sub_vals.resize(old_sub_count)
 
         // Restore caller's AST and safe_mode
 
@@ -5051,8 +5051,8 @@ struct Checker {
         var s_fields_ne: List(int) = .{}
         var s_tp_ne: List(string) = .{}
         switch (self.ast.getNode(struct_node)) { Node.decl |d| => switch (d) { Decl.struct_decl |sd| => { s_fields_ne = sd.fields; s_tp_ne = sd.type_params }, else => {} }, else => {} }
-        const s_fields_count = s_fields_ne.count
-        const tp_count = s_tp_ne.count
+        const s_fields_count = s_fields_ne.len()
+        const tp_count = s_tp_ne.len()
 
         if (ta_count != tp_count) {
 
@@ -5077,7 +5077,7 @@ struct Checker {
         }
 
         // Set up substitution from DEFINING file's AST
-        const old_sub_count = self.type_sub_keys.count
+        const old_sub_count = self.type_sub_keys.len()
         for i in 0..tp_count {
             const tp_name = s_tp_ne.get(i)
             self.pushTypeSub(tp_name, resolved_args.get(i))
@@ -5095,8 +5095,8 @@ struct Checker {
         switch (self.ast.getNode(struct_node)) { Node.decl |d| => switch (d) { Decl.struct_decl |sd| => { sd_nested3 = sd.nested_decls; sd_tp3 = sd.type_params }, else => {} }, else => {} }
         self.instantiateNestedMethods(cache_key, sd_nested3, resolved_args, sd_tp3, info.ast_ptr)
 
-        self.type_sub_keys.count = old_sub_count
-        self.type_sub_vals.count = old_sub_count
+        self.type_sub_keys.resize(old_sub_count)
+        self.type_sub_vals.resize(old_sub_count)
 
         // Restore caller's AST and safe_mode
 
@@ -5114,7 +5114,7 @@ struct Checker {
         var fn_params: List(int) = .{}
         var ret_type_n = null_node
         switch (self.ast.getNode(idx)) { Node.decl |d| => switch (d) { Decl.fn_decl |fd| => { fn_params = fd.params; ret_type_n = fd.return_type }, else => {} }, else => {} }
-        const params_count = fn_params.count
+        const params_count = fn_params.len()
 
         const params_ptr = @intCast(i64, alloc_raw(params_count * @sizeOf(FuncParam)))
         for pi in 0..params_count {
@@ -5229,7 +5229,7 @@ struct Checker {
             if (field_name == "value") { return ComptimeValue.makeInt(base_val.enum_field.value) }
         }
         if (base_val.tag == CV_ARRAY) {
-            if (field_name == "len") { return ComptimeValue.makeInt(base_val.array.elements.count) }
+            if (field_name == "len") { return ComptimeValue.makeInt(base_val.array.elements.len()) }
         }
         return null
     }
@@ -5243,7 +5243,7 @@ struct Checker {
         const base_val = self.evalComptimeValue(base_n) orelse return null
         const idx_val = (self.evalComptimeValue(idx_n) orelse return null).asInt() orelse return null
         if (base_val.tag == CV_ARRAY) {
-            if (idx_val >= 0 and idx_val < base_val.array.elements.count) {
+            if (idx_val >= 0 and idx_val < base_val.array.elements.len()) {
                 return base_val.array.elements.get(idx_val)
             }
         }
@@ -5253,7 +5253,7 @@ struct Checker {
     fn evalComptimeValue(idx: int) ?ComptimeValue {
         if (idx == null_node) { return null }
         // Zig checker.zig:858 — bounds check before accessing node
-        if (idx < 0 or idx >= self.ast.nodes.count) { return null }
+        if (idx < 0 or idx >= self.ast.nodes.len()) { return null }
         const tag = nodeTag(self.ast, idx)
 
         // Literal: int, float, string, bool, undefined
@@ -5375,7 +5375,7 @@ struct Checker {
                     }
                 }
             }
-            if (bk == BuiltinKind.int_from_enum and bc_args.count > 0) {
+            if (bk == BuiltinKind.int_from_enum and bc_args.len() > 0) {
                 const cv = self.evalConstExpr(bc_args.get(0))
                 if (cv.0 != 0) { return ComptimeValue.makeInt(cv.1) }
             }
@@ -5407,7 +5407,7 @@ struct Checker {
             var blk_stmts: List(int) = .{}
             var result_expr = null_node
             switch (self.ast.getNode(idx)) { Node.expr |e| => switch (e) { Expr.block_expr |blk| => { blk_stmts = blk.stmts; result_expr = blk.result_expr }, else => {} }, else => {} }
-            if (blk_stmts.count == 0) { return self.evalComptimeValue(result_expr) }
+            if (blk_stmts.len() == 0) { return self.evalComptimeValue(result_expr) }
             return null
         }
 
@@ -5435,7 +5435,7 @@ struct Checker {
                 if (field_name == "value") { return ComptimeValue.makeInt(base_val.enum_field.value) }
             }
             if (base_val.tag == CV_ARRAY) {
-                if (field_name == "len") { return ComptimeValue.makeInt(base_val.array.elements.count) }
+                if (field_name == "len") { return ComptimeValue.makeInt(base_val.array.elements.len()) }
             }
             return null
         }
@@ -5448,7 +5448,7 @@ struct Checker {
             const base_val = self.evalComptimeValue(base_n) orelse return null
             const idx_val = (self.evalComptimeValue(idx_n) orelse return null).asInt() orelse return null
             if (base_val.tag == CV_ARRAY) {
-                if (idx_val >= 0 and idx_val < base_val.array.elements.count) {
+                if (idx_val >= 0 and idx_val < base_val.array.elements.len()) {
                     return base_val.array.elements.get(idx_val)
                 }
             }
@@ -5600,7 +5600,7 @@ struct Checker {
         var bc_args: List(int) = .{}
         switch (self.ast.getNode(idx)) { Node.expr |e| => switch (e) { Expr.builtin_call |bc| => { bk = bc.kind; type_arg_n = bc.type_arg; bc_args = bc.args }, else => {} }, else => {} }
         // @hasField(T, "name") — Zig checker.zig:989-1009
-        if (bk == BuiltinKind.has_field and type_arg_n != null_node and bc_args.count >= 1) {
+        if (bk == BuiltinKind.has_field and type_arg_n != null_node and bc_args.len() >= 1) {
             const ti = self.resolveTypeArg(type_arg_n)
             if (ti != invalid_type) {
                 const t = self.types.get(ti)
@@ -5736,7 +5736,7 @@ struct Checker {
         var stmts: List(int) = .{}
         var result_n = null_node
         switch (self.ast.getNode(idx)) { Node.expr |e| => switch (e) { Expr.block_expr |blk| => { stmts = blk.stmts; result_n = blk.result_expr }, else => {} }, else => {} }
-        if (stmts.count == 0) { return self.evalConstExpr(result_n) }
+        if (stmts.len() == 0) { return self.evalConstExpr(result_n) }
         // Block with statements — only allowed in comptime context
         if (self.in_comptime) { return self.evalComptimeStmts(stmts, result_n) }
         return (0, 0)
@@ -5745,7 +5745,7 @@ struct Checker {
     /// Execute comptime block statements and evaluate final expression.
     /// Handles: var_stmt (init), assign_stmt (mutate), for_stmt (inline), expr_stmt (discard).
     fn evalComptimeStmts(stmts: List(int), final_expr: int) (int, int) {
-        for i in 0..stmts.count {
+        for i in 0..stmts.len() {
             const stmt_idx = stmts.get(i)
             const tag = nodeTag(self.ast, stmt_idx)
             if (tag == "var_stmt") {
@@ -5805,7 +5805,7 @@ struct Checker {
                     if (nodeTag(self.ast, body_n) == "block_stmt") {
                         var body_stmts: List(int) = .{}
                         switch (self.ast.getNode(body_n)) { Node.stmt |s| => switch (s) { Stmt.block_stmt |bs| => { body_stmts = bs.stmts }, else => {} }, else => {} }
-                        for j in 0..body_stmts.count {
+                        for j in 0..body_stmts.len() {
                             const inner_tag = nodeTag(self.ast, body_stmts.get(j))
                             if (inner_tag == "assign_stmt") {
                                 var at = null_node
@@ -5954,7 +5954,7 @@ struct Checker {
         for bi in 0..b_es.variant_count {
             const bv = b_es.getVariant(bi)
             var found = false
-            for mi in 0..merged.count {
+            for mi in 0..merged.len() {
                 if (merged.get(mi) == bv.name) {
                     found = true
                     break
@@ -5965,9 +5965,9 @@ struct Checker {
 
         // Allocate merged variant array
         var merged_ptr: int = 0
-        if (merged.count > 0) {
-            merged_ptr = @intCast(i64, alloc_raw(merged.count * @sizeOf(ErrorVariant)))
-            for i in 0..merged.count {
+        if (merged.len() > 0) {
+            merged_ptr = @intCast(i64, alloc_raw(merged.len() * @sizeOf(ErrorVariant)))
+            for i in 0..merged.len() {
                 const dest = @intToPtr(*ErrorVariant, merged_ptr + i * @sizeOf(ErrorVariant))
                 dest.name = merged.get(i)
             }
@@ -5976,7 +5976,7 @@ struct Checker {
         const merged_name = "${a_es.name}||${b_es.name}"
         return self.types.add(Type.error_set(ErrorSetType {
             name: merged_name,
-            variant_count: merged.count,
+            variant_count: merged.len(),
             variant_names: merged_ptr,
         }))
     }
@@ -5988,7 +5988,7 @@ struct Checker {
     fn checkScopeUnused(sc: *Scope) void {
         if (!self.lint_mode) { return }
         const keys = sc.symbols.keys()
-        for ki in 0..keys.count {
+        for ki in 0..keys.len() {
             const sym = sc.symbols.get(keys.get(ki))
             if (sym.used) { continue }
             if (@lenOf(sym.name) > 0 and charAt(sym.name, 0) == '_') { continue }
@@ -6026,14 +6026,14 @@ struct Checker {
     /// Zig ref: checker.zig:267-308
     fn checkStmtsWithReachability(stmts: List(int)) void {
         // Pre-pass: collect block-scoped type declarations (struct/enum/union/type_alias/error_set/trait)
-        for i in 0..stmts.count {
+        for i in 0..stmts.len() {
             const stmt_idx = stmts.get(i)
             if (self.isDeclNode(stmt_idx)) {
                 self.collectNestedDecl("", stmt_idx)
             }
         }
         // Post-collect: check method bodies for block-scoped structs
-        for i in 0..stmts.count {
+        for i in 0..stmts.len() {
             const stmt_idx = stmts.get(i)
             if (self.isStructDeclNode(stmt_idx)) {
                 self.checkDecl(stmt_idx)
@@ -6041,7 +6041,7 @@ struct Checker {
         }
         var seen_terminal = false
         var warned = false
-        for i in 0..stmts.count {
+        for i in 0..stmts.len() {
             const stmt_idx = stmts.get(i)
             if (seen_terminal and self.lint_mode and !warned) {
                 self.err.warningWithCode(self.ast.nodeSpan(stmt_idx).start, WarningCode.w004, "unreachable code")
@@ -6062,13 +6062,13 @@ struct Checker {
         if (tag == "block_stmt") {
             const node = self.ast.getNode(idx)
             switch (node) { Node.stmt |s| => switch (s) { Stmt.block_stmt |bs| => {
-                return bs.stmts.count == 0
+                return bs.stmts.len() == 0
             }, else => {} }, else => {} }
         }
         if (tag == "block_expr") {
             const node = self.ast.getNode(idx)
             switch (node) { Node.expr |e| => switch (e) { Expr.block_expr |be| => {
-                return be.stmts.count == 0 and be.result_expr == null_node
+                return be.stmts.len() == 0 and be.result_expr == null_node
             }, else => {} }, else => {} }
         }
         return false
@@ -6158,7 +6158,7 @@ struct Checker {
         var sc: ?*Scope = self.scope
         while (sc) |s| {
             const keys = s.symbols.keys()
-            for si in 0..keys.count {
+            for si in 0..keys.len() {
                 const candidate = keys.get(si)
                 if (candidate == name) { continue }
                 if (!self.isUserVisibleName(candidate)) { continue }
@@ -6244,11 +6244,10 @@ struct Checker {
         var best: ?string = null
         var best_dist = 999
 
-        // Search type registry name_map
-        // States are i64 per slot (matching Map internals: @intToPtr(*i64, states + idx * @sizeOf(i64)))
-        for ki in 0..self.types.name_map.capacity {
-            if (@intToPtr(*i64, self.types.name_map.states + ki * @sizeOf(i64)).* != 1) { continue }
-            const candidate = @intToPtr(*string, self.types.name_map.keys + ki * @sizeOf(string)).*
+        // Search type registry name_map keys
+        var nm_keys = self.types.name_map.keys()
+        for ki in 0..nm_keys.len() {
+            const candidate = nm_keys.get(ki)
             if (candidate == name) { continue }
             if (!self.isUserVisibleName(candidate)) { continue }
             const d = self.editDistance(name, candidate)
@@ -6260,9 +6259,9 @@ struct Checker {
 
         // Also check generic struct names
         const _gs = @intToPtr(*Map(string, int), self.generic_structs)
-        for ki in 0.._gs.capacity {
-            if (@intToPtr(*i64, _gs.states + ki * @sizeOf(i64)).* != 1) { continue }
-            const candidate = @intToPtr(*string, _gs.keys + ki * @sizeOf(string)).*
+        var gs_keys = _gs.keys()
+        for ki in 0..gs_keys.len() {
+            const candidate = gs_keys.get(ki)
             if (candidate == name) { continue }
             const d = self.editDistance(name, candidate)
             if (d < best_dist and d <= 2 and d * 2 <= @lenOf(name)) {
@@ -6294,15 +6293,10 @@ struct Checker {
 /// Allocate a zero-initialized Map(string, int) on the heap.
 /// Returns the raw pointer (int) to the Map struct.
 fn allocMap() int {
-    const size = 40  // Map has 5 fields × 8 bytes: keys, values, states, count, capacity
+    const size = 8  // Map has 1 field: buf (i64)
     const ptr = @intCast(i64, alloc_raw(size))
-    // Zero-init all fields
-    var mp = @intToPtr(*Map(string, int), ptr)
-    mp.keys = 0
-    mp.values = 0
-    mp.states = 0
-    mp.count = 0
-    mp.capacity = 0
+    // Zero-init buf field (0 = empty map)
+    @intToPtr(*i64, ptr).* = 0
     return ptr
 }
 
@@ -6311,8 +6305,8 @@ fn allocMap() int {
 /// Uses alloc+zero because selfcot can't resolve `new List(Symbol)` in free functions.
 /// TODO: fix selfcot's type resolution for generic types in free functions.
 fn allocSymbolList() *List(Symbol) {
-    const ptr = @intCast(i64, alloc_raw(24))
-    memset_zero(ptr, 24)
+    const ptr = @intCast(i64, alloc_raw(8))  // List has 1 field: buf (i64)
+    memset_zero(ptr, 8)
     return @intToPtr(*List(Symbol), ptr)
 }
 
@@ -6618,15 +6612,15 @@ test "checker type substitution" {
     @assertEq(c.lookupTypeSub("U"), STRING)
 
     // Restore by truncation
-    c.type_sub_keys.count = 1
-    c.type_sub_vals.count = 1
+    c.type_sub_keys.resize(1)
+    c.type_sub_vals.resize(1)
     @assert(c.hasTypeSubstitution())
     @assertEq(c.lookupTypeSub("T"), I64)
     @assertEq(c.lookupTypeSub("U"), -1)
 
     // Full restore
-    c.type_sub_keys.count = 0
-    c.type_sub_vals.count = 0
+    c.type_sub_keys.clear()
+    c.type_sub_vals.clear()
     @assertEq(c.hasTypeSubstitution(), false)
 }
 

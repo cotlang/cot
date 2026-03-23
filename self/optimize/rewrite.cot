@@ -20,23 +20,23 @@ import "../check/types"
 fn rewrite(func: *SsaFunc, string_offsets: *Map(string, int)) void {
     var total_values: i64 = 0
     var const_strings: i64 = 0
-    for bi in 0..func.blocks.count {
+    for bi in 0..func.blocks.len() {
         const blk = func.blocks.get(bi)
-        for vi in 0..blk.values.count {
+        for vi in 0..blk.values.len() {
             total_values += 1
             if (blk.values.get(vi).op == SsaOp.const_string) { const_strings += 1 }
         }
     }
-    debug(.codegen, "=== Rewritegeneric pass for '${func.name}' (${func.blocks.count} blocks, ${total_values} values, ${const_strings} const_strings) ===")
+    debug(.codegen, "=== Rewritegeneric pass for '${func.name}' (${func.blocks.len()} blocks, ${total_values} values, ${const_strings} const_strings) ===")
 
     var rewritten: int = 0
 
-    for bi in 0..func.blocks.count {
+    for bi in 0..func.blocks.len() {
         const blk = func.blocks.get(bi)
 
         // Collect const_string values to rewrite
         var to_rewrite: List(*SsaValue) = .{}
-        for vi in 0..blk.values.count {
+        for vi in 0..blk.values.len() {
             const val = blk.values.get(vi)
             if (val.op == SsaOp.const_string) {
                 to_rewrite.append(val)
@@ -44,7 +44,7 @@ fn rewrite(func: *SsaFunc, string_offsets: *Map(string, int)) void {
         }
 
         // Rewrite each collected value
-        for ri in 0..to_rewrite.count {
+        for ri in 0..to_rewrite.len() {
             const val = to_rewrite.get(ri)
             if (rewriteConstString(func, bi, val, string_offsets)) {
                 rewritten += 1
@@ -68,7 +68,7 @@ fn rewriteConstString(func: *SsaFunc, block_idx: int, val: *SsaValue, string_off
     const string_idx = val.aux_int
 
     // Get the actual string content
-    if (string_idx < 0 or string_idx >= func.string_literals.count) {
+    if (string_idx < 0 or string_idx >= func.string_literals.len()) {
         return false
     }
     const str = func.string_literals.get(string_idx)
@@ -125,7 +125,7 @@ test "rewriteConstString basic" {
 
     // Verify transformation
     @assertEq(v.op == SsaOp.string_make, true)
-    @assertEq(v.args.count, 2)
+    @assertEq(v.args.len(), 2)
 
     // Check ptr constant
     const ptr_val = v.args.get(0)

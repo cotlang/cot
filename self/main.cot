@@ -139,7 +139,7 @@ fn cmdCheck(path: string, content: string) void {
 
     // Check if file has imports — use multi-file path
     var imports = ast.getImports()
-    if (imports.count > 0) {
+    if (imports.len() > 0) {
         cmdCheckMultiFile(path)
         return
     }
@@ -156,8 +156,8 @@ fn cmdCheck(path: string, content: string) void {
     println("${path}: ok")
 }
 
-/// Build a .wasm binary from a Cot source file.
-/// Pipeline: parse → check → lower → SSA → Wasm codegen → write .wasm
+// Build a wasm binary from a Cot source file.
+// Pipeline: parse -> check -> lower -> SSA -> Wasm codegen -> write wasm
 fn cmdBuildWithOutput(path: string, user_output: string) void {
     // Use -o path if provided, otherwise compute from source path
     var output_path = user_output
@@ -399,7 +399,7 @@ fn compileToIR(path: string, content: string, lower_opts: LowerOptions) CompileR
 
     // Multi-file path: check + lower all files with shared state
     var imports = ast.getImports()
-    if (imports.count > 0) {
+    if (imports.len() > 0) {
         return compileWithImports(path, project_safe, lower_opts)
     }
 
@@ -427,12 +427,12 @@ fn compileWithImports(path: string, project_safe: bool, lower_opts: LowerOptions
     var checkers: List(int) = .{}  // @ptrToInt of heap-allocated Checkers
     var checker_errs: List(int) = .{}  // @ptrToInt of heap-allocated ErrorReporters
 
-    for fi in 0..parsed_files.count {
+    for fi in 0..parsed_files.len() {
         const pf = parsed_files.get(fi)
         eprintln("[cot] check: ${pf.path}")
         checkAndStoreChecker(pf, types, &shared, &checked_scopes, &checkers, &checker_errs)
     }
-    eprintln("[cot] check done: ${parsed_files.count} files")
+    eprintln("[cot] check done: ${parsed_files.len()} files")
     var lower_shared = SharedLowerState {
         builder: Builder.init(),
         lowered_generics: .{},
@@ -453,19 +453,19 @@ fn compileWithImports(path: string, project_safe: bool, lower_opts: LowerOptions
 
     // Build module name map (Zig driver.zig lines 461-509)
     // Register main file first (Zig driver.zig lines 476-482)
-    if (parsed_files.count > 0) {
-        const main_pf = parsed_files.get(parsed_files.count - 1)
+    if (parsed_files.len() > 0) {
+        const main_pf = parsed_files.get(parsed_files.len() - 1)
         const main_base = basename(main_pf.path)
         const main_module = if (endsWith(main_base, ".cot")) {
             substring(main_base, 0, main_base.len - 4)
         } else { main_base }
         lower_shared.module_names.set(main_pf.path, main_module)
     }
-    for fi in 0..parsed_files.count {
+    for fi in 0..parsed_files.len() {
         const pf = parsed_files.get(fi)
         var imports = pf.ast.getImports()
         const source_dir = dirname(pf.path)
-        for ii in 0..imports.count {
+        for ii in 0..imports.len() {
             const import_path = imports.get(ii)
             const resolved = resolveImportPath(import_path, source_dir)
             if (!lower_shared.module_names.contains(resolved)) {
@@ -475,7 +475,7 @@ fn compileWithImports(path: string, project_safe: bool, lower_opts: LowerOptions
     }
 
     // Lower each file using stored checkers (Zig driver.zig line 547: &checkers.items[i])
-    for fi in 0..parsed_files.count {
+    for fi in 0..parsed_files.len() {
         const pf = parsed_files.get(fi)
         eprintln("[cot] lower: ${pf.path}")
         const chk_ptr = @intToPtr(*Checker, checkers.get(fi))
@@ -491,7 +491,7 @@ fn compileWithImports(path: string, project_safe: bool, lower_opts: LowerOptions
     const span = Span.zero()
     lower_shared.builder.startFunc("__cot_init_globals", VOID, VOID, span)
     if (lower_shared.builder.func()) |fb| {
-        for i in 0..lower_shared.init_func_names.count {
+        for i in 0..lower_shared.init_func_names.len() {
             var no_args: List(int) = .{}
             fb.emitCall(lower_shared.init_func_names.get(i), no_args, false, VOID, span)
         }
@@ -500,12 +500,12 @@ fn compileWithImports(path: string, project_safe: bool, lower_opts: LowerOptions
     lower_shared.builder.endFunc()
 
     // Generate test runner if in test mode (uses a temporary Lowerer for the runner methods)
-    if (lower_opts.test_mode and lower_shared.all_test_names.count > 0) {
+    if (lower_opts.test_mode and lower_shared.all_test_names.len() > 0) {
         generateMultiFileTestRunner(lower_shared, types, lower_opts)
     }
 
     // Generate bench runner if in bench mode
-    if (lower_opts.bench_mode and lower_shared.all_bench_names.count > 0) {
+    if (lower_opts.bench_mode and lower_shared.all_bench_names.len() > 0) {
         generateMultiFileBenchRunner(lower_shared, types)
     }
 
@@ -527,7 +527,7 @@ fn generateMultiFileTestRunner(lower_shared: SharedLowerState, types: TypeRegist
     lower_inst.setFailFast(lower_opts.fail_fast)
 
     // Copy collected test names
-    for i in 0..lower_shared.all_test_names.count {
+    for i in 0..lower_shared.all_test_names.len() {
         lower_inst.test_names.append(lower_shared.all_test_names.get(i))
         lower_inst.test_display_names.append(lower_shared.all_test_display_names.get(i))
     }
@@ -547,7 +547,7 @@ fn generateMultiFileBenchRunner(lower_shared: SharedLowerState, types: TypeRegis
     initLowererMaps(lower_inst)
 
     // Copy collected bench names
-    for i in 0..lower_shared.all_bench_names.count {
+    for i in 0..lower_shared.all_bench_names.len() {
         lower_inst.bench_names.append(lower_shared.all_bench_names.get(i))
         lower_inst.bench_display_names.append(lower_shared.all_bench_display_names.get(i))
     }
@@ -592,12 +592,12 @@ fn lowerChecked(ast: *Ast, types: TypeRegistry, errs: ErrorReporter, checker: Ch
     lower_inst.generateGlobalInits()
 
     // Generate test runner if in test mode
-    if (lower_opts.test_mode and lower_inst.test_names.count > 0) {
+    if (lower_opts.test_mode and lower_inst.test_names.len() > 0) {
         lower_inst.generateTestRunner()
     }
 
     // Generate bench runner if in bench mode
-    if (lower_opts.bench_mode and lower_inst.bench_names.count > 0) {
+    if (lower_opts.bench_mode and lower_inst.bench_names.len() > 0) {
         lower_inst.generateBenchRunner()
     }
 
@@ -680,7 +680,7 @@ fn lowerOneFile(cf: CheckedFile, types: TypeRegistry, shared: SharedLowerState, 
     lower_inst.lowerToBuilder()
 
     // Go init function pattern: generate per-file init function for this file's globals
-    if (lower_inst.pending_global_inits.count > 0) {
+    if (lower_inst.pending_global_inits.len() > 0) {
         const init_name = "__cot_init_file_" ++ intToString(shared.file_counter)
         lower_inst.generateGlobalInitsNamed(init_name)
         shared.init_func_names.append(init_name)
@@ -689,7 +689,7 @@ fn lowerOneFile(cf: CheckedFile, types: TypeRegistry, shared: SharedLowerState, 
 
     // Collect test names for multi-file test runner
     if (lower_opts.test_mode) {
-        for i in 0..lower_inst.test_names.count {
+        for i in 0..lower_inst.test_names.len() {
             shared.all_test_names.append(lower_inst.test_names.get(i))
             shared.all_test_display_names.append(lower_inst.test_display_names.get(i))
         }
@@ -697,7 +697,7 @@ fn lowerOneFile(cf: CheckedFile, types: TypeRegistry, shared: SharedLowerState, 
 
     // Collect bench names for multi-file bench runner
     if (lower_opts.bench_mode) {
-        for i in 0..lower_inst.bench_names.count {
+        for i in 0..lower_inst.bench_names.len() {
             shared.all_bench_names.append(lower_inst.bench_names.get(i))
             shared.all_bench_display_names.append(lower_inst.bench_display_names.get(i))
         }
@@ -741,9 +741,9 @@ fn writeByteList(path: string, bytes: List(int)) void {
     }
     // Write bytes in chunks — convert to a temp buffer
     var i = 0
-    while (i < bytes.count) {
+    while (i < bytes.len()) {
         // Process up to 4096 bytes at a time
-        var chunk_size = bytes.count - i
+        var chunk_size = bytes.len() - i
         if (chunk_size > 4096) { chunk_size = 4096 }
         // Pack bytes into raw memory buffer
         const buf_ptr = alloc_raw(chunk_size)
@@ -817,7 +817,7 @@ fn checkFileRecursive(file_path: string, shared: SharedCheckerState, types: Type
     // Recurse into imports (dependencies checked first)
     var imports = ast.getImports()
     const source_dir = dirname(file_path)
-    for i in 0..imports.count {
+    for i in 0..imports.len() {
         const resolved = resolveImportPath(imports.get(i), source_dir)
         checkFileRecursive(resolved, shared, types, seen, in_progress, project_safe, checked_scopes)
     }
@@ -832,7 +832,7 @@ fn checkFileRecursive(file_path: string, shared: SharedCheckerState, types: Type
 
     // Per-file scope: push file scope, copy imported symbols (driver.zig createFileScope pattern)
     checker.pushFileScope()
-    for i in 0..imports.count {
+    for i in 0..imports.len() {
         const resolved = resolveImportPath(imports.get(i), source_dir)
         if (checked_scopes.contains(resolved)) {
             const entry = checked_scopes.get(resolved)
@@ -855,7 +855,7 @@ fn checkFileRecursive(file_path: string, shared: SharedCheckerState, types: Type
 
 /// Check if a string is in a List (linear search workaround for Map.has() native codegen bug).
 fn listContainsStr(list: List(string), s: string) bool {
-    for i in 0..list.count {
+    for i in 0..list.len() {
         if (list.get(i) == s) { return true }
     }
     return false
@@ -890,7 +890,7 @@ fn checkAllFilesRecursive(file_path: string, shared: SharedCheckerState, types: 
     // Recurse into imports first, registering module names
     var imports = ast.getImports()
     const source_dir = dirname(file_path)
-    for i in 0..imports.count {
+    for i in 0..imports.len() {
         const import_path = imports.get(i)
         const resolved = resolveImportPath(import_path, source_dir)
         if (!lower_shared.module_names.contains(resolved)) {
@@ -906,7 +906,7 @@ fn checkAllFilesRecursive(file_path: string, shared: SharedCheckerState, types: 
     checker.loadSharedState(shared)
 
     checker.pushFileScope()
-    for i in 0..imports.count {
+    for i in 0..imports.len() {
         const resolved = resolveImportPath(imports.get(i), source_dir)
         if (checked_scopes.contains(resolved)) {
             const entry = checked_scopes.get(resolved)
@@ -961,7 +961,7 @@ fn parseFileRecursive(file_path: string, parsed_files: *List(ParsedFile), seen: 
     // Recurse into imports first (dependencies before dependents)
     var imports = ast.getImports()
     const source_dir = dirname(file_path)
-    for i in 0..imports.count {
+    for i in 0..imports.len() {
         const resolved = resolveImportPath(imports.get(i), source_dir)
         parseFileRecursive(resolved, parsed_files, seen, in_progress, project_safe)
     }
@@ -986,7 +986,7 @@ fn checkAndStoreChecker(pf: ParsedFile, types: TypeRegistry, shared: *SharedChec
     checker.pushFileScope()
     var imports = pf.ast.getImports()
     const source_dir = dirname(pf.path)
-    for i in 0..imports.count {
+    for i in 0..imports.len() {
         const resolved = resolveImportPath(imports.get(i), source_dir)
         if (checked_scopes.contains(resolved)) {
             const entry = checked_scopes.get(resolved)
@@ -1155,26 +1155,26 @@ test "ir builder integration" {
     builder.addGlobal(Global.init("counter", INT, false, span))
 
     const ir = builder.getIR()
-    @assertEq(ir.funcs.count, 1)
+    @assertEq(ir.funcs.len(), 1)
     @assert(ir.getFunc("main") != null)
-    @assertEq(ir.globals.count, 1)
+    @assertEq(ir.globals.len(), 1)
     @assert(ir.getGlobal("counter") != null)
 
     // Verify basic function structure (first 7 fields are accessible)
     const f = ir.funcs.get(0)
     @assertEq(f.name, "main")
     @assertEq(f.return_type, INT)
-    @assertEq(f.params.count, 0)
-    @assertEq(f.locals.count, 0)
-    @assertEq(f.blocks.count, 1)
+    @assertEq(f.params.len(), 0)
+    @assertEq(f.locals.len(), 0)
+    @assertEq(f.blocks.len(), 1)
     @assertEq(f.entry, 0)
     // All 13 Func fields accessible (type dedup + scope resolution fixed this)
     // With pointer-based Builder.func(), mutations propagate correctly:
     // emitConstInt + emitRet = 2 nodes
-    @assertEq(f.nodes.count, 2)
+    @assertEq(f.nodes.len(), 2)
     @assertEq(f.span.start, 0)
     @assertEq(f.span.end, 0)
-    @assertEq(f.string_literals.count, 0)
+    @assertEq(f.string_literals.len(), 0)
 }
 
 test "ir builder with blocks and branches" {
@@ -1196,10 +1196,10 @@ test "ir builder with blocks and branches" {
 
     const f = fb.build()
     @assertEq(f.name, "branch_test")
-    @assertEq(f.blocks.count, 3)
+    @assertEq(f.blocks.len(), 3)
     // Verify all Func fields accessible (type dedup fixed large struct return)
-    @assertEq(f.nodes.count, 6)
-    @assertEq(f.params.count, 0)
+    @assertEq(f.nodes.len(), 6)
+    @assertEq(f.params.len(), 0)
 }
 
 test "ir scope management integration" {

@@ -343,7 +343,7 @@ struct Parser {
         if (self.safe_mode and @lenOf(self.current_impl_type) > 0 and !self.current_impl_is_generic and is_static == 0) {
             // Check if first param is already named "self"
             var needs_self = true
-            if (params.count > 0) {
+            if (params.len() > 0) {
                 const first_name = nodeFieldDefName(self.ast, params.get(0))
                 if (first_name == "self") {
                     needs_self = false
@@ -359,7 +359,7 @@ struct Parser {
                 // Prepend self to params
                 var new_params: List(int) = .{}
                 new_params.append(self_param)
-                for pi in 0..params.count {
+                for pi in 0..params.len() {
                     new_params.append(params.get(pi))
                 }
                 params = new_params
@@ -598,7 +598,7 @@ struct Parser {
                 const saved_impl = self.current_impl_type
                 const saved_impl_generic = self.current_impl_is_generic
                 self.current_impl_type = name
-                self.current_impl_is_generic = (type_params.count > 0)
+                self.current_impl_is_generic = (type_params.len() > 0)
                 // Parse fields first, then nested decls (methods, consts)
                 while (self.tok != Token.rbrace and self.tok != Token.eof) {
                     self.collectDocComment()
@@ -729,7 +729,7 @@ struct Parser {
         const saved_impl = self.current_impl_type
         const saved_impl_generic = self.current_impl_is_generic
         self.current_impl_type = name
-        self.current_impl_is_generic = (type_params.count > 0)
+        self.current_impl_is_generic = (type_params.len() > 0)
 
         // Parse nested declarations (const, enum, struct, type, fn, static fn) before fields
         var nested: List(int) = .{}
@@ -1949,11 +1949,11 @@ struct Parser {
             }
         }
         // If last stmt is expr_stmt, extract as result
-        if (stmts.count > 0) {
-            const last_inner = nodeExprStmtExpr(self.ast, stmts.get(stmts.count - 1))
+        if (stmts.len() > 0) {
+            const last_inner = nodeExprStmtExpr(self.ast, stmts.get(stmts.len() - 1))
             if (last_inner != null_node) {
                 result_expr = last_inner
-                stmts.count -= 1
+                stmts.resize(stmts.len() - 1)
             }
         }
         self.expect(Token.rbrace as int)
@@ -1976,11 +1976,11 @@ struct Parser {
             }
         }
         // If last stmt is expr_stmt, extract as result
-        if (stmts.count > 0) {
-            const last_inner = nodeExprStmtExpr(self.ast, stmts.get(stmts.count - 1))
+        if (stmts.len() > 0) {
+            const last_inner = nodeExprStmtExpr(self.ast, stmts.get(stmts.len() - 1))
             if (last_inner != null_node) {
                 result_expr = last_inner
-                stmts.count -= 1
+                stmts.resize(stmts.len() - 1)
             }
         }
         self.expect(Token.rbrace as int)
@@ -2848,7 +2848,7 @@ struct Parser {
         if (self.match(Token.arrow as int)) {
             ret = self.parseType()
         }
-        return self.ast.addExpr(Expr.type_expr(TypeExprNode { .kind = TYPE_FUNCTION, .data1 = ret, .data2 = param_types.count, .span = self.spanSE(start, self.tok_end) }))
+        return self.ast.addExpr(Expr.type_expr(TypeExprNode { .kind = TYPE_FUNCTION, .data1 = ret, .data2 = param_types.len(), .span = self.spanSE(start, self.tok_end) }))
     }
 
     // ================================================================
@@ -2895,7 +2895,7 @@ test "parse import" {
     var p = Parser.init(s, ast, errors)
     p.parseFile()
     @assertEq(errors.errorCount(), 0)
-    @assertEq(ast.file_decls.count, 1)
+    @assertEq(ast.file_decls.len(), 1)
     @assertEq(nodeDeclTag(ast, ast.file_decls.get(0)), "import_decl")
 }
 
@@ -2907,7 +2907,7 @@ test "parse const decl" {
     var p = Parser.init(s, ast, errors)
     p.parseFile()
     @assertEq(errors.errorCount(), 0)
-    @assertEq(ast.file_decls.count, 1)
+    @assertEq(ast.file_decls.len(), 1)
     @assertEq(nodeDeclTag(ast, ast.file_decls.get(0)), "var_decl")
 }
 
@@ -2919,7 +2919,7 @@ test "parse fn decl" {
     var p = Parser.init(s, ast, errors)
     p.parseFile()
     @assertEq(errors.errorCount(), 0)
-    @assertEq(ast.file_decls.count, 1)
+    @assertEq(ast.file_decls.len(), 1)
     @assertEq(nodeDeclTag(ast, ast.file_decls.get(0)), "fn_decl")
 }
 
@@ -2931,7 +2931,7 @@ test "parse test decl" {
     var p = Parser.init(s, ast, errors)
     p.parseFile()
     @assertEq(errors.hasErrors(), false)
-    @assertEq(ast.file_decls.count, 1)
+    @assertEq(ast.file_decls.len(), 1)
     @assertEq(nodeDeclTag(ast, ast.file_decls.get(0)), "test_decl")
 }
 
@@ -2943,7 +2943,7 @@ test "parse struct decl" {
     var p = Parser.init(s, ast, errors)
     p.parseFile()
     @assertEq(errors.hasErrors(), false)
-    @assertEq(ast.file_decls.count, 1)
+    @assertEq(ast.file_decls.len(), 1)
     @assertEq(nodeDeclTag(ast, ast.file_decls.get(0)), "struct_decl")
 }
 
@@ -2955,7 +2955,7 @@ test "parse multiple decls" {
     var p = Parser.init(s, ast, errors)
     p.parseFile()
     @assertEq(errors.hasErrors(), false)
-    @assertEq(ast.file_decls.count, 3)
+    @assertEq(ast.file_decls.len(), 3)
 }
 
 test "parse binary expr" {
@@ -2966,7 +2966,7 @@ test "parse binary expr" {
     var p = Parser.init(s, ast, errors)
     p.parseFile()
     @assertEq(errors.hasErrors(), false)
-    @assertEq(ast.file_decls.count, 1)
+    @assertEq(ast.file_decls.len(), 1)
 }
 
 test "parse if stmt" {
@@ -3021,7 +3021,7 @@ test "parse closure expr" {
     var p = Parser.init(s, ast, errors)
     p.parseFile()
     @assertEq(errors.hasErrors(), false)
-    @assertEq(ast.file_decls.count, 1)
+    @assertEq(ast.file_decls.len(), 1)
 }
 
 test "parse struct init" {
@@ -3056,7 +3056,7 @@ test "parse enum decl" {
     var p = Parser.init(s, ast, errors)
     p.parseFile()
     @assertEq(errors.hasErrors(), false)
-    @assertEq(ast.file_decls.count, 1)
+    @assertEq(ast.file_decls.len(), 1)
     @assertEq(nodeDeclTag(ast, ast.file_decls.get(0)), "enum_decl")
 }
 
@@ -3068,7 +3068,7 @@ test "parse enum with backing type" {
     var p = Parser.init(s, ast, errors)
     p.parseFile()
     @assertEq(errors.hasErrors(), false)
-    @assertEq(ast.file_decls.count, 1)
+    @assertEq(ast.file_decls.len(), 1)
     @assertEq(nodeDeclTag(ast, ast.file_decls.get(0)), "enum_decl")
 }
 
@@ -3080,7 +3080,7 @@ test "parse error set decl" {
     var p = Parser.init(s, ast, errors)
     p.parseFile()
     @assertEq(errors.hasErrors(), false)
-    @assertEq(ast.file_decls.count, 1)
+    @assertEq(ast.file_decls.len(), 1)
     @assertEq(nodeDeclTag(ast, ast.file_decls.get(0)), "error_set_decl")
 }
 
@@ -3092,7 +3092,7 @@ test "parse union decl" {
     var p = Parser.init(s, ast, errors)
     p.parseFile()
     @assertEq(errors.hasErrors(), false)
-    @assertEq(ast.file_decls.count, 1)
+    @assertEq(ast.file_decls.len(), 1)
     @assertEq(nodeDeclTag(ast, ast.file_decls.get(0)), "union_decl")
 }
 
@@ -3104,7 +3104,7 @@ test "parse inline struct decl" {
     var p = Parser.init(s, ast, errors)
     p.parseFile()
     @assertEq(errors.hasErrors(), false)
-    @assertEq(ast.file_decls.count, 1)
+    @assertEq(ast.file_decls.len(), 1)
     @assertEq(nodeDeclTag(ast, ast.file_decls.get(0)), "struct_decl")
 }
 
@@ -3117,7 +3117,7 @@ test "parse const non-type backtrack" {
     var p = Parser.init(s, ast, errors)
     p.parseFile()
     @assertEq(errors.hasErrors(), false)
-    @assertEq(ast.file_decls.count, 2)
+    @assertEq(ast.file_decls.len(), 2)
     @assertEq(nodeDeclTag(ast, ast.file_decls.get(0)), "var_decl")
     @assertEq(nodeDeclTag(ast, ast.file_decls.get(1)), "var_decl")
 }
@@ -3150,7 +3150,7 @@ test "parse fn type simple" {
     var p = Parser.init(s, ast, errors)
     p.parseFile()
     @assertEq(errors.errorCount(), 0)
-    @assertEq(ast.file_decls.count, 1)
+    @assertEq(ast.file_decls.len(), 1)
 }
 
 test "parse fn type as param" {
@@ -3161,7 +3161,7 @@ test "parse fn type as param" {
     var p = Parser.init(s, ast, errors)
     p.parseFile()
     @assertEq(errors.errorCount(), 0)
-    @assertEq(ast.file_decls.count, 1)
+    @assertEq(ast.file_decls.len(), 1)
 }
 
 test "parse mixed inline types" {
@@ -3172,7 +3172,7 @@ test "parse mixed inline types" {
     var p = Parser.init(s, ast, errors)
     p.parseFile()
     @assertEq(errors.hasErrors(), false)
-    @assertEq(ast.file_decls.count, 3)
+    @assertEq(ast.file_decls.len(), 3)
     @assertEq(nodeDeclTag(ast, ast.file_decls.get(0)), "enum_decl")
     @assertEq(nodeDeclTag(ast, ast.file_decls.get(1)), "error_set_decl")
     @assertEq(nodeDeclTag(ast, ast.file_decls.get(2)), "var_decl")
@@ -3186,7 +3186,7 @@ test "parse impl block with param" {
     var p = Parser.init(s, ast, errors)
     p.parseFile()
     @assertEq(errors.errorCount(), 0)
-    @assertEq(ast.file_decls.count, 1)
+    @assertEq(ast.file_decls.len(), 1)
     @assertEq(nodeDeclTag(ast, ast.file_decls.get(0)), "impl_block")
 }
 
@@ -3198,7 +3198,7 @@ test "parse generic fn" {
     var p = Parser.init(s, ast, errors)
     p.parseFile()
     @assertEq(errors.errorCount(), 0)
-    @assertEq(ast.file_decls.count, 1)
+    @assertEq(ast.file_decls.len(), 1)
     @assertEq(nodeDeclTag(ast, ast.file_decls.get(0)), "fn_decl")
 }
 
@@ -3210,7 +3210,7 @@ test "parse generic impl block" {
     var p = Parser.init(s, ast, errors)
     p.parseFile()
     @assertEq(errors.errorCount(), 0)
-    @assertEq(ast.file_decls.count, 1)
+    @assertEq(ast.file_decls.len(), 1)
     @assertEq(nodeDeclTag(ast, ast.file_decls.get(0)), "impl_block")
 }
 
@@ -3222,7 +3222,7 @@ test "parse orelse expr" {
     var p = Parser.init(s, ast, errors)
     p.parseFile()
     @assertEq(errors.errorCount(), 0)
-    @assertEq(ast.file_decls.count, 1)
+    @assertEq(ast.file_decls.len(), 1)
     @assertEq(nodeDeclTag(ast, ast.file_decls.get(0)), "fn_decl")
 }
 
@@ -3234,7 +3234,7 @@ test "parse orelse return" {
     var p = Parser.init(s, ast, errors)
     p.parseFile()
     @assertEq(errors.errorCount(), 0)
-    @assertEq(ast.file_decls.count, 1)
+    @assertEq(ast.file_decls.len(), 1)
     @assertEq(nodeDeclTag(ast, ast.file_decls.get(0)), "fn_decl")
 }
 
@@ -3246,7 +3246,7 @@ test "parse impl trait for type" {
     var p = Parser.init(s, ast, errors)
     p.parseFile()
     @assertEq(errors.errorCount(), 0)
-    @assertEq(ast.file_decls.count, 1)
+    @assertEq(ast.file_decls.len(), 1)
     @assertEq(nodeDeclTag(ast, ast.file_decls.get(0)), "impl_trait")
 }
 
@@ -3258,7 +3258,7 @@ test "parse where clause" {
     var p = Parser.init(s, ast, errors)
     p.parseFile()
     @assertEq(errors.errorCount(), 0)
-    @assertEq(ast.file_decls.count, 1)
+    @assertEq(ast.file_decls.len(), 1)
     @assertEq(nodeDeclTag(ast, ast.file_decls.get(0)), "fn_decl")
 }
 
@@ -3270,7 +3270,7 @@ test "parse where clause multi" {
     var p = Parser.init(s, ast, errors)
     p.parseFile()
     @assertEq(errors.errorCount(), 0)
-    @assertEq(ast.file_decls.count, 1)
+    @assertEq(ast.file_decls.len(), 1)
     @assertEq(nodeDeclTag(ast, ast.file_decls.get(0)), "fn_decl")
 }
 
@@ -3282,7 +3282,7 @@ test "parse switch range pattern" {
     var p = Parser.init(s, ast, errors)
     p.parseFile()
     @assertEq(errors.errorCount(), 0)
-    @assertEq(ast.file_decls.count, 1)
+    @assertEq(ast.file_decls.len(), 1)
 }
 
 test "parse switch guard" {
@@ -3293,7 +3293,7 @@ test "parse switch guard" {
     var p = Parser.init(s, ast, errors)
     p.parseFile()
     @assertEq(errors.errorCount(), 0)
-    @assertEq(ast.file_decls.count, 1)
+    @assertEq(ast.file_decls.len(), 1)
 }
 
 test "parse switch wildcard" {
@@ -3304,7 +3304,7 @@ test "parse switch wildcard" {
     var p = Parser.init(s, ast, errors)
     p.parseFile()
     @assertEq(errors.errorCount(), 0)
-    @assertEq(ast.file_decls.count, 1)
+    @assertEq(ast.file_decls.len(), 1)
 }
 
 test "parse generic impl trait" {
@@ -3315,6 +3315,6 @@ test "parse generic impl trait" {
     var p = Parser.init(s, ast, errors)
     p.parseFile()
     @assertEq(errors.errorCount(), 0)
-    @assertEq(ast.file_decls.count, 1)
+    @assertEq(ast.file_decls.len(), 1)
     @assertEq(nodeDeclTag(ast, ast.file_decls.get(0)), "impl_trait")
 }

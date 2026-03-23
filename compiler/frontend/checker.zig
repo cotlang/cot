@@ -3929,6 +3929,15 @@ pub const Checker = struct {
             self.type_substitution = sub_map;
             defer self.type_substitution = old_sub;
 
+            // @safe generic self injection: resolve the concrete struct's pointer type once.
+            // Non-generic @safe methods get self injected by the parser (parser.zig:291-301).
+            // Generic methods skip parser injection (current_impl_is_generic=true), so we
+            // replicate it here during instantiation — same pattern, different stage.
+            const safe_self_type: ?TypeIndex = if (self.safe_mode) blk: {
+                const concrete_type = self.generics.instantiation_cache.get(concrete_name) orelse break :blk null;
+                break :blk self.types.makePointer(concrete_type) catch null;
+            } else null;
+
             // Pass 1: Register all method signatures (like collectDecl for non-generic impl)
             for (impl_info.methods) |method_idx| {
                 const method_decl = (self.tree.getNode(method_idx) orelse continue).asDecl() orelse continue;
@@ -3936,7 +3945,17 @@ pub const Checker = struct {
                 const f = method_decl.fn_decl;
 
                 const synth_name = try std.fmt.allocPrint(self.allocator, "{s}_{s}", .{ concrete_name, f.name });
-                const func_type = try self.buildFuncType(f.params, f.return_type);
+                // @safe generic: prepend self param to function type (mirrors parser injection)
+                const func_type = if (safe_self_type != null and !f.is_static) blk: {
+                    const base_type = try self.buildFuncType(f.params, f.return_type);
+                    const base_info = self.types.get(base_type);
+                    if (base_info != .func) break :blk base_type;
+                    var new_params = std.ArrayListUnmanaged(types.FuncParam){};
+                    defer new_params.deinit(self.allocator);
+                    try new_params.append(self.allocator, .{ .name = "self", .type_idx = safe_self_type.? });
+                    for (base_info.func.params) |p| try new_params.append(self.allocator, p);
+                    break :blk try self.types.makeFunc(new_params.items, base_info.func.return_type);
+                } else try self.buildFuncType(f.params, f.return_type);
 
                 if (!self.global_scope.isDefined(synth_name)) {
                     try self.global_scope.define(Symbol.init(synth_name, .function, func_type, method_idx, false));
@@ -3962,23 +3981,45 @@ pub const Checker = struct {
                 try self.generics.generic_inst_by_name.put(synth_name, inst);
             }
 
-            // Pass 2: Check all method bodies — always save/restore expr_types.
-            // Generic method bodies use the declaring file's AST, whose NodeIndexes
-            // can collide with the host file's (or with a parent generic's tree during
-            // nested instantiation, e.g. Map → MapIterator in the same file).
-            const saved_expr_types_2 = self.expr_types;
-            self.expr_types = std.AutoHashMap(NodeIndex, TypeIndex).init(self.allocator);
-            defer {
-                self.expr_types.deinit();
-                self.expr_types = saved_expr_types_2;
-            }
+            // Pass 2: Check all method bodies and PRESERVE expr_types for Phase 3 lowering.
+            // Go pattern: check body with fresh expr_types, preserve in GenericInstInfo.
+            // This eliminates Phase 3 re-checking (which would fail for @safe generic
+            // methods because self injection only happens here, not in the lowerer).
             for (impl_info.methods) |method_idx| {
                 const method_decl = (self.tree.getNode(method_idx) orelse continue).asDecl() orelse continue;
                 if (method_decl != .fn_decl) continue;
                 const f = method_decl.fn_decl;
 
                 const synth_name = try std.fmt.allocPrint(self.allocator, "{s}_{s}", .{ concrete_name, f.name });
-                try self.checkFnDeclWithName(f, method_idx, synth_name);
+
+                // Fresh expr_types per method — preserved in GenericInstInfo for lowerer
+                var inst_expr_types = std.AutoHashMap(NodeIndex, TypeIndex).init(self.allocator);
+                {
+                    const saved_et = self.expr_types;
+                    self.expr_types = inst_expr_types;
+                    defer {
+                        inst_expr_types = self.expr_types; // capture populated map
+                        self.expr_types = saved_et;
+                    }
+                    // @safe generic: inject self into scope for body checking.
+                    // Mirrors parser injection (parser.zig:291-301) for non-generic @safe methods.
+                    if (safe_self_type != null and !f.is_static) {
+                        var self_scope = Scope.init(self.allocator, self.scope);
+                        defer self_scope.deinit();
+                        try self_scope.define(Symbol.init("self", .parameter, safe_self_type.?, method_idx, true));
+                        const old_scope_2 = self.scope;
+                        self.scope = &self_scope;
+                        defer self.scope = old_scope_2;
+                        try self.checkFnDeclWithName(f, method_idx, synth_name);
+                    } else {
+                        try self.checkFnDeclWithName(f, method_idx, synth_name);
+                    }
+                }
+
+                // Update GenericInstInfo with preserved expr_types
+                if (self.generics.generic_inst_by_name.getPtr(synth_name)) |ptr| {
+                    ptr.expr_types = inst_expr_types;
+                }
             }
         }
     }

@@ -15,8 +15,8 @@ import "../debug"
 /// Zig reference: compiler/ssa/passes/deadcode.zig:25-124
 fn deadcode(func: *SsaFunc) void {
     var total_values: i64 = 0
-    for bi in 0..func.blocks.count { total_values += func.blocks.get(bi).values.count }
-    debug(.deadcode, "=== Deadcode pass for '${func.name}' (${func.blocks.count} blocks, ${total_values} values) ===")
+    for bi in 0..func.blocks.len() { total_values += func.blocks.get(bi).values.len() }
+    debug(.deadcode, "=== Deadcode pass for '${func.name}' (${func.blocks.len()} blocks, ${total_values} values) ===")
 
     // 1. Find reachable blocks via BFS from entry.
     var reachable: Map(int, bool) = .{}
@@ -24,12 +24,12 @@ fn deadcode(func: *SsaFunc) void {
 
     // 2. Remove edges from dead blocks to live blocks (phi consistency).
     // Zig deadcode.zig:39-52
-    for bi in 0..func.blocks.count {
+    for bi in 0..func.blocks.len() {
         const blk = func.blocks.get(bi)
         if (reachable.contains(blk.id)) { continue }
         // Dead block — remove edges to live successors
         var si = 0
-        while (si < blk.succs.count) {
+        while (si < blk.succs.len()) {
             const succ_edge = blk.succs.get(si)
             if (reachable.contains(func.blocks.get(succ_edge.block).id)) {
                 blk.succs.orderedRemove(si)
@@ -43,11 +43,11 @@ fn deadcode(func: *SsaFunc) void {
     }
 
     // 3. Convert BlockFirst → BlockPlain (Zig deadcode.zig:55-64)
-    for bi in 0..func.blocks.count {
+    for bi in 0..func.blocks.len() {
         const blk = func.blocks.get(bi)
         if (!reachable.contains(blk.id)) { continue }
         if (blk.kind == SsaBlockKind.first) {
-            if (blk.succs.count > 1) {
+            if (blk.succs.len() > 1) {
                 blk.succs.orderedRemove(1)
             }
             blk.kind = SsaBlockKind.plain
@@ -59,10 +59,10 @@ fn deadcode(func: *SsaFunc) void {
     liveValues(func, &reachable, &live)
 
     // 5. Remove dead values from blocks (Zig deadcode.zig:88-102)
-    for bi in 0..func.blocks.count {
+    for bi in 0..func.blocks.len() {
         const blk = func.blocks.get(bi)
         var new_values: List(*SsaValue) = .{}
-        for vi in 0..blk.values.count {
+        for vi in 0..blk.values.len() {
             const val = blk.values.get(vi)
             if (live.contains(val.id)) {
                 new_values.append(val)
@@ -77,27 +77,27 @@ fn deadcode(func: *SsaFunc) void {
     // Layout will schedule them last; gen will skip their empty value lists.
 
     var remaining_values: i64 = 0
-    for bi2 in 0..func.blocks.count { remaining_values += func.blocks.get(bi2).values.count }
-    debug(.deadcode, "=== Deadcode complete for '${func.name}': ${func.blocks.count} blocks, ${remaining_values} values remaining ===")
+    for bi2 in 0..func.blocks.len() { remaining_values += func.blocks.get(bi2).values.len() }
+    debug(.deadcode, "=== Deadcode complete for '${func.name}': ${func.blocks.len()} blocks, ${remaining_values} values remaining ===")
 
 }
 
 /// BFS from entry block to find all reachable blocks.
 /// Zig deadcode.zig:127-149
 fn reachableBlocks(func: *SsaFunc, reachable: *Map(int, bool)) void {
-    if (func.blocks.count == 0) { return }
+    if (func.blocks.len() == 0) { return }
     const entry = func.blocks.get(0)
     reachable.set(entry.id, true)
 
     var worklist: List(int) = .{}
     worklist.append(0)
 
-    while (worklist.count > 0) {
+    while (worklist.len() > 0) {
         const bi = worklist.pop()
         const blk = func.blocks.get(bi)
-        for si in 0..blk.succs.count {
+        for si in 0..blk.succs.len() {
             const succ_idx = blk.succs.get(si).block
-            if (succ_idx >= 0 and succ_idx < func.blocks.count) {
+            if (succ_idx >= 0 and succ_idx < func.blocks.len()) {
                 const succ = func.blocks.get(succ_idx)
                 if (!reachable.contains(succ.id)) {
                     reachable.set(succ.id, true)
@@ -115,12 +115,12 @@ fn liveValues(func: *SsaFunc, reachable: *Map(int, bool), live: *Map(int, bool))
     var q: List(*SsaValue) = .{}
 
     // Seed: control values + side-effecting values + used values
-    for bi in 0..func.blocks.count {
+    for bi in 0..func.blocks.len() {
         const blk = func.blocks.get(bi)
         if (!reachable.contains(blk.id)) { continue }
 
         // Control values are live
-        for ci in 0..blk.controls.count {
+        for ci in 0..blk.controls.len() {
             const ctrl = blk.controls.get(ci)
             if (!live.contains(ctrl.id)) {
                 live.set(ctrl.id, true)
@@ -129,7 +129,7 @@ fn liveValues(func: *SsaFunc, reachable: *Map(int, bool), live: *Map(int, bool))
         }
 
         // Values with side effects or uses > 0 are live
-        for vi in 0..blk.values.count {
+        for vi in 0..blk.values.len() {
             const val = blk.values.get(vi)
             if ((isSideEffecting(val.op) or val.uses > 0) and !live.contains(val.id)) {
                 live.set(val.id, true)
@@ -139,9 +139,9 @@ fn liveValues(func: *SsaFunc, reachable: *Map(int, bool), live: *Map(int, bool))
     }
 
     // Transitive closure: mark all args of live values as live
-    while (q.count > 0) {
+    while (q.len() > 0) {
         const val = q.pop()
-        for ai in 0..val.args.count {
+        for ai in 0..val.args.len() {
             const arg = val.args.get(ai)
             if (arg != null_val and !live.contains(arg.id)) {
                 live.set(arg.id, true)
@@ -154,7 +154,7 @@ fn liveValues(func: *SsaFunc, reachable: *Map(int, bool), live: *Map(int, bool))
 /// Remove predecessor edge pointing to block_idx from blk.
 fn removePredEdge(blk: SsaBlock, block_idx: int) void {
     var pi = 0
-    while (pi < blk.preds.count) {
+    while (pi < blk.preds.len()) {
         if (blk.preds.get(pi).block == block_idx) {
             blk.preds.orderedRemove(pi)
         } else {
@@ -168,19 +168,19 @@ fn removePredEdge(blk: SsaBlock, block_idx: int) void {
 /// must not contribute to use counts.
 fn recomputeUses(func: *SsaFunc) void {
     // Zero all uses
-    for vi in 0..func.values.count {
+    for vi in 0..func.values.len() {
         func.values.get(vi).uses = 0
     }
 
     // Count uses: only from values that are in blocks (not removed values)
     var bi = 0
-    while (bi < func.blocks.count) {
+    while (bi < func.blocks.len()) {
         const blk = func.blocks.get(bi)
         var bvi = 0
-        while (bvi < blk.values.count) {
+        while (bvi < blk.values.len()) {
             const val = blk.values.get(bvi)
             var ai = 0
-            while (ai < val.args.count) {
+            while (ai < val.args.len()) {
                 const arg = val.args.get(ai)
                 if (arg != null_val) {
                     arg.uses += 1
@@ -194,13 +194,13 @@ fn recomputeUses(func: *SsaFunc) void {
         // block.values but their args still need uses counted so they aren't
         // wrongly removed as dead.
         var ci = 0
-        while (ci < blk.controls.count) {
+        while (ci < blk.controls.len()) {
             const ctrl = blk.controls.get(ci)
             if (ctrl != null_val) {
                 ctrl.uses += 1
                 // Count uses from control value's args
                 var cai = 0
-                while (cai < ctrl.args.count) {
+                while (cai < ctrl.args.len()) {
                     const ctrl_arg = ctrl.args.get(cai)
                     if (ctrl_arg != null_val) {
                         ctrl_arg.uses += 1
@@ -302,7 +302,7 @@ test "deadcode removes unused values" {
 
     deadcode(&func)
 
-    @assertEq(b0.values.count, 1)
+    @assertEq(b0.values.len(), 1)
     @assertEq(b0.values.get(0).id, v1.id)
 }
 
@@ -320,7 +320,7 @@ test "deadcode keeps side effects" {
 
     deadcode(&func)
 
-    @assertEq(b0.values.count, 1)
+    @assertEq(b0.values.len(), 1)
     @assertEq(b0.values.get(0).id, v1.id)
 }
 
@@ -347,5 +347,5 @@ test "deadcode keeps transitive deps" {
     deadcode(&func)
 
     // v0 and v1 kept (v1=control, v0=arg of v1), v2 removed
-    @assertEq(b0.values.count, 2)
+    @assertEq(b0.values.len(), 2)
 }

@@ -479,38 +479,38 @@ fn generateTestSummaryBody(write_func_idx: int, eprint_int_func_idx: int, time_f
 
 test "generateTestBeginBody produces valid bytecode" {
     const body = generateTestBeginBody(5, 3)
-    @assert(body.count > 2)
-    @assertEq(body.get(body.count - 1), 0x0B)
+    @assert(body.len() > 2)
+    @assertEq(body.get(body.len() - 1), 0x0B)
 }
 
 test "generateTestPrintNameBody produces valid bytecode" {
     const body = generateTestPrintNameBody(1, 5, 3, 4)
-    @assert(body.count > 20)
-    @assertEq(body.get(body.count - 1), 0x0B)
+    @assert(body.len() > 20)
+    @assertEq(body.get(body.len() - 1), 0x0B)
 }
 
 test "generateTestPassBody produces valid bytecode" {
     const body = generateTestPassBody(1, 2, 5, 3)
-    @assert(body.count > 20)
-    @assertEq(body.get(body.count - 1), 0x0B)
+    @assert(body.len() > 20)
+    @assertEq(body.get(body.len() - 1), 0x0B)
 }
 
 test "generateTestFailBody produces valid bytecode" {
     const body = generateTestFailBody(1, 2, 5, 3, 10, 6, 7, 8, 9, 11)
-    @assert(body.count > 20)
-    @assertEq(body.get(body.count - 1), 0x0B)
+    @assert(body.len() > 20)
+    @assertEq(body.get(body.len() - 1), 0x0B)
 }
 
 test "generateTestStoreFailValuesBody produces valid bytecode" {
     const body = generateTestStoreFailValuesBody(6, 7, 11, 8, 9, 10)
-    @assert(body.count > 10)
-    @assertEq(body.get(body.count - 1), 0x0B)
+    @assert(body.len() > 10)
+    @assertEq(body.get(body.len() - 1), 0x0B)
 }
 
 test "generateTestSummaryBody produces valid bytecode" {
     const body = generateTestSummaryBody(1, 2, 5, 4)
-    @assert(body.count > 20)
-    @assertEq(body.get(body.count - 1), 0x0B)
+    @assert(body.len() > 20)
+    @assertEq(body.get(body.len() - 1), 0x0B)
 }
 
 test "addTestRuntime registers all 6 functions" {
@@ -533,6 +533,6 @@ test "emitWriteStr packs bytes correctly" {
     emitWriteStr(&code, 0, 1, "ok")
     const result = code.finish()
     // Should have: local.get 1, i64.const <packed>, i64.store, i64.const 2, local.get 1, i64.extend_i32_u, i64.const 2, call 0, drop, end
-    @assert(result.count > 5)
-    @assertEq(result.get(result.count - 1), 0x0B) // end
+    @assert(result.len() > 5)
+    @assertEq(result.get(result.len() - 1), 0x0B) // end
 }

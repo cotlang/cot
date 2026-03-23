@@ -357,7 +357,7 @@ test "Symbol init" {
     @assertEq(sym.index, 0)
     @assertEq(sym.is_func, false)
     @assertEq(sym.param_count, 0)
-    @assertEq(sym.text.count, 0)
+    @assertEq(sym.text.len(), 0)
 }
 
 test "ProgBuilder basic" {
@@ -440,7 +440,7 @@ test "AddrVal br_table survives Prog list" {
     @assertEq(p2.instr == As.br_table, true)
     switch (p2.to.val) {
         AddrVal.br_table |vals| => {
-            @assertEq(vals.count, 3)
+            @assertEq(vals.len(), 3)
         },
         else => { @assert(false) },
     }
@@ -470,7 +470,7 @@ test "AddrVal br_table survives insert" {
     @assertEq(p2.instr == As.br_table, true)
     switch (p2.to.val) {
         AddrVal.br_table |vals| => {
-            @assertEq(vals.count, 2)
+            @assertEq(vals.len(), 2)
         },
         else => { @assert(false) },
     }

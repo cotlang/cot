@@ -170,7 +170,7 @@ struct SSABuilder {
         // Multi-word locals (structs, tuples) occupy multiple 8-byte slots
         var slot_offsets: List(int) = .{}
         var next_slot: int = 0
-        for i in 0..ir_func.locals.count {
+        for i in 0..ir_func.locals.len() {
             slot_offsets.append(next_slot)
             const local = ir_func.locals.get(i)
             const num_slots = @max(1, (local.size + 7) / 8)
@@ -181,7 +181,7 @@ struct SSABuilder {
 
         // Initialize parameters — each param kind in its own function to keep stack small
         var phys_reg_idx: int = 0
-        for i in 0..ir_func.params.count {
+        for i in 0..ir_func.params.len() {
             const param = ir_func.params.get(i)
             const local_type = type_reg.get(param.type_idx)
             const is_string_or_slice = param.type_idx == STRING or local_type.tag == TAG_SLICE
@@ -275,7 +275,7 @@ struct SSABuilder {
         const block_id = self.func.blocks.get(self.cur_block).id
         // Save current vars snapshot into defvars flat list
         var keys = self.vars.keys()
-        for i in 0..keys.count {
+        for i in 0..keys.len() {
             const local_idx = keys.get(i)
             const val = self.vars.get(local_idx)
             self.setDefvar(block_id, local_idx, val)
@@ -310,25 +310,25 @@ struct SSABuilder {
 
     fn build() SsaFunc {
         // Copy local sizes for stack allocation
-        if (self.ir_func.locals.count > 0) {
-            for i in 0..self.ir_func.locals.count {
+        if (self.ir_func.locals.len() > 0) {
+            for i in 0..self.ir_func.locals.len() {
                 self.func.local_sizes.append(self.ir_func.locals.get(i).size)
             }
         }
-        if (self.ir_func.string_literals.count > 0) {
+        if (self.ir_func.string_literals.len() > 0) {
             self.func.string_literals = self.ir_func.string_literals
         }
 
         // Pre-scan for logical operands
-        for i in 0..self.ir_func.blocks.count {
+        for i in 0..self.ir_func.blocks.len() {
             const ir_block = self.ir_func.blocks.get(i)
-            if (ir_block.nodes.count < 0 or ir_block.nodes.count > 100000) {
-                @panic("CORRUPT block[${i}] in ${self.ir_func.name}: nodes.count=${ir_block.nodes.count}")
+            if (ir_block.nodes.len() < 0 or ir_block.nodes.len() > 100000) {
+                @panic("CORRUPT block[${i}] in ${self.ir_func.name}: nodes.len()=${ir_block.nodes.len()}")
             }
-            for j in 0..ir_block.nodes.count {
+            for j in 0..ir_block.nodes.len() {
                 const node_idx = ir_block.nodes.get(j)
-                if (node_idx < 0 or node_idx >= self.ir_func.nodes.count) {
-                    @panic("BAD node_idx ${node_idx} in block[${i}] of ${self.ir_func.name} (nodes.count=${self.ir_func.nodes.count})")
+                if (node_idx < 0 or node_idx >= self.ir_func.nodes.len()) {
+                    @panic("BAD node_idx ${node_idx} in block[${i}] of ${self.ir_func.name} (nodes.len()=${self.ir_func.nodes.len()})")
                 }
                 const node = self.ir_func.getNode(node_idx)
                 switch (node.data) {
@@ -344,11 +344,11 @@ struct SSABuilder {
         }
 
         // Walk all IR blocks
-        for i in 0..self.ir_func.blocks.count {
+        for i in 0..self.ir_func.blocks.len() {
             const ssa_block = self.getOrCreateBlock(i)
             if (i != 0) { self.startBlock(ssa_block) }
             const ir_block = self.ir_func.blocks.get(i)
-            for j in 0..ir_block.nodes.count {
+            for j in 0..ir_block.nodes.len() {
                 const node_idx = ir_block.nodes.get(j)
                 if (self.logical_operands.contains(node_idx)) { continue }
                 self.convertNode(node_idx)
@@ -359,8 +359,8 @@ struct SSABuilder {
         self.verify()
         const f = self.takeFunc()
         var total_values: i64 = 0
-        for bi in 0..f.blocks.count { total_values += f.blocks.get(bi).values.count }
-        debug(.ssa, "=== SSA built for '${f.name}': ${f.blocks.count} blocks, ${total_values} values, ${f.local_sizes.count} locals ===")
+        for bi in 0..f.blocks.len() { total_values += f.blocks.get(bi).values.len() }
+        debug(.ssa, "=== SSA built for '${f.name}': ${f.blocks.len()} blocks, ${total_values} values, ${f.local_sizes.len()} locals ===")
         return f
     }
 
@@ -369,7 +369,7 @@ struct SSABuilder {
     fn convertNode(node_idx: int) *SsaValue {
         // null_node is -1 but may appear as 0xFFFFFFFF due to 32-bit field truncation.
         // Treat any out-of-range index as null to handle both representations.
-        if (node_idx < 0 or node_idx >= self.ir_func.nodes.count) { return null_val }
+        if (node_idx < 0 or node_idx >= self.ir_func.nodes.len()) { return null_val }
         if (self.node_values.contains(node_idx)) { return self.node_values.get(node_idx) }
         const node = self.ir_func.getNode(node_idx)
         const cur = self.cur_block
@@ -604,12 +604,12 @@ struct SSABuilder {
     }
 
     fn getSlotOffset(local_idx: int) int {
-        if (local_idx < self.local_slot_offsets.count) {
+        if (local_idx < self.local_slot_offsets.len()) {
             return self.local_slot_offsets.get(local_idx)
         }
         // Dynamically-added locals: compute offset by summing sizes of all preceding locals
         var next_slot: int = 0
-        for i in 0..self.ir_func.locals.count {
+        for i in 0..self.ir_func.locals.len() {
             if (i == local_idx) { return next_slot }
             const num_slots = @max(1, (self.ir_func.locals.get(i).size + 7) / 8)
             next_slot += num_slots
@@ -898,7 +898,7 @@ struct SSABuilder {
 
         if (!is_large) {
             if (value.op == SsaOp.off_ptr and value.type_idx == VOID) {
-                if (global_idx < self.ir_globals.count) {
+                if (global_idx < self.ir_globals.len()) {
                     const global_type_idx = self.ir_globals.get(global_idx).type_idx
                     const global_type = self.type_reg.get(global_type_idx)
                     if (global_type.tag == TAG_STRUCT or global_type.tag == TAG_TUPLE or global_type.tag == TAG_UNION or self.isCompoundOptional(global_type_idx)) {
@@ -912,7 +912,7 @@ struct SSABuilder {
             const move_val = self.func.newValue(SsaOp.move, VOID, cur, self.cur_pos_line, self.cur_pos_col)
             move_val.addArg2(gaddr, value)
             var move_size = 8
-            if (type_size > 0) { move_size = type_size } else if (global_idx < self.ir_globals.count) { move_size = self.ir_globals.get(global_idx).size }
+            if (type_size > 0) { move_size = type_size } else if (global_idx < self.ir_globals.len()) { move_size = self.ir_globals.get(global_idx).size }
             move_val.aux_int = move_size
             self.func.addValueToBlock(move_val, cur)
             return value
@@ -1035,7 +1035,7 @@ struct SSABuilder {
             }
         }
 
-        for k in 0..args.count {
+        for k in 0..args.len() {
             const arg_idx = args.get(k)
             const arg_val = self.convertNode(arg_idx)
             if (arg_val == null_val) { continue }
@@ -1094,7 +1094,7 @@ struct SSABuilder {
         // Search backwards for a store that stored this value
         const cur = self.cur_block
         const blk = self.func.blocks.get(cur)
-        for i in 0..blk.values.count {
+        for i in 0..blk.values.len() {
             const sv = blk.values.get(i)
             if (sv.op == SsaOp.store and sv.argsLen() >= 2 and sv.args.get(1) == val) {
                 return sv.args.get(0)
@@ -1109,7 +1109,7 @@ struct SSABuilder {
         if (callee == null_val) { return null_val }
         const call_val = self.func.newValue(SsaOp.inter_call, type_idx, cur, self.cur_pos_line, self.cur_pos_col)
         call_val.addArg(callee)
-        for k in 0..args.count {
+        for k in 0..args.len() {
             const arg_val = self.convertNode(args.get(k))
             if (arg_val == null_val) { continue }
             self.addCallArg(call_val, arg_val)
@@ -1126,7 +1126,7 @@ struct SSABuilder {
         const call_val = self.func.newValue(SsaOp.closure_call, type_idx, cur, self.cur_pos_line, self.cur_pos_col)
         call_val.addArg(callee)
         call_val.addArg(context)
-        for k in 0..args.count {
+        for k in 0..args.len() {
             const arg_val = self.convertNode(args.get(k))
             if (arg_val == null_val) { continue }
             self.addCallArg(call_val, arg_val)
@@ -1652,7 +1652,7 @@ struct SSABuilder {
         const cur = self.cur_block
         const val = self.func.newValue(SsaOp.wasm_gc_struct_new, type_idx, cur, self.cur_pos_line, self.cur_pos_col)
         val.aux = SsaAux.str(gc.type_name)
-        for k in 0..gc.field_values.count {
+        for k in 0..gc.field_values.len() {
             const arg = self.convertNode(gc.field_values.get(k))
             if (arg != null_val) { val.addArg(arg) }
         }
@@ -1712,8 +1712,8 @@ struct SSABuilder {
         const cur = self.cur_block
         const val = self.func.newValue(SsaOp.wasm_gc_array_new_fixed, type_idx, cur, self.cur_pos_line, self.cur_pos_col)
         val.aux = SsaAux.str(gc.type_name)
-        val.aux_int = gc.values.count
-        for k in 0..gc.values.count {
+        val.aux_int = gc.values.len()
+        for k in 0..gc.values.len() {
             const arg = self.convertNode(gc.values.get(k))
             if (arg != null_val) { val.addArg(arg) }
         }
@@ -1820,9 +1820,9 @@ struct SSABuilder {
 
     fn insertPhis() void {
         var fwd_refs: List(*SsaValue) = .{}
-        for i in 0..self.func.blocks.count {
+        for i in 0..self.func.blocks.len() {
             const blk = self.func.blocks.get(i)
-            for j in 0..blk.values.count {
+            for j in 0..blk.values.len() {
                 const v = blk.values.get(j)
                 if (v.op == SsaOp.fwd_ref) {
                     fwd_refs.append(v)
@@ -1833,17 +1833,17 @@ struct SSABuilder {
 
         var phi_args: List(*SsaValue) = .{}
 
-        while (fwd_refs.count > 0) {
+        while (fwd_refs.len() > 0) {
             const fwd = fwd_refs.pop()
             const block_idx = fwd.block
             if (block_idx == null_block) { continue }
             const block = self.func.blocks.get(block_idx)
-            if (block_idx == self.func.entry or block.preds.count == 0) { continue }
+            if (block_idx == self.func.entry or block.preds.len() == 0) { continue }
 
             const local_idx = fwd.aux_int
             phi_args.clear()
 
-            for k in 0..block.preds.count {
+            for k in 0..block.preds.len() {
                 const pred_edge = block.preds.get(k)
                 const val = self.lookupVarOutgoing(pred_edge.block, local_idx, fwd.type_idx, &fwd_refs)
                 phi_args.append(val)
@@ -1851,7 +1851,7 @@ struct SSABuilder {
 
             var witness = null_val
             var need_phi = false
-            for k in 0..phi_args.count {
+            for k in 0..phi_args.len() {
                 const a = phi_args.get(k)
                 if (a == fwd) { continue }
                 if (witness == null_val) {
@@ -1863,7 +1863,7 @@ struct SSABuilder {
 
             if (need_phi) {
                 fwd.op = SsaOp.phi
-                for k in 0..phi_args.count {
+                for k in 0..phi_args.len() {
                     fwd.addArg(phi_args.get(k))
                 }
             } else if (witness != null_val) {
@@ -1879,12 +1879,12 @@ struct SSABuilder {
         // Reorder block values so phis come first, without using clear()/append()
         // which trigger ARC release/retain and can free values prematurely.
         // Instead, collect into temp lists and write directly to backing array.
-        for i in 0..self.func.blocks.count {
+        for i in 0..self.func.blocks.len() {
             var blk = self.func.blocks.get(i)
             var phis: List(*SsaValue) = .{}
             var non_phis: List(*SsaValue) = .{}
 
-            for j in 0..blk.values.count {
+            for j in 0..blk.values.len() {
                 const v = blk.values.get(j)
                 if (v.op == SsaOp.phi) {
                     phis.append(v)
@@ -1893,36 +1893,34 @@ struct SSABuilder {
                 }
             }
 
-            if (phis.count == 0) { continue }
+            if (phis.len() == 0) { continue }
 
-            // Write reordered values directly to the backing array (no ARC)
+            // Write reordered values directly via elemPtr (no ARC)
             var wi = 0
-            for j in 0..phis.count {
-                var ptr = @intToPtr(**SsaValue, blk.values.items + wi * @sizeOf(*SsaValue))
-                ptr.* = phis.get(j)
+            for j in 0..phis.len() {
+                blk.values.elemPtr(wi).* = phis.get(j)
                 wi += 1
             }
-            for j in 0..non_phis.count {
-                var ptr = @intToPtr(**SsaValue, blk.values.items + wi * @sizeOf(*SsaValue))
-                ptr.* = non_phis.get(j)
+            for j in 0..non_phis.len() {
+                blk.values.elemPtr(wi).* = non_phis.get(j)
                 wi += 1
             }
         }
     }
 
     fn verify() void {
-        for i in 0..self.func.blocks.count {
+        for i in 0..self.func.blocks.len() {
             const blk = self.func.blocks.get(i)
-            if (blk.preds.count == 0 and i != self.func.entry) { continue }
+            if (blk.preds.len() == 0 and i != self.func.entry) { continue }
             var seen_non_phi = false
-            for j in 0..blk.values.count {
+            for j in 0..blk.values.len() {
                 const v = blk.values.get(j)
                 if (v.op == SsaOp.phi) {
                     if (seen_non_phi) {
                         @panic("verify: phi after non-phi in block ${i} of ${self.ir_func.name}")
                     }
-                    if (v.argsLen() != blk.preds.count) {
-                        @panic("verify: phi args=${v.argsLen()} != preds=${blk.preds.count} in block ${i} of ${self.ir_func.name}")
+                    if (v.argsLen() != blk.preds.len()) {
+                        @panic("verify: phi args=${v.argsLen()} != preds=${blk.preds.len()} in block ${i} of ${self.ir_func.name}")
                     }
                 } else {
                     seen_non_phi = true
@@ -1932,15 +1930,15 @@ struct SSABuilder {
                 }
             }
             if (blk.kind == SsaBlockKind.ret) {
-                if (blk.succs.count != 0) {
-                    @panic("verify: ret block ${i} has ${blk.succs.count} succs in ${self.ir_func.name}")
+                if (blk.succs.len() != 0) {
+                    @panic("verify: ret block ${i} has ${blk.succs.len()} succs in ${self.ir_func.name}")
                 }
             }
             if (blk.kind == SsaBlockKind.if_) {
-                if (blk.succs.count != 2) {
-                    @panic("verify: if block ${i} has ${blk.succs.count} succs (want 2) in ${self.ir_func.name}")
+                if (blk.succs.len() != 2) {
+                    @panic("verify: if block ${i} has ${blk.succs.len()} succs (want 2) in ${self.ir_func.name}")
                 }
-                if (blk.controls.count == 0) {
+                if (blk.controls.len() == 0) {
                     @panic("verify: if block ${i} has no controls in ${self.ir_func.name}")
                 }
             }
@@ -1950,7 +1948,7 @@ struct SSABuilder {
     // === Defvar helpers (flat list) ===
 
     fn lookupDefvar(block_id: int, local_idx: int) *SsaValue {
-        var i = self.defvars.count
+        var i = self.defvars.len()
         while (i > 0) {
             i -= 1
             const entry = self.defvars.get(i)
@@ -1962,7 +1960,7 @@ struct SSABuilder {
     }
 
     fn setDefvar(block_id: int, local_idx: int, value: *SsaValue) void {
-        var i = self.defvars.count
+        var i = self.defvars.len()
         while (i > 0) {
             i -= 1
             var entry = self.defvars.get(i)
@@ -1989,7 +1987,7 @@ struct SSABuilder {
             if (result != null_val) {
                 return result
             }
-            if (blk.preds.count == 1) {
+            if (blk.preds.len() == 1) {
                 cur = blk.preds.get(0).block
                 continue
             }

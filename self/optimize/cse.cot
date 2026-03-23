@@ -14,22 +14,22 @@ import "../debug"
 /// Run CSE on a function.
 fn cse(func: *SsaFunc) void {
     var total_values: i64 = 0
-    for bi in 0..func.blocks.count { total_values += func.blocks.get(bi).values.count }
-    debug(.codegen, "=== CSE pass for '${func.name}' (${func.blocks.count} blocks, ${total_values} values) ===")
+    for bi in 0..func.blocks.len() { total_values += func.blocks.get(bi).values.len() }
+    debug(.codegen, "=== CSE pass for '${func.name}' (${func.blocks.len()} blocks, ${total_values} values) ===")
 
     // Build a hash for each value and look for duplicates within the same block.
     // rewrite[val.id] = *SsaValue means "replace val with that value"
     var rewrite: Map(int, *SsaValue) = .{}
 
     var bi = 0
-    while (bi < func.blocks.count) {
+    while (bi < func.blocks.len()) {
         const blk = func.blocks.get(bi)
 
         // Hash table: hash → first *SsaValue with that hash
         var seen: Map(int, *SsaValue) = .{}
 
         var vi = 0
-        while (vi < blk.values.count) {
+        while (vi < blk.values.len()) {
             const val = blk.values.get(vi)
 
             // Skip non-CSE-able ops (side effects, phis, memory ops)
@@ -52,17 +52,17 @@ fn cse(func: *SsaFunc) void {
         bi += 1
     }
 
-    if (rewrite.count == 0) {
+    if (rewrite.len() == 0) {
         debug(.codegen, "=== CSE complete for '${func.name}': 0 rewrites ===")
         return
     }
 
     // Apply rewrites: for each value, replace args that have rewrites
-    for vi in 0..func.values.count {
+    for vi in 0..func.values.len() {
         const val = func.values.get(vi)
         var changed = false
         var ai = 0
-        while (ai < val.args.count) {
+        while (ai < val.args.len()) {
             const arg = val.args.get(ai)
             if (rewrite.contains(arg.id)) {
                 val.setArg(ai, rewrite.get(arg.id))
@@ -74,10 +74,10 @@ fn cse(func: *SsaFunc) void {
 
     // Also rewrite block controls
     bi = 0
-    while (bi < func.blocks.count) {
+    while (bi < func.blocks.len()) {
         const blk = func.blocks.get(bi)
         var ci = 0
-        while (ci < blk.controls.count) {
+        while (ci < blk.controls.len()) {
             const ctrl = blk.controls.get(ci)
             if (rewrite.contains(ctrl.id)) {
                 blk.controls.set(ci, rewrite.get(ctrl.id))
@@ -87,7 +87,7 @@ fn cse(func: *SsaFunc) void {
         bi += 1
     }
 
-    debug(.codegen, "=== CSE complete for '${func.name}': ${rewrite.count} rewrites ===")
+    debug(.codegen, "=== CSE complete for '${func.name}': ${rewrite.len()} rewrites ===")
 }
 
 /// Check if an op can be CSE'd (pure, no side effects).
@@ -154,7 +154,7 @@ fn hashValue(val: SsaValue) int {
     h = h ^ (val.type_idx * 17)
     h = h ^ (val.aux_int * 13)
     var ai = 0
-    while (ai < val.args.count) {
+    while (ai < val.args.len()) {
         h = h ^ (val.args.get(ai).id * (7 + ai))
         ai += 1
     }
@@ -168,9 +168,9 @@ fn valuesEqual(a: SsaValue, b: SsaValue) bool {
     if (a.op != b.op) { return false }
     if (a.type_idx != b.type_idx) { return false }
     if (a.aux_int != b.aux_int) { return false }
-    if (a.args.count != b.args.count) { return false }
+    if (a.args.len() != b.args.len()) { return false }
     var ai = 0
-    while (ai < a.args.count) {
+    while (ai < a.args.len()) {
         if (a.args.get(ai).id != b.args.get(ai).id) { return false }
         ai += 1
     }
