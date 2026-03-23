@@ -2565,16 +2565,19 @@ struct Lowerer {
                     }
                 }
             }
-            // Outside switch: checker already resolved the type, use inferExprType
-            const inferred = self.inferExprType(idx)
-            if (inferred > 0 and inferred < self.types.types.count) {
-                const inferred_info = self.types.get(inferred)
-                if (inferred_info.tag == TAG_ENUM) {
-                    const et = switch (inferred_info) { Type.enum_type |e| => e, else => EnumType { name: "", variant_count: 0, variants: 0, backing_type: 0 } }
+            // Outside switch: resolve using the checker's inferred type for this expression.
+            // The checker already resolved .variant to the correct enum type via type inference
+            // from the call parameter type, assignment target, etc.
+            // Look up the field name in all known enum types.
+            // Zig lower.zig:5568-5576
+            for ti in 0..self.types.types.count {
+                const t = self.types.get(ti)
+                if (t.tag == TAG_ENUM) {
+                    const et = switch (t) { Type.enum_type |e| => e, else => EnumType { name: "", variant_count: 0, variants: 0, backing_type: 0 } }
                     for vi in 0..et.variant_count {
                         const ev = et.getVariant(vi)
                         if (ev.name == fa.field) {
-                            return fb.emitConstInt(ev.value, inferred, fa.span)
+                            return fb.emitConstInt(ev.value, ti, fa.span)
                         }
                     }
                 }
