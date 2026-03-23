@@ -2684,6 +2684,30 @@ pub const Lowerer = struct {
             return;
         }
 
+        // Bitfield packed struct: build backing integer from shifted field values
+        // result = (field0 << 0) | (field1 << bit_offset_1) | (field2 << bit_offset_2) | ...
+        if (struct_type.backing_int != 0) {
+            var result = try fb.emitConstInt(0, struct_type.backing_int, span);
+            for (struct_init.fields) |field_init| {
+                for (struct_type.fields) |struct_field| {
+                    if (std.mem.eql(u8, struct_field.name, field_init.name)) {
+                        var fval = try self.lowerExprNode(field_init.value);
+                        // Shift left by bit_offset
+                        if (struct_field.bit_offset > 0) {
+                            const shift = try fb.emitConstInt(@intCast(struct_field.bit_offset), TypeRegistry.I64, span);
+                            fval = try fb.emitBinary(.shl, fval, shift, TypeRegistry.I64, span);
+                        }
+                        // OR into result
+                        result = try fb.emitBinary(.bit_or, result, fval, TypeRegistry.I64, span);
+                        break;
+                    }
+                }
+            }
+            // Store the backing integer to the local
+            _ = try fb.emitStoreLocal(local_idx, result, span);
+            return;
+        }
+
         // ARC path (unchanged): store fields to local via offset
         for (struct_init.fields) |field_init| {
             for (struct_type.fields, 0..) |struct_field, i| {
@@ -5690,13 +5714,52 @@ pub const Lowerer = struct {
         var field_idx: u32 = 0;
         var field_offset: i64 = 0;
         var field_type: TypeIndex = TypeRegistry.VOID;
+        var field_bit_offset: u8 = 0;
+        var field_bit_width: u8 = 0;
         for (struct_type.fields, 0..) |field, i| {
             if (std.mem.eql(u8, field.name, fa.field)) {
                 field_idx = @intCast(i);
                 field_offset = @intCast(field.offset);
                 field_type = field.type_idx;
+                field_bit_offset = field.bit_offset;
+                field_bit_width = field.bit_width;
                 break;
             }
+        }
+
+        // Bitfield access: load backing integer → shift right → mask
+        // Zig reference: Type.zig:3550 — packed struct bit-level access
+        if (field_bit_width > 0 and struct_type.backing_int != 0) {
+            const backing_type = struct_type.backing_int;
+            const base_node2 = self.tree.getNode(fa.base) orelse return ir.null_node;
+            const base_expr2 = base_node2.asExpr() orelse return ir.null_node;
+
+            // Load the entire backing integer
+            var backing_val: ir.NodeIndex = undefined;
+            if (base_expr2 == .ident and base_type != .pointer) {
+                if (fb.lookupLocal(base_expr2.ident.name)) |local_idx| {
+                    backing_val = try fb.emitLoadLocal(local_idx, backing_type, fa.span);
+                } else {
+                    backing_val = try self.lowerExprNode(fa.base);
+                }
+            } else {
+                backing_val = try self.lowerExprNode(fa.base);
+            }
+
+            // Shift right by bit_offset
+            if (field_bit_offset > 0) {
+                const shift_amount = try fb.emitConstInt(@intCast(field_bit_offset), TypeRegistry.I64, fa.span);
+                backing_val = try fb.emitBinary(.shr, backing_val, shift_amount, TypeRegistry.I64, fa.span);
+            }
+
+            // Mask to bit_width
+            if (field_bit_width < 64) {
+                const mask_val: i64 = (@as(i64, 1) << @intCast(field_bit_width)) - 1;
+                const mask = try fb.emitConstInt(mask_val, TypeRegistry.I64, fa.span);
+                backing_val = try fb.emitBinary(.bit_and, backing_val, mask, TypeRegistry.I64, fa.span);
+            }
+
+            return backing_val;
         }
 
         // WasmGC path: use gc_struct_get instead of offset-based loads

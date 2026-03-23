@@ -520,7 +520,8 @@ pub const Checker = struct {
                 // Build struct type AFTER nested types are registered (so fields can reference them)
                 const struct_type = try self.buildStructTypeWithLayout(s.name, s.fields, s.layout);
                 // Update the placeholder with the real type
-                self.types.types.items[@intCast(placeholder)] = .{ .struct_type = .{ .name = s.name, .fields = self.types.get(struct_type).struct_type.fields, .size = self.types.get(struct_type).struct_type.size, .alignment = self.types.get(struct_type).struct_type.alignment, .layout = s.layout } };
+                const st = self.types.get(struct_type).struct_type;
+                self.types.types.items[@intCast(placeholder)] = .{ .struct_type = .{ .name = s.name, .fields = st.fields, .size = st.size, .alignment = st.alignment, .layout = s.layout, .backing_int = st.backing_int } };
             },
             .enum_decl => |e| {
                 if (self.scope.isDefined(e.name)) { self.reportRedefined(e.span.start, e.name); return; }
