@@ -9663,6 +9663,18 @@ pub const Lowerer = struct {
                 self.current_dict_entries = dict_entries;
                 self.current_dict_params = dict_params;
             }
+            // @safe generic: inject self param (parser skips it for generic structs).
+            // Mirrors checker's self injection in instantiateGenericImplMethods.
+            if (self.chk.safe_mode and !f.is_static and (f.params.len == 0 or !std.mem.eql(u8, f.params[0].name, "self"))) {
+                // Resolve concrete struct type from the method name prefix: "List(17)_append" → "List(17)"
+                if (std.mem.lastIndexOf(u8, inst_info.concrete_name, "_")) |underscore| {
+                    const struct_name = inst_info.concrete_name[0..underscore];
+                    if (self.chk.resolveTypeByName(struct_name)) |struct_type| {
+                        const ptr_type = self.chk.types.makePointer(struct_type) catch struct_type;
+                        _ = try fb.addParam("self", ptr_type, self.type_reg.sizeOf(ptr_type));
+                    }
+                }
+            }
             for (f.params) |param| {
                 var param_type = self.resolveTypeNode(param.type_expr);
                 // Mirror checker buildFuncType: skip safeWrapType for generic type params.
@@ -11199,24 +11211,30 @@ pub const Lowerer = struct {
                 if (self.target.isWasm()) {
                     return try fb.emitConstBool(true, bc.span);
                 }
-                // If ptr is 0 (null/empty), return true (empty is always "unique")
+                // Use local variable to pass result across blocks (CLIF requires dominance).
+                // Pattern: var result = true; if (ptr != 0) { result = refcount == 1 }
+                const result_local = try fb.addLocalWithSize("__is_unique", TypeRegistry.BOOL, true, 1);
+                const true_val = try fb.emitConstBool(true, bc.span);
+                _ = try fb.emitStoreLocal(result_local, true_val, bc.span);
                 const zero = try fb.emitConstInt(0, TypeRegistry.I64, bc.span);
                 const is_null = try fb.emitBinary(.eq, arg, zero, TypeRegistry.BOOL, bc.span);
                 const check_blk = try fb.newBlock("is_unique.check");
                 const merge_blk = try fb.newBlock("is_unique.merge");
                 _ = try fb.emitBranch(is_null, merge_blk, check_blk, bc.span);
                 fb.setBlock(check_blk);
-                // Load refcount from ptr - 8
+                // Load refcount word from ptr - 8 (native: 32-byte header, refcount at offset 24)
+                // Swift InlineRefCounts: bit 0 = PURE_SWIFT_DEALLOC, bits 1+ = unowned count
+                // Initial refcount word = 3 (PURE_SWIFT_DEALLOC | UNOWNED_RC_ONE = 1 | 2)
+                // isUnique = refcount_word == INITIAL_REFCOUNT (3)
                 const eight = try fb.emitConstInt(8, TypeRegistry.I64, bc.span);
                 const rc_addr = try fb.emitBinary(.sub, arg, eight, TypeRegistry.I64, bc.span);
                 const refcount = try fb.emitPtrLoadValue(rc_addr, TypeRegistry.I64, bc.span);
-                const one = try fb.emitConstInt(1, TypeRegistry.I64, bc.span);
-                const is_one = try fb.emitBinary(.eq, refcount, one, TypeRegistry.BOOL, bc.span);
+                const initial_rc = try fb.emitConstInt(3, TypeRegistry.I64, bc.span); // PURE_SWIFT_DEALLOC | UNOWNED_RC_ONE
+                const is_one = try fb.emitBinary(.eq, refcount, initial_rc, TypeRegistry.BOOL, bc.span);
+                _ = try fb.emitStoreLocal(result_local, is_one, bc.span);
                 _ = try fb.emitJump(merge_blk, bc.span);
                 fb.setBlock(merge_blk);
-                // Phi: null → true, non-null → (refcount == 1)
-                const true_val = try fb.emitConstBool(true, bc.span);
-                return try fb.emitSelect(is_null, true_val, is_one, TypeRegistry.BOOL, bc.span);
+                return try fb.emitLoadLocal(result_local, TypeRegistry.BOOL, bc.span);
             },
             // @panic("message") — Zig @panic: write file:line + message to stderr, then exit(2)
             // Reference: Zig std/debug.zig panic(), Go runtime.gopanic
