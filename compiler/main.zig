@@ -1393,7 +1393,21 @@ fn compileAndLinkFull(
                 }
             };
             const wasm_basename = std.fs.path.basename(wasm_path);
-            const glue = js_glue.generate(allocator, wasm_basename) catch {
+            // Build JsImport list from driver's collected extern fns
+            var js_imports = std.ArrayListUnmanaged(js_glue.JsImport){};
+            defer js_imports.deinit(allocator);
+            if (!compile_target.isWasi()) {
+                const wasi_rt = @import("codegen/wasi_runtime.zig");
+                for (compile_driver.user_extern_fns.items, 0..) |name, idx| {
+                    if (wasi_rt.isRuntimeFunction(name)) continue;
+                    js_imports.append(allocator, .{
+                        .name = name,
+                        .param_count = compile_driver.user_extern_param_counts.items[idx],
+                        .has_result = compile_driver.user_extern_has_result.items[idx],
+                    }) catch {};
+                }
+            }
+            const glue = js_glue.generate(allocator, wasm_basename, js_imports.items) catch {
                 std.debug.print("Error: Failed to generate JS glue\n", .{});
                 std.process.exit(1);
             };

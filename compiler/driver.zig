@@ -777,7 +777,8 @@ pub const Driver = struct {
         while (iter.next()) |entry| {
             const sym = entry.value_ptr.*;
             if (sym.is_extern and sym.kind == .function) {
-                self.user_extern_fns.append(self.allocator, sym.name) catch {};
+                // Dupe name — sym.name points into parser arena which may be freed before JS glue generation
+                self.user_extern_fns.append(self.allocator, self.allocator.dupe(u8, sym.name) catch sym.name) catch {};
 
                 // Resolve param count and return type from the type registry.
                 // Cot's Wasm ABI: all params are i64, strings decompose to (ptr, len).
