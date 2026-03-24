@@ -9369,17 +9369,8 @@ pub const Lowerer = struct {
             }
         }
 
-        // If base already lowered, just emit the concrete wrapper and return.
-        // Each concrete instantiation (List(5)_append, List(6)_append) needs its own
-        // wrapper that passes the appropriate TypeMetadata, but they share the base.
-        if (self.builder.hasFunc(base_name)) {
-            if (!self.builder.hasFunc(inst_info.concrete_name)) {
-                self.type_substitution = sub_map;
-                defer self.type_substitution = null;
-                try self.emitVWTWrapper(inst_info, base_name, f);
-            }
-            return;
-        }
+        // Already emitted under the concrete name — skip
+        if (self.builder.hasFunc(inst_info.concrete_name)) return;
 
         // Use preserved expr_types from checker
         const saved_expr_types = self.chk.expr_types;
@@ -9406,8 +9397,11 @@ pub const Lowerer = struct {
         const uses_sret = self.needsSret(return_type);
         const wasm_return_type = if (uses_sret) TypeRegistry.VOID else return_type;
 
-        // Emit function under BASE name with metadata params
-        self.builder.startFunc(base_name, TypeRegistry.VOID, wasm_return_type, f.span);
+        // Emit function under concrete name (each instantiation gets its own body
+        // because return type convention can differ per T — e.g., i64 vs SRET struct).
+        // The body uses VWT witnesses for ARC operations.
+        _ = base_name;
+        self.builder.startFunc(inst_info.concrete_name, TypeRegistry.VOID, wasm_return_type, f.span);
         if (self.builder.func()) |fb| {
             if (uses_sret) fb.sret_return_type = return_type;
             fb.is_destructor = std.mem.eql(u8, f.name, "deinit");
@@ -9417,12 +9411,6 @@ pub const Lowerer = struct {
             self.weak_locals.clearRetainingCapacity();
             if (uses_sret) {
                 _ = try fb.addParam("__sret", TypeRegistry.I64, 8);
-            }
-
-            // VWT: Add *TypeMetadata params — one per type parameter
-            for (param_names) |pn| {
-                const meta_name = try std.fmt.allocPrint(self.allocator, "__metadata_{s}", .{pn});
-                _ = try fb.addParam(meta_name, TypeRegistry.I64, 8);
             }
 
             // @safe generic: inject self param
@@ -9473,11 +9461,6 @@ pub const Lowerer = struct {
             self.current_func = null;
         }
         try self.builder.endFunc();
-
-        // Also emit a thin wrapper under the concrete name that calls the base with metadata.
-        // This maintains backward compatibility: existing call sites use "List(5)_append".
-        // The wrapper just prepends the concrete type's metadata and delegates.
-        try self.emitVWTWrapper(inst_info, base_name, f);
     }
 
     /// Compute the base generic name from a concrete name.
