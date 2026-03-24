@@ -9332,6 +9332,10 @@ pub const Lowerer = struct {
         // Already emitted under the concrete name — skip
         if (self.builder.hasFunc(inst_info.concrete_name)) return;
 
+        // Skip: base_name sharing deferred to future optimization.
+        // Each instantiation gets its own body (same as old monomorphization).
+        _ = base_name;
+
         // Use preserved expr_types from checker
         const saved_expr_types = self.chk.expr_types;
         if (inst_info.expr_types) |et| {
@@ -9360,7 +9364,6 @@ pub const Lowerer = struct {
         // Emit function under concrete name (each instantiation gets its own body
         // because return type convention can differ per T — e.g., i64 vs SRET struct).
         // The body uses VWT witnesses for ARC operations.
-        _ = base_name;
         self.builder.startFunc(inst_info.concrete_name, TypeRegistry.VOID, wasm_return_type, f.span);
         if (self.builder.func()) |fb| {
             if (uses_sret) fb.sret_return_type = return_type;
