@@ -1867,9 +1867,19 @@ pub const Lowerer = struct {
                         }
                     }
                 } else {
-                    // Expression result → lower, store to temp, copy temp fields to SRET
+                    // Expression result → lower, store to temp, copy temp fields to SRET.
+                    // Swift convention: if the expression is +1 (struct literal, new, call),
+                    // the fields are already retained. Just copy the words — no extra retain.
+                    // If the expression is +0 (ident/field access), retain before copy.
                     const lowered = try self.lowerExprNode(ret.value);
                     if (lowered != ir.null_node) {
+                        // Check if expression is +0 (not owned) — needs retain for SRET transfer
+                        const ret_src_node = self.tree.getNode(ret.value);
+                        const ret_src_expr = if (ret_src_node) |n| n.asExpr() else null;
+                        const is_owned_expr = if (ret_src_expr) |e| (e == .struct_init or e == .new_expr or e == .call) else false;
+                        if (!is_owned_expr and !self.target.isWasm() and self.type_reg.couldBeARC(sret_type)) {
+                            _ = try self.emitCopyValue(fb, lowered, sret_type, ret.span);
+                        }
                         const tmp_local = try fb.addLocalWithSize("__ret_sret_src", sret_type, false, sret_size);
                         _ = try fb.emitStoreLocal(tmp_local, lowered, ret.span);
                         for (0..num_words) |i| {
@@ -2330,6 +2340,14 @@ pub const Lowerer = struct {
                 // Register scope_destroy for .{} (zero_init), not for undefined
                 if (is_zero_init) {
                     try self.maybeRegisterScopeDestroy(local_idx, type_idx);
+                    // Register ARC release cleanup for zero-init collections/structs with ARC fields.
+                    // The variable starts at buf=0 but may grow (e.g., list.append allocates).
+                    // At scope exit, emitDestroyValue handles null buf safely (no-op).
+                    if (!self.target.isWasm() and self.type_reg.couldBeARC(type_idx)) {
+                        const loaded = try fb.emitLoadLocal(local_idx, type_idx, var_stmt.span);
+                        const cleanup = arc.Cleanup.initForLocal(.release, loaded, type_idx, local_idx);
+                        _ = try self.cleanup_stack.push(cleanup);
+                    }
                 }
                 return;
             }
