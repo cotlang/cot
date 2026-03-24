@@ -710,9 +710,7 @@ struct FuncBuilder {
             eprintln("BUG: emit current_block=${self.current_block} >= blocks.len()=${self.blocks.len()}")
             @panic("emit: current_block out of bounds")
         }
-        var block = self.blocks.get(self.current_block)
-        block.nodes.append(idx)
-        self.blocks.set(self.current_block, block)
+        self.blocks.getPtr(self.current_block).nodes.append(idx)
         return idx
     }
 

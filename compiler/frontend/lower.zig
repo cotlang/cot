@@ -6969,14 +6969,14 @@ pub const Lowerer = struct {
                             const field_ptr_type = try self.type_reg.makePointer(struct_field.type_idx);
                             const field_addr = try fb.emitAddrOffset(ptr_node, field_offset, field_ptr_type, ne.span);
                             _ = try fb.emitPtrStoreValue(field_addr, value_node, ne.span);
-                            // Retain +0 managed pointers (Swift store [init] pattern)
-                            if (!self.target.isWasm() and fld_ti == .pointer and fld_ti.pointer.managed) {
+                            // Copy (retain) non-trivial +0 values (Swift store [init]: emitCopyValue).
+                            // Matches lowerStructInitExpr pattern — all type categories, not just managed pointers.
+                            if (!self.target.isWasm() and !self.type_reg.isTrivial(struct_field.type_idx)) {
                                 const fi_node = self.tree.getNode(field_init.value);
                                 const fi_expr = if (fi_node) |n| n.asExpr() else null;
                                 const fi_owned = if (fi_expr) |e| (e == .new_expr or e == .call) else false;
                                 if (!fi_owned) {
-                                    var retain_args = [_]ir.NodeIndex{value_node};
-                                    _ = try fb.emitCall("retain", &retain_args, false, struct_field.type_idx, ne.span);
+                                    _ = try self.emitCopyValue(fb, value_node, struct_field.type_idx, ne.span);
                                 }
                             }
                         }
@@ -11186,8 +11186,10 @@ pub const Lowerer = struct {
                 if (self.target.isWasm()) return arg;
                 const arg_type = self.inferExprType(bc.args[0]);
                 if (self.type_reg.couldBeARC(arg_type)) {
-                    var args = [_]ir.NodeIndex{arg};
-                    return try fb.emitCall("retain", &args, false, arg_type, bc.span);
+                    // Swift value witness copy: use emitCopyValue for all type categories.
+                    // retain() only works for single managed pointers. Structs with ARC
+                    // fields (e.g. struct containing List) need recursive field-by-field copy.
+                    _ = try self.emitCopyValue(fb, arg, arg_type, bc.span);
                 }
                 return arg;
             },
@@ -11197,8 +11199,10 @@ pub const Lowerer = struct {
                 const arg = try self.lowerExprNode(bc.args[0]);
                 const arg_type = self.inferExprType(bc.args[0]);
                 if (self.type_reg.couldBeARC(arg_type)) {
-                    var args = [_]ir.NodeIndex{arg};
-                    _ = try fb.emitCall("release", &args, false, TypeRegistry.VOID, bc.span);
+                    // Swift value witness destroy: use emitDestroyValue for all type categories.
+                    // release() only works for single managed pointers. Structs with ARC
+                    // fields need recursive field-by-field destroy.
+                    try self.emitDestroyValue(fb, arg, arg_type, bc.span);
                 }
                 return ir.null_node;
             },
