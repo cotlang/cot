@@ -392,6 +392,7 @@ pub const TypeKind = union(enum) {
     function: struct { params: []const NodeIndex, ret: NodeIndex },
     tuple: []const NodeIndex,
     generic_instance: GenericInstance,
+    existential: NodeIndex, // node pointing to trait name ident
 };
 pub const TryExpr = struct { operand: NodeIndex, span: Span };
 pub const AwaitExpr = struct { operand: NodeIndex, span: Span };

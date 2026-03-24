@@ -2820,6 +2820,28 @@ pub const Checker = struct {
                 self.err.errorWithCode(f.span.start, .e300, "cannot access field on this type");
                 return invalid_type;
             },
+            .existential => |exist| {
+                // Look up method in trait's method list, return func_type from first conformance.
+                // Strip 'self' parameter — existential dispatch handles receiver implicitly.
+                for (exist.method_names) |mn| {
+                    if (std.mem.eql(u8, mn, f.field)) {
+                        if (exist.conforming_types.len > 0) {
+                            if (self.lookupMethod(exist.conforming_types[0], f.field)) |m| {
+                                const ft = self.types.get(m.func_type);
+                                if (ft == .func and ft.func.params.len > 0) {
+                                    // Create new func type without self param
+                                    const new_params = ft.func.params[1..];
+                                    return try self.types.add(.{ .func = .{ .params = new_params, .return_type = ft.func.return_type } });
+                                }
+                                return m.func_type;
+                            }
+                        }
+                        return TypeRegistry.VOID;
+                    }
+                }
+                self.err.errorWithCode(f.span.start, .e300, "trait has no such method");
+                return invalid_type;
+            },
             else => {
                 self.err.errorWithCode(f.span.start, .e300, "cannot access field on this type");
                 return invalid_type;
@@ -3837,6 +3859,33 @@ pub const Checker = struct {
                 break :blk try self.types.makeTuple(elem_types.items);
             },
             .generic_instance => |gi| try self.resolveGenericInstance(gi, te.span),
+            .existential => |trait_node| blk: {
+                // Resolve trait name from the ident node
+                const trait_ident = self.tree.getNode(trait_node) orelse break :blk invalid_type;
+                const trait_expr = trait_ident.asExpr() orelse break :blk invalid_type;
+                const trait_name = if (trait_expr == .ident) trait_expr.ident.name else break :blk invalid_type;
+                // Look up trait definition
+                const trait_def = self.generics.trait_defs.get(trait_name) orelse {
+                    self.err.errorWithCode(te.span.start, .e301, try std.fmt.allocPrint(self.allocator, "undefined trait '{s}'", .{trait_name}));
+                    break :blk invalid_type;
+                };
+                // Collect conforming types from trait_impls ("Trait:Type" → trait)
+                var conforming = std.ArrayListUnmanaged([]const u8){};
+                var impl_it = self.generics.trait_impls.iterator();
+                while (impl_it.next()) |impl_entry| {
+                    if (std.mem.eql(u8, impl_entry.value_ptr.*, trait_name)) {
+                        const key = impl_entry.key_ptr.*;
+                        if (std.mem.indexOf(u8, key, ":")) |colon| {
+                            try conforming.append(self.allocator, key[colon + 1 ..]);
+                        }
+                    }
+                }
+                const exist_idx = try self.types.makeExistential(trait_name, trait_def.method_names);
+                // Update conforming_types on the existential type
+                var exist_type = &self.types.types.items[@intCast(exist_idx)];
+                exist_type.existential.conforming_types = try self.allocator.dupe([]const u8, conforming.items);
+                break :blk exist_idx;
+            },
         };
     }
 

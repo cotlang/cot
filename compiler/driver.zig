@@ -385,6 +385,7 @@ pub const Driver = struct {
         }
 
         try self.emitVWTWitnesses(&lowerer.builder, &type_reg);
+        try self.emitProtocolWitnessTables(&lowerer.builder, &generic_ctx);
 
         var ir_result = try lowerer.builder.getIR();
         defer ir_result.deinit();
@@ -432,6 +433,82 @@ pub const Driver = struct {
             vwt_emitted += 1;
         }
         if (vwt_emitted > 0) std.debug.print("VWT: {d} types emitted, {d} unique witnesses, total funcs: {d}\n", .{ vwt_emitted, gen.emitted.count(), builder.funcs.items.len });
+    }
+
+    /// Emit Protocol Witness Tables for each `impl Trait for Type` conformance.
+    /// Each PWT is a global array of function pointers, one per trait method.
+    /// Swift ref: GenProto.cpp emitWitnessTable()
+    fn emitProtocolWitnessTables(self: *Driver, builder: *ir_mod.Builder, generic_ctx: *checker_mod.SharedGenericContext) !void {
+        _ = self;
+        const Span = @import("frontend/source.zig").Span;
+        var pwt_count: usize = 0;
+
+        // Iterate all trait implementations: key="Trait:Type", value=trait_name
+        var it = generic_ctx.trait_impls.iterator();
+        while (it.next()) |entry| {
+            const impl_key = entry.key_ptr.*;
+            const trait_name = entry.value_ptr.*;
+
+            // Parse target type from impl_key "Trait:Type"
+            const colon_pos = std.mem.indexOf(u8, impl_key, ":") orelse continue;
+            const target_type = impl_key[colon_pos + 1 ..];
+
+            // Look up trait definition for method names
+            const trait_def = generic_ctx.trait_defs.get(trait_name) orelse continue;
+            const method_count = trait_def.method_names.len;
+            if (method_count == 0) continue;
+
+            // Global name: __pwt_{Trait}_{Type}
+            const pwt_name = try std.fmt.allocPrint(builder.allocator, "__pwt_{s}_{s}", .{ trait_name, target_type });
+
+            // Skip if already emitted (multi-file builds)
+            if (builder.lookupGlobal(pwt_name) != null) continue;
+
+            // Allocate global: method_count * 8 bytes (one function pointer per method)
+            const pwt_size: u32 = @intCast(method_count * 8);
+            try builder.addGlobal(ir_mod.Global.initWithSize(pwt_name, types_mod.TypeRegistry.I64, false, Span.zero, pwt_size));
+
+            // Emit init function: __pwt_init_{Trait}_{Type}
+            const init_name = try std.fmt.allocPrint(builder.allocator, "__pwt_init_{s}_{s}", .{ trait_name, target_type });
+            builder.startFunc(init_name, types_mod.TypeRegistry.VOID, types_mod.TypeRegistry.VOID, Span.zero);
+            if (builder.func()) |fb| {
+                const pwt_info = builder.lookupGlobal(pwt_name) orelse continue;
+                const pwt_addr = try fb.emitAddrGlobal(pwt_info.idx, pwt_name, types_mod.TypeRegistry.I64, Span.zero);
+
+                // Store function pointers for each trait method
+                for (trait_def.method_names, 0..) |method_name, i| {
+                    // Concrete method name: "{Type}_{method}" (e.g., "Dog_speak")
+                    // May be module-qualified: "{module}.{Type}_{method}"
+                    const bare_fn = try std.fmt.allocPrint(builder.allocator, "{s}_{s}", .{ target_type, method_name });
+                    // Search builder for the actual function name (may be module-qualified)
+                    const concrete_fn = if (builder.hasFunc(bare_fn))
+                        bare_fn
+                    else blk: {
+                        // Search all functions for a suffix match
+                        var found_name: []const u8 = bare_fn;
+                        for (builder.funcs.items) |func| {
+                            if (std.mem.endsWith(u8, func.name, bare_fn)) {
+                                // Verify it ends with ".{bare_fn}" (module-qualified)
+                                if (func.name.len > bare_fn.len and func.name[func.name.len - bare_fn.len - 1] == '.') {
+                                    found_name = func.name;
+                                    break;
+                                }
+                            }
+                        }
+                        break :blk found_name;
+                    };
+                    const fn_addr = try fb.emitFuncAddr(concrete_fn, types_mod.TypeRegistry.I64, Span.zero);
+                    const offset = try fb.emitConstInt(@intCast(i * 8), types_mod.TypeRegistry.I64, Span.zero);
+                    const slot_addr = try fb.emitBinary(.add, pwt_addr, offset, types_mod.TypeRegistry.I64, Span.zero);
+                    _ = try fb.emitPtrStoreValue(slot_addr, fn_addr, Span.zero);
+                }
+
+                _ = try fb.emitRet(null, Span.zero);
+            }
+            try builder.endFunc();
+            pwt_count += 1;
+        }
+        if (pwt_count > 0) std.debug.print("PWT: {d} conformances emitted\n", .{pwt_count});
     }
 
     /// Compile a source file (supports imports).
@@ -759,6 +836,7 @@ pub const Driver = struct {
         }
 
         try self.emitVWTWitnesses(&shared_builder, &type_reg);
+        try self.emitProtocolWitnessTables(&shared_builder, &generic_ctx);
 
         var final_ir = try shared_builder.getIR();
         defer final_ir.deinit();

@@ -854,6 +854,17 @@ pub const Parser = struct {
             return try self.parseBuiltinCall(start);
         }
 
+        // any Trait — existential type (Swift OpaqueExistentialContainer)
+        if (self.match(.kw_any)) {
+            if (self.check(.ident)) {
+                const trait_name = self.tok.text;
+                self.advance();
+                const named = try self.tree.addExpr(.{ .ident = .{ .name = trait_name, .span = Span.init(start, self.pos()) } });
+                return try self.tree.addExpr(.{ .type_expr = .{ .kind = .{ .existential = named }, .span = Span.init(start, self.pos()) } });
+            }
+            return null;
+        }
+
         if (self.check(.ident) or self.tok.tok.isTypeKeyword()) {
             var type_name = if (self.tok.text.len > 0) self.tok.text else self.tok.tok.string();
             self.advance();

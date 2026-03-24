@@ -475,6 +475,7 @@ const TokenCollector = struct {
             .tuple => |elems| {
                 for (elems) |e| self.walkNode(e);
             },
+            .existential => |inner| self.walkNode(inner),
         }
     }
 

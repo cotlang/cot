@@ -74,6 +74,16 @@ pub const ListType = struct { elem: TypeIndex };
 pub const TupleType = struct { element_types: []const TypeIndex };
 pub const FutureType = struct { result_type: TypeIndex };
 pub const DistinctType = struct { name: []const u8, underlying: TypeIndex };
+/// Swift OpaqueExistentialContainer: 40 bytes = 3-word buffer + metadata ptr + witness table ptr.
+/// Holds any value conforming to a trait, with VWT-based lifecycle and indirect method dispatch.
+pub const ExistentialType = struct {
+    trait_name: []const u8,
+    method_names: []const []const u8,
+    method_count: u32,
+    /// Type names that conform to this trait (populated during checking).
+    /// Used by isAssignable to allow implicit coercion: Dog → any Animal.
+    conforming_types: []const []const u8 = &.{},
+};
 
 // Aggregate types
 pub const StructField = struct {
@@ -117,6 +127,7 @@ pub const Type = union(enum) {
     func: FuncType,
     future: FutureType,
     distinct: DistinctType,
+    existential: ExistentialType,
 
     pub fn underlying(self: Type) Type { return self; }
     pub fn isInvalid(self: Type) bool { return self == .basic and self.basic == .invalid; }
@@ -316,6 +327,7 @@ pub const TypeRegistry = struct {
             .future => "Future",
             .func => "function",
             .distinct => |d| d.name,
+            .existential => |e| e.trait_name,
         };
     }
 
@@ -410,6 +422,19 @@ pub const TypeRegistry = struct {
         return self.add(.{ .tuple = .{ .element_types = try self.allocator.dupe(TypeIndex, element_types) } });
     }
 
+    pub fn makeExistential(self: *TypeRegistry, trait_name: []const u8, method_names: []const []const u8) !TypeIndex {
+        // Dedup: scan for existing existential with same trait name
+        for (self.types.items, 0..) |t, i| {
+            if (t == .existential and std.mem.eql(u8, t.existential.trait_name, trait_name))
+                return @intCast(i);
+        }
+        return self.add(.{ .existential = .{
+            .trait_name = trait_name,
+            .method_names = try self.allocator.dupe([]const u8, method_names),
+            .method_count = @intCast(method_names.len),
+        } });
+    }
+
     /// Returns the byte offset of element `index` within a tuple.
     pub fn tupleElementOffset(self: *const TypeRegistry, tuple_idx: TypeIndex, index: u32) u32 {
         const tup = self.get(tuple_idx).tuple;
@@ -481,13 +506,14 @@ pub const TypeRegistry = struct {
                 break :blk 8 + payload_aligned;
             },
             .distinct => |d| self.sizeOf(d.underlying),
+            .existential => 40, // 3-word buffer (24) + metadata ptr (8) + witness table ptr (8)
         };
     }
 
     pub fn alignmentOf(self: *const TypeRegistry, idx: TypeIndex) u32 {
         return switch (self.get(idx)) {
             .basic => |k| if (k.size() == 0) 1 else k.size(),
-            .pointer, .func, .optional, .error_union, .error_set, .slice, .map, .list, .union_type, .tuple, .future => 8,
+            .pointer, .func, .optional, .error_union, .error_set, .slice, .map, .list, .union_type, .tuple, .future, .existential => 8,
             .array => |a| self.alignmentOf(a.elem),
             .struct_type => |s| s.alignment,
             .enum_type => |e| self.alignmentOf(e.backing_type),
@@ -561,6 +587,8 @@ pub const TypeRegistry = struct {
             },
             // Distinct types inherit triviality from their underlying type
             .distinct => |d| self.isTrivial(d.underlying),
+            // Existentials are non-trivial (contain VWT-managed value)
+            .existential => false,
         };
     }
 
@@ -612,6 +640,8 @@ pub const TypeRegistry = struct {
         if (t == .slice) return self.couldBeARC(t.slice.elem);
         // Distinct: check underlying
         if (t == .distinct) return self.couldBeARC(t.distinct.underlying);
+        // Existentials contain VWT-managed values (always non-trivial)
+        if (t == .existential) return true;
         return false;
     }
 
@@ -704,6 +734,7 @@ pub const TypeRegistry = struct {
             .func => false,
             .future => |fa| self.equal(fa.result_type, tb.future.result_type),
             .distinct => |da| std.mem.eql(u8, da.name, tb.distinct.name),
+            .existential => |ea| std.mem.eql(u8, ea.trait_name, tb.existential.trait_name),
         };
     }
 
@@ -790,6 +821,22 @@ pub const TypeRegistry = struct {
                 if (!self.isAssignable(fe, te)) return false;
             }
             return true;
+        }
+
+        // Existential coercion: ConcreteType → any Trait (if ConcreteType implements Trait)
+        if (to_t == .existential) {
+            const from_name = self.typeName(from);
+            for (to_t.existential.conforming_types) |conforming| {
+                if (std.mem.eql(u8, from_name, conforming)) return true;
+            }
+            // Also allow pointer-to-conforming: *Dog → any Animal
+            if (from_t == .pointer) {
+                const elem_name = self.typeName(from_t.pointer.elem);
+                for (to_t.existential.conforming_types) |conforming| {
+                    if (std.mem.eql(u8, elem_name, conforming)) return true;
+                }
+            }
+            return false;
         }
 
         // Function types

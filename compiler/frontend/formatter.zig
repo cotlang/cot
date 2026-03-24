@@ -1057,6 +1057,10 @@ pub const Formatter = struct {
                 self.printNode(info.value);
                 self.write(")") catch {};
             },
+            .existential => |inner| {
+                self.write("any ") catch {};
+                self.printNode(inner);
+            },
         }
     }
 

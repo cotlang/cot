@@ -2477,8 +2477,14 @@ pub const Lowerer = struct {
                         }
                     } else {
                         // Non-ARC path (trivial types, weak, unowned)
-                        const value_node = try self.lowerExprNode(var_stmt.value);
+                        var value_node = try self.lowerExprNode(var_stmt.value);
                         if (value_node == ir.null_node) return;
+                        // Existential coercion: concrete → any Trait
+                        const type_info_check = self.type_reg.get(type_idx);
+                        if (type_info_check == .existential) {
+                            const val_type = self.inferExprType(var_stmt.value);
+                            value_node = try self.emitExistentialErasure(fb, value_node, val_type, type_idx, var_stmt.span);
+                        }
                         _ = try fb.emitStoreLocal(local_idx, value_node, var_stmt.span);
 
                         if (!self.target.isWasm() and var_stmt.is_weak and self.type_reg.couldBeARC(type_idx)) {
@@ -4591,6 +4597,145 @@ pub const Lowerer = struct {
     //   LoadableStructTypeLowering — recursive field copy/destroy
     //   LoadableEnumTypeLowering — tag-based conditional copy/destroy
     // ========================================================================
+
+    /// Emit method call on existential value via PWT indirect dispatch.
+    /// Swift GenExistential.cpp:emitWitnessMethodRef() + emitApply()
+    /// Container layout: [buffer 24B][metadata_ptr 8B][pwt_ptr 8B]
+    fn lowerExistentialMethodCall(self: *Lowerer, call: ast.Call, fa: ast.FieldAccess, exist: types.ExistentialType) !ir.NodeIndex {
+        const fb = self.current_func orelse return ir.null_node;
+        const method_name = fa.field;
+
+        // Find method index in trait's method list
+        var method_idx: ?usize = null;
+        for (exist.method_names, 0..) |mn, i| {
+            if (std.mem.eql(u8, mn, method_name)) { method_idx = i; break; }
+        }
+        if (method_idx == null) return ir.null_node;
+
+        // Lower the existential value (the receiver)
+        const exist_val = try self.lowerExprNode(fa.base);
+        if (exist_val == ir.null_node) return ir.null_node;
+
+        // Store existential to temp to access by address
+        const exist_tmp = try fb.addLocalWithSize("__exist_recv", TypeRegistry.I64, false, 40);
+        _ = try fb.emitStoreLocal(exist_tmp, exist_val, call.span);
+        const exist_addr = try fb.emitAddrLocal(exist_tmp, TypeRegistry.I64, call.span);
+
+        // Load PWT pointer from container offset 32
+        const pwt_offset = try fb.emitConstInt(32, TypeRegistry.I64, call.span);
+        const pwt_addr = try fb.emitBinary(.add, exist_addr, pwt_offset, TypeRegistry.I64, call.span);
+        const pwt_ptr = try fb.emitPtrLoadValue(pwt_addr, TypeRegistry.I64, call.span);
+
+        // Load method function pointer from PWT[method_idx * 8]
+        const fn_offset = try fb.emitConstInt(@intCast(method_idx.? * 8), TypeRegistry.I64, call.span);
+        const fn_addr = try fb.emitBinary(.add, pwt_ptr, fn_offset, TypeRegistry.I64, call.span);
+        const fn_ptr = try fb.emitPtrLoadValue(fn_addr, TypeRegistry.I64, call.span);
+
+        // Project value pointer: buffer at offset 0
+        // (inline storage — value starts at container base)
+        const value_ptr = exist_addr;
+
+        // Build args: [self_ptr, ...user_args]
+        var args = std.ArrayListUnmanaged(ir.NodeIndex){};
+        defer args.deinit(self.allocator);
+        try args.append(self.allocator, value_ptr);
+        for (call.args) |arg_idx| {
+            const arg_val = try self.lowerExprNode(arg_idx);
+            try args.append(self.allocator, arg_val);
+        }
+
+        // Determine return type from trait method signature
+        // For now: look up the first conforming type's method to get the return type
+        var return_type = TypeRegistry.VOID;
+        if (exist.conforming_types.len > 0) {
+            const first_type = exist.conforming_types[0];
+            const concrete_method = try std.fmt.allocPrint(self.allocator, "{s}_{s}", .{ first_type, method_name });
+            if (self.chk.lookupMethod(first_type, method_name)) |mi| {
+                const ft = self.type_reg.get(mi.func_type);
+                if (ft == .func) return_type = ft.func.return_type;
+            }
+            _ = concrete_method;
+        }
+
+        // Emit indirect call through function pointer
+        return try fb.emitCallIndirect(fn_ptr, args.items, return_type, call.span);
+    }
+
+    /// Emit existential container construction: concrete value → any Trait.
+    /// Swift GenExistential.cpp:emitExistentialErasure()
+    /// Container layout: [buffer 24B][metadata_ptr 8B][pwt_ptr 8B] = 40 bytes.
+    fn emitExistentialErasure(self: *Lowerer, fb: *ir.FuncBuilder, value: ir.NodeIndex, concrete_type: TypeIndex, existential_type: TypeIndex, span: Span) !ir.NodeIndex {
+        const exist_info = self.type_reg.get(existential_type);
+        if (exist_info != .existential) return value;
+        const concrete_name = self.type_reg.typeName(concrete_type);
+
+        // Allocate 40-byte container on stack
+        const container = try fb.addLocalWithSize("__exist_container", existential_type, false, 40);
+        const container_addr = try fb.emitAddrLocal(container, TypeRegistry.I64, span);
+
+        // Store value in buffer (bytes 0-23)
+        // For now: inline storage only (most Cot types ≤ 24 bytes)
+        const val_size = self.type_reg.sizeOf(concrete_type);
+        const val_tmp = try fb.addLocalWithSize("__exist_val", concrete_type, false, val_size);
+        _ = try fb.emitStoreLocal(val_tmp, value, span);
+        const val_addr = try fb.emitAddrLocal(val_tmp, TypeRegistry.I64, span);
+        const size_const = try fb.emitConstInt(@intCast(if (val_size > 24) 8 else val_size), TypeRegistry.I64, span);
+        var memcpy_args = [_]ir.NodeIndex{ container_addr, val_addr, size_const };
+        _ = try fb.emitCall("memcpy", &memcpy_args, false, TypeRegistry.VOID, span);
+
+        // Store TypeMetadata pointer at offset 24
+        const meta_global = try std.fmt.allocPrint(self.allocator, "__type_metadata_{s}", .{concrete_name});
+        const metadata = if (self.builder.lookupGlobal(meta_global)) |gi|
+            try fb.emitAddrGlobal(gi.idx, meta_global, TypeRegistry.I64, span)
+        else
+            try fb.emitConstInt(0, TypeRegistry.I64, span);
+        const meta_offset = try fb.emitConstInt(24, TypeRegistry.I64, span);
+        const meta_addr = try fb.emitBinary(.add, container_addr, meta_offset, TypeRegistry.I64, span);
+        _ = try fb.emitPtrStoreValue(meta_addr, metadata, span);
+
+        // Store PWT at offset 32: allocate inline PWT with concrete method function pointers.
+        // PWT layout: [fn_ptr_0][fn_ptr_1]... one per trait method.
+        const method_count = exist_info.existential.method_count;
+        const pwt_size_val: u32 = method_count * 8;
+        if (pwt_size_val > 0) {
+            // Allocate PWT buffer
+            const pwt_buf_size = try fb.emitConstInt(@intCast(pwt_size_val), TypeRegistry.I64, span);
+            const zero_tag = try fb.emitConstInt(0, TypeRegistry.I64, span);
+            var alloc_args = [_]ir.NodeIndex{ zero_tag, pwt_buf_size };
+            const pwt_buf = try fb.emitCall("alloc", &alloc_args, false, TypeRegistry.I64, span);
+
+            // Fill PWT with concrete method function pointers
+            for (exist_info.existential.method_names, 0..) |method_name, i| {
+                const method_fn_name = try std.fmt.allocPrint(self.allocator, "{s}_{s}", .{ concrete_name, method_name });
+                // Try qualified name if unqualified not found
+                const resolved_fn = if (self.builder.hasFunc(method_fn_name))
+                    method_fn_name
+                else blk: {
+                    var found: []const u8 = method_fn_name;
+                    for (self.builder.funcs.items) |func| {
+                        if (std.mem.endsWith(u8, func.name, method_fn_name)) {
+                            if (func.name.len > method_fn_name.len and func.name[func.name.len - method_fn_name.len - 1] == '.') {
+                                found = func.name;
+                                break;
+                            }
+                        }
+                    }
+                    break :blk found;
+                };
+                const fn_addr_val = try fb.emitFuncAddr(resolved_fn, TypeRegistry.I64, span);
+                const slot_offset = try fb.emitConstInt(@intCast(i * 8), TypeRegistry.I64, span);
+                const slot_addr = try fb.emitBinary(.add, pwt_buf, slot_offset, TypeRegistry.I64, span);
+                _ = try fb.emitPtrStoreValue(slot_addr, fn_addr_val, span);
+            }
+
+            // Store PWT buffer pointer at container offset 32
+            const pwt_offset = try fb.emitConstInt(32, TypeRegistry.I64, span);
+            const pwt_dest = try fb.emitBinary(.add, container_addr, pwt_offset, TypeRegistry.I64, span);
+            _ = try fb.emitPtrStoreValue(pwt_dest, pwt_buf, span);
+        }
+
+        return try fb.emitLoadLocal(container, existential_type, span);
+    }
 
     /// Emit a type-appropriate copy (retain) for a value.
     /// Swift TypeLowering::emitCopyValue (TypeLowering.cpp:1388-1394).
@@ -8785,6 +8930,11 @@ pub const Lowerer = struct {
                     .slice => if (base_type_idx == TypeRegistry.STRING) "string" else null,
                     else => null,
                 };
+                // Existential method dispatch: load fn_ptr from PWT, call indirectly
+                if (base_type == .existential) {
+                    return try self.lowerExistentialMethodCall(call, fa, base_type.existential);
+                }
+
                 if (type_name) |name| {
                     if (self.chk.lookupMethod(name, fa.field)) |method_info| {
                         return try self.lowerMethodCall(call, fa, method_info, name);
