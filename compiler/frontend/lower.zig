@@ -9337,10 +9337,7 @@ pub const Lowerer = struct {
         // Compute base name: "List(5)_append" → "List_append"
         const base_name = try self.computeGenericBaseName(inst_info.concrete_name);
 
-        // If already lowered under the base name, skip
-        if (self.builder.hasFunc(base_name)) return;
-
-        // Swap to defining file's AST
+        // Swap to defining file's AST (needed for both base lowering and wrapper-only path)
         const saved_tree = self.tree;
         const saved_chk_tree = self.chk.tree;
         const saved_safe_mode = self.chk.safe_mode;
@@ -9369,6 +9366,18 @@ pub const Lowerer = struct {
             if (i < inst_info.type_args.len) {
                 try sub_map.put(param_name, inst_info.type_args[i]);
             }
+        }
+
+        // If base already lowered, just emit the concrete wrapper and return.
+        // Each concrete instantiation (List(5)_append, List(6)_append) needs its own
+        // wrapper that passes the appropriate TypeMetadata, but they share the base.
+        if (self.builder.hasFunc(base_name)) {
+            if (!self.builder.hasFunc(inst_info.concrete_name)) {
+                self.type_substitution = sub_map;
+                defer self.type_substitution = null;
+                try self.emitVWTWrapper(inst_info, base_name, f);
+            }
+            return;
         }
 
         // Use preserved expr_types from checker
