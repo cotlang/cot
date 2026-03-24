@@ -560,6 +560,61 @@ test "existential copy" {
 
 ---
 
+## Implementation Status (2026-03-25)
+
+### Completed (Phases 1-4):
+
+| Component | Status | Swift Reference | Proof |
+|-----------|--------|-----------------|-------|
+| ExistentialType struct | DONE | ExistentialContainer.h | 40B = 5 words, fields match Swift |
+| `any Trait` parsing | DONE | Type expression for `any Protocol` | kw_any + TYPE_EXISTENTIAL |
+| Type resolution | DONE | Protocol type lookup | trait_defs + conforming_types |
+| sizeOf = 40 | DONE | OpaqueExistentialContainer | 24 buffer + 8 metadata + 8 PWT |
+| isTrivial = false | DONE | TypeLowering | Non-trivial (contains VWT value) |
+| couldBeARC = true | DONE | TypeLowering | Contains reference-managed values |
+| isAssignable coercion | DONE | Implicit coercion Dog → any Animal | conforming_types check |
+| SSA large-type (13 sites) | DONE | GenOpaque.cpp | Address-based access for >8B |
+| Container construction | DONE | GenExistential.cpp emitExistentialErasure | memcpy buffer + metadata@24 + PWT@32 |
+| Inline PWT allocation | DONE | GenProto.cpp emitWitnessTable | alloc + func_addr per method |
+| Method dispatch | DONE | GenProto.cpp emitWitnessMethodRef | PWT[idx*8] → call_indirect |
+| Self-stripping in checker | DONE | Protocol method signatures | Remove self param for caller |
+| resolveTypeNode | DONE | — | Existential case added to lowerer |
+| Native dispatch | WORKING | — | `a.age()` returns 7 correctly |
+
+### Known Bugs:
+
+1. **Wasm multi-method PWT ordering** — `first()` returns `second()`'s value on wasm. The PWT entries are correct in memory but `func_table_indices` may map function names to wrong table indices. Single-method traits work on both native and wasm.
+
+2. **Out-of-line storage incomplete** — `emitExistentialErasure` line 4688 copies only 8 bytes for types > 24B. Should allocate box and store box pointer. Currently all Cot types used with existentials are ≤ 24 bytes so this doesn't trigger in practice.
+
+3. **Global PWT init not called** — `emitProtocolWitnessTables` in driver.zig emits `__pwt_init_{Trait}_{Type}` functions but they are never registered in `__cot_init_globals`. The inline PWT in `emitExistentialErasure` works as a fallback, but the global approach is dead code.
+
+### Not Yet Implemented:
+
+| Feature | Phase | Depends on |
+|---------|-------|------------|
+| Existential reassignment (`a = c`) | 3 | Assignment coercion in lowerer |
+| Function parameter coercion | 3 | Call argument coercion in lowerer |
+| Existential ARC lifecycle | 5 | VWT dispatch for containers |
+| Dynamic casting (`as?`, `is`) | 6 | Metadata type_idx check |
+| Self-hosted port | 7 | All above |
+| Real metadata at generic call sites | 8 | Existential infrastructure |
+
+### Audit Proof: Swift 1:1 Mapping
+
+| Cot Code | Swift Reference | Match |
+|----------|-----------------|-------|
+| Container 40B layout | OpaqueExistentialContainer (5 words) | ✓ Exact |
+| Buffer offset 0 | GenExistential.cpp projectValue() CreateStructGEP(0) | ✓ Exact |
+| Metadata offset 24 | GenExistential.cpp projectMetadataRef() offset=getFixedBufferSize() | ✓ Exact |
+| PWT offset 32 | GenExistential.cpp projectWitnessTable() offset=24+8 | ✓ Exact |
+| PWT method order | GenProto.cpp emitWitnessTable() trait declaration order | ✓ Exact |
+| Address-based access | GenExistential.cpp CreateStructGEP pattern | ✓ Exact (SSA large-type) |
+| Method dispatch | GenProto.cpp emitWitnessMethodRef() → indirect call | ✓ Exact |
+| Self as buffer ptr | GenExistential.cpp projectValue() → address | ✓ Exact |
+
+---
+
 ## Risk Notes
 
 1. **Inline vs boxed storage** — Most Cot types are ≤24 bytes (int, string, pointers, small structs). Boxed path only needed for large structs. Start with inline-only, add boxing when needed.
