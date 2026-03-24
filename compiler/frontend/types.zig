@@ -895,8 +895,207 @@ pub const Shape = struct {
 };
 
 // ============================================================================
+// Value Witness Table: Swift-style ARC dispatch for generics
+// ============================================================================
+// Reference: apple/swift include/swift/ABI/ValueWitnessTable.h
+//            apple/swift include/swift/ABI/ValueWitness.def
+//            apple/swift include/swift/ABI/MetadataValues.h
+//
+// Every concrete type gets a VWT containing function pointers for copy, destroy,
+// and type layout info. Generic functions receive *TypeMetadata (which points to
+// the VWT) as a hidden parameter, enabling one function body for all T.
+
+/// ValueWitnessFlags — Swift MetadataValues.h TargetValueWitnessFlags.
+/// Alignment is packed into bits 0-7 as (alignment - 1).
+/// All "IsNon*" flags use negative polarity: bit SET means NOT the property.
+pub const ValueWitnessFlags = struct {
+    data: u32,
+
+    // Flag bit constants — Swift MetadataValues.h
+    pub const AlignmentMask: u32 = 0x000000FF; // bits 0-7: alignment - 1
+    pub const IsNonPOD: u32 = 0x00010000; // bit 16: NOT plain-old-data
+    pub const IsNonInline: u32 = 0x00020000; // bit 17: does NOT fit in 3-word inline buffer
+    pub const IsNonBitwiseTakable: u32 = 0x00100000; // bit 20: NOT bitwise-takable
+    pub const HasEnumWitnesses: u32 = 0x00200000; // bit 21: VWT has enum witness extension
+
+    pub fn init(alignment: u32, is_pod: bool, is_inline: bool, is_bitwise_takable: bool, has_enum_witnesses: bool) ValueWitnessFlags {
+        var d: u32 = (alignment - 1) & AlignmentMask;
+        if (!is_pod) d |= IsNonPOD;
+        if (!is_inline) d |= IsNonInline;
+        if (!is_bitwise_takable) d |= IsNonBitwiseTakable;
+        if (has_enum_witnesses) d |= HasEnumWitnesses;
+        return .{ .data = d };
+    }
+
+    pub fn getAlignment(self: ValueWitnessFlags) u32 {
+        return (self.data & AlignmentMask) + 1;
+    }
+    pub fn isPOD(self: ValueWitnessFlags) bool {
+        return (self.data & IsNonPOD) == 0;
+    }
+    pub fn isInlineStorage(self: ValueWitnessFlags) bool {
+        return (self.data & IsNonInline) == 0;
+    }
+    pub fn isBitwiseTakable(self: ValueWitnessFlags) bool {
+        return (self.data & IsNonBitwiseTakable) == 0;
+    }
+    pub fn hasEnumWitnesses(self: ValueWitnessFlags) bool {
+        return (self.data & HasEnumWitnesses) != 0;
+    }
+};
+
+/// Witness function pointer types.
+/// All take *const TypeMetadata as final parameter (Swift ABI convention).
+/// OpaqueValue* = *anyopaque in Zig; ValueBuffer* = *[3]usize for inline storage.
+pub const WitnessFn = struct {
+    /// dest_buffer, src_buffer, metadata → returns pointer into dest buffer
+    pub const InitializeBufferWithCopyOfBuffer = *const fn (*[3]usize, *[3]usize, *const TypeMetadata) callconv(.c) *anyopaque;
+    /// object, metadata → void
+    pub const Destroy = *const fn (*anyopaque, *const TypeMetadata) callconv(.c) void;
+    /// dest, src, metadata → dest
+    pub const InitializeWithCopy = *const fn (*anyopaque, *anyopaque, *const TypeMetadata) callconv(.c) *anyopaque;
+    /// dest (valid), src, metadata → dest
+    pub const AssignWithCopy = *const fn (*anyopaque, *anyopaque, *const TypeMetadata) callconv(.c) *anyopaque;
+    /// dest, src (invalidated), metadata → dest
+    pub const InitializeWithTake = *const fn (*anyopaque, *anyopaque, *const TypeMetadata) callconv(.c) *anyopaque;
+    /// dest (valid), src (invalidated), metadata → dest
+    pub const AssignWithTake = *const fn (*anyopaque, *anyopaque, *const TypeMetadata) callconv(.c) *anyopaque;
+    /// value, emptyCases, metadata → tag index
+    pub const GetEnumTagSinglePayload = *const fn (*const anyopaque, u32, *const TypeMetadata) callconv(.c) u32;
+    /// value, whichCase, emptyCases, metadata → void
+    pub const StoreEnumTagSinglePayload = *const fn (*anyopaque, u32, u32, *const TypeMetadata) callconv(.c) void;
+    /// obj, metadata → tag index
+    pub const GetEnumTag = *const fn (*const anyopaque, *const TypeMetadata) callconv(.c) u32;
+    /// obj, metadata → void (strips tag, exposes raw payload)
+    pub const DestructiveProjectEnumData = *const fn (*anyopaque, *const TypeMetadata) callconv(.c) void;
+    /// obj, tag, metadata → void (writes tag into payload)
+    pub const DestructiveInjectEnumTag = *const fn (*anyopaque, u32, *const TypeMetadata) callconv(.c) void;
+};
+
+/// ValueWitnessTable — Swift ABI, 88 bytes on 64-bit (base) or 112 bytes (with enum witnesses).
+/// Reference: apple/swift include/swift/ABI/ValueWitnessTable.h
+///
+/// Memory layout matches Swift exactly:
+///   0x00-0x3F: 8 required function pointers
+///   0x40-0x47: size (u64)
+///   0x48-0x4F: stride (u64)
+///   0x50-0x53: flags (ValueWitnessFlags, u32)
+///   0x54-0x57: extraInhabitantCount (u32)
+///   0x58-0x6F: 3 conditional enum witnesses (only if HasEnumWitnesses flag set)
+pub const ValueWitnessTable = struct {
+    // --- 8 required function witnesses ---
+    initializeBufferWithCopyOfBuffer: WitnessFn.InitializeBufferWithCopyOfBuffer,
+    destroy: WitnessFn.Destroy,
+    initializeWithCopy: WitnessFn.InitializeWithCopy,
+    assignWithCopy: WitnessFn.AssignWithCopy,
+    initializeWithTake: WitnessFn.InitializeWithTake,
+    assignWithTake: WitnessFn.AssignWithTake,
+    getEnumTagSinglePayload: WitnessFn.GetEnumTagSinglePayload,
+    storeEnumTagSinglePayload: WitnessFn.StoreEnumTagSinglePayload,
+
+    // --- 4 required data witnesses ---
+    size: u64, // sizeof(T) — StoredSize, platform-native
+    stride: u64, // aligned size for arrays (size rounded up to alignment)
+    flags: ValueWitnessFlags, // alignment + POD/inline/bitwiseTakable/enumWitnesses
+    extraInhabitantCount: u32, // extra inhabitants for Optional optimization
+
+    // --- 3 conditional enum witnesses (present only when flags.hasEnumWitnesses()) ---
+    // These are stored AFTER the base VWT in EnumValueWitnessTable.
+    // Access via EnumValueWitnessTable when hasEnumWitnesses() is true.
+
+    /// Swift's 3-word inline buffer size (24 bytes on 64-bit).
+    /// Values that fit inline are stored directly; larger values are heap-boxed.
+    pub const NumWords_ValueBuffer: usize = 3;
+    pub const ValueBufferSize: usize = NumWords_ValueBuffer * @sizeOf(usize); // 24 on 64-bit
+
+    /// Swift's canBeInline: value fits in the 3-word ValueBuffer.
+    pub fn canBeInline(is_bitwise_takable: bool, size: u64, alignment: u64) bool {
+        return is_bitwise_takable and size <= ValueBufferSize and alignment <= @alignOf(usize);
+    }
+
+    /// Check if this VWT is for a POD type (no copy/destroy needed).
+    pub fn isPOD(self: *const ValueWitnessTable) bool {
+        return self.flags.isPOD();
+    }
+};
+
+/// EnumValueWitnessTable — extends base VWT with 3 enum-specific witnesses.
+/// Reference: apple/swift TargetEnumValueWitnessTable
+/// Total: 112 bytes on 64-bit.
+pub const EnumValueWitnessTable = struct {
+    base: ValueWitnessTable,
+    getEnumTag: WitnessFn.GetEnumTag,
+    destructiveProjectEnumData: WitnessFn.DestructiveProjectEnumData,
+    destructiveInjectEnumTag: WitnessFn.DestructiveInjectEnumTag,
+};
+
+/// TypeMetadataKind — what type of type this metadata describes.
+/// Reference: apple/swift include/swift/ABI/MetadataKind.def
+pub const TypeMetadataKind = enum(u64) {
+    struct_type = 0x200, // StructMetadata
+    enum_type = 0x201, // EnumMetadata
+    optional_type = 0x202, // OptionalMetadata (single-payload enum)
+    tuple_type = 0x301, // TupleMetadata
+    function_type = 0x302, // FunctionMetadata
+    // Cot-specific:
+    list_type = 0x400, // List(T) collection
+    map_type = 0x401, // Map(K,V) collection
+};
+
+/// TypeMetadata — per-type metadata with VWT pointer.
+/// Reference: apple/swift include/swift/ABI/Metadata.h
+///
+/// Memory layout (Swift convention):
+///   [metadata - 8]: pointer to ValueWitnessTable (the "header")
+///   [metadata + 0]: kind (TypeMetadataKind)
+///   [metadata + 8]: type-specific fields...
+///
+/// Generic functions receive *TypeMetadata as a hidden parameter.
+/// They access the VWT via: metadata.vwt (at offset -1 in Swift, stored as field in Cot).
+pub const TypeMetadata = struct {
+    /// Pointer to this type's ValueWitnessTable.
+    /// In Swift, this is at offset -1 (one pointer before the metadata address).
+    /// In Cot, we store it as an explicit field for simplicity.
+    vwt: *const ValueWitnessTable,
+    /// What kind of type this metadata describes.
+    kind: TypeMetadataKind,
+    /// Type index in the TypeRegistry (Cot-specific, for type-specific operations).
+    type_idx: TypeIndex,
+};
+
+// ============================================================================
 // Tests
 // ============================================================================
+
+test "ValueWitnessTable layout matches Swift ABI" {
+    // Swift VWT base: 88 bytes on 64-bit (8 fn ptrs × 8 + 2 × u64 + u32 + u32)
+    try std.testing.expectEqual(@as(usize, 88), @sizeOf(ValueWitnessTable));
+    // Swift EnumVWT: 112 bytes (88 + 3 fn ptrs × 8)
+    try std.testing.expectEqual(@as(usize, 112), @sizeOf(EnumValueWitnessTable));
+    // TypeMetadata: vwt pointer + kind + type_idx
+    try std.testing.expectEqual(@as(usize, 24), @sizeOf(TypeMetadata));
+    // ValueBuffer: 3 words = 24 bytes
+    try std.testing.expectEqual(@as(usize, 24), ValueWitnessTable.ValueBufferSize);
+}
+
+test "ValueWitnessFlags packing" {
+    // Alignment 8 → stored as 7 (alignment - 1)
+    const f = ValueWitnessFlags.init(8, true, true, true, false);
+    try std.testing.expectEqual(@as(u32, 7), f.data);
+    try std.testing.expectEqual(@as(u32, 8), f.getAlignment());
+    try std.testing.expect(f.isPOD());
+    try std.testing.expect(f.isInlineStorage());
+    try std.testing.expect(f.isBitwiseTakable());
+    try std.testing.expect(!f.hasEnumWitnesses());
+
+    // Non-POD, non-inline, with enum witnesses
+    const f2 = ValueWitnessFlags.init(16, false, false, true, true);
+    try std.testing.expectEqual(@as(u32, 16), f2.getAlignment());
+    try std.testing.expect(!f2.isPOD());
+    try std.testing.expect(!f2.isInlineStorage());
+    try std.testing.expect(f2.isBitwiseTakable());
+    try std.testing.expect(f2.hasEnumWitnesses());
+}
 
 test "BasicKind predicates" {
     try std.testing.expect(BasicKind.i32_type.isInteger());
