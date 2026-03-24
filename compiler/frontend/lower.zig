@@ -3137,6 +3137,15 @@ pub const Lowerer = struct {
         switch (target_expr) {
             .ident => |id| {
                 if (fb.lookupLocal(id.name)) |local_idx| {
+                    // Existential coercion: concrete → any Trait at assignment
+                    // Swift GenExistential.cpp emitExistentialErasure at store [assign] sites
+                    const local_type_ea = fb.locals.items[local_idx].type_idx;
+                    if (self.type_reg.get(local_type_ea) == .existential) {
+                        const val_type = self.inferExprType(assign.value);
+                        const erased = try self.emitExistentialErasure(fb, value_node, val_type, local_type_ea, assign.span);
+                        _ = try fb.emitStoreLocal(local_idx, erased, assign.span);
+                        return;
+                    }
                     // ARC: Retain-before-release for local assignment.
                     // Swift SILGen pattern (SILLowerAggregateInstrs.cpp:75-96, TypeLowering.cpp:1213-1216):
                     //   load old → retain new → store new → release old
@@ -9335,6 +9344,18 @@ pub const Lowerer = struct {
                                 arg_node = try fb.emitLoadLocal(tmp, params[arg_i].type_idx, call.span);
                             }
                         }
+                    }
+                }
+            }
+
+            // Existential coercion: concrete → any Trait at call sites
+            // Swift GenExistential.cpp emitExistentialErasure at apply sites
+            if (param_types) |params| {
+                if (arg_i < params.len) {
+                    const param_exist_info = self.type_reg.get(params[arg_i].type_idx);
+                    if (param_exist_info == .existential) {
+                        const arg_type = self.inferExprType(arg_idx);
+                        arg_node = try self.emitExistentialErasure(fb, arg_node, arg_type, params[arg_i].type_idx, call.span);
                     }
                 }
             }
