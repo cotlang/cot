@@ -121,6 +121,11 @@ pub const GenericInstInfo = struct {
     /// overflow for complex files. Go's type checker fully resolves all types during checking;
     /// codegen just reads the results. Same pattern here.
     expr_types: ?std.AutoHashMap(NodeIndex, TypeIndex) = null,
+    /// Swift ResultConvention: true when return type is a generic type parameter (T).
+    /// Forces indirect return (SRET) regardless of concrete type size, ensuring
+    /// uniform calling convention across all instantiations.
+    /// Reference: swift/include/swift/AST/Types.h ResultConvention::Indirect
+    has_indirect_result: bool = false,
 };
 
 /// Info about a trait definition.
@@ -268,6 +273,26 @@ pub const Checker = struct {
             if (sym.kind == .type_name) return sym.type_idx;
         }
         return self.types.lookupByName(name);
+    }
+
+    /// Swift ResultConvention: check if an AST type node refers to a type parameter.
+    /// Used at type-checking time to determine indirect result convention.
+    /// Reference: swift/include/swift/AST/Types.h isIndirectFormalResult()
+    pub fn isTypeParamName(self: *const Checker, type_node: NodeIndex, type_param_names: []const []const u8) bool {
+        const node = self.tree.getNode(type_node) orelse return false;
+        const expr = node.asExpr() orelse return false;
+        const name = switch (expr) {
+            .ident => |id| id.name,
+            .type_expr => |te| switch (te.kind) {
+                .named => |n| n,
+                else => return false,
+            },
+            else => return false,
+        };
+        for (type_param_names) |pn| {
+            if (std.mem.eql(u8, name, pn)) return true;
+        }
+        return false;
     }
 
     /// Run lint checks on the file scope (top-level unused functions/vars).
@@ -3969,6 +3994,11 @@ pub const Checker = struct {
                     .source_tree = self.tree,
                 });
 
+                // Swift ResultConvention: check if return type is a type parameter.
+                // Determined here at type-checking time, stored in GenericInstInfo,
+                // read by lowerer and call sites. Never recomputed.
+                const indirect_result = self.isTypeParamName(f.return_type, impl_info.type_params);
+
                 // Add to generic_inst_by_name so the lowerer can find and lower it
                 const inst = GenericInstInfo{
                     .concrete_name = synth_name,
@@ -3977,6 +4007,7 @@ pub const Checker = struct {
                     .type_param_names = impl_info.type_params,
                     .tree = impl_info.tree,
                     .scope = impl_info.scope,
+                    .has_indirect_result = indirect_result,
                 };
                 try self.generics.generic_inst_by_name.put(synth_name, inst);
             }
@@ -4130,6 +4161,7 @@ pub const Checker = struct {
             .tree = gen_info.tree,
             .scope = gen_info.scope,
             .expr_types = inst_expr_types, // preserved from Phase 2
+            .has_indirect_result = self.isTypeParamName(f.return_type, f.type_params),
         };
         try self.generic_instantiations.put(c.callee, inst);
         // Also store by concrete name (never overwritten, for nested generic calls)

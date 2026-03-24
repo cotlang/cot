@@ -9384,12 +9384,12 @@ pub const Lowerer = struct {
 
         const return_type = self.resolveTypeNode(f.return_type);
 
-        // Swift pattern: ALL generic return types use indirect return (SRET).
-        // This ensures uniform calling convention — List<Int>.pop() and
-        // List<BigStruct>.pop() both return through a pointer, enabling one
-        // shared body. Reference: GenCall.cpp line 677-685 addIndirectResult()
-        const has_generic_return = self.isGenericReturnType(f.return_type, param_names);
-        const uses_sret = has_generic_return or self.needsSret(return_type);
+        // Swift ResultConvention: use indirect return when the checker determined
+        // the return type is a generic type parameter (has_indirect_result), OR
+        // when the concrete return type is too large for register return.
+        // This ensures uniform calling convention across all instantiations.
+        // Reference: swift/lib/IRGen/GenCall.cpp:677-685 addIndirectResult()
+        const uses_sret = inst_info.has_indirect_result or self.needsSret(return_type);
         const wasm_return_type = if (uses_sret) TypeRegistry.VOID else return_type;
 
         // Emit function under BASE name — one body shared by all instantiations.
@@ -9435,6 +9435,14 @@ pub const Lowerer = struct {
                 } else false;
                 if (!is_substituted) param_type = self.chk.safeWrapType(param_type) catch param_type;
                 _ = try fb.addParam(param.name, param_type, self.type_reg.sizeOf(param_type));
+            }
+
+            // Swift convention: metadata params AFTER user params.
+            // One *TypeMetadata per type parameter.
+            // Reference: GenProto.cpp:4312-4377 expandPolymorphicSignature()
+            for (param_names) |pn| {
+                const meta_name = try std.fmt.allocPrint(self.allocator, "__metadata_{s}", .{pn});
+                _ = try fb.addParam(meta_name, TypeRegistry.I64, 8);
             }
 
             if (f.body != null_node) {
@@ -9849,26 +9857,33 @@ pub const Lowerer = struct {
         // Go LinkFuncName: qualify method call target (skip for generic instances)
         // Swift pattern: generic instance methods call the BASE name (shared body).
         // Non-generic methods use their qualified name.
-        const method_link_name = if (self.chk.generics.generic_inst_by_name.contains(method_info.func_name))
+        const is_generic_call = self.chk.generics.generic_inst_by_name.contains(method_info.func_name);
+        const method_link_name = if (is_generic_call)
             self.computeGenericBaseName(method_info.func_name) catch method_info.func_name
         else
             try self.resolveMethodName(receiver_type_name, method_info.func_name, method_info.source_tree);
 
-        // SRET for method calls: use indirect return if the type is large OR if the
-        // callee is a generic function with generic return type (Swift: ALL generic
-        // returns are indirect to ensure uniform calling convention).
-        const is_generic_call = self.chk.generics.generic_inst_by_name.contains(method_info.func_name);
-        const callee_has_generic_return = if (is_generic_call) blk: {
+        // Swift ResultConvention: use indirect return if type is large OR if the
+        // callee has has_indirect_result (generic return type). Read the stored flag,
+        // don't recompute from AST. Reference: Types.h isIndirectFormalResult()
+        const callee_has_indirect = if (is_generic_call)
+            (if (self.chk.generics.generic_inst_by_name.get(method_info.func_name)) |gi| gi.has_indirect_result else false)
+        else
+            false;
+        // Swift convention: append metadata args after user args for generic calls.
+        // Reference: GenProto.cpp:3947-4001 emitPolymorphicArguments()
+        if (is_generic_call) {
             if (self.chk.generics.generic_inst_by_name.get(method_info.func_name)) |gi| {
-                const fn_n = self.tree.getNode(gi.generic_node) orelse break :blk false;
-                const fn_d = fn_n.asDecl() orelse break :blk false;
-                if (fn_d != .fn_decl) break :blk false;
-                const tp = if (gi.type_param_names.len > 0) gi.type_param_names else fn_d.fn_decl.type_params;
-                break :blk self.isGenericReturnType(fn_d.fn_decl.return_type, tp);
+                for (gi.type_args) |type_arg| {
+                    // Pass 0 as metadata placeholder (will be real metadata when VWT dispatch is active)
+                    _ = type_arg;
+                    const meta = try fb.emitConstInt(0, TypeRegistry.I64, call.span);
+                    try args.append(self.allocator, meta);
+                }
             }
-            break :blk false;
-        } else false;
-        if (self.needsSret(return_type) or callee_has_generic_return) {
+        }
+
+        if (self.needsSret(return_type) or callee_has_indirect) {
             const ret_size = self.type_reg.sizeOf(return_type);
             const sret_local = try fb.getOrCreateSretLocal(return_type, ret_size);
             const sret_addr = try fb.emitAddrLocal(sret_local, TypeRegistry.I64, call.span);
