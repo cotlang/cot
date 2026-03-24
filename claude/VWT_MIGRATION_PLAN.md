@@ -266,7 +266,7 @@ by the lowerer. Deletion of checker monomorphization is Phase 3 (after VWT is pr
 
 ### 2.3 Verification — PARTIAL
 - [x] All 22 test/cases files pass (VWT is now unconditional default)
-- [ ] selfcot builds — infinite loop FIXED, but SSA-to-CLIF codegen errors on VWT call return values
+- [ ] selfcot builds — infinite loop FIXED (commit 38f2ef1), SSA-to-CLIF bug: VWT emitCopyValue creates temp locals + addr_local + call + load_local pattern that SSA builder doesn't track through blocks correctly. Affects all non-trivial functions in multi-file builds. Root cause: VWT dispatch always creates temp local storage for OpaqueValue* convention, SSA value numbering loses the load_local after the call.
 - [ ] selfcot2 builds (depends on selfcot)
 - [ ] Binary size comparison: VWT binary vs monomorphized binary
 
