@@ -384,9 +384,9 @@ pub const Driver = struct {
             try lowerer.generateTestRunner();
         }
 
-        // VWT Phase 1.3: Emit witness functions for all non-trivial concrete types.
-        // These go through the same IR → SSA → codegen pipeline as user functions.
-        try self.emitVWTWitnesses(&lowerer.builder, &type_reg);
+        // VWT: Witness emission deferred — will be integrated into lowerer on demand
+        // (Swift pattern: emitValueWitnessTable called during IRGen, not as post-pass).
+        // Currently inline ARC is used; witnesses emitted when VWT dispatch is enabled.
 
         var ir_result = try lowerer.builder.getIR();
         defer ir_result.deinit();
@@ -765,8 +765,7 @@ pub const Driver = struct {
             runner.deinitWithoutBuilder();
         }
 
-        // VWT Phase 1.3: Emit witness functions for all non-trivial types (multi-file path).
-        try self.emitVWTWitnesses(&shared_builder, &type_reg);
+        // VWT: Witness emission deferred (see single-file path comment).
 
         var final_ir = try shared_builder.getIR();
         defer final_ir.deinit();
