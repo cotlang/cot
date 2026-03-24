@@ -112,8 +112,6 @@ pub const Driver = struct {
     // Wasm-level param count (strings decomposed to ptr+len = 2 params).
     user_extern_param_counts: std.ArrayListUnmanaged(u32) = .{},
     user_extern_has_result: std.ArrayListUnmanaged(bool) = .{},
-    /// Dict dispatch: maps concrete generic name → list of dict helper fn names (extra args).
-    dict_arg_names: ?*const std.StringHashMap([]const []const u8) = null,
     /// COT_SSA: function name to generate interactive HTML visualizer for.
     /// Set via COT_SSA env var or --ssa=funcname CLI flag.
     /// Reference: Go GOSSAFUNC env var (ssagen/ssa.go lines 44-77)
@@ -371,11 +369,6 @@ pub const Driver = struct {
         var lowerer = lower_mod.Lowerer.init(self.allocator, &tree, &type_reg, &err_reporter, &chk, self.target);
         defer lowerer.deinit();
         lowerer.release_mode = self.release_mode;
-        // VWT Phase 1.4: Enable VWT dispatch for ARC operations.
-        // Set COT_VWT=1 to use VWT witness calls instead of inline ARC.
-        if (std.posix.getenv("COT_VWT")) |v| {
-            if (std.mem.eql(u8, v, "1")) lowerer.use_vwt = true;
-        }
         if (self.test_mode) lowerer.setTestMode(true);
         if (self.fail_fast) lowerer.setFailFast(true);
         try lowerer.lowerToBuilder();
@@ -398,9 +391,6 @@ pub const Driver = struct {
         var ir_result = try lowerer.builder.getIR();
         defer ir_result.deinit();
 
-        // Shape stenciling: pass dict arg names to code generator for call resolution
-        self.dict_arg_names = &lowerer.dict_arg_names;
-
         return self.generateCode(ir_result.funcs, ir_result.globals, &type_reg, "<input>", source_text);
     }
 
@@ -412,23 +402,31 @@ pub const Driver = struct {
         var gen = vwt_gen_mod.VWTGenerator.init(builder.allocator, type_reg);
         defer gen.deinit();
 
-        // Only emit witnesses for named struct/union/enum types — these are the types
-        // that the lowerer's VWT dispatch actually references by name. Intermediate
-        // types (pointers, optionals, etc.) get witnesses emitted recursively from
-        // their parent struct/union when needed.
+        // Swift pattern: emit VWT for EVERY non-trivial concrete type.
+        // Every type that participates in generic code gets its own VWT table.
+        // Reference: apple/swift lib/IRGen/GenValueWitness.cpp emitValueWitnessTable()
         for (type_reg.types.items, 0..) |t, i| {
             const type_idx: types_mod.TypeIndex = @intCast(i);
             if (type_reg.isTrivial(type_idx)) continue;
 
-            // Only emit for named aggregate types — skip anonymous/intermediate types
-            const type_name: ?[]const u8 = switch (t) {
+            const type_name = switch (t) {
                 .struct_type => |s| s.name,
                 .union_type => |u| u.name,
-                else => null,
+                .enum_type => |e| e.name,
+                .pointer => "pointer",
+                .list => "list",
+                .map => "map",
+                .optional => "optional",
+                .error_union => "error_union",
+                .future => "Future",
+                .slice => "slice",
+                .array => "array",
+                .tuple => "tuple",
+                .distinct => |d| d.name,
+                else => continue,
             };
-            if (type_name == null) continue;
 
-            _ = gen.emitWitnesses(builder, type_idx, type_name.?) catch |err| switch (err) {
+            _ = gen.emitWitnesses(builder, type_idx, type_name) catch |err| switch (err) {
                 error.MissingVWTEntry => continue,
                 else => return err,
             };
@@ -579,14 +577,6 @@ pub const Driver = struct {
         var shared_lowered_generics = std.StringHashMap(void).init(self.allocator);
         defer shared_lowered_generics.deinit();
 
-        // Shape stenciling: share stencil maps across files (same pattern as lowered_generics).
-        var shared_shape_stencils = std.StringHashMap([]const u8).init(self.allocator);
-        defer shared_shape_stencils.deinit();
-        var shared_dict_arg_names = std.StringHashMap([]const []const u8).init(self.allocator);
-        defer shared_dict_arg_names.deinit();
-        var shared_generated_dict_helpers = std.StringHashMap(void).init(self.allocator);
-        defer shared_generated_dict_helpers.deinit();
-
         var all_test_names = std.ArrayListUnmanaged([]const u8){};
         defer all_test_names.deinit(self.allocator);
         var all_test_display_names = std.ArrayListUnmanaged([]const u8){};
@@ -619,9 +609,6 @@ pub const Driver = struct {
             var lower_err = errors_mod.ErrorReporter.init(&pf.source, null);
             var lowerer = lower_mod.Lowerer.initWithBuilder(self.allocator, &pf.tree, &type_reg, &lower_err, &checkers.items[i], shared_builder, self.target);
             lowerer.lowered_generics = shared_lowered_generics;
-            lowerer.shape_stencils = shared_shape_stencils;
-            lowerer.dict_arg_names = shared_dict_arg_names;
-            lowerer.generated_dict_helpers = shared_generated_dict_helpers;
             lowerer.module_name = canonical_path_to_module.get(pf.path) orelse "";
             lowerer.tree_module_map = &tree_module_map;
             lowerer.release_mode = self.release_mode;
@@ -631,29 +618,17 @@ pub const Driver = struct {
 
             lowerer.lowerToBuilder() catch |e| {
                 shared_lowered_generics = lowerer.lowered_generics;
-                shared_shape_stencils = lowerer.shape_stencils;
-
-                shared_dict_arg_names = lowerer.dict_arg_names;
-                shared_generated_dict_helpers = lowerer.generated_dict_helpers;
                 lowerer.deinitWithoutBuilder();
                 return e;
             };
             // ARC Phase 4: Generate synthetic deinit functions for structs with ARC fields
             lowerer.emitPendingAutoDeinits() catch |e| {
                 shared_lowered_generics = lowerer.lowered_generics;
-                shared_shape_stencils = lowerer.shape_stencils;
-
-                shared_dict_arg_names = lowerer.dict_arg_names;
-                shared_generated_dict_helpers = lowerer.generated_dict_helpers;
                 lowerer.deinitWithoutBuilder();
                 return e;
             };
             if (lower_err.hasErrors()) {
                 shared_lowered_generics = lowerer.lowered_generics;
-                shared_shape_stencils = lowerer.shape_stencils;
-
-                shared_dict_arg_names = lowerer.dict_arg_names;
-                shared_generated_dict_helpers = lowerer.generated_dict_helpers;
                 lowerer.deinitWithoutBuilder();
                 return error.LowerError;
             }
@@ -663,9 +638,6 @@ pub const Driver = struct {
                 const init_name = try std.fmt.allocPrint(self.allocator, "__cot_init_file_{d}", .{i});
                 lowerer.generateGlobalInitsNamed(init_name) catch |e| {
                     shared_lowered_generics = lowerer.lowered_generics;
-                    shared_shape_stencils = lowerer.shape_stencils;
-                    shared_dict_arg_names = lowerer.dict_arg_names;
-                    shared_generated_dict_helpers = lowerer.generated_dict_helpers;
                     lowerer.deinitWithoutBuilder();
                     return e;
                 };
@@ -682,9 +654,6 @@ pub const Driver = struct {
             }
             shared_builder = lowerer.builder;
             shared_lowered_generics = lowerer.lowered_generics;
-            shared_shape_stencils = lowerer.shape_stencils;
-            shared_dict_arg_names = lowerer.dict_arg_names;
-            shared_generated_dict_helpers = lowerer.generated_dict_helpers;
 
             // Track func→file mapping: all functions added by this file's lowering
             const func_count_after = shared_builder.funcs.items.len;
@@ -793,9 +762,6 @@ pub const Driver = struct {
 
         var final_ir = try shared_builder.getIR();
         defer final_ir.deinit();
-
-        // Shape stenciling: pass aliases and dict arg names to code generator for call resolution
-        self.dict_arg_names = &shared_dict_arg_names;
 
         // Multi-file source map: store per-file data for pctab encoder
         self.parsed_file_paths = file_paths_list.items;
@@ -1587,7 +1553,6 @@ pub const Driver = struct {
 
             // Build SSA from IR
             var ssa_builder = try ssa_builder_mod.SSABuilder.init(func_alloc, ir_func, globals, type_reg, self.target);
-            ssa_builder.dict_arg_names = self.dict_arg_names; // Dict dispatch: inject fn-ptr args
             errdefer ssa_builder.deinit();
 
             const ssa_func = try ssa_builder.build();
@@ -6291,7 +6256,6 @@ pub const Driver = struct {
 
             // Build SSA
             var ssa_builder = try ssa_builder_mod.SSABuilder.init(func_alloc, ir_func, globals, type_reg, self.target);
-            ssa_builder.dict_arg_names = self.dict_arg_names; // Dict dispatch: inject fn-ptr args
             errdefer ssa_builder.deinit();
 
             const ssa_func = try ssa_builder.build();

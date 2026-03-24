@@ -51,19 +51,6 @@ pub const Lowerer = struct {
     spawn_counter: u32 = 0,
     lowered_generics: std.StringHashMap(void),
     type_substitution: ?std.StringHashMap(TypeIndex) = null,
-    /// Shape stenciling: maps "GenericBaseName$shape_key" → stenciled function name.
-    /// When a generic function is shape-stencilable and the first instance for a shape,
-    /// it's lowered under the stencil name. Subsequent same-shape instances are aliases.
-    shape_stencils: std.StringHashMap([]const u8),
-    /// Maps concrete function name → list of dict helper names to pass as extra args.
-    /// E.g., "List(17)_indexOf" → &["__cot_dict_i64_eq"]
-    dict_arg_names: std.StringHashMap([]const []const u8),
-    /// Tracks which dict helper functions have been generated (deduplication).
-    generated_dict_helpers: std.StringHashMap(void),
-    /// During dict-stenciled function body lowering: the dict entries for the current function.
-    current_dict_entries: ?[]const DictEntry = null,
-    /// During dict-stenciled function body lowering: local indices for dict fn-ptr params.
-    current_dict_params: ?[]ir.LocalIdx = null,
     /// Compilation target — used for @targetOs(), @targetArch(), @target() comptime builtins
     target: target_mod.Target = target_mod.Target.native(),
     /// Async state machine: local index of the state pointer param for the current async poll function.
@@ -83,10 +70,6 @@ pub const Lowerer = struct {
     /// Release mode: when false (default/debug), emit runtime safety checks.
     /// When true (--release), skip safety checks for performance.
     release_mode: bool = false,
-    /// VWT Phase 1.4: When true, emitCopyValue/emitDestroyValue dispatch through VWT
-    /// witness functions (__vwt_destroy_T, __vwt_initializeWithCopy_T) instead of
-    /// inlining ARC operations. Witnesses must be emitted into the builder (driver does this).
-    use_vwt: bool = false,
     /// Zig Sema pattern: current switch subject enum type for .variant shorthand resolution
     current_switch_enum_type: TypeIndex = types.invalid_type,
     /// Comptime structured value bindings — for inline for over comptime arrays (Phase 5)
@@ -486,19 +469,6 @@ pub const Lowerer = struct {
         span: Span,
     };
 
-    /// Dictionary dispatch entry: describes a type-dependent operation on a type parameter.
-    /// Go reference: cmd/compile/internal/noder/reader.go — dictionary holds method ptrs per shape.
-    /// Dictionary entry for shaped generic functions.
-    /// Go reference: writerDict.typeParamMethodExprs (writer.go:200).
-    /// Only method calls on type param receivers need dict entries.
-    /// Binary ops use shape type's native operators (no dict dispatch).
-    pub const DictEntry = struct {
-        /// The method name on the T-typed receiver
-        method_name: []const u8,
-        /// Which type parameter this entry applies to (index into type_args)
-        type_param_idx: u8 = 0,
-    };
-
     pub fn init(allocator: Allocator, tree: *const Ast, type_reg: *TypeRegistry, err: *ErrorReporter, chk: *checker.Checker, target: target_mod.Target) Lowerer {
         return initWithBuilder(allocator, tree, type_reg, err, chk, ir.Builder.init(allocator, type_reg), target);
     }
@@ -522,9 +492,6 @@ pub const Lowerer = struct {
             .bench_names = .{},
             .bench_display_names = .{},
             .lowered_generics = std.StringHashMap(void).init(allocator),
-            .shape_stencils = std.StringHashMap([]const u8).init(allocator),
-            .dict_arg_names = std.StringHashMap([]const []const u8).init(allocator),
-            .generated_dict_helpers = std.StringHashMap(void).init(allocator),
             .target = target,
             .global_error_table = std.StringHashMap(i64).init(allocator),
             .async_poll_names = std.StringHashMap([]const u8).init(allocator),
@@ -558,9 +525,6 @@ pub const Lowerer = struct {
         self.bench_names.deinit(self.allocator);
         self.bench_display_names.deinit(self.allocator);
         self.lowered_generics.deinit();
-        self.shape_stencils.deinit();
-        self.dict_arg_names.deinit();
-        self.generated_dict_helpers.deinit();
         self.comptime_value_vars.deinit();
         self.global_comptime_values.deinit();
         self.weak_locals.deinit(self.allocator);
@@ -4643,7 +4607,7 @@ pub const Lowerer = struct {
         // VWT dispatch: call __vwt_initializeWithCopy_{typeName} instead of inlining.
         // Store src value to temp, allocate dest temp, pass both addresses to witness.
         // Witness copies src → dest and retains ARC resources.
-        if (self.use_vwt) {
+        {
             const type_name = self.type_reg.typeName(type_idx);
             const copy_name = try std.fmt.allocPrint(self.allocator, "__vwt_initializeWithCopy_{s}", .{type_name});
             const val_size = self.type_reg.sizeOf(type_idx);
@@ -4663,8 +4627,6 @@ pub const Lowerer = struct {
             // Load the copied value from dest
             return try fb.emitLoadLocal(dst_tmp, type_idx, span);
         }
-
-        // Managed pointer: retain
         if (info == .pointer and info.pointer.managed) {
             var args = [_]ir.NodeIndex{value};
             return try fb.emitCall("retain", &args, false, type_idx, span);
@@ -4883,7 +4845,7 @@ pub const Lowerer = struct {
 
         // VWT dispatch: call __vwt_destroy_{typeName} instead of inlining.
         // Store value to temp, pass its address to the witness (OpaqueValue* convention).
-        if (self.use_vwt) {
+        {
             const type_name = self.type_reg.typeName(type_idx);
             const destroy_name = try std.fmt.allocPrint(self.allocator, "__vwt_destroy_{s}", .{type_name});
             const val_size = self.type_reg.sizeOf(type_idx);
@@ -4900,8 +4862,6 @@ pub const Lowerer = struct {
             _ = try fb.emitCall(destroy_name, &args, false, TypeRegistry.VOID, span);
             return;
         }
-
-        // Managed pointer: release
         if (info == .pointer and info.pointer.managed) {
             var args = [_]ir.NodeIndex{value};
             _ = try fb.emitCall("release", &args, false, TypeRegistry.VOID, span);
@@ -9323,229 +9283,8 @@ pub const Lowerer = struct {
     /// Go pattern: check.later() (types2/call.go:152-166) defers verification to after
     /// all instantiations are collected. We similarly defer lowering to after all regular
     /// declarations, preventing builder state corruption from nested startFunc/endFunc.
-    // =========================================================================
-    // Shape stenciling: Go-style GC shape deduplication for generics
-    // =========================================================================
-    // Reference: Go's shapify() in cmd/compile/internal/noder/reader.go:891-969.
-    // Detects when monomorphized generic functions produce identical code across
-    // different types with the same shape (size, alignment, ARC kind).
 
-    /// Go model: scan AST body for method calls on type-param-derived receivers.
-    /// Returns deduplicated DictEntry slice (method_name + type_param_idx).
-    /// Go reference: writer.go typeParamMethodExprIdx — entries added on demand during body encoding.
-    /// This is a simple pre-scan that only looks for method calls where the receiver's
-    /// AST type annotation is a type parameter name (key in type_substitution).
-    fn scanMethodCallDictEntries(self: *Lowerer, body_node: ast.NodeIndex, param_names: []const []const u8, fn_params: []const ast.Field) []const DictEntry {
-        var collector = std.ArrayListUnmanaged(DictEntry){};
-        defer collector.deinit(self.allocator);
-        self.scanNodeForMethodCalls(body_node, param_names, fn_params, &collector);
-
-        if (collector.items.len == 0) return &.{};
-
-        // Deduplicate: same (method_name, type_param_idx) only once
-        var deduped = std.ArrayListUnmanaged(DictEntry){};
-        deduped.ensureTotalCapacity(self.allocator, collector.items.len) catch return &.{};
-        for (collector.items) |entry| {
-            var found = false;
-            for (deduped.items) |existing| {
-                if (existing.type_param_idx == entry.type_param_idx and
-                    std.mem.eql(u8, existing.method_name, entry.method_name))
-                {
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) deduped.appendAssumeCapacity(entry);
-        }
-        const entries = self.allocator.dupe(DictEntry, deduped.items) catch return &.{};
-        deduped.deinit(self.allocator);
-        return entries;
-    }
-
-    /// Recursive AST walk: find method calls on type-param-derived receivers.
-    /// A receiver is "derived" if its AST type annotation is a type parameter name.
-    fn scanNodeForMethodCalls(self: *Lowerer, node_idx: ast.NodeIndex, param_names: []const []const u8, fn_params: []const ast.Field, collector: *std.ArrayListUnmanaged(DictEntry)) void {
-        const node = self.tree.getNode(node_idx) orelse return;
-        switch (node) {
-            .expr => |expr| self.scanExprForMethodCalls(expr, param_names, fn_params, collector),
-            .stmt => |stmt| self.scanStmtForMethodCalls(stmt, param_names, fn_params, collector),
-            .decl => {},
-        }
-    }
-
-    fn scanExprForMethodCalls(self: *Lowerer, expr: ast.Expr, param_names: []const []const u8, fn_params: []const ast.Field, collector: *std.ArrayListUnmanaged(DictEntry)) void {
-        switch (expr) {
-            .call => |call| {
-                // Check if this is a method call on a type-param-derived receiver
-                const callee_node = self.tree.getNode(call.callee);
-                if (callee_node) |cn| {
-                    if (cn.asExpr()) |ce| {
-                        if (ce == .field_access) {
-                            // Check receiver's AST type provenance — is it declared as a type param?
-                            if (self.receiverTypeParamIdx(ce.field_access.base, param_names, fn_params)) |pi| {
-                                collector.append(self.allocator, .{
-                                    .method_name = ce.field_access.field,
-                                    .type_param_idx = pi,
-                                }) catch return;
-                            }
-                        }
-                    }
-                }
-                self.scanNodeForMethodCalls(call.callee, param_names, fn_params, collector);
-                for (call.args) |arg| self.scanNodeForMethodCalls(arg, param_names, fn_params, collector);
-            },
-            .binary => |bin| {
-                self.scanNodeForMethodCalls(bin.left, param_names, fn_params, collector);
-                self.scanNodeForMethodCalls(bin.right, param_names, fn_params, collector);
-            },
-            .if_expr => |ie| {
-                self.scanNodeForMethodCalls(ie.condition, param_names, fn_params, collector);
-                self.scanNodeForMethodCalls(ie.then_branch, param_names, fn_params, collector);
-                self.scanNodeForMethodCalls(ie.else_branch, param_names, fn_params, collector);
-            },
-            .block_expr => |be| {
-                for (be.stmts) |stmt| self.scanNodeForMethodCalls(stmt, param_names, fn_params, collector);
-                self.scanNodeForMethodCalls(be.expr, param_names, fn_params, collector);
-            },
-            .unary => |u| self.scanNodeForMethodCalls(u.operand, param_names, fn_params, collector),
-            .index => |ix| {
-                self.scanNodeForMethodCalls(ix.base, param_names, fn_params, collector);
-                self.scanNodeForMethodCalls(ix.idx, param_names, fn_params, collector);
-            },
-            .slice_expr => |se| {
-                self.scanNodeForMethodCalls(se.base, param_names, fn_params, collector);
-                self.scanNodeForMethodCalls(se.start, param_names, fn_params, collector);
-                self.scanNodeForMethodCalls(se.end, param_names, fn_params, collector);
-            },
-            .field_access => |fa| self.scanNodeForMethodCalls(fa.base, param_names, fn_params, collector),
-            .paren => |p| self.scanNodeForMethodCalls(p.inner, param_names, fn_params, collector),
-            .struct_init => |si| {
-                for (si.fields) |f| self.scanNodeForMethodCalls(f.value, param_names, fn_params, collector);
-            },
-            .new_expr => |ne| {
-                for (ne.fields) |f| self.scanNodeForMethodCalls(f.value, param_names, fn_params, collector);
-            },
-            .try_expr => |te| self.scanNodeForMethodCalls(te.operand, param_names, fn_params, collector),
-            .catch_expr => |ce_| {
-                self.scanNodeForMethodCalls(ce_.operand, param_names, fn_params, collector);
-                self.scanNodeForMethodCalls(ce_.fallback, param_names, fn_params, collector);
-            },
-            .orelse_expr => |oe| {
-                self.scanNodeForMethodCalls(oe.operand, param_names, fn_params, collector);
-                if (oe.fallback != null_node) self.scanNodeForMethodCalls(oe.fallback, param_names, fn_params, collector);
-            },
-            .addr_of => |ao| self.scanNodeForMethodCalls(ao.operand, param_names, fn_params, collector),
-            .deref => |d| self.scanNodeForMethodCalls(d.operand, param_names, fn_params, collector),
-            .array_literal => |al| {
-                for (al.elements) |elem| self.scanNodeForMethodCalls(elem, param_names, fn_params, collector);
-            },
-            .tuple_literal => |tl| {
-                for (tl.elements) |elem| self.scanNodeForMethodCalls(elem, param_names, fn_params, collector);
-            },
-            .string_interp => |si| {
-                for (si.segments) |seg| switch (seg) {
-                    .expr => |seg_expr| self.scanNodeForMethodCalls(seg_expr, param_names, fn_params, collector),
-                    .text => {},
-                };
-            },
-            .switch_expr => |se| {
-                self.scanNodeForMethodCalls(se.subject, param_names, fn_params, collector);
-                for (se.cases) |case| {
-                    for (case.patterns) |pat| self.scanNodeForMethodCalls(pat, param_names, fn_params, collector);
-                    self.scanNodeForMethodCalls(case.body, param_names, fn_params, collector);
-                }
-                if (se.else_body != ast.null_node) self.scanNodeForMethodCalls(se.else_body, param_names, fn_params, collector);
-            },
-            .closure_expr, .spawn_expr, .await_expr, .select_expr, .comptime_block => {},
-            .builtin_call => |bc| {
-                for (bc.args) |arg| {
-                    if (arg != ast.null_node) self.scanNodeForMethodCalls(arg, param_names, fn_params, collector);
-                }
-            },
-            .ident, .literal, .type_expr, .error_literal, .zero_init, .bad_expr => {},
-        }
-    }
-
-    fn scanStmtForMethodCalls(self: *Lowerer, stmt: ast.Stmt, param_names: []const []const u8, fn_params: []const ast.Field, collector: *std.ArrayListUnmanaged(DictEntry)) void {
-        switch (stmt) {
-            .expr_stmt => |es| self.scanNodeForMethodCalls(es.expr, param_names, fn_params, collector),
-            .return_stmt => |rs| self.scanNodeForMethodCalls(rs.value, param_names, fn_params, collector),
-            .var_stmt => |vs| self.scanNodeForMethodCalls(vs.value, param_names, fn_params, collector),
-            .assign_stmt => |as_| {
-                self.scanNodeForMethodCalls(as_.target, param_names, fn_params, collector);
-                self.scanNodeForMethodCalls(as_.value, param_names, fn_params, collector);
-            },
-            .if_stmt => |is_| {
-                self.scanNodeForMethodCalls(is_.condition, param_names, fn_params, collector);
-                self.scanNodeForMethodCalls(is_.then_branch, param_names, fn_params, collector);
-                self.scanNodeForMethodCalls(is_.else_branch, param_names, fn_params, collector);
-            },
-            .while_stmt => |ws| {
-                self.scanNodeForMethodCalls(ws.condition, param_names, fn_params, collector);
-                self.scanNodeForMethodCalls(ws.body, param_names, fn_params, collector);
-                self.scanNodeForMethodCalls(ws.continue_expr, param_names, fn_params, collector);
-            },
-            .for_stmt => |fs| {
-                self.scanNodeForMethodCalls(fs.iterable, param_names, fn_params, collector);
-                self.scanNodeForMethodCalls(fs.body, param_names, fn_params, collector);
-            },
-            .block_stmt => |bs| {
-                for (bs.stmts) |s| self.scanNodeForMethodCalls(s, param_names, fn_params, collector);
-            },
-            .defer_stmt => |ds| self.scanNodeForMethodCalls(ds.expr, param_names, fn_params, collector),
-            .destructure_stmt => |ds| self.scanNodeForMethodCalls(ds.value, param_names, fn_params, collector),
-            .break_stmt, .continue_stmt, .bad_stmt => {},
-        }
-    }
-
-    /// Check if a receiver expression's type annotation refers to a type parameter.
-    /// Go reference: writer.go typIdx — tracks "derived" flag compositionally.
-    /// Here we check the AST: if the receiver is an identifier matching a function parameter
-    /// whose AST type annotation is a type parameter name, it's derived.
-    fn receiverTypeParamIdx(self: *Lowerer, receiver_node: ast.NodeIndex, param_names: []const []const u8, fn_params: []const ast.Field) ?u8 {
-        const node = self.tree.getNode(receiver_node) orelse return null;
-        const expr = node.asExpr() orelse return null;
-
-        // For identifier receivers: check if the variable is a function parameter
-        // whose AST type annotation is a type parameter name.
-        if (expr == .ident) {
-            const receiver_name = expr.ident.name;
-            // Walk AST function params (NOT IR locals) to check type annotations
-            for (fn_params) |param| {
-                if (!std.mem.eql(u8, param.name, receiver_name)) continue;
-                // Check if param's type_expr is a type parameter name identifier
-                if (param.type_expr == null_node) continue;
-                const type_node = self.tree.getNode(param.type_expr) orelse continue;
-                const type_expr = type_node.asExpr() orelse continue;
-                // Direct type param: `x: T` where T is a type parameter
-                if (type_expr == .ident) {
-                    for (param_names, 0..) |pname, i| {
-                        if (std.mem.eql(u8, type_expr.ident.name, pname)) return @intCast(i);
-                    }
-                }
-                // Named type expr: `x: T` as type_expr node
-                if (type_expr == .type_expr and type_expr.type_expr.kind == .named) {
-                    for (param_names, 0..) |pname, i| {
-                        if (std.mem.eql(u8, type_expr.type_expr.kind.named, pname)) return @intCast(i);
-                    }
-                }
-                // Pointer to type param: `x: *T`
-                if (type_expr == .type_expr and type_expr.type_expr.kind == .pointer) {
-                    const elem_node = self.tree.getNode(type_expr.type_expr.kind.pointer) orelse continue;
-                    const elem_expr = elem_node.asExpr() orelse continue;
-                    if (elem_expr == .ident) {
-                        for (param_names, 0..) |pname, i| {
-                            if (std.mem.eql(u8, elem_expr.ident.name, pname)) return @intCast(i);
-                        }
-                    }
-                }
-                break; // Found the param, stop searching
-            }
-        }
-        return null;
-    }
-
-    /// Shape stenciling: resolve a call target through shape aliases.
+    /// VWT generic function lowering: resolve a call target through shape aliases.
     fn ensureGenericFnQueued(self: *Lowerer, inst_info: checker.GenericInstInfo) !void {
         if (self.lowered_generics.contains(inst_info.concrete_name)) return;
         try self.lowered_generics.put(inst_info.concrete_name, {});
@@ -9563,7 +9302,7 @@ pub const Lowerer = struct {
         // We must loop until no new instantiations are queued, because lowering one
         // generic body may queue new ones (e.g., List_append calls List_ensureCapacity).
         // Zig pattern: collect-then-process to avoid iterator invalidation.
-        // lowerGenericFnInstance's re-check can trigger new instantiations that
+        // lowerGenericFnInstanceVWT's re-check can trigger new instantiations that
         // modify generic_inst_by_name, so we snapshot pending names each iteration.
         //
         // Multi-file: builder.hasFunc() prevents re-emitting generics already lowered
@@ -9584,11 +9323,7 @@ pub const Lowerer = struct {
             // Process collected snapshot (safe — no iterator active)
             for (pending.items) |inst_info| {
                 if (self.builder.hasFunc(inst_info.concrete_name)) continue;
-                if (self.use_vwt) {
-                    try self.lowerGenericFnInstanceVWT(inst_info);
-                } else {
-                    try self.lowerGenericFnInstance(inst_info);
-                }
+                try self.lowerGenericFnInstanceVWT(inst_info);
                 made_progress = true;
             }
         }
@@ -9834,392 +9569,6 @@ pub const Lowerer = struct {
                 _ = try fb.emitRet(result, f.span);
             }
             self.current_func = null;
-        }
-        try self.builder.endFunc();
-    }
-
-    /// Lower one concrete generic function as a top-level function.
-    fn lowerGenericFnInstance(self: *Lowerer, inst_info: checker.GenericInstInfo) !void {
-        // Swap to the defining file's AST for cross-file generic resolution
-        const saved_tree = self.tree;
-        const saved_chk_tree = self.chk.tree;
-        const saved_safe_mode = self.chk.safe_mode;
-        const saved_scope = self.chk.scope;
-        self.tree = inst_info.tree;
-        self.chk.tree = inst_info.tree;
-        // Use the defining file's @safe mode, not the calling file's
-        if (inst_info.tree.file) |file| self.chk.safe_mode = file.safe_mode;
-        // Use the defining file's scope so re-check resolves identifiers correctly
-        if (inst_info.scope) |s| self.chk.scope = s;
-        defer {
-            self.tree = saved_tree;
-            self.chk.tree = saved_chk_tree;
-            self.chk.safe_mode = saved_safe_mode;
-            self.chk.scope = saved_scope;
-        }
-
-        const fn_node = self.tree.getNode(inst_info.generic_node) orelse return;
-        const fn_decl_node = fn_node.asDecl() orelse return;
-        if (fn_decl_node != .fn_decl) return;
-        const f = fn_decl_node.fn_decl;
-
-        // Build type substitution map: T -> i64, U -> f64, etc.
-        // For impl block methods, type_params come from the impl block (type_param_names),
-        // not from the fn_decl (which has no type_params for impl methods).
-        var sub_map = std.StringHashMap(TypeIndex).init(self.allocator);
-        defer sub_map.deinit();
-        const param_names = if (inst_info.type_param_names.len > 0) inst_info.type_param_names else f.type_params;
-        for (param_names, 0..) |param_name, i| {
-            if (i < inst_info.type_args.len) {
-                try sub_map.put(param_name, inst_info.type_args[i]);
-            }
-        }
-
-        // Go pattern: use expr_types preserved from Phase 2 instead of re-checking.
-        // Go's type checker resolves all types during checking; codegen reads the results.
-        // This eliminates checkFnDeclWithName during lowering, avoiding stack overflow from
-        // deep generic chains (checkFnDeclBody + checkBlockExpr + instantiateGenericFunc = 18KB+).
-        const saved_expr_types = self.chk.expr_types;
-        if (inst_info.expr_types) |et| {
-            // Use Phase 2 expr_types directly — no re-checking needed
-            self.chk.expr_types = et;
-        } else {
-            // Fallback: re-check if no preserved expr_types (shouldn't happen for well-formed code)
-            self.chk.expr_types = std.AutoHashMap(ir.NodeIndex, TypeIndex).init(self.allocator);
-            self.chk.type_substitution = sub_map;
-            self.chk.checkFnDeclWithName(f, inst_info.generic_node, inst_info.concrete_name) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-            };
-            self.chk.type_substitution = null;
-        }
-        defer {
-            // Only deinit if we created fresh expr_types (fallback path)
-            if (inst_info.expr_types == null) self.chk.expr_types.deinit();
-            self.chk.expr_types = saved_expr_types;
-        }
-
-        // Go model: every generic with type args gets shaped + wrapper treatment.
-        // No tiering — all generics are stenciled. Dict entries determined by simple
-        // method-call-on-type-param scan (not full body walk).
-        // Reference: Go cmd/compile/internal/noder/reader.go:1377-1396.
-        var dict_entries: []const DictEntry = &.{};
-        var has_stencil = false;
-        var stencil_name: []const u8 = inst_info.concrete_name;
-
-        if (inst_info.type_args.len > 0) stencil_check: {
-            // Scan body for method calls on type-param-derived receivers
-            dict_entries = self.scanMethodCallDictEntries(f.body, param_names, f.params);
-
-            // Shape sharing only when dict entries exist — dict entries cover the
-            // type-dependent method calls, making the body safe to share across
-            // same-shape types. Without dict entries, the body may contain internal
-            // calls to other type-specific functions, so monomorphize fully.
-            if (dict_entries.len == 0) break :stencil_check;
-
-            // Build shape key: "List_append$s8p" (base name with method suffix + shape)
-            var shape_key_buf = std.ArrayListUnmanaged(u8){};
-            defer shape_key_buf.deinit(self.allocator);
-            const base_end = std.mem.indexOf(u8, inst_info.concrete_name, "(") orelse inst_info.concrete_name.len;
-            shape_key_buf.appendSlice(self.allocator, inst_info.concrete_name[0..base_end]) catch break :stencil_check;
-            if (std.mem.indexOf(u8, inst_info.concrete_name, ")")) |paren_close| {
-                if (paren_close + 1 < inst_info.concrete_name.len) {
-                    shape_key_buf.appendSlice(self.allocator, inst_info.concrete_name[paren_close + 1 ..]) catch break :stencil_check;
-                }
-            }
-            shape_key_buf.appendSlice(self.allocator, "$") catch break :stencil_check;
-            for (inst_info.type_args, 0..) |type_arg, ti| {
-                if (ti > 0) shape_key_buf.append(self.allocator, '_') catch break :stencil_check;
-                const shape = types.Shape.fromType(self.type_reg, type_arg);
-                const sk = shape.key();
-                shape_key_buf.appendSlice(self.allocator, sk.slice()) catch break :stencil_check;
-            }
-            const shape_key = self.allocator.dupe(u8, shape_key_buf.items) catch break :stencil_check;
-
-            if (self.shape_stencils.get(shape_key)) |existing_stencil_name| {
-                // Already stenciled for this shape — generate wrapper only.
-                self.generateDictHelpers(inst_info, dict_entries) catch break :stencil_check;
-                self.buildDictArgNames(inst_info, dict_entries) catch break :stencil_check;
-                // Generate wrapper with type substitution active so resolveTypeNode(T)
-                // resolves to the concrete type.
-                const saved_sub = self.type_substitution;
-                self.type_substitution = sub_map;
-                defer self.type_substitution = saved_sub;
-                try self.generateDictWrapper(inst_info, existing_stencil_name, f, true);
-                return;
-            }
-
-            // First instance for this shape — lower the body under stencil name.
-            has_stencil = true;
-            stencil_name = std.fmt.allocPrint(self.allocator, "__stencil_{s}", .{inst_info.concrete_name}) catch break :stencil_check;
-            self.shape_stencils.put(shape_key, stencil_name) catch break :stencil_check;
-            self.buildDictArgNames(inst_info, dict_entries) catch break :stencil_check;
-        }
-
-        // Generate dict helper functions BEFORE starting the function body
-        // (can't nest startFunc/endFunc calls)
-        if (dict_entries.len > 0) {
-            try self.generateDictHelpers(inst_info, dict_entries);
-        }
-
-        // Lower the concrete function body with type substitution active
-        self.type_substitution = sub_map;
-        defer self.type_substitution = null;
-
-        const return_type = self.resolveTypeNode(f.return_type);
-        const uses_sret = self.needsSret(return_type);
-        const wasm_return_type = if (uses_sret) TypeRegistry.VOID else return_type;
-        // Go pattern: shaped function has internal name when dict entries exist,
-        // concrete name otherwise. Wrapper bridges the gap.
-        self.builder.startFunc(stencil_name, TypeRegistry.VOID, wasm_return_type, f.span);
-        if (self.builder.func()) |fb| {
-            if (uses_sret) fb.sret_return_type = return_type;
-            fb.is_destructor = std.mem.eql(u8, f.name, "deinit");
-            self.current_func = fb;
-            self.cleanup_stack.clear();
-            self.comptime_value_vars.clearRetainingCapacity();
-            self.weak_locals.clearRetainingCapacity();
-            if (uses_sret) {
-                _ = try fb.addParam("__sret", TypeRegistry.I64, 8);
-            }
-            // Dict-stenciled functions: add extra fn-ptr params BEFORE regular params
-            if (dict_entries.len > 0) {
-                const dict_params = try self.allocator.alloc(ir.LocalIdx, dict_entries.len);
-                for (dict_entries, 0..) |_, di| {
-                    const param_name = std.fmt.allocPrint(self.allocator, "__dict_{d}", .{di}) catch "__dict";
-                    dict_params[di] = try fb.addParam(param_name, TypeRegistry.I64, 8);
-                }
-                self.current_dict_entries = dict_entries;
-                self.current_dict_params = dict_params;
-            }
-            // @safe generic: inject self param (parser skips it for generic structs).
-            // Mirrors checker's self injection in instantiateGenericImplMethods.
-            if (self.chk.safe_mode and !f.is_static and (f.params.len == 0 or !std.mem.eql(u8, f.params[0].name, "self"))) {
-                // Resolve concrete struct type from the method name prefix: "List(17)_append" → "List(17)"
-                if (std.mem.lastIndexOf(u8, inst_info.concrete_name, "_")) |underscore| {
-                    const struct_name = inst_info.concrete_name[0..underscore];
-                    if (self.chk.resolveTypeByName(struct_name)) |struct_type| {
-                        const ptr_type = self.chk.types.makePointer(struct_type) catch struct_type;
-                        _ = try fb.addParam("self", ptr_type, self.type_reg.sizeOf(ptr_type));
-                    }
-                }
-            }
-            for (f.params) |param| {
-                var param_type = self.resolveTypeNode(param.type_expr);
-                // Mirror checker buildFuncType: skip safeWrapType for generic type params.
-                // T → Point shouldn't become *Point even in @safe; the checker's func_type
-                // already kept it as Point, so the caller decomposes it as a struct value.
-                const is_substituted = if (self.type_substitution) |sub| blk: {
-                    if (param.type_expr != null_node) {
-                        if (self.tree.getNode(param.type_expr)) |node| {
-                            if (node.asExpr()) |expr_node| {
-                                if (expr_node == .ident) {
-                                    break :blk sub.contains(expr_node.ident.name);
-                                } else if (expr_node == .type_expr and expr_node.type_expr.kind == .named) {
-                                    break :blk sub.contains(expr_node.type_expr.kind.named);
-                                }
-                            }
-                        }
-                    }
-                    break :blk false;
-                } else false;
-                if (!is_substituted) param_type = self.chk.safeWrapType(param_type) catch param_type;
-                _ = try fb.addParam(param.name, param_type, self.type_reg.sizeOf(param_type));
-            }
-            if (f.body != null_node) {
-                _ = try self.lowerBlockNode(f.body);
-                if (return_type == TypeRegistry.VOID and fb.needsTerminator()) {
-                    try self.emitCleanups(0);
-                    _ = try fb.emitRet(null, f.span);
-                } else if (fb.needsTerminator()) {
-                    const rti4 = self.type_reg.get(return_type);
-                    if (rti4 == .error_union and rti4.error_union.elem == TypeRegistry.VOID) {
-                        try self.emitCleanups(0);
-                        try self.emitErrorVoidSuccessReturn(fb, return_type, f.span);
-                    }
-                }
-            }
-            self.current_func = null;
-            self.current_dict_entries = null;
-            self.current_dict_params = null;
-        }
-        try self.builder.endFunc();
-
-        // Go pattern: generate concrete wrapper for dict-stenciled canonical instance.
-        // The stencil body was lowered under "__stencil_ConcreteName". Now generate
-        // a wrapper under the concrete name that tail-calls the stencil with dict args.
-        if (has_stencil and dict_entries.len > 0) {
-            try self.generateDictWrapper(inst_info, stencil_name, f, true);
-        }
-    }
-
-    /// Generate a wrapper function that tail-calls a shaped function body.
-    /// Go pattern (reader.go:1377-1396): each concrete instantiation gets a wrapper
-    /// that prepends its specific dictionary args (if any) and tail-calls the shaped function.
-    /// Wrapper signature matches the original concrete function (no dict params).
-    /// Wrapper body: load dict fn-ptr addresses, prepend before original args, call stencil.
-    fn generateDictWrapper(self: *Lowerer, inst_info: checker.GenericInstInfo, stencil_name: []const u8, f: ast.FnDecl, has_dict: bool) !void {
-        _ = has_dict;
-        const fb_outer = self.current_func;
-        const saved_cleanup = self.cleanup_stack.items;
-
-        const return_type = self.resolveTypeNode(f.return_type);
-        const uses_sret = self.needsSret(return_type);
-        const wasm_return_type = if (uses_sret) TypeRegistry.VOID else return_type;
-
-        self.builder.startFunc(inst_info.concrete_name, TypeRegistry.VOID, wasm_return_type, f.span);
-        if (self.builder.func()) |fb| {
-            self.current_func = fb;
-            self.cleanup_stack.clear();
-            if (uses_sret) {
-                _ = try fb.addParam("__sret", TypeRegistry.I64, 8);
-            }
-            // Add original params (no dict params — wrapper has concrete signature)
-            for (f.params) |param| {
-                var param_type = self.resolveTypeNode(param.type_expr);
-                param_type = self.chk.safeWrapType(param_type) catch param_type;
-                _ = try fb.addParam(param.name, param_type, self.type_reg.sizeOf(param_type));
-            }
-
-            // Build call args: dict fn-ptrs first, then original params
-            var call_args = std.ArrayListUnmanaged(ir.NodeIndex){};
-            defer call_args.deinit(self.allocator);
-
-            // Prepend dict function pointer addresses
-            if (self.dict_arg_names.get(inst_info.concrete_name)) |helpers| {
-                for (helpers) |helper_name| {
-                    const fn_addr = try fb.emitFuncAddr(helper_name, TypeRegistry.I64, f.span);
-                    try call_args.append(self.allocator, fn_addr);
-                }
-            }
-
-            // Append SRET pointer if needed
-            if (uses_sret) {
-                const sret_val = try fb.emitLoadLocal(0, TypeRegistry.I64, f.span); // __sret param
-                try call_args.append(self.allocator, sret_val);
-            }
-
-            // Forward all original params as-is (same types as stencil expects).
-            // The wrapper and stencil have identical param types — the only
-            // difference is the dict params prepended at the front.
-            // Don't decompose — just load each local and pass through.
-            const param_start: ir.LocalIdx = if (uses_sret) 1 else 0;
-            for (f.params, 0..) |param, pi| {
-                _ = param;
-                const local_idx: ir.LocalIdx = param_start + @as(ir.LocalIdx, @intCast(pi));
-                const local_type = fb.locals.items[local_idx].type_idx;
-                const val = try fb.emitLoadLocal(local_idx, local_type, f.span);
-                try call_args.append(self.allocator, val);
-            }
-
-            // Tail-call the stencil function
-            if (uses_sret) {
-                _ = try fb.emitCall(stencil_name, call_args.items, false, TypeRegistry.VOID, f.span);
-                const sret_local: ir.LocalIdx = 0;
-                const ret_val = try fb.emitLoadLocal(sret_local, return_type, f.span);
-                _ = try fb.emitRet(ret_val, f.span);
-            } else if (return_type == TypeRegistry.VOID) {
-                _ = try fb.emitCall(stencil_name, call_args.items, false, TypeRegistry.VOID, f.span);
-                _ = try fb.emitRet(null, f.span);
-            } else {
-                const result = try fb.emitCall(stencil_name, call_args.items, false, return_type, f.span);
-                _ = try fb.emitRet(result, f.span);
-            }
-
-            self.current_func = fb_outer;
-            self.cleanup_stack.items = saved_cleanup;
-        }
-        try self.builder.endFunc();
-    }
-
-    /// Build the dict_arg_names mapping for a concrete generic instance.
-    /// Maps "List(17)_indexOf" → ["__cot_dict_i64_eq"] (the helper function names).
-    fn buildDictArgNames(self: *Lowerer, inst_info: checker.GenericInstInfo, dict_entries: []const DictEntry) !void {
-        const helpers = try self.allocator.alloc([]const u8, dict_entries.len);
-        for (dict_entries, 0..) |entry, i| {
-            const concrete_type = inst_info.type_args[entry.type_param_idx];
-            helpers[i] = try self.dictHelperName(concrete_type, entry);
-        }
-        try self.dict_arg_names.put(inst_info.concrete_name, helpers);
-    }
-
-    /// Generate the dict helper name for a (concrete_type, operation) pair.
-    /// E.g., i64 + .binary_op(.eql) → "__cot_dict_i64_eq"
-    /// Generate the dict helper name for a (concrete_type, method) pair.
-    /// Go reference: writerDict.typeParamMethodExprs — method name + type name.
-    fn dictHelperName(self: *Lowerer, concrete_type: TypeIndex, entry: DictEntry) ![]const u8 {
-        const type_name = self.type_reg.typeName(concrete_type);
-        return std.fmt.allocPrint(self.allocator, "__cot_dict_{s}_{s}", .{
-            type_name,
-            entry.method_name,
-        });
-    }
-
-    /// Generate method call trampoline functions for dictionary dispatch.
-    /// Go reference: dictNameOf (reader.go:1424) populates typeParamMethodExprs
-    /// with resolved method function pointers for each concrete type.
-    fn generateDictHelpers(self: *Lowerer, inst_info: checker.GenericInstInfo, dict_entries: []const DictEntry) !void {
-        for (dict_entries) |entry| {
-            const concrete_type = inst_info.type_args[entry.type_param_idx];
-            const helper_name = try self.dictHelperName(concrete_type, entry);
-            if (self.generated_dict_helpers.contains(helper_name)) continue;
-            try self.generated_dict_helpers.put(helper_name, {});
-            try self.generateMethodCallHelper(helper_name, concrete_type, entry.method_name);
-        }
-    }
-
-    /// Generate a method call trampoline: __cot_dict_TYPE_METHOD(params...) -> RetType
-    /// Forwards to the concrete method on the concrete type.
-    fn generateMethodCallHelper(self: *Lowerer, name: []const u8, concrete_type: TypeIndex, method_name: []const u8) !void {
-        const type_name = self.type_reg.typeName(concrete_type);
-        const method_info = self.type_reg.lookupMethod(type_name, method_name) orelse return;
-
-        const func_type_info = self.type_reg.get(method_info.func_type);
-        const params = if (func_type_info == .func) func_type_info.func.params else &[_]types.FuncParam{};
-        const return_type = if (func_type_info == .func) func_type_info.func.return_type else TypeRegistry.VOID;
-        const uses_sret = self.needsSret(return_type);
-        const ir_return_type = if (uses_sret) TypeRegistry.VOID else return_type;
-
-        const span = Span.init(Pos.zero, Pos.zero);
-        self.builder.startFunc(name, TypeRegistry.VOID, ir_return_type, span);
-        if (self.builder.func()) |fb| {
-            if (uses_sret) fb.sret_return_type = return_type;
-
-            // SRET param (hidden first param for large returns)
-            if (uses_sret) {
-                _ = try fb.addParam("__sret", TypeRegistry.I64, 8);
-            }
-
-            // Add params matching the method signature and build forward call args
-            var call_args = std.ArrayListUnmanaged(ir.NodeIndex){};
-            defer call_args.deinit(self.allocator);
-
-            // For SRET: forward the sret pointer as first arg to the concrete method
-            if (uses_sret) {
-                const sret_param = fb.lookupLocal("__sret") orelse return;
-                const sret_val = try fb.emitLoadLocal(sret_param, TypeRegistry.I64, span);
-                try call_args.append(self.allocator, sret_val);
-            }
-
-            for (params) |param| {
-                const local = try fb.addParam(param.name, param.type_idx, self.type_reg.sizeOf(param.type_idx));
-                const val = try fb.emitLoadLocal(local, param.type_idx, span);
-                try call_args.append(self.allocator, val);
-            }
-
-            // Resolve the concrete method name
-            const concrete_method = if (self.chk.generics.generic_inst_by_name.contains(method_info.func_name))
-                method_info.func_name
-            else
-                try self.resolveMethodName(type_name, method_info.func_name, method_info.source_tree);
-
-            if (uses_sret) {
-                // Forward SRET: call concrete method (which also uses SRET), then return void
-                _ = try fb.emitCall(concrete_method, call_args.items, false, TypeRegistry.VOID, span);
-                _ = try fb.emitRet(null, span);
-            } else {
-                const result = try fb.emitCall(concrete_method, call_args.items, false, return_type, span);
-                _ = try fb.emitRet(result, span);
-            }
         }
         try self.builder.endFunc();
     }
@@ -10505,68 +9854,6 @@ pub const Lowerer = struct {
 
         const func_type = self.type_reg.get(method_info.func_type);
         const return_type = if (func_type == .func) func_type.func.return_type else TypeRegistry.VOID;
-
-        // Dict dispatch: if inside a dict-stenciled body and receiver is a type param,
-        // emit indirect call through the dictionary fn-ptr param.
-        if (self.current_dict_entries) |entries| {
-            if (self.current_dict_params) |params| {
-                const receiver_type_idx = self.inferExprType(fa.base);
-                if (self.type_substitution) |sub| {
-                    var sub_it = sub.valueIterator();
-                    while (sub_it.next()) |vp| {
-                        // Check if receiver is T or *T
-                        const is_match = vp.* == receiver_type_idx or blk: {
-                            const rti = self.type_reg.get(receiver_type_idx);
-                            break :blk rti == .pointer and vp.* == rti.pointer.elem;
-                        };
-                        if (is_match) {
-                            for (entries, 0..) |entry, di| {
-                                {
-                                    const mn = entry.method_name;
-                                    if (std.mem.eql(u8, mn, fa.field)) {
-                                            const fn_ptr = try fb.emitLoadLocal(params[di], TypeRegistry.I64, call.span);
-                                            if (self.needsSret(return_type)) {
-                                                const ret_size = self.type_reg.sizeOf(return_type);
-                                                const sret_local = try fb.getOrCreateSretLocal(return_type, ret_size);
-                                                const sret_addr = try fb.emitAddrLocal(sret_local, TypeRegistry.I64, call.span);
-                                                var sret_args2 = std.ArrayListUnmanaged(ir.NodeIndex){};
-                                                defer sret_args2.deinit(self.allocator);
-                                                try sret_args2.append(self.allocator, sret_addr);
-                                                try sret_args2.appendSlice(self.allocator, args.items);
-                                                _ = try fb.emitCallIndirect(fn_ptr, sret_args2.items, TypeRegistry.VOID, call.span);
-                                                return try fb.emitLoadLocal(sret_local, return_type, call.span);
-                                            }
-                                            // @safe auto-ref: the dict helper may expect *T
-                                            // (from @safe method signature) but args contain T (value).
-                                            // Auto-ref the receiver if needed, matching normal call path.
-                                            if (self.chk.safe_mode and args.items.len > 0) {
-                                                const recv_type = self.inferExprType(fa.base);
-                                                const recv_info = self.type_reg.get(recv_type);
-                                                if (recv_info != .pointer) {
-                                                    // Receiver is value type — helper expects *T. Take address.
-                                                    const ptr_type = self.type_reg.makePointer(recv_type) catch TypeRegistry.I64;
-                                                    const recv_node = self.tree.getNode(fa.base);
-                                                    if (recv_node) |rn| {
-                                                        if (rn.asExpr()) |re| {
-                                                            if (re == .ident) {
-                                                                if (fb.lookupLocal(re.ident.name)) |local_idx| {
-                                                                    args.items[0] = try fb.emitAddrLocal(local_idx, ptr_type, call.span);
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                            return try fb.emitCallIndirect(fn_ptr, args.items, return_type, call.span);
-                                        }
-                                    }
-                            }
-                            break;
-                        }
-                    }
-                }
-            }
-        }
 
         // Go LinkFuncName: qualify method call target (skip for generic instances)
         const method_link_name_raw = if (self.chk.generics.generic_inst_by_name.contains(method_info.func_name))
