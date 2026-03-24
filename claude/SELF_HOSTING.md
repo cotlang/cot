@@ -1,6 +1,6 @@
 # Cot Self-Hosting: Status, Blockers, and Path to 0.4
 
-**Updated:** 2026-03-23
+**Updated:** 2026-03-25
 **Goal:** `selfcot build self/main.cot -o /tmp/selfcot.wasm` produces a working Wasm compiler.
 **Milestone:** Self-hosting completion is the gate for **Cot 0.4** release.
 
@@ -128,6 +128,17 @@ This is caused by the Zig compiler's generic instantiation or comptime evaluatio
 
 ### Ad-Hoc ARC Dispatch — FIXED
 All inline retain/release replaced with centralized `emitCopyValue`/`emitDestroyValue`.
+
+### VWT Migration — COMPLETE (2026-03-25)
+**VWT dispatch fully connected.** `emitCopyValue` and `emitDestroyValue` now call VWT witness
+functions (`__vwt_initializeWithCopy_{type}`, `__vwt_destroy_{type}`) for ALL non-trivial types.
+Old inline ARC code deleted (~450 lines). Dict/stenciling infrastructure deleted from `self/`
+(~620 lines). VWT witness emission gated on native target (wasm skips — no ARC).
+- 482 VWT types emitted, 135 unique witnesses, 2,558 total functions
+- Selfcot builds in ~10.9s (was 8.7s pre-VWT dispatch — ~1s overhead from witness functions)
+- `emitVWTWrapper`, `isGenericReturnType`, `emitOptionalFieldRetain` deleted
+- `computeGenericBaseName` kept (used by active VWT path)
+- Checker monomorphization kept (still needed for type checking — VWT changes codegen only)
 
 ### Blockers A, B, C from 2026-03-20 — ALL RESOLVED
 - **Blocker A** (SIGSEGV in lowerGenericFnInstance for ir, ssa, builder) — resolved

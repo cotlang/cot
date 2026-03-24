@@ -153,8 +153,6 @@ struct SSABuilder {
     cur_pos_line: int,
     cur_pos_col: int,
     local_slot_offsets: List(int),
-    shape_aliases: ?*Map(string, string),
-    dict_arg_names: ?*Map(string, string),  // concrete_name → comma-separated helper names
     logical_operands: Map(int, *SsaValue),
 
     static fn init(ir_func: Func, ir_globals: List(Global), type_reg: *TypeRegistry) SSABuilder {
@@ -221,8 +219,6 @@ struct SSABuilder {
             cur_pos_line: 0,
             cur_pos_col: 0,
             local_slot_offsets: slot_offsets,
-            shape_aliases: null,
-            dict_arg_names: null,
             logical_operands: logical_operands,
         }
     }
@@ -989,43 +985,9 @@ struct SSABuilder {
 
     fn convertCall(func_name: string, args: List(int), type_idx: int) *SsaValue {
         const cur = self.cur_block
-        // Shape stenciling: resolve aliased function names
-        var resolved_name = func_name
-        if (self.shape_aliases) |aliases| {
-            if (aliases.contains(func_name)) {
-                resolved_name = aliases.get(func_name)
-            }
-        }
 
         const call_val = self.func.newValue(SsaOp.static_call, type_idx, cur, self.cur_pos_line, self.cur_pos_col)
-        call_val.aux = SsaAux.str(resolved_name)
-
-        // Dict dispatch: inject fn-ptr args for dict-stenciled functions
-        if (self.dict_arg_names) |dan| {
-            if (dan.contains(func_name)) {
-                // Helper names are comma-separated: "name1,name2,..."
-                const helpers_csv = dan.get(func_name)
-                var start = 0
-                for ci in 0..helpers_csv.len {
-                    if (helpers_csv[ci] == 44) {  // ','
-                        const helper_name = substring(helpers_csv, start, ci)
-                        const addr_val = self.func.newValue(SsaOp.addr, I64, cur, self.cur_pos_line, self.cur_pos_col)
-                        addr_val.aux = SsaAux.str(helper_name)
-                        self.func.addValueToBlock(addr_val, cur)
-                        call_val.addArg(addr_val)
-                        start = ci + 1
-                    }
-                }
-                // Last (or only) helper name
-                if (start < helpers_csv.len) {
-                    const helper_name = substring(helpers_csv, start, helpers_csv.len)
-                    const addr_val = self.func.newValue(SsaOp.addr, I64, cur, self.cur_pos_line, self.cur_pos_col)
-                    addr_val.aux = SsaAux.str(helper_name)
-                    self.func.addValueToBlock(addr_val, cur)
-                    call_val.addArg(addr_val)
-                }
-            }
-        }
+        call_val.aux = SsaAux.str(func_name)
 
         for k in 0..args.len() {
             const arg_idx = args.get(k)

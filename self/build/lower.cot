@@ -65,22 +65,6 @@ struct CaptureInfo {
 
 /// Dict entry: a type-dependent operation (binary op or method call) in a generic body.
 /// Copied from lower.zig:474-482
-const DICT_BINARY_OP: int = 0
-const DICT_METHOD_CALL: int = 1
-
-struct DictEntry {
-    kind: int,               // DICT_BINARY_OP or DICT_METHOD_CALL
-    op: int,                 // BinaryOp enum value (for binary_op)
-    method_name: string,     // method name (for method_call)
-    type_param_idx: int,     // which type param this entry applies to
-}
-
-/// Stencil analysis results (3-tier).
-/// Copied from lower.zig:488-496
-const STENCIL_SHAPE_ONLY: int = 0      // Tier 1: no type-dependent ops (alias only)
-const STENCIL_DICT: int = 1            // Tier 2: binary ops/method calls (share body + fn-ptr args)
-const STENCIL_NOT_STENCILABLE: int = 2 // Tier 3: closures, async, switch on T (full mono)
-
 /// Global init entry for __cot_init_globals.
 struct GlobalInit {
     global_idx: int,
@@ -91,25 +75,6 @@ struct GlobalInit {
 }
 
 /// Map Token op to dict helper name suffix.
-/// Copied from lower.zig:8375-8390
-fn dictOpName(op: int) string {
-    const tok = @enumFromInt(op) as Token
-    return switch (tok) {
-        Token.eql => "eq",
-        Token.neq => "ne",
-        Token.lss => "lt",
-        Token.gtr => "gt",
-        Token.leq => "le",
-        Token.geq => "ge",
-        Token.add => "add",
-        Token.sub => "sub",
-        Token.mul => "mul",
-        Token.quo => "div",
-        Token.rem => "mod",
-        else => "unknown",
-    }
-}
-
 // ============================================================================
 // Lowerer
 // ============================================================================
@@ -148,16 +113,6 @@ struct Lowerer {
     module_name: string,
     tree_module_map: Map(int, string),
     spawn_counter: int,
-    // Shape stenciling state
-    shape_stencils: Map(string, string),      // shape_key → first stencil name
-    shape_aliases: Map(string, string),       // concrete_name → stencil name (alias)
-    generated_dict_helpers: Map(string, int), // dedup: helper_name → 1
-    shape_analysis_cache: Map(int, int),      // generic_node → stencil result (int)
-    stencil_dict_entries: List(DictEntry),    // entries from last analyzeStencilability
-    dict_arg_names: Map(string, string),      // concrete_name → comma-separated helper names
-    current_dict_entries: List(DictEntry),    // active dict entries during stenciled fn body
-    current_dict_params: List(int),           // active dict param locals during stenciled fn body
-    has_dict_context: bool,                   // true when inside a dict-stenciled function
     gc_mode: bool,                            // true when targeting WasmGC (structs/unions are GC refs)
     builder: Builder,
 
@@ -2475,30 +2430,6 @@ struct Lowerer {
             }
         }
 
-        // Dict dispatch: if inside a dict-stenciled body and this op is on a type-param type,
-        // emit indirect call through the dictionary fn-ptr param instead of a direct binary op.
-        if (self.has_dict_context) {
-            const left_type_idx = self.inferExprType(bin.left)
-            if (self.chk.hasTypeSubstitution()) {
-                // Check if left type matches any substituted type param
-                for si in 0..self.chk.type_sub_vals.len() {
-                    if (self.chk.type_sub_vals.get(si) == left_type_idx) {
-                        // Find matching dict entry for this binary op (entry.op is Token value)
-                        for di in 0..self.current_dict_entries.len() {
-                            const entry = self.current_dict_entries.get(di)
-                            if (entry.kind == DICT_BINARY_OP and entry.op == bin.op) {
-                                const fn_ptr = fb.emitLoadLocal(self.current_dict_params.get(di), I64, bin.span)
-                                var call_args: List(int) = .{}
-                                call_args.append(left)
-                                call_args.append(right)
-                                return fb.emitCallIndirect(fn_ptr, call_args, result_type, bin.span)
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
         const op = tokenToBinaryOp(tok)
         return fb.emitBinary(op, left, right, result_type, bin.span)
     }
@@ -3679,54 +3610,40 @@ struct Lowerer {
             else => "",
         }
         if (m_type_name == "" and base_type_idx == STRING) { m_type_name = "string" }
-        // Go LinkFuncName: qualify method call target (skip for generic instances).
-        // Generic instances use bare name (TypeIndex makes it unique).
-        // Zig reference: lower.zig line 9510-9513.
-        const resolved_method = if (self.lookupGenericInst(method_info.func_name) != null) {
-            method_info.func_name
+        // Zig lower.zig:9894-9901: resolve to BASE name for generic calls
+        const is_generic_call = self.lookupGenericInst(method_info.func_name) != null
+        const resolved_method = if (is_generic_call) {
+            self.computeGenericBaseName(method_info.func_name)
         } else {
             self.resolveMethodName(m_type_name, method_info.func_name, method_info.source_tree)
         }
 
-        // Dict dispatch: if inside a dict-stenciled body and receiver is a type param,
-        // emit indirect call through the dictionary fn-ptr param.
-        if (self.has_dict_context) {
-            const recv_type = self.inferExprType(fa.base)
-            if (self.chk.hasTypeSubstitution()) {
-                for si in 0..self.chk.type_sub_vals.len() {
-                    const sub_type = self.chk.type_sub_vals.get(si)
-                    // Check if receiver is T or *T
-                    var is_match = (sub_type == recv_type)
-                    if (!is_match and self.types.isPointer(recv_type)) {
-                        is_match = (sub_type == self.types.pointerElem(recv_type))
+        // Zig lower.zig:9906-9909: check has_indirect_result
+        var callee_has_indirect = false
+        if (is_generic_call) {
+            if (self.lookupGenericInst(method_info.func_name)) |gi| {
+                callee_has_indirect = gi.has_indirect_result
+            }
+        }
+
+        // Zig lower.zig:9912-9921: append metadata args for generic calls
+        if (is_generic_call) {
+            if (self.lookupGenericInst(method_info.func_name)) |gi| {
+                var ta_count = 0
+                if (gi.type_args_str.len > 0) {
+                    ta_count = 1
+                    for ci in 0..gi.type_args_str.len {
+                        if (gi.type_args_str[ci] == 59) { ta_count += 1 }
                     }
-                    if (is_match) {
-                        for di in 0..self.current_dict_entries.len() {
-                            const entry = self.current_dict_entries.get(di)
-                            if (entry.kind == DICT_METHOD_CALL and entry.method_name == fa.field) {
-                                const fn_ptr = fb.emitLoadLocal(self.current_dict_params.get(di), I64, call.span)
-                                if (self.needsSret(return_type)) {
-                                    const ret_size = self.types.sizeOf(return_type)
-                                    const sret_local = fb.addLocalWithSize("__sret_tmp", return_type, false, ret_size)
-                                    const sret_addr = fb.emitAddrLocal(sret_local, I64, call.span)
-                                    var sret_args: List(int) = .{}
-                                    sret_args.append(sret_addr)
-                                    for ai in 0..args.len() {
-                                        sret_args.append(args.get(ai))
-                                    }
-                                    fb.emitCallIndirect(fn_ptr, sret_args, VOID, call.span)
-                                    return fb.emitLoadLocal(sret_local, return_type, call.span)
-                                }
-                                return fb.emitCallIndirect(fn_ptr, args, return_type, call.span)
-                            }
-                        }
-                    }
+                }
+                for mi in 0..ta_count {
+                    args.append(fb.emitConstInt(0, I64, call.span))
                 }
             }
         }
 
-        // SRET for method calls returning large types
-        if (self.needsSret(return_type)) {
+        // Zig lower.zig:9923-9934: SRET
+        if (self.needsSret(return_type) or callee_has_indirect) {
             return self.emitSretCall(resolved_method, args, return_type, call.span)
         }
 
@@ -3849,12 +3766,28 @@ struct Lowerer {
 
         const ret_type = switch (cfunc_info_raw) { Type.func |ft| => ft.return_type, else => VOID }
 
-        // SRET for generic function calls
-        if (self.needsSret(ret_type)) {
-            return self.emitSretCall(concrete_name, gen_args, ret_type, call.span)
+        // VWT: resolve to base name + append metadata
+        const base_name = self.computeGenericBaseName(concrete_name)
+        var callee_has_indirect = false
+        if (self.lookupGenericInst(concrete_name)) |gi| {
+            callee_has_indirect = gi.has_indirect_result
+            var ta_count = 0
+            if (gi.type_args_str.len > 0) {
+                ta_count = 1
+                for ci in 0..gi.type_args_str.len {
+                    if (gi.type_args_str[ci] == 59) { ta_count += 1 }
+                }
+            }
+            for mi in 0..ta_count {
+                gen_args.append(fb.emitConstInt(0, I64, call.span))
+            }
         }
 
-        return fb.emitCall(concrete_name, gen_args, false, ret_type, call.span)
+        if (self.needsSret(ret_type) or callee_has_indirect) {
+            return self.emitSretCall(base_name, gen_args, ret_type, call.span)
+        }
+
+        return fb.emitCall(base_name, gen_args, false, ret_type, call.span)
     }
 
     // ========================================================================
@@ -7214,441 +7147,23 @@ struct Lowerer {
         self.builder.endFunc()
     }
 
-    // ========================================================================
-    // Shape Stenciling / Dict Helpers
-    // ========================================================================
-
-    /// Generate a dict helper name for a type-dependent operation.
-    /// Format: __cot_dict_{type_name}_{op_name}
-    /// Copied from lower.zig:8360-8372
-    fn dictHelperName(concrete_type: int, entry: DictEntry) string {
-        const type_name = self.types.typeName(concrete_type)
-        if (entry.kind == DICT_BINARY_OP) {
-            return "__cot_dict_" ++ type_name ++ "_" ++ dictOpName(entry.op)
+    /// Compute the base generic name from a concrete name.
+    /// "List(5)_append" → "List_append", "Map(5;6)_get" → "Map_get", "List(5)" → "List"
+    /// Zig: lower.zig:9466-9478 computeGenericBaseName()
+    fn computeGenericBaseName(concrete_name: string) string {
+        var paren_open: int = -1
+        var paren_close: int = -1
+        for ci in 0..concrete_name.len {
+            if (concrete_name[ci] == 40) { paren_open = ci }
+            if (concrete_name[ci] == 41) { paren_close = ci }
         }
-        return "__cot_dict_" ++ type_name ++ "_" ++ entry.method_name
-    }
-
-    /// Generate a binary op helper function.
-    /// Emits: __cot_dict_{type}_{op}(a: T, b: T) -> T or bool
-    /// Copied from lower.zig:8411-8443
-    fn generateBinaryOpHelper(name: string, concrete_type: int, op: int) void {
-        const fb = self.builder.func() orelse return null_node
-        // Comparison ops return bool, arithmetic returns T
-        // op is a Token value; convert to BinaryOp for IR emission
-        const bop = tokenToBinaryOp(op)
-        const return_type = switch (bop) {
-            BinaryOp.eq, BinaryOp.ne, BinaryOp.lt, BinaryOp.gt, BinaryOp.le, BinaryOp.ge => BOOL,
-            else => concrete_type,
+        if (paren_open < 0 or paren_close < 0) { return concrete_name }
+        if (paren_close + 1 >= concrete_name.len) {
+            return @string(concrete_name.ptr, paren_open)
         }
-        const sz = self.types.sizeOf(concrete_type)
-        const span = Span { start: 0, end: 0 }
-        self.builder.startFunc(name, VOID, return_type, span)
-        if (self.builder.func()) |fb| {
-            const param_a = fb.addParam("a", concrete_type, sz)
-            const param_b = fb.addParam("b", concrete_type, sz)
-            const a_val = fb.emitLoadLocal(param_a, concrete_type, span)
-            const b_val = fb.emitLoadLocal(param_b, concrete_type, span)
-            const result = fb.emitBinary(bop, a_val, b_val, return_type, span)
-            fb.emitRet(result, span)
-        }
-        self.builder.endFunc()
-    }
-
-    /// Generate a method call helper function.
-    /// Emits: __cot_dict_{type}_{method}(args...) -> R { return concrete_method(args...) }
-    /// Copied from lower.zig:8447-8500
-    fn generateMethodCallHelper(name: string, concrete_type: int, method_name: string) void {
-        const fb = self.builder.func() orelse return null_node
-        const type_name = self.types.typeName(concrete_type)
-        const mi_idx = self.types.lookupMethod(type_name, method_name)
-        if (mi_idx < 0) { return }
-        const mi = self.types.getMethodInfo(mi_idx)
-        const func_info = self.types.get(mi.func_type)
-        var return_type = VOID
-        switch (func_info) {
-            Type.func |f| => { return_type = f.return_type },
-            else => {},
-        }
-        const uses_sret = self.needsSret(return_type)
-        const ir_return_type = if (uses_sret) { VOID } else { return_type }
-
-        const span = Span { start: 0, end: 0 }
-        self.builder.startFunc(name, VOID, ir_return_type, span)
-        if (self.builder.func()) |fb| {
-            if (uses_sret) { fb.sret_return_type = return_type }
-
-            // SRET hidden first param
-            if (uses_sret) { fb.addParam("__sret", I64, 8) }
-
-            // Add params and build forward call args
-            var call_args: List(int) = .{}
-            if (uses_sret) {
-                if (fb.lookupLocal("__sret")) |sret_idx| {
-                    call_args.append(fb.emitLoadLocal(sret_idx, I64, span))
-                }
-            }
-
-            const ff = switch (func_info) { Type.func |f| => f, else => FuncType { param_count: 0, params: 0, return_type: VOID } }
-            for i in 0..ff.param_count {
-                const p = ff.getParam(i)
-                const local = fb.addParam(p.name, p.type_idx, self.types.sizeOf(p.type_idx))
-                call_args.append(fb.emitLoadLocal(local, p.type_idx, span))
-            }
-
-            // Resolve concrete method name
-            const concrete_method = self.resolveMethodName(type_name, mi.func_name, mi.source_tree)
-
-            if (uses_sret) {
-                fb.emitCall(concrete_method, call_args, false, VOID, span)
-                fb.emitRet(null_node, span)
-            } else {
-                const result = fb.emitCall(concrete_method, call_args, false, return_type, span)
-                fb.emitRet(result, span)
-            }
-        }
-        self.builder.endFunc()
-    }
-
-    /// Check if a type matches one of the type parameter concrete types.
-    /// Returns the index or -1.
-    /// Copied from lower.zig:7864-7869
-    fn typeParamIndex(type_param_types: List(int), ty: int) int {
-        for i in 0..type_param_types.len() {
-            if (type_param_types.get(i) == ty) { return i }
-        }
-        return -1
-    }
-
-    /// Analyze a generic function body for stencilability.
-    /// Returns STENCIL_SHAPE_ONLY, STENCIL_DICT, or STENCIL_NOT_STENCILABLE.
-    /// Copied from lower.zig:7825-7860
-    fn analyzeStencilability(body_node: int, type_param_types: List(int)) int {
-        if (type_param_types.len() == 0) { return STENCIL_NOT_STENCILABLE }
-
-        var collector: List(DictEntry) = .{}
-        const ok = self.collectNodeDictEntries(body_node, type_param_types, &collector)
-        if (!ok) { return STENCIL_NOT_STENCILABLE }
-        if (collector.len() == 0) {
-            self.stencil_dict_entries.clear()
-            return STENCIL_SHAPE_ONLY
-        }
-
-        // Deduplicate and store in stencil_dict_entries
-        self.stencil_dict_entries.clear()
-        for i in 0..collector.len() {
-            const entry = collector.get(i)
-            var found = false
-            for j in 0..self.stencil_dict_entries.len() {
-                const existing = self.stencil_dict_entries.get(j)
-                if (existing.kind == entry.kind and existing.op == entry.op
-                    and existing.type_param_idx == entry.type_param_idx
-                    and existing.method_name == entry.method_name) {
-                    found = true
-                }
-            }
-            if (!found) { self.stencil_dict_entries.append(entry) }
-        }
-        return STENCIL_DICT
-    }
-
-    /// Recursive AST walk: collect DictEntry for Tier 2 ops.
-    /// Returns false if Tier 3 (not stencilable) found.
-    /// Copied from lower.zig:7877-8043
-    fn collectNodeDictEntries(node_idx: int, tpt: List(int), collector: *List(DictEntry)) bool {
-        if (node_idx == null_node) { return true }
-        const node = self.tree.getNode(node_idx)
-        var result = true
-        switch (node) {
-            Node.expr |expr| => { result = self.collectExprDictEntries(expr, node_idx, tpt, collector) },
-            Node.stmt |stmt| => { result = self.collectStmtDictEntries(stmt, tpt, collector) },
-            Node.decl |_| => {},
-        }
-        return result
-    }
-
-    /// Collect dict entries from an expression.
-    /// Copied from lower.zig:7887-8043
-    fn collectExprDictEntries(expr: Expr, node_idx: int, tpt: List(int), collector: *List(DictEntry)) bool {
-        // Use tag string to dispatch — avoids return-in-switch-arm limitation
-        const tag1 = exprTagStr1(expr)
-        const tag = if (@lenOf(tag1) > 0) { tag1 } else { exprTagStr2(expr) }
-
-        if (tag == "binary") {
-            var bin_left = 0
-            var bin_right = 0
-            var bin_op = 0
-            switch (expr) { Expr.binary |bin| => { bin_left = bin.left; bin_right = bin.right; bin_op = bin.op }, else => {} }
-            const left_type = self.chk.expr_types.getOrNull(bin_left) orelse -1
-            const right_type = self.chk.expr_types.getOrNull(bin_right) orelse -1
-            const left_pi = self.typeParamIndex(tpt, left_type)
-            const right_pi = self.typeParamIndex(tpt, right_type)
-            if (left_pi >= 0 or right_pi >= 0) {
-                const bop = @enumFromInt(bin_op) as BinaryOp
-                const is_dict_op = bop.isComparison() or bop.isArithmetic()
-                if (!is_dict_op) { return false }
-                const pi = if (left_pi >= 0) { left_pi } else { right_pi }
-                collector.append(DictEntry { kind: DICT_BINARY_OP, op: bin_op, method_name: "", type_param_idx: pi })
-            }
-            if (!self.collectNodeDictEntries(bin_left, tpt, collector)) { return false }
-            return self.collectNodeDictEntries(bin_right, tpt, collector)
-        }
-
-        if (tag == "call") {
-            var callee_n = 0
-            var call_args: List(int) = .{}
-            switch (expr) { Expr.call |c| => { callee_n = c.callee; call_args = c.args }, else => {} }
-            // Check method calls on T-typed receiver
-            const callee_node = self.tree.getNode(callee_n)
-            switch (callee_node) { Node.expr |ce| => switch (ce) {
-                Expr.field_access |fa| => {
-                    const recv_type = self.chk.expr_types.getOrNull(fa.base) orelse -1
-                    var pi = self.typeParamIndex(tpt, recv_type)
-                    if (pi < 0 and recv_type >= 0 and self.types.isPointer(recv_type)) {
-                        pi = self.typeParamIndex(tpt, self.types.pointerElem(recv_type))
-                    }
-                    if (pi >= 0) {
-                        collector.append(DictEntry { kind: DICT_METHOD_CALL, op: 0, method_name: fa.field, type_param_idx: pi })
-                    }
-                },
-                else => {},
-            }, else => {} }
-            if (!self.collectNodeDictEntries(callee_n, tpt, collector)) { return false }
-            for i in 0..call_args.len() {
-                if (!self.collectNodeDictEntries(call_args.get(i), tpt, collector)) { return false }
-            }
-            return true
-        }
-
-        if (tag == "if_expr") {
-            var cond = 0
-            var then_br = 0
-            var else_br = null_node
-            switch (expr) { Expr.if_expr |ie| => { cond = ie.condition; then_br = ie.then_branch; else_br = ie.else_branch }, else => {} }
-            if (!self.collectNodeDictEntries(cond, tpt, collector)) { return false }
-            if (!self.collectNodeDictEntries(then_br, tpt, collector)) { return false }
-            return self.collectNodeDictEntries(else_br, tpt, collector)
-        }
-
-        if (tag == "block_expr") {
-            var stmts: List(int) = .{}
-            var result_n = null_node
-            switch (expr) { Expr.block_expr |be| => { stmts = be.stmts; result_n = be.result_expr }, else => {} }
-            for i in 0..stmts.len() {
-                if (!self.collectNodeDictEntries(stmts.get(i), tpt, collector)) { return false }
-            }
-            return self.collectNodeDictEntries(result_n, tpt, collector)
-        }
-
-        if (tag == "unary") {
-            var operand = 0
-            switch (expr) { Expr.unary |u| => { operand = u.operand }, else => {} }
-            return self.collectNodeDictEntries(operand, tpt, collector)
-        }
-
-        if (tag == "paren") {
-            var inner = 0
-            switch (expr) { Expr.paren |p| => { inner = p.inner }, else => {} }
-            return self.collectNodeDictEntries(inner, tpt, collector)
-        }
-
-        if (tag == "field_access") {
-            var base = 0
-            switch (expr) { Expr.field_access |fa| => { base = fa.base }, else => {} }
-            return self.collectNodeDictEntries(base, tpt, collector)
-        }
-
-        if (tag == "index_expr") {
-            var base = 0
-            var idx = 0
-            switch (expr) { Expr.index_expr |ix| => { base = ix.base; idx = ix.idx }, else => {} }
-            if (!self.collectNodeDictEntries(base, tpt, collector)) { return false }
-            return self.collectNodeDictEntries(idx, tpt, collector)
-        }
-
-        if (tag == "try_expr") {
-            var operand = 0
-            switch (expr) { Expr.try_expr |te| => { operand = te.operand }, else => {} }
-            return self.collectNodeDictEntries(operand, tpt, collector)
-        }
-
-        if (tag == "catch_expr") {
-            var operand = 0
-            var fallback = null_node
-            switch (expr) { Expr.catch_expr |ce| => { operand = ce.operand; fallback = ce.fallback }, else => {} }
-            if (!self.collectNodeDictEntries(operand, tpt, collector)) { return false }
-            return self.collectNodeDictEntries(fallback, tpt, collector)
-        }
-
-        if (tag == "orelse_expr") {
-            var operand = 0
-            var fallback = null_node
-            switch (expr) { Expr.orelse_expr |oe| => { operand = oe.operand; fallback = oe.fallback }, else => {} }
-            if (!self.collectNodeDictEntries(operand, tpt, collector)) { return false }
-            if (fallback != null_node) {
-                if (!self.collectNodeDictEntries(fallback, tpt, collector)) { return false }
-            }
-            return true
-        }
-
-        if (tag == "addr_of") {
-            var operand = 0
-            switch (expr) { Expr.addr_of |ao| => { operand = ao.operand }, else => {} }
-            return self.collectNodeDictEntries(operand, tpt, collector)
-        }
-
-        if (tag == "deref") {
-            var operand = 0
-            switch (expr) { Expr.deref |d| => { operand = d.operand }, else => {} }
-            return self.collectNodeDictEntries(operand, tpt, collector)
-        }
-
-        // Tier 3: closures, async, spawn, select → not stencilable
-        if (tag == "closure_expr" or tag == "spawn_expr" or tag == "select_expr" or tag == "await_expr") {
-            return false
-        }
-
-        // Safe leaf nodes (ident, literal, etc.)
-        return true
-    }
-
-    /// Collect dict entries from a statement.
-    /// Copied from lower.zig:8046-8105
-    fn collectStmtDictEntries(stmt: Stmt, tpt: List(int), collector: *List(DictEntry)) bool {
-        const tag = stmtTagStr(stmt)
-
-        if (tag == "expr_stmt") {
-            var expr_node = 0
-            switch (stmt) { Stmt.expr_stmt |es| => { expr_node = es.expr }, else => {} }
-            return self.collectNodeDictEntries(expr_node, tpt, collector)
-        }
-
-        if (tag == "return_stmt") {
-            var value = 0
-            switch (stmt) { Stmt.return_stmt |rs| => { value = rs.value }, else => {} }
-            if (value != null_node) { return self.collectNodeDictEntries(value, tpt, collector) }
-            return true
-        }
-
-        if (tag == "var_stmt") {
-            var value = 0
-            switch (stmt) { Stmt.var_stmt |vs| => { value = vs.value }, else => {} }
-            if (value != null_node) { return self.collectNodeDictEntries(value, tpt, collector) }
-            return true
-        }
-
-        if (tag == "assign_stmt") {
-            var target = 0
-            var value = 0
-            switch (stmt) { Stmt.assign_stmt |as_stmt| => { target = as_stmt.target; value = as_stmt.value }, else => {} }
-            return self.collectNodeDictEntries(target, tpt, collector)
-                and self.collectNodeDictEntries(value, tpt, collector)
-        }
-
-        if (tag == "if_stmt") {
-            var condition = 0
-            var then_branch = 0
-            var else_branch = 0
-            switch (stmt) { Stmt.if_stmt |is_stmt| => { condition = is_stmt.condition; then_branch = is_stmt.then_branch; else_branch = is_stmt.else_branch }, else => {} }
-            if (!self.collectNodeDictEntries(condition, tpt, collector)) { return false }
-            if (!self.collectNodeDictEntries(then_branch, tpt, collector)) { return false }
-            if (else_branch != null_node) {
-                if (!self.collectNodeDictEntries(else_branch, tpt, collector)) { return false }
-            }
-            return true
-        }
-
-        if (tag == "while_stmt") {
-            var condition = 0
-            var body = 0
-            switch (stmt) { Stmt.while_stmt |ws| => { condition = ws.condition; body = ws.body }, else => {} }
-            return self.collectNodeDictEntries(condition, tpt, collector)
-                and self.collectNodeDictEntries(body, tpt, collector)
-        }
-
-        if (tag == "for_stmt") {
-            var iterable = 0
-            var body = 0
-            switch (stmt) { Stmt.for_stmt |fs| => { iterable = fs.iterable; body = fs.body }, else => {} }
-            if (iterable != null_node) {
-                if (!self.collectNodeDictEntries(iterable, tpt, collector)) { return false }
-            }
-            return self.collectNodeDictEntries(body, tpt, collector)
-        }
-
-        if (tag == "block_stmt") {
-            var ok = true
-            switch (stmt) { Stmt.block_stmt |bs| => {
-                for i in 0..bs.stmts.len() {
-                    if (!self.collectNodeDictEntries(bs.stmts.get(i), tpt, collector)) { ok = false }
-                }
-            }, else => {} }
-            return ok
-        }
-
-        if (tag == "defer_stmt") {
-            var expr_node = 0
-            switch (stmt) { Stmt.defer_stmt |ds| => { expr_node = ds.expr }, else => {} }
-            return self.collectNodeDictEntries(expr_node, tpt, collector)
-        }
-
-        // All other statement types: safe
-        return true
-    }
-
-    /// Generate all dict helpers for a generic instance.
-    /// Copied from lower.zig:8395-8408
-    fn generateDictHelpers(type_args: List(int), dict_entries: List(DictEntry)) void {
-        for i in 0..dict_entries.len() {
-            const entry = dict_entries.get(i)
-            var concrete_type = 0
-            if (entry.type_param_idx < type_args.len()) {
-                concrete_type = type_args.get(entry.type_param_idx)
-            }
-            const helper_name = self.dictHelperName(concrete_type, entry)
-            // Dedup
-            if (self.generated_dict_helpers.contains(helper_name)) { continue }
-            self.generated_dict_helpers.set(helper_name, 1)
-
-            if (entry.kind == DICT_BINARY_OP) {
-                self.generateBinaryOpHelper(helper_name, concrete_type, entry.op)
-            } else {
-                self.generateMethodCallHelper(helper_name, concrete_type, entry.method_name)
-            }
-        }
-    }
-
-    /// Build the dict_arg_names mapping for a concrete generic instance.
-    /// Maps concrete_name → comma-separated helper function names.
-    /// Copied from lower.zig:8349-8356
-    fn buildDictArgNames(inst: *GenericInstInfo, dict_entries: List(DictEntry)) void {
-        // Parse type args from inst.type_args_str
-        var type_args: List(int) = .{}
-        const tas = inst.type_args_str
-        var start = 0
-        for ci in 0..tas.len {
-            if (tas[ci] == 59) {  // ';'
-                type_args.append(Lowerer.parseIntSubstr(tas, start, ci))
-                start = ci + 1
-            }
-        }
-        if (start < tas.len) {
-            type_args.append(Lowerer.parseIntSubstr(tas, start, tas.len))
-        }
-
-        // Build comma-separated helper names
-        var result = ""
-        for i in 0..dict_entries.len() {
-            const entry = dict_entries.get(i)
-            var concrete_type = 0
-            if (entry.type_param_idx < type_args.len()) {
-                concrete_type = type_args.get(entry.type_param_idx)
-            }
-            const helper_name = self.dictHelperName(concrete_type, entry)
-            if (i > 0) { result = result ++ "," }
-            result = result ++ helper_name
-        }
-        self.dict_arg_names.set(inst.concrete_name, result)
+        const prefix = @string(concrete_name.ptr, paren_open)
+        const suffix = @string(concrete_name.ptr + paren_close + 1, concrete_name.len - paren_close - 1)
+        return prefix ++ suffix
     }
 
     /// Parse type args string into a list of ints.
@@ -8146,10 +7661,10 @@ struct Lowerer {
     // Generic function queue
     // ========================================================================
 
+    /// Zig: lower.zig:9286-9310 lowerQueuedGenericFunctions()
     fn lowerQueuedGenericFunctions() void {
         var made_progress = true
         var iter_count = 0
-        var total_lowered = 0
         while (made_progress) {
             made_progress = false
             iter_count += 1
@@ -8158,48 +7673,49 @@ struct Lowerer {
             for i in 0..all_keys.len() {
                 const key = all_keys.get(i)
                 if (!self.lowered_generics.contains(key)) { continue }
-                if (self.builder.hasFunc(key)) { continue }
+                // VWT: check BASE name (one body per generic definition)
+                const bn = self.computeGenericBaseName(key)
+                if (self.builder.hasFunc(bn)) { continue }
                 pending.append(key)
             }
-            if (iter_count > 100) { return }  // Safety: prevent infinite loops
-            // Process collected snapshot (safe — no iterator active)
+            if (iter_count > 100) { return }
             for i in 0..pending.len() {
                 const name = pending.get(i)
-                if (self.builder.hasFunc(name)) { continue }
+                const bn = self.computeGenericBaseName(name)
+                if (self.builder.hasFunc(bn)) { continue }
                 self.lowerGenericFnInstance(name)
-                if (!self.builder.hasFunc(name)) {
-                    // Function lowering failed silently (e.g., shape alias, missing body).
-                    // Mark as lowered to prevent infinite re-processing.
-                    self.builder.startFunc(name, VOID, VOID, Span.zero())
+                if (!self.builder.hasFunc(bn)) {
+                    self.builder.startFunc(bn, VOID, VOID, Span.zero())
                     if (self.builder.func()) |fb| {
                         fb.emitRet(null_node, Span.zero())
                     }
                     self.builder.endFunc()
                 }
-                total_lowered += 1
                 made_progress = true
             }
         }
     }
 
-    /// Lower one concrete generic function as a top-level function.
     fn lowerGenericFnInstance(concrete_name: string) void {
-        // Look up the GenericInstInfo
         if (self.lookupGenericInst(concrete_name)) |inst| {
-            self.lowerGenericFnInstanceInner(inst, concrete_name)
+            self.lowerGenericFnInstanceVWT(inst, concrete_name)
         }
     }
 
-    fn lowerGenericFnInstanceInner(inst: *GenericInstInfo, concrete_name: string) void {
-        // Swap to the defining file's AST for cross-file generic resolution
+    /// VWT: 1:1 port of Zig lower.zig:9317-9464 lowerGenericFnInstanceVWT()
+    fn lowerGenericFnInstanceVWT(inst: *GenericInstInfo, concrete_name: string) void {
+        // Zig line 9321: compute base name, skip if already emitted
+        const base_name = self.computeGenericBaseName(concrete_name)
+        if (self.builder.hasFunc(base_name)) { return }
+
+        // Zig line 9334-9341: swap to defining file's AST
         const saved_tree = self.tree
         self.tree = inst.getAst()
 
-        // Get the fn_decl node from the defining file's AST
-        const fn_node = self.tree.getNode(inst.generic_node)
+        // Zig line 9349-9352: extract fn_decl
         var fn_d: FnDecl = undefined
         var found = false
-        switch (fn_node) { Node.decl |d| => switch (d) {
+        switch (self.tree.getNode(inst.generic_node)) { Node.decl |d| => switch (d) {
             Decl.fn_decl |f| => { fn_d = f; found = true },
             else => {},
         }, else => {} }
@@ -8208,30 +7724,30 @@ struct Lowerer {
             return
         }
 
-        // Set up type substitution in checker from type_args_str + type_param_names
-        // Both are semicolon-separated: "5;17" and "K;V"
+        // Zig line 9354-9362: build type substitution
         const saved_sub_count = self.chk.type_sub_keys.len()
-        const type_args = inst.type_args_str
-        const param_names = inst.type_param_names
-        self.parseAndPushTypeSubs(type_args, param_names)
+        self.parseAndPushTypeSubs(inst.type_args_str, inst.type_param_names)
 
-        // Shape stenciling DISABLED — selfcot's Wasm linker doesn't support
-        // shape aliases yet. Every generic instance is lowered fully.
-        // TODO: Re-enable when func_indices resolves aliases at link time.
+        // Parse type param names for metadata params
+        var param_names: List(string) = .{}
+        var pn_start = 0
+        for ci in 0..inst.type_param_names.len {
+            if (inst.type_param_names[ci] == 59) {
+                param_names.append(@string(inst.type_param_names.ptr + pn_start, ci - pn_start))
+                pn_start = ci + 1
+            }
+        }
+        if (pn_start < inst.type_param_names.len) {
+            param_names.append(@string(inst.type_param_names.ptr + pn_start, inst.type_param_names.len - pn_start))
+        }
 
-        // Go pattern: use expr_types preserved from Phase 2 instead of re-checking.
-        // This eliminates checkFnDeclBody during lowering, avoiding stack overflow.
+        // Zig line 9364-9380: use preserved expr_types or re-check
         const saved_expr_types = self.chk.expr_types
         const saved_chk_ast = self.chk.ast
-        self.chk.ast = self.tree  // swap checker AST to defining file
+        self.chk.ast = self.tree
         if (inst.expr_types_ptr != 0) {
-            // Use Phase 2 expr_types directly — no re-checking needed
             self.chk.expr_types = @intToPtr(*Map(int, int), inst.expr_types_ptr).*
         } else {
-            // Fallback: fresh expr_types with re-check (for impl method generics).
-            // Zig/Go pattern: use a temporary ErrorReporter for the defining file's
-            // source to prevent corrupt byte offset → source text mapping.
-            // The defining file's AST is in self.tree (swapped above).
             var fresh_types: Map(int, int) = .{}
             self.chk.expr_types = fresh_types
             const saved_err = self.chk.err
@@ -8241,12 +7757,14 @@ struct Lowerer {
             self.chk.err = saved_err
         }
 
-        // Lower the concrete function body
+        // Zig line 9386-9393: return type + SRET with has_indirect_result
         const return_type = self.resolveTypeNode(fn_d.return_type)
-        const uses_sret = self.needsSret(return_type)
+        const uses_sret = inst.has_indirect_result or self.needsSret(return_type)
         var wasm_return_type = return_type
         if (uses_sret) { wasm_return_type = VOID }
-        self.builder.startFunc(concrete_name, VOID, wasm_return_type, fn_d.span)
+
+        // Zig line 9395-9396: emit under BASE name
+        self.builder.startFunc(base_name, VOID, wasm_return_type, fn_d.span)
         if (self.builder.func()) |fb| {
             if (uses_sret) { fb.sret_return_type = return_type }
             self.clearPerFunctionState()
@@ -8255,27 +7773,54 @@ struct Lowerer {
                 fb.addParam("__sret", I64, 8)
             }
 
-            // Dict-stenciled functions disabled (shape stenciling off)
+            // Zig line 9408-9417: @safe self param injection
+            if (self.chk.safe_mode and !fn_d.is_static) {
+                var has_self_param = false
+                if (fn_d.params.len() > 0) {
+                    switch (self.tree.getNode(fn_d.params.get(0))) { Node.expr |e| => switch (e) {
+                        Expr.field_def |fd| => { if (fd.name == "self") { has_self_param = true } },
+                        else => {},
+                    }, else => {} }
+                }
+                if (!has_self_param) {
+                    // Use concrete_name for struct name extraction (not base_name)
+                    var us_pos: int = -1
+                    for uci in 0..concrete_name.len {
+                        if (concrete_name[uci] == 95) { us_pos = uci }
+                    }
+                    if (us_pos >= 0) {
+                        const struct_name = @string(concrete_name.ptr, us_pos)
+                        const struct_type = self.types.lookupByName(struct_name)
+                        if (struct_type >= 0) {
+                            const ptr_type = self.chk.safeWrapType(struct_type)
+                            fb.addParam("self", ptr_type, self.types.sizeOf(ptr_type))
+                        }
+                    }
+                }
+            }
 
-            // Add params
+            // Zig line 9419-9438: regular params
             for pi in 0..fn_d.params.len() {
                 const param_idx = fn_d.params.get(pi)
-                const p_node = self.tree.getNode(param_idx)
                 var pname = ""
                 var ptype_expr = null_node
-                switch (p_node) { Node.expr |e| => switch (e) {
+                switch (self.tree.getNode(param_idx)) { Node.expr |e| => switch (e) {
                     Expr.field_def |fd| => { pname = fd.name; ptype_expr = fd.type_expr },
                     else => {},
                 }, else => {} }
                 var param_type = self.resolveTypeNode(ptype_expr)
-                // Skip safeWrapType for substituted type parameters.
-                // Mirror checker isSubstitutedTypeParam: check both Expr.ident
-                // and Expr.type_expr with TYPE_NAMED kind (Zig ref: lower.zig:9179-9182).
                 const is_substituted = self.chk.isSubstitutedTypeParam(ptype_expr)
                 if (!is_substituted) { param_type = self.chk.safeWrapType(param_type) }
                 fb.addParam(pname, param_type, self.types.sizeOf(param_type))
             }
 
+            // Zig line 9440-9446: metadata params AFTER user params
+            for mi in 0..param_names.len() {
+                const meta_name = "__metadata_" ++ param_names.get(mi)
+                fb.addParam(meta_name, I64, 8)
+            }
+
+            // Zig line 9448-9460: lower body
             if (fn_d.body != null_node) {
                 self.lowerBlockNode(fn_d.body)
                 if (return_type == VOID and fb.needsTerminator()) {
@@ -8293,13 +7838,9 @@ struct Lowerer {
                 }
             }
         }
-        // Clear dict context
-        self.has_dict_context = false
-        self.current_dict_entries.clear()
-        self.current_dict_params.clear()
         self.builder.endFunc()
 
-        // Restore type substitution, checker AST, expr_types, and tree
+        // Restore
         self.chk.type_sub_keys.resize(saved_sub_count)
         self.chk.type_sub_vals.resize(saved_sub_count)
         self.chk.expr_types = saved_expr_types
@@ -8761,7 +8302,7 @@ struct Lowerer {
             }
             // Qualify deinit method name for cross-module consistency
             const qualified_deinit = if (self.lookupGenericInst(method_info.func_name) != null) {
-                method_info.func_name
+                self.computeGenericBaseName(method_info.func_name)
             } else {
                 self.resolveMethodName(struct_name, method_info.func_name, method_info.source_tree)
             }
@@ -9564,23 +9105,6 @@ fn initLowererMaps(lower: *Lowerer) void {
     var tmm: Map(int, string) = .{}
     lower.tree_module_map = tmm
     lower.spawn_counter = 0
-    var ss: Map(string, string) = .{}
-    lower.shape_stencils = ss
-    var sa: Map(string, string) = .{}
-    lower.shape_aliases = sa
-    var gdh: Map(string, int) = .{}
-    lower.generated_dict_helpers = gdh
-    var sac: Map(int, int) = .{}
-    lower.shape_analysis_cache = sac
-    var dan: Map(string, string) = .{}
-    lower.dict_arg_names = dan
-    var sde: List(DictEntry) = .{}
-    lower.stencil_dict_entries = sde
-    var cde: List(DictEntry) = .{}
-    lower.current_dict_entries = cde
-    var cdp: List(int) = .{}
-    lower.current_dict_params = cdp
-    lower.has_dict_context = false
 }
 
 // ============================================================================
@@ -9869,62 +9393,3 @@ test "lookupComptimeValue" {
     @assertEq(r3.?.tag, CV_STRING)
 }
 
-test "dictOpName" {
-    @assertEq(dictOpName(Token.eql as int), "eq")
-    @assertEq(dictOpName(Token.neq as int), "ne")
-    @assertEq(dictOpName(Token.lss as int), "lt")
-    @assertEq(dictOpName(Token.add as int), "add")
-    @assertEq(dictOpName(Token.sub as int), "sub")
-    @assertEq(dictOpName(Token.mul as int), "mul")
-    @assertEq(dictOpName(Token.quo as int), "div")
-    @assertEq(dictOpName(Token.rem as int), "mod")
-}
-
-test "DictEntry struct" {
-    const entry = DictEntry {
-        kind: DICT_BINARY_OP,
-        op: Token.eql as int,
-        method_name: "",
-        type_param_idx: 0,
-    }
-    @assertEq(entry.kind, DICT_BINARY_OP)
-    @assertEq(entry.type_param_idx, 0)
-
-    const method_entry = DictEntry {
-        kind: DICT_METHOD_CALL,
-        op: 0,
-        method_name: "toString",
-        type_param_idx: 1,
-    }
-    @assertEq(method_entry.kind, DICT_METHOD_CALL)
-    @assertEq(method_entry.method_name, "toString")
-}
-
-test "shape stencil maps init" {
-    var ast = Ast.init("test.cot")
-    var types = TypeRegistry.init()
-    var err = ErrorReporter.init()
-    var chk = Checker.init(&ast, &types, &err)
-
-    var lower: Lowerer = undefined
-    lower.tree = &ast
-    lower.types = &types
-    lower.err = &err
-    lower.chk = &chk
-    initLowererScalars(&lower)
-    initLowererLists(&lower)
-    initLowererMaps(&lower)
-
-    // Stencil maps should be empty initially
-    @assert(!lower.shape_stencils.contains("test"))
-    @assert(!lower.shape_aliases.contains("test"))
-    @assert(!lower.generated_dict_helpers.contains("test"))
-
-    // Can register shape stencils
-    lower.shape_stencils.set("List$s8in", "List__i64__push")
-    @assert(lower.shape_stencils.contains("List$s8in"))
-
-    // Can register aliases
-    lower.shape_aliases.set("List__u64__push", "List__i64__push")
-    @assert(lower.shape_aliases.contains("List__u64__push"))
-}

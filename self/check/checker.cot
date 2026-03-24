@@ -217,6 +217,8 @@ struct GenericInstInfo {
     ast_ptr: int,             // @ptrToInt of defining file's *Ast (raw — ARC doesn't track)
     /// Go pattern: expr_types from Phase 2 body checking, preserved for Phase 3 lowering.
     expr_types_ptr: int,      // @ptrToInt of heap-allocated Map(int, int), 0 = none
+    /// Swift ResultConvention: true when return type is a generic type parameter.
+    has_indirect_result: bool,
 
     fn getAst() *Ast {
         return @intToPtr(*Ast, self.ast_ptr)
@@ -4474,9 +4476,33 @@ struct Checker {
         return result ++ ")"
     }
 
+    /// Check if return type node refers to a generic type parameter.
+    /// Zig: checker.zig:281-295 isTypeParamName()
+    fn isTypeParamName(return_type_node: int, type_params: List(string)) bool {
+        if (return_type_node == null_node) { return false }
+        var name = ""
+        switch (self.ast.getNode(return_type_node)) { Node.expr |e| => switch (e) {
+            Expr.ident |id| => { name = id.name },
+            Expr.type_expr |te| => {
+                if (te.kind == TYPE_NAMED and te.data1 != null_node) {
+                    switch (self.ast.getNode(te.data1)) { Node.expr |e2| => switch (e2) {
+                        Expr.ident |id2| => { name = id2.name },
+                        else => {},
+                    }, else => {} }
+                }
+            },
+            else => {},
+        }, else => {} }
+        if (name == "") { return false }
+        for i in 0..type_params.len() {
+            if (type_params.get(i) == name) { return true }
+        }
+        return false
+    }
+
     /// Register a generic instance so the lowerer can find it by concrete name.
     /// Zig: self.generics.generic_inst_by_name.put(name, inst)
-    fn registerGenericInst(concrete_name: string, generic_node: int, type_args: List(int), type_param_names: List(string), ast_ptr: int, expr_types_ptr: int) void {
+    fn registerGenericInst(concrete_name: string, generic_node: int, type_args: List(int), type_param_names: List(string), ast_ptr: int, expr_types_ptr: int, has_indirect_result: bool) void {
         // Serialize type args: "5" or "5;17"
         // NOTE: Use explicit ++ instead of string interpolation to avoid
         // a Zig compiler codegen bug where "${str};${int}" truncates str.
@@ -4510,6 +4536,7 @@ struct Checker {
             type_param_names: tp_copy,
             ast_ptr: ast_ptr,
             expr_types_ptr: expr_types_ptr,
+            has_indirect_result: has_indirect_result,
         }
         self.generic_inst_by_name.set(concrete_name, inst)
     }
@@ -4663,11 +4690,14 @@ struct Checker {
             // (fn_decl.type_params is empty for struct methods; T comes from struct)
             // Use fn's own type_params if it has any, otherwise struct's type_params
             var fn_tp: List(string) = .{}
-            switch (self.ast.getNode(nested_idx)) { Node.decl |d| => switch (d) { Decl.fn_decl |f| => { fn_tp = f.type_params }, else => {} }, else => {} }
+            var fn_ret: int = null_node
+            switch (self.ast.getNode(nested_idx)) { Node.decl |d| => switch (d) { Decl.fn_decl |f| => { fn_tp = f.type_params; fn_ret = f.return_type }, else => {} }, else => {} }
             if (fn_tp.len() > 0) {
-                self.registerGenericInst(synth_name, nested_idx, resolved_args, fn_tp, ast_ptr, 0)
+                const indirect = self.isTypeParamName(fn_ret, fn_tp)
+                self.registerGenericInst(synth_name, nested_idx, resolved_args, fn_tp, ast_ptr, 0, indirect)
             } else {
-                self.registerGenericInst(synth_name, nested_idx, resolved_args, type_param_names, ast_ptr, 0)
+                const indirect = self.isTypeParamName(fn_ret, type_param_names)
+                self.registerGenericInst(synth_name, nested_idx, resolved_args, type_param_names, ast_ptr, 0, indirect)
             }
         }
 
@@ -4749,8 +4779,11 @@ struct Checker {
                     source_tree: 0,
                 })
 
-                // Register for lowerer (Zig line 3537)
-                self.registerGenericInst(synth_name, method_idx, resolved_args, impl_tp, entry.ast_ptr, 0)
+                // Swift ResultConvention: check if return type is a type parameter
+                var method_ret: int = null_node
+                switch (self.ast.getNode(method_idx)) { Node.decl |d| => switch (d) { Decl.fn_decl |mf| => { method_ret = mf.return_type }, else => {} }, else => {} }
+                const indirect = self.isTypeParamName(method_ret, impl_tp)
+                self.registerGenericInst(synth_name, method_idx, resolved_args, impl_tp, entry.ast_ptr, 0, indirect)
             }
 
             // Pass 2: Check all method bodies
@@ -4924,8 +4957,15 @@ struct Checker {
 
 
 
-        // Register for lowerer with preserved expr_types (Go pattern)
-        self.registerGenericInst(cache_key, fn_node, resolved_args, fn_tp, info.ast_ptr, et_ptr)
+        // Swift ResultConvention: check if return type is a type parameter
+        const def_ast = info.getAst()
+        var fn_ret: int = null_node
+        switch (def_ast.getNode(fn_node)) { Node.decl |d| => switch (d) { Decl.fn_decl |fd2| => { fn_ret = fd2.return_type }, else => {} }, else => {} }
+        const tmp_ast = self.ast
+        self.ast = def_ast
+        const indirect = self.isTypeParamName(fn_ret, fn_tp)
+        self.ast = tmp_ast
+        self.registerGenericInst(cache_key, fn_node, resolved_args, fn_tp, info.ast_ptr, et_ptr, indirect)
 
         return func_type
     }

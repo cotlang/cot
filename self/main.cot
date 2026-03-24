@@ -436,11 +436,6 @@ fn compileWithImports(path: string, project_safe: bool, lower_opts: LowerOptions
     var lower_shared = SharedLowerState {
         builder: Builder.init(),
         lowered_generics: .{},
-        shape_stencils: .{},
-        shape_aliases: .{},
-        generated_dict_helpers: .{},
-        dict_arg_names: .{},
-        shape_analysis_cache: .{},
         init_func_names: .{},
         file_counter: 0,
         all_test_names: .{},
@@ -624,11 +619,6 @@ struct CheckedFile {
 struct SharedLowerState {
     builder: Builder,
     lowered_generics: Map(string, int),
-    shape_stencils: Map(string, string),
-    shape_aliases: Map(string, string),
-    generated_dict_helpers: Map(string, int),
-    dict_arg_names: Map(string, string),
-    shape_analysis_cache: Map(int, int),
     // Multi-file pipeline tracking (Go init function pattern)
     init_func_names: List(string),
     file_counter: int,
@@ -665,11 +655,6 @@ fn lowerOneFile(cf: CheckedFile, types: TypeRegistry, shared: SharedLowerState, 
     initLowererLists(lower_inst)
     initLowererMaps(lower_inst)
     lower_inst.lowered_generics = shared.lowered_generics
-    lower_inst.shape_stencils = shared.shape_stencils
-    lower_inst.shape_aliases = shared.shape_aliases
-    lower_inst.generated_dict_helpers = shared.generated_dict_helpers
-    lower_inst.dict_arg_names = shared.dict_arg_names
-    lower_inst.shape_analysis_cache = shared.shape_analysis_cache
     lower_inst.tree_module_map = shared.tree_module_map
 
     // Set modes before lowering
@@ -708,11 +693,6 @@ fn lowerOneFile(cf: CheckedFile, types: TypeRegistry, shared: SharedLowerState, 
     // Zig driver uses manual memory management; Cot needs this ARC workaround.
     shared.builder = lower_inst.builder
     shared.lowered_generics = lower_inst.lowered_generics
-    shared.shape_stencils = lower_inst.shape_stencils
-    shared.shape_aliases = lower_inst.shape_aliases
-    shared.generated_dict_helpers = lower_inst.generated_dict_helpers
-    shared.dict_arg_names = lower_inst.dict_arg_names
-    shared.shape_analysis_cache = lower_inst.shape_analysis_cache
 
     // Zero only the managed pointer fields to prevent ARC from releasing them.
     // tree (*Ast) and chk (*Checker) are owned by parsed_files/checkers.

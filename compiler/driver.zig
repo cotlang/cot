@@ -384,9 +384,7 @@ pub const Driver = struct {
             try lowerer.generateTestRunner();
         }
 
-        // VWT: Witness emission deferred — will be integrated into lowerer on demand
-        // (Swift pattern: emitValueWitnessTable called during IRGen, not as post-pass).
-        // Currently inline ARC is used; witnesses emitted when VWT dispatch is enabled.
+        try self.emitVWTWitnesses(&lowerer.builder, &type_reg);
 
         var ir_result = try lowerer.builder.getIR();
         defer ir_result.deinit();
@@ -398,14 +396,9 @@ pub const Driver = struct {
     /// Witnesses are emitted as IR functions into the builder and flow through the
     /// standard SSA → codegen pipeline alongside user functions.
     fn emitVWTWitnesses(self: *Driver, builder: *ir_mod.Builder, type_reg: *types_mod.TypeRegistry) !void {
-        _ = self;
+        if (self.target.isWasm()) return;
         var gen = vwt_gen_mod.VWTGenerator.init(builder.allocator, type_reg);
         defer gen.deinit();
-
-        // VWT witnesses are defined but only emitted when needed for indirect dispatch
-        // (existential types). For direct dispatch with concrete types, inline ARC is used.
-        // Skip emission entirely to avoid compile time overhead (~1000 extra functions).
-        if (true) return;
 
         var vwt_emitted: usize = 0;
         // Swift pattern: emit VWT for EVERY non-trivial concrete type.
@@ -765,7 +758,7 @@ pub const Driver = struct {
             runner.deinitWithoutBuilder();
         }
 
-        // VWT: Witness emission deferred (see single-file path comment).
+        try self.emitVWTWitnesses(&shared_builder, &type_reg);
 
         var final_ir = try shared_builder.getIR();
         defer final_ir.deinit();

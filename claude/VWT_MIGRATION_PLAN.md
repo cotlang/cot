@@ -255,19 +255,22 @@ by the lowerer. Deletion of checker monomorphization is Phase 3 (after VWT is pr
 - [x] `expr_types` preservation works (unchanged)
 - [x] Trait bound checking unchanged (orthogonal to VWT)
 
-### 2.2 Lowerer Changes — IN PROGRESS
+### 2.2 Lowerer Changes — DONE (2026-03-25)
 - [x] Generic function lowering emits ONE body with `*Metadata` params (`lowerGenericFnInstanceVWT`)
-- [x] All ARC paths use VWT witnesses instead of inline code (via `use_vwt` flag)
-- [x] `@arcRetain`/`@arcRelease` builtins dispatch through VWT (via `emitCopyValue`/`emitDestroyValue`)
-- [x] Struct init, new expr, SRET return all use VWT witnesses (via `emitCopyValue`)
-- [x] Thin wrapper functions bridge concrete names → base name with metadata (`emitVWTWrapper`)
-- [x] `lowerMethodCall` on generic types: call sites use concrete name → wrapper → VWT base (no change needed)
-- [x] Generic function queue: now dispatches to `lowerGenericFnInstanceVWT` which emits base + wrapper
+- [x] All ARC paths use VWT witnesses instead of inline code (`emitCopyValue`/`emitDestroyValue` call VWT witnesses directly)
+- [x] `emitCopyValue` calls `__vwt_initializeWithCopy_{type}` for ALL non-trivial types
+- [x] `emitDestroyValue` calls `__vwt_destroy_{type}` for ALL non-trivial types
+- [x] Old inline ARC code deleted (450+ lines removed from emitCopyValue/emitDestroyValue)
+- [x] `emitOptionalFieldRetain`, `emitVWTWrapper`, `isGenericReturnType` deleted (dead code)
+- [x] `lowerMethodCall` on generic types: call sites use `computeGenericBaseName` → base name + metadata
+- [x] Generic function queue: dispatches to `lowerGenericFnInstanceVWT` which emits base body
 
-### 2.3 Verification — PARTIAL
-- [x] All 22 test/cases files pass (VWT is now unconditional default)
-- [ ] selfcot builds — infinite loop FIXED (commit 38f2ef1), SSA-to-CLIF bug: VWT emitCopyValue creates temp locals + addr_local + call + load_local pattern that SSA builder doesn't track through blocks correctly. Affects all non-trivial functions in multi-file builds. Root cause: VWT dispatch always creates temp local storage for OpaqueValue* convention, SSA value numbering loses the load_local after the call.
-- [ ] selfcot2 builds (depends on selfcot)
+### 2.3 Verification — DONE (2026-03-25)
+- [x] All 22 test/cases files pass (native and wasm)
+- [x] selfcot builds in ~10.9s (482 VWT types, 135 unique witnesses, 2,558 total funcs)
+- [x] `/tmp/selfcot version` → `cot 0.3.7 (self-hosted)`
+- [x] VWT witness emission gated on native target (wasm has no ARC, skips VWT)
+- [ ] selfcot2 builds (depends on selfcot — separate milestone)
 - [ ] Binary size comparison: VWT binary vs monomorphized binary
 
 ---
@@ -319,15 +322,22 @@ These cannot be deleted until the checker is refactored to not monomorphize at a
 ### 3.6 SSA Pass — KEEP
 - [x] `rewritegeneric.zig` — misleading name, actually rewrites const_string→string_make (KEEP)
 
-### 3.7 self/ (Self-Hosted Compiler) — NOT YET (56 matches remaining)
-These will be deleted when VWT is ported to self/. Cannot delete now because
-selfcot still uses the old monomorphization path internally.
-- [ ] `DictEntry` struct in `self/build/lower.cot`
-- [ ] `current_dict_entries`, `current_dict_params`, `has_dict_context` fields
-- [ ] `shape_aliases`, `shape_analysis_cache`, `stencil_dict_entries` fields
-- [ ] `analyzeStencilability()`, `ensureGenericFnQueued()`, `lowerGenericFnInstanceInner()`
-- [ ] Dict dispatch in lowerBinary/lowerCall
-- [ ] All `current_dict_*`, `lowered_generics`, `shape_*` references in lower.cot and main.cot
+### 3.7 self/ (Self-Hosted Compiler) — STENCILING DELETED (2026-03-25, ~620 lines)
+Dict/stenciling infrastructure removed. Core generic instantiation (ensureGenericFnQueued,
+lowerGenericFnInstanceInner, lowerQueuedGenericFunctions) kept — selfcot still uses
+monomorphization for generics (VWT not yet ported to self/).
+- [x] `DictEntry` struct, `DICT_BINARY_OP`, `DICT_METHOD_CALL`, `STENCIL_*` constants
+- [x] `dictOpName()`, `dictHelperName()`, `generateBinaryOpHelper()`, `generateMethodCallHelper()`
+- [x] `analyzeStencilability()`, `collectNodeDictEntries()`, `collectExprDictEntries()`, `collectStmtDictEntries()`
+- [x] `generateDictHelpers()`, `buildDictArgNames()`
+- [x] `current_dict_entries`, `current_dict_params`, `has_dict_context` fields
+- [x] `shape_stencils`, `shape_aliases`, `generated_dict_helpers`, `shape_analysis_cache`, `stencil_dict_entries`, `dict_arg_names` fields
+- [x] Dict dispatch in lowerBinary and lowerMethodCall
+- [x] All stenciling fields in `SharedLowerState` (main.cot) and `Builder` (builder.cot)
+- [x] Test blocks for DictEntry and dictOpName
+- [x] Verified: `grep -c` returns 0 for all stenciling patterns in self/
+- [ ] `lowered_generics` — still used by generic instantiation (not stenciling)
+- [ ] `ensureGenericFnQueued()`, `lowerGenericFnInstanceInner()` — still used for monomorphization
 
 ---
 
