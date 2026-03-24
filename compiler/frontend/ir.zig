@@ -601,6 +601,8 @@ pub const Builder = struct {
     funcs: std.ArrayListUnmanaged(Func) = .{},
     globals: std.ArrayListUnmanaged(Global) = .{},
     structs: std.ArrayListUnmanaged(StructDef) = .{},
+    /// O(1) function name lookup (populated by endFunc).
+    func_names: std.StringHashMapUnmanaged(void) = .{},
 
     pub fn init(allocator: Allocator, type_reg: *TypeRegistry) Builder { return .{ .ir = IR.init(allocator, type_reg), .allocator = allocator }; }
 
@@ -608,6 +610,7 @@ pub const Builder = struct {
         self.funcs.deinit(self.allocator);
         self.globals.deinit(self.allocator);
         self.structs.deinit(self.allocator);
+        self.func_names.deinit(self.allocator);
         if (self.current_func) |*fb| fb.deinit();
     }
 
@@ -616,14 +619,15 @@ pub const Builder = struct {
 
     pub fn endFunc(self: *Builder) !void {
         if (self.current_func) |*fb| {
-            try self.funcs.append(self.allocator, try fb.build());
+            const built = try fb.build();
+            try self.func_names.put(self.allocator, built.name, {});
+            try self.funcs.append(self.allocator, built);
             self.current_func = null;
         }
     }
 
     pub fn hasFunc(self: *const Builder, name: []const u8) bool {
-        for (self.funcs.items) |f| if (std.mem.eql(u8, f.name, name)) return true;
-        return false;
+        return self.func_names.contains(name);
     }
 
     pub fn addGlobal(self: *Builder, g: Global) !void { try self.globals.append(self.allocator, g); }
