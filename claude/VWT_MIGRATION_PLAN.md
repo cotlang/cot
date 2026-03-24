@@ -265,8 +265,8 @@ by the lowerer. Deletion of checker monomorphization is Phase 3 (after VWT is pr
 - [x] Generic function queue: now dispatches to `lowerGenericFnInstanceVWT` which emits base + wrapper
 
 ### 2.3 Verification — PARTIAL
-- [x] All 22 test/cases files pass with `COT_VWT=1` (verified)
-- [ ] selfcot builds with `COT_VWT=1` (performance issue — too many VWT functions for 41-file project)
+- [x] All 22 test/cases files pass (VWT is now unconditional default)
+- [ ] selfcot builds — infinite loop FIXED, but SSA-to-CLIF codegen errors on VWT call return values
 - [ ] selfcot2 builds (depends on selfcot)
 - [ ] Binary size comparison: VWT binary vs monomorphized binary
 
@@ -277,102 +277,57 @@ by the lowerer. Deletion of checker monomorphization is Phase 3 (after VWT is pr
 Every item must be checked off AND verified by grep.
 
 ### 3.1 types.zig — Delete Shape Infrastructure
-- [ ] `Shape` struct (line 816) — shape definition
-- [ ] `Shape.ArcKind` enum (line 826) — ARC categorization
-- [ ] `Shape.RegClass` enum (line 836) — register class
-- [ ] `Shape.fromType()` (line 843) — compute shape from type
-- [ ] `Shape.eql()` (line 864) — shape equality
-- [ ] `Shape.key()` (line 870) — shape suffix string
-- [ ] `ShapeKey` struct (line 887) — shape string buffer
-- [ ] `isMonomorphizedCollection()` (line 500) — name-based hack
-- [ ] Remove `isMonomorphizedCollection` call from `isTrivial()` (line 536)
-- [ ] Remove `isMonomorphizedCollection` call from `couldBeARC()` (line 585)
+- [ ] `Shape` struct — shape definition
+- [ ] `Shape.ArcKind` enum — ARC categorization
+- [ ] `Shape.RegClass` enum — register class
+- [ ] `Shape.fromType()` — compute shape from type
+- [ ] `Shape.eql()` — shape equality
+- [ ] `Shape.key()` — shape suffix string
+- [ ] `ShapeKey` struct — shape string buffer
+- [ ] `isMonomorphizedCollection()` — name-based hack (still used by VWT classifyType — must replace first)
+- [ ] Remove `isMonomorphizedCollection` call from `isTrivial()`
+- [ ] Remove `isMonomorphizedCollection` call from `couldBeARC()`
 
-### 3.2 checker.zig — Delete Monomorphization
-- [ ] `GenericInstInfo` struct (line 112) — all fields including:
-  - [ ] `concrete_name: []const u8`
-  - [ ] `generic_node: NodeIndex`
-  - [ ] `type_args: []const TypeIndex`
-  - [ ] `type_param_names: []const []const u8`
-  - [ ] `tree: *const Ast`
-  - [ ] `scope: ?*Scope`
-  - [ ] `expr_types: ?std.AutoHashMap(NodeIndex, TypeIndex)` — **NOTE: may need VWT equivalent**
-- [ ] `GenericImplInfo` struct (line 170) — generic impl block metadata
-- [ ] `SharedGenericContext.instantiation_cache` (line 138) — dedup cache
-- [ ] `SharedGenericContext.generic_inst_by_name` (line 139) — name→inst map for lowerer
-- [ ] `SharedGenericContext.generic_impl_blocks` (line 140) — impl blocks per generic
-- [ ] `resolveGenericInstance()` (line 3820) — instantiate generic struct
-- [ ] `instantiateGenericImplMethods()` (line 3896) — monomorphize impl methods
-- [ ] `instantiateGenericFunc()` (line 4030) — instantiate generic function
-- [ ] `buildGenericCacheKey()` (line 4144) — dedup key builder
-- [ ] `parseMapTypeArgs()` (line 179) — parse "Map(K;V)" format
-- [ ] `type_substitution` field and ALL uses — substitution map during instantiation
+### 3.2 checker.zig — KEEP for now
+GenericInstInfo, instantiation_cache, generic_inst_by_name, resolveGenericInstance,
+instantiateGenericImplMethods, etc. are all STILL USED by the VWT lowering path.
+The VWT lowerer reads GenericInstInfo to get concrete_name, type_args, expr_types.
+These cannot be deleted until the checker is refactored to not monomorphize at all.
+**Defer to Phase 5 (post-VWT stabilization).**
 
-**KEEP (still needed for VWT):**
-- [ ] `GenericInfo` struct (line 103) — generic definition metadata (type_params, bounds)
-- [ ] `SharedGenericContext.generic_structs` (line 136) — generic struct definitions
-- [ ] `SharedGenericContext.generic_functions` (line 137) — generic function definitions
-- [ ] `SharedGenericContext.trait_defs` (line 141) — trait definitions
-- [ ] `SharedGenericContext.trait_impls` (line 142) — trait impl keys
-- [ ] `buildStructType()` (line 4207) — still needed for non-generic structs
+### 3.3 lower.zig — DONE (778 lines deleted in commit c27e9b0)
+- [x] `shape_stencils`, `dict_arg_names`, `generated_dict_helpers`, `current_dict_entries`, `current_dict_params` fields
+- [x] `DictEntry` struct
+- [x] `lowerGenericFnInstance()` (old non-VWT monomorphization)
+- [x] `scanMethodCallDictEntries`, `scanNodeForMethodCalls`, `scanExprForMethodCalls`, `scanStmtForMethodCalls`, `receiverTypeParamIdx`
+- [x] `buildDictArgNames`, `dictHelperName`, `generateDictHelpers`, `generateMethodCallHelper`, `generateDictWrapper`
+- [x] Dict dispatch in `lowerMethodCall()`
+- [x] `use_vwt` flag (VWT is now unconditional)
+- [x] `isMonomorphizedCollection` calls in `emitCopyValue`/`emitDestroyValue`/`@arcRetain`/`@arcRelease` (replaced by VWT dispatch)
+- [x] Verified: `grep -c` returns 0 for all deleted patterns
 
-### 3.3 lower.zig — Delete Shape Stenciling & Dict Dispatch
-- [ ] `shape_stencils` field (line 57) — stencil cache
-- [ ] `dict_arg_names` field (line 60) — dict helper names
-- [ ] `current_dict_entries` field (line 64) — runtime dict entries
-- [ ] `current_dict_params` field (line 65) — runtime dict param locals
-- [ ] `lowered_generics` field (line 52) — **MISSED IN AUDIT 1** — dedup map for generic functions
-- [ ] `DictEntry` struct (line 491) — method call descriptor
-- [ ] `lowerGenericFnInstance()` (~line 9546) — **CORRECTED NAME** — Phase 3 generic lowering
-- [ ] `lowerQueuedGenericFunctions()` (line 9509) — **MISSED IN AUDIT 1** — process queued generics
-- [ ] `ensureGenericFnQueued()` (line 9501) — generic function queue management
-- [ ] `scanMethodCallDictEntries()` (line 9290) — scan AST for method calls
-- [ ] `scanNodeForMethodCalls()` (line 9319) — recursive AST walk
-- [ ] `scanExprForMethodCalls()` (line 9328) — expression walker
-- [ ] `scanStmtForMethodCalls()` (line 9421) — statement walker
-- [ ] `receiverTypeParamIdx()` (line 9457) — check if receiver is type param
-- [ ] `buildDictArgNames()` (line 9840) — create dict helper names
-- [ ] `dictHelperName()` (line 9853) — generate helper name
-- [ ] `generateDictHelpers()` (line 9864) — generate trampolines
-- [ ] `generateMethodCallHelper()` (line 9876) — generate trampoline function
-- [ ] `generateDictWrapper()` (line 9764) — wrapper around stencil
-- [ ] Dict dispatch in `lowerMethodCall()` (lines 10213-10273) — indirect call logic
-- [ ] All `generic_fn_queue` / `pending_generic_fns` references
-- [ ] `isMonomorphizedCollection` calls in `emitCopyValue` (line 4671)
-- [ ] `isMonomorphizedCollection` calls in `emitDestroyValue` (line 4908)
-- [ ] `isMonomorphizedCollection` calls in `@arcRetain` handler (line 11232)
-- [ ] `isMonomorphizedCollection` calls in `@arcRelease` handler (line 11250)
+### 3.4 driver.zig — DONE (deleted in commit c27e9b0)
+- [x] `shared_shape_stencils`, `shared_dict_arg_names`, `shared_generated_dict_helpers`
+- [x] All code passing shape_stencils/dict_arg_names to lowerer instances
+- [x] `use_vwt` assignment (VWT is now unconditional)
+- [x] Verified: `grep -c` returns 0 for all deleted patterns
 
-### 3.4 driver.zig — Delete Shared Contexts
-- [ ] `shared_shape_stencils` (line 542) — shared stencil cache
-- [ ] `lowered_generics` sharing code — **MISSED IN AUDIT 1** — dedup across files
-- [ ] All code passing shape_stencils to lowerer instances (lines 581, 593, 603, 612, 625)
-- [ ] All code passing lowered_generics to lowerer instances
+### 3.5 ast.zig — KEEP
+- [x] `GenericInstance` struct — still used for parsing `Type(Args)` (KEEP)
+- [x] `TypeKind.generic_instance` — still needed for type expression parsing (KEEP)
 
-### 3.5 ast.zig — Evaluate
-- [ ] `GenericInstance` struct (line 382) — **KEEP** — still used for parsing `Type(Args)`
-- [ ] `TypeKind.generic_instance` (line 394) — **KEEP** — still needed for type expression parsing
+### 3.6 SSA Pass — KEEP
+- [x] `rewritegeneric.zig` — misleading name, actually rewrites const_string→string_make (KEEP)
 
-### 3.6 SSA Pass
-- [ ] `rewritegeneric.zig` — **KEEP** — misleading name, actually rewrites const_string→string_make
-
-### 3.7 self/ (Self-Hosted Compiler) — Delete ALL Stenciling/Dict Infrastructure
-- [ ] `DictEntry` struct in `self/build/lower.cot:71-76`
-- [ ] `current_dict_entries` field in `self/build/lower.cot:158`
-- [ ] `current_dict_params` field in `self/build/lower.cot:159`
-- [ ] `has_dict_context` field and all uses
-- [ ] `shape_aliases` in `self/build/lower.cot:153` — **MISSED IN AUDIT 1**
-- [ ] `shape_analysis_cache` in `self/build/lower.cot:155` — **MISSED IN AUDIT 1**
-- [ ] `stencil_dict_entries` in `self/build/lower.cot:156` — **MISSED IN AUDIT 1**
-- [ ] `analyzeStencilability()` in `self/build/lower.cot:7326` — **MISSED IN AUDIT 1**
-- [ ] `ensureGenericFnQueued()` in `self/build/lower.cot:8063` — **MISSED IN AUDIT 1**
-- [ ] `lowerGenericFnInstanceInner()` in `self/build/lower.cot:8193` — **MISSED IN AUDIT 1**
-- [ ] Dict dispatch in `self/build/lower.cot:2480-2500` (lowerBinary)
-- [ ] Dict dispatch in `self/build/lower.cot:3700-3720` (lowerCall)
-- [ ] All `current_dict_*` references in `self/build/lower.cot`
-- [ ] All `lowered_generics` references in `self/main.cot:438, 626-627, 667, 710`
-- [ ] `lowered_generics` field in `self/build/lower.cot:141`
-- [ ] All `shape_*` references in `self/main.cot:440, 443, 628, 631, 669, 672, 712, 715`
+### 3.7 self/ (Self-Hosted Compiler) — NOT YET (56 matches remaining)
+These will be deleted when VWT is ported to self/. Cannot delete now because
+selfcot still uses the old monomorphization path internally.
+- [ ] `DictEntry` struct in `self/build/lower.cot`
+- [ ] `current_dict_entries`, `current_dict_params`, `has_dict_context` fields
+- [ ] `shape_aliases`, `shape_analysis_cache`, `stencil_dict_entries` fields
+- [ ] `analyzeStencilability()`, `ensureGenericFnQueued()`, `lowerGenericFnInstanceInner()`
+- [ ] Dict dispatch in lowerBinary/lowerCall
+- [ ] All `current_dict_*`, `lowered_generics`, `shape_*` references in lower.cot and main.cot
 
 ---
 
