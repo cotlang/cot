@@ -1,5 +1,24 @@
 # Claude AI Instructions
 
+## 🚨🚨🚨 USE PIPELINE DEBUGGER FOR ALL BUGS — NO TEMPORARY PRINTS 🚨🚨🚨
+
+**NEVER add temporary `std.debug.print` or `eprintln` statements to debug.** Use the pipeline debug system instead:
+
+```bash
+COT_DEBUG=all ./zig-out/bin/cot build file.cot       # All pipeline phases
+COT_DEBUG=codegen ./zig-out/bin/cot build file.cot    # Codegen only
+COT_DEBUG=lower,ssa ./zig-out/bin/cot build file.cot  # Specific phases
+COT_SSA=funcName ./zig-out/bin/cot build file.cot     # SSA HTML visualizer
+```
+
+**Use `pipeline_debug.zig`** for ALL logging. When investigating a bug:
+1. First use `COT_DEBUG=all` to see where in the pipeline the issue occurs
+2. Use `COT_SSA=funcName` to inspect SSA for the specific function
+3. Add PERMANENT debug logging to `pipeline_debug.zig` (not temporary prints) if new phases need visibility
+4. Enhance the debug system with new categories/phases as needed — it's an investment, not a workaround
+
+**WHY:** Temporary prints get left behind, don't compose, and waste rebuild cycles. The pipeline debugger is always available, covers all phases, and produces actionable HTML visualizations. Claude has repeatedly wasted hours with temporary prints instead of using the existing world-class debug infrastructure.
+
 ## 🚨🚨🚨 NEVER CHECK OUT OLD VERSIONS OR COMPARE AGAINST OLD BUILDS 🚨🚨🚨
 
 **DO NOT** use `git checkout`, `git stash`, or build old versions to compare behavior. This wastes massive amounts of time. Fix the current code by reading it, understanding it, and comparing with the Zig reference. The Zig compiler IS the reference — not an old selfcot build.
