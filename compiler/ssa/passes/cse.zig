@@ -8,7 +8,9 @@
 const std = @import("std");
 const Func = @import("../func.zig").Func;
 const Block = @import("../block.zig").Block;
-const Value = @import("../value.zig").Value;
+const value_mod = @import("../value.zig");
+const Value = value_mod.Value;
+const Aux = value_mod.Aux;
 const Op = @import("../op.zig").Op;
 const debug = @import("../../pipeline_debug.zig");
 
@@ -81,31 +83,65 @@ fn canCSE(op: Op) bool {
     if (info.writes_memory or info.reads_memory) return false;
     if (op == .phi or op == .arg or op == .copy or op == .fwd_ref) return false;
     if (op == .sp or op == .init_mem) return false;
-    // addr ops represent distinct function references — aux.string differs even when aux_int matches.
-    // CSE only compares aux_int, so two different func_addr would be incorrectly merged.
-    if (op == .addr) return false;
     return true;
 }
 
+/// Go cse.go:393-417 — hash-based value numbering includes op, type, aux, auxint, args.
 fn hashValue(v: *Value) u64 {
     var h: u64 = @intFromEnum(v.op);
     h = h *% 31 +% @as(u64, @intCast(v.type_idx));
     h = h *% 17 +% @as(u64, @bitCast(v.aux_int));
+    // Go cse.go: auxIDs map assigns unique IDs to each Aux value for hashing.
+    // We hash the aux union tag + string content directly.
+    h = h *% 23 +% hashAux(v.aux);
     for (v.args, 0..) |a, i| {
         h = h *% 13 +% @as(u64, @intCast(a.id)) *% (@as(u64, 7) +% @as(u64, @intCast(i)));
     }
     return h;
 }
 
+fn hashAux(aux: Aux) u64 {
+    return switch (aux) {
+        .none => 0,
+        .string => |s| blk: {
+            var h: u64 = 0xcbf29ce484222325;
+            for (s) |c| h = (h ^ c) *% 0x100000001b3;
+            break :blk h;
+        },
+        .symbol => |p| if (p) |ptr| @intFromPtr(ptr) else 0,
+        .symbol_off => |so| @intFromPtr(so.sym) *% 31 +% @as(u64, @bitCast(so.offset)),
+        .call => |c| @intFromPtr(c),
+        .type_ref => |t| @as(u64, @intCast(t)),
+        .cond => |cc| @intFromEnum(cc),
+    };
+}
+
+/// Go cse.go:419-457 — cmpVal compares op, type, aux, auxint, args.
+/// Must match hashValue: values that hash equal must compare equal.
 fn valuesEqual(a: *Value, b: *Value) bool {
     if (a.op != b.op) return false;
     if (a.type_idx != b.type_idx) return false;
     if (a.aux_int != b.aux_int) return false;
+    // Go cse.go:447-455 — compare Aux field (function name, symbol, etc.)
+    if (!auxEqual(a.aux, b.aux)) return false;
     if (a.args.len != b.args.len) return false;
     for (a.args, b.args) |aa, ba| {
         if (aa != ba) return false;
     }
     return true;
+}
+
+fn auxEqual(a: Aux, b: Aux) bool {
+    if (@intFromEnum(a) != @intFromEnum(b)) return false;
+    return switch (a) {
+        .none => true,
+        .string => |sa| std.mem.eql(u8, sa, b.string),
+        .symbol => |pa| pa == b.symbol,
+        .symbol_off => |sa| sa.sym == b.symbol_off.sym and sa.offset == b.symbol_off.offset,
+        .call => |ca| ca == b.call,
+        .type_ref => |ta| ta == b.type_ref,
+        .cond => |ca| ca == b.cond,
+    };
 }
 
 // Tests
