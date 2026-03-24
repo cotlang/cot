@@ -121,9 +121,14 @@ pub fn isEnabled(phase: Phase) bool {
 }
 
 /// Log a message if the phase is enabled.
+/// Compilation start time for elapsed timestamps.
+var start_time: ?i128 = null;
+
 pub fn log(phase: Phase, comptime fmt: []const u8, args: anytype) void {
     if (!isEnabled(phase)) return;
-    std.debug.print("[{s}] " ++ fmt ++ "\n", .{@tagName(phase)} ++ args);
+    if (start_time == null) start_time = std.time.nanoTimestamp();
+    const elapsed_ms = @divTrunc(std.time.nanoTimestamp() - start_time.?, 1_000_000);
+    std.debug.print("[{s} {d}ms] " ++ fmt ++ "\n", .{ @tagName(phase), @as(i64, @intCast(elapsed_ms)) } ++ args);
 }
 
 /// Log a message with elapsed time in microseconds.
