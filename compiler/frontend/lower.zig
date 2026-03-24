@@ -8946,10 +8946,19 @@ pub const Lowerer = struct {
                     .slice => if (base_type_idx == TypeRegistry.STRING) "string" else null,
                     else => null,
                 };
-                // Existential method dispatch: load fn_ptr from PWT, call indirectly
+                // Existential method dispatch: load fn_ptr from PWT, call indirectly.
+                // Swift IndirectTypeInfo: existential params are always pointer-wrapped.
+                // Auto-deref: if base is *any Trait, unwrap to any Trait.
                 if (base_type == .existential) {
                     debug.log(.lower, "existential call detected: base_type_idx={d} method='{s}'", .{ base_type_idx, fa.field });
                     return try self.lowerExistentialMethodCall(call, fa, base_type.existential);
+                }
+                if (base_type == .pointer) {
+                    const pointee = self.type_reg.get(base_type.pointer.elem);
+                    if (pointee == .existential) {
+                        debug.log(.lower, "existential call via pointer: base_type_idx={d} method='{s}'", .{ base_type_idx, fa.field });
+                        return try self.lowerExistentialMethodCall(call, fa, pointee.existential);
+                    }
                 }
                 debug.log(.lower, "method call: base_type_idx={d} base_tag={d} method='{s}' type_name={s}", .{
                     base_type_idx,
@@ -9348,14 +9357,28 @@ pub const Lowerer = struct {
                 }
             }
 
-            // Existential coercion: concrete → any Trait at call sites
-            // Swift GenExistential.cpp emitExistentialErasure at apply sites
+            // Existential coercion: concrete → any Trait (or *any Trait) at call sites.
+            // Swift GenExistential.cpp emitExistentialErasure at apply sites.
+            // Swift IndirectTypeInfo: existential params are pointer-wrapped.
             if (param_types) |params| {
                 if (arg_i < params.len) {
-                    const param_exist_info = self.type_reg.get(params[arg_i].type_idx);
-                    if (param_exist_info == .existential) {
+                    const param_info = self.type_reg.get(params[arg_i].type_idx);
+                    // Direct existential param (any Trait)
+                    if (param_info == .existential) {
                         const arg_type = self.inferExprType(arg_idx);
                         arg_node = try self.emitExistentialErasure(fb, arg_node, arg_type, params[arg_i].type_idx, call.span);
+                    }
+                    // Indirect existential param (*any Trait — Swift @in_guaranteed)
+                    if (param_info == .pointer) {
+                        const pointee = self.type_reg.get(param_info.pointer.elem);
+                        if (pointee == .existential) {
+                            const arg_type = self.inferExprType(arg_idx);
+                            const erased = try self.emitExistentialErasure(fb, arg_node, arg_type, param_info.pointer.elem, call.span);
+                            // Store to temp local, pass address (indirect convention)
+                            const tmp = try fb.addLocalWithSize("__exist_arg", param_info.pointer.elem, false, 40);
+                            _ = try fb.emitStoreLocal(tmp, erased, call.span);
+                            arg_node = try fb.emitAddrLocal(tmp, TypeRegistry.I64, call.span);
+                        }
                     }
                 }
             }
@@ -9369,7 +9392,7 @@ pub const Lowerer = struct {
                 try args.append(self.allocator, ptr_val);
                 try args.append(self.allocator, len_val);
             } else {
-                // Decompose large compound args (struct/union/tuple > 8 bytes)
+                // Decompose large compound args (struct/union/tuple/existential > 8 bytes)
                 var is_large_compound = false;
                 var is_opt_ptr_arg2 = false;
                 if (param_types) |params| {

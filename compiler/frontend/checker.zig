@@ -4239,8 +4239,13 @@ pub const Checker = struct {
     /// In @safe mode, wrap struct types with pointer (C#-style reference semantics).
     /// Handles: Foo → *Foo, Error!Foo → Error!*Foo. Leaves non-struct types unchanged.
     pub fn safeWrapType(self: *Checker, type_idx: TypeIndex) !TypeIndex {
+        // Swift IndirectTypeInfo: existentials are ALWAYS passed by pointer,
+        // regardless of @safe mode. 40-byte container passed as 8-byte pointer.
+        // Reference: swift/lib/IRGen/GenExistential.cpp:899-905
+        const t_pre = self.types.get(type_idx);
+        if (t_pre == .existential) return try self.types.makePointer(type_idx);
         if (!self.safe_mode) return type_idx;
-        const t = self.types.get(type_idx);
+        const t = t_pre;
         // Structs and unions are passed by pointer in @safe mode (like TypeScript objects)
         if (t == .struct_type or t == .union_type) return try self.types.makePointer(type_idx);
         if (t == .error_union) {

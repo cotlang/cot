@@ -764,6 +764,12 @@ pub const TypeRegistry = struct {
         }
         if (from_t == .distinct) return false; // distinct → non-distinct requires explicit cast
 
+        // T -> *any Trait (Swift indirect existential: concrete → pointer-to-existential)
+        if (to_t == .pointer) {
+            const to_elem = self.get(to_t.pointer.elem);
+            if (to_elem == .existential) return self.isAssignable(from, to_t.pointer.elem);
+        }
+
         // T -> ?T
         if (to_t == .optional) return self.isAssignable(from, to_t.optional.elem);
 
