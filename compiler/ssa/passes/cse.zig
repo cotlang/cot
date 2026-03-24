@@ -81,6 +81,9 @@ fn canCSE(op: Op) bool {
     if (info.writes_memory or info.reads_memory) return false;
     if (op == .phi or op == .arg or op == .copy or op == .fwd_ref) return false;
     if (op == .sp or op == .init_mem) return false;
+    // addr ops represent distinct function references — aux.string differs even when aux_int matches.
+    // CSE only compares aux_int, so two different func_addr would be incorrectly merged.
+    if (op == .addr) return false;
     return true;
 }
 

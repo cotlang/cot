@@ -850,6 +850,7 @@ pub const GenState = struct {
                 if (fn_name) |name| {
                     if (self.func_table_indices) |indices| {
                         if (indices.get(name)) |table_idx| {
+                            debug.log(.codegen, "wasm/gen: func_addr '{s}' → table_idx={d}", .{ name, table_idx });
                             _ = try self.builder.appendFrom(.i64_const, prog_mod.constAddr(@intCast(table_idx)));
                         } else {
                             debug.log(.codegen, "wasm/gen: addr op: function '{s}' not in func_table_indices", .{name});

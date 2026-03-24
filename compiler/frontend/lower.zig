@@ -4613,6 +4613,7 @@ pub const Lowerer = struct {
     fn lowerExistentialMethodCall(self: *Lowerer, call: ast.Call, fa: ast.FieldAccess, exist: types.ExistentialType) !ir.NodeIndex {
         const fb = self.current_func orelse return ir.null_node;
         const method_name = fa.field;
+        debug.log(.lower, "existential dispatch: method='{s}' trait='{s}' n_methods={d}", .{ method_name, exist.trait_name, exist.method_count });
 
         // Find method index in trait's method list
         var method_idx: ?usize = null;
@@ -8938,8 +8939,15 @@ pub const Lowerer = struct {
                 };
                 // Existential method dispatch: load fn_ptr from PWT, call indirectly
                 if (base_type == .existential) {
+                    debug.log(.lower, "existential call detected: base_type_idx={d} method='{s}'", .{ base_type_idx, fa.field });
                     return try self.lowerExistentialMethodCall(call, fa, base_type.existential);
                 }
+                debug.log(.lower, "method call: base_type_idx={d} base_tag={d} method='{s}' type_name={s}", .{
+                    base_type_idx,
+                    @intFromEnum(base_type),
+                    fa.field,
+                    if (type_name) |n| n else "(null)",
+                });
 
                 if (type_name) |name| {
                     if (self.chk.lookupMethod(name, fa.field)) |method_info| {
