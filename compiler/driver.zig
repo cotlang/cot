@@ -452,6 +452,7 @@ pub const Driver = struct {
             // Parse target type from impl_key "Trait:Type"
             const colon_pos = std.mem.indexOf(u8, impl_key, ":") orelse continue;
             const target_type = impl_key[colon_pos + 1 ..];
+            debug.log(.codegen, "PWT: impl_key='{s}' trait='{s}' target='{s}'", .{ impl_key, trait_name, target_type });
 
             // Look up trait definition for method names
             const trait_def = generic_ctx.trait_defs.get(trait_name) orelse continue;

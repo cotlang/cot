@@ -4765,6 +4765,29 @@ pub const Lowerer = struct {
         // Trivial types: no copy needed
         if (self.type_reg.isTrivial(type_idx)) return value;
 
+        // Existential copy: Swift two-stage pattern.
+        // Stage 1: memcpy metadata + PWT pointers (no ARC, just pointer copy).
+        // Stage 2: call initializeBufferWithCopyOfBuffer through VWT for the value.
+        // Reference: swift/include/swift/Runtime/ExistentialContainer.h copyTypeInto()
+        if (info == .existential) {
+            debug.log(.lower, "existential copy: type_idx={d}", .{type_idx});
+            // Existential is 40 bytes, accessed by address.
+            // Source value is already an address (SSA returns addr for >8B types).
+            const src_addr = value;
+            const dst_tmp = try fb.addLocalWithSize("__exist_copy_dst", type_idx, false, 40);
+            const dst_addr = try fb.emitAddrLocal(dst_tmp, TypeRegistry.I64, span);
+            // Memcpy the full 40 bytes (buffer + metadata + PWT)
+            const size_40 = try fb.emitConstInt(40, TypeRegistry.I64, span);
+            var mc_args = [_]ir.NodeIndex{ dst_addr, src_addr, size_40 };
+            _ = try fb.emitCall("memcpy", &mc_args, false, TypeRegistry.VOID, span);
+            // Stage 2: load metadata from container[24], load VWT from metadata[0],
+            // call initializeBufferWithCopyOfBuffer (VWT slot 0) on the value buffer.
+            // For now: inline values (≤24B) are POD or have their own VWT copy handled
+            // by the memcpy above. ARC-managed values inside the buffer need retain.
+            // TODO: call VWT initializeBufferWithCopyOfBuffer for proper ARC.
+            return try fb.emitLoadLocal(dst_tmp, type_idx, span);
+        }
+
         // VWT dispatch: call witness function for all non-trivial types.
         {
             const type_name = self.type_reg.typeName(type_idx);
@@ -5001,6 +5024,20 @@ pub const Lowerer = struct {
 
         // Trivial types: no destroy needed
         if (self.type_reg.isTrivial(type_idx)) return;
+
+        // Existential destroy: call VWT destroy on the value inside the buffer.
+        // Swift ExistentialContainer.cpp: projectValue() + vwt->destroy().
+        // The metadata ptr at container[24] tells us which VWT to use.
+        // For now: existential values with inline storage (≤24B) — the value inside
+        // the buffer may need ARC release. The PWT heap buffer also needs deallocation.
+        // TODO: Full VWT destroy dispatch through metadata for proper ARC cleanup.
+        if (info == .existential) {
+            debug.log(.lower, "existential destroy: type_idx={d}", .{type_idx});
+            // For inline storage: the contained value is in the first 24 bytes.
+            // The PWT buffer was heap-allocated — release it.
+            // For now: noop (no ARC on wasm, native cleans up stack-allocated containers).
+            return;
+        }
 
         // VWT dispatch: call witness function for all non-trivial types.
         {
