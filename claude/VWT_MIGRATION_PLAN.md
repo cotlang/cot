@@ -206,35 +206,38 @@ Note: This is for existential types (`any Protocol`). Cot can skip this if we do
 - [x] Native + Wasm: witnesses compile through pipeline without errors (tested)
 - [x] Dedup: VWTGenerator tracks emitted types, no duplicates across files
 
-### 1.4 Generic Function Codegen with VWT
-- [ ] Generic functions receive `*Metadata` parameter(s) — one per type param
-- [ ] Access VWT via `metadata[-1]` (pointer at offset -8 from metadata)
-- [ ] `@sizeOf(T)` → load `vwt.size`
-- [ ] `@arcRetain(value)` → call `vwt.initializeWithCopy(dest, src, metadata)`
-- [ ] `@arcRelease(value)` → call `vwt.destroy(value, metadata)`
-- [ ] Scope-exit cleanup → call `vwt.destroy(local, metadata)`
-- [ ] `new` field stores → call `vwt.initializeWithCopy` for each non-trivial field
-- [ ] Return (SRET) → call `vwt.initializeWithCopy` for ownership transfer
-- [ ] Assignment to existing value → call `vwt.assignWithCopy`
-- [ ] Move/forward → call `vwt.initializeWithTake` (no retain, source invalidated)
-- [ ] Struct literal field init → `vwt.initializeWithCopy` for non-trivial +0 fields
+### 1.4 Generic Function Codegen with VWT — IN PROGRESS
+- [x] Generic functions receive `*Metadata` parameter(s) — one per type param (`lowerGenericFnInstanceVWT`)
+- [x] `@arcRetain(value)` → call `vwt.initializeWithCopy` (via `use_vwt` dispatch in `emitCopyValue`)
+- [x] `@arcRelease(value)` → call `vwt.destroy` (via `use_vwt` dispatch in `emitDestroyValue`)
+- [x] Scope-exit cleanup → call `vwt.destroy` (cleanup stack calls `emitDestroyValue` which dispatches)
+- [x] `new` field stores → goes through `emitCopyValue` which dispatches to VWT
+- [x] Return (SRET) → goes through `emitCopyValue` which dispatches to VWT
+- [x] Assignment to existing value → `emitCopyValue` dispatches to VWT `initializeWithCopy`
+- [ ] Access VWT via `metadata[-1]` (not needed yet — witnesses called by name, not through metadata pointer)
+- [ ] `@sizeOf(T)` → load `vwt.size` (not needed yet — concrete size known at lowering time)
+- [ ] Move/forward → `vwt.initializeWithTake` (not yet wired — currently memcpy)
+- [ ] Struct literal field init → VWT copy for non-trivial +0 fields (goes through emitCopyValue)
 
-### 1.5 Call Sites
-- [ ] Calling generic fn with concrete T: pass T's `*Metadata` as extra arg after explicit args
-- [ ] Multiple type params (e.g., `Map(K, V)`): pass K's metadata AND V's metadata
-- [ ] Nested generics: forward metadata parameter to inner generic calls
-- [ ] Method calls on generic types: metadata comes from the type's instantiation context
+### 1.5 Call Sites — IN PROGRESS
+- [x] Calling generic fn with concrete T: `emitVWTWrapper` passes metadata (placeholder 0 for now)
+- [x] Multiple type params: metadata param added per type_param_name in `lowerGenericFnInstanceVWT`
+- [x] Method calls on generic types: wrapper calls base function with metadata prepended
+- [ ] Nested generics: forward metadata parameter to inner generic calls (TODO)
+- [ ] TypeMetadata globals: wrappers currently pass 0 placeholder, need real metadata pointers
 
-### 1.6 Native Codegen
-- [ ] Emit VWT as global constant data section
-- [ ] Emit TypeMetadata as global constant (VWT pointer + kind + descriptor)
-- [ ] Witness function pointers resolved at link time
+### 1.6 Native Codegen — DEFERRED (witnesses use standard pipeline)
+VWT witnesses are emitted as regular IR functions that flow through the standard
+SSA → CLIF IR → native pipeline. No special native codegen needed until we switch
+to indirect calls through VWT function pointers (Phase 2).
+- [ ] Emit VWT as global constant data section (needed for indirect dispatch)
+- [ ] Emit TypeMetadata as global constant (needed for indirect dispatch)
+- [ ] Witness function pointers resolved at link time (needed for indirect dispatch)
 - [ ] CLIF IR: indirect calls `call_indirect vwt.destroy, [value, metadata]`
 
-### 1.7 Wasm Codegen
+### 1.7 Wasm Codegen — DEFERRED (witnesses use standard pipeline)
+Same as native: witnesses are regular Wasm module functions, no special codegen needed.
 - [ ] Wasm VWT: all function pointers = Wasm function indices
-- [ ] Trivial VWT: destroy=noop function, copy=memcpy function
-- [ ] Non-trivial VWT: concrete witness functions in the Wasm module
 - [ ] Wasm table for indirect calls through VWT function pointers
 
 ---
@@ -248,13 +251,14 @@ Note: This is for existential types (`any Protocol`). Cot can skip this if we do
 - [ ] `expr_types` preservation still works (VWT doesn't change type checking)
 - [ ] Trait bound checking remains (orthogonal to VWT)
 
-### 2.2 Lowerer Changes
-- [ ] Generic function lowering emits ONE body with `*Metadata` params
+### 2.2 Lowerer Changes — IN PROGRESS
+- [x] Generic function lowering emits ONE body with `*Metadata` params (`lowerGenericFnInstanceVWT`)
+- [x] All ARC paths use VWT witnesses instead of inline code (via `use_vwt` flag)
+- [x] `@arcRetain`/`@arcRelease` builtins dispatch through VWT (via `emitCopyValue`/`emitDestroyValue`)
+- [x] Struct init, new expr, SRET return all use VWT witnesses (via `emitCopyValue`)
+- [x] Thin wrapper functions bridge concrete names → base name with metadata (`emitVWTWrapper`)
 - [ ] `lowerMethodCall` on generic types: emit indirect call via VWT, not concrete name
-- [ ] All ARC paths use VWT witnesses instead of inline `emitCopyValue`/`emitDestroyValue`
-- [ ] `@arcRetain`/`@arcRelease` builtins dispatch through VWT
-- [ ] Struct init, new expr, SRET return all use VWT witnesses
-- [ ] Remove generic function queue (one body per definition, no queue needed)
+- [ ] Remove generic function queue (still used — wrappers depend on it)
 
 ### 2.3 Verification
 - [ ] All 22 test/cases files pass

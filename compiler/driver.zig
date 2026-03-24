@@ -412,23 +412,24 @@ pub const Driver = struct {
         var gen = vwt_gen_mod.VWTGenerator.init(builder.allocator, type_reg);
         defer gen.deinit();
 
-        // Iterate all registered types, emit witnesses for non-trivial ones.
-        // The generator handles dedup — calling emitWitnesses twice for the same
-        // type name is a no-op.
+        // Only emit witnesses for named struct/union/enum types — these are the types
+        // that the lowerer's VWT dispatch actually references by name. Intermediate
+        // types (pointers, optionals, etc.) get witnesses emitted recursively from
+        // their parent struct/union when needed.
         for (type_reg.types.items, 0..) |t, i| {
             const type_idx: types_mod.TypeIndex = @intCast(i);
             if (type_reg.isTrivial(type_idx)) continue;
 
-            // Get a stable type name for witness function naming
-            const type_name = switch (t) {
+            // Only emit for named aggregate types — skip anonymous/intermediate types
+            const type_name: ?[]const u8 = switch (t) {
                 .struct_type => |s| s.name,
                 .union_type => |u| u.name,
-                .enum_type => |e| e.name,
-                else => type_reg.typeName(type_idx),
+                else => null,
             };
+            if (type_name == null) continue;
 
-            _ = gen.emitWitnesses(builder, type_idx, type_name) catch |err| switch (err) {
-                error.MissingVWTEntry => continue, // skip types that fail
+            _ = gen.emitWitnesses(builder, type_idx, type_name.?) catch |err| switch (err) {
+                error.MissingVWTEntry => continue,
                 else => return err,
             };
         }

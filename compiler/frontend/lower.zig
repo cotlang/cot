@@ -9574,10 +9574,249 @@ pub const Lowerer = struct {
             // Process collected snapshot (safe — no iterator active)
             for (pending.items) |inst_info| {
                 if (self.builder.hasFunc(inst_info.concrete_name)) continue;
-                try self.lowerGenericFnInstance(inst_info);
+                if (self.use_vwt) {
+                    try self.lowerGenericFnInstanceVWT(inst_info);
+                } else {
+                    try self.lowerGenericFnInstance(inst_info);
+                }
                 made_progress = true;
             }
         }
+    }
+
+    /// VWT: Lower one generic function with metadata parameters.
+    /// Emits ONE body per base generic name (e.g., "List_append") that takes
+    /// *TypeMetadata params for each type parameter. ARC operations dispatch
+    /// through VWT witnesses instead of inlined concrete code.
+    fn lowerGenericFnInstanceVWT(self: *Lowerer, inst_info: checker.GenericInstInfo) !void {
+        // Compute base name: "List(5)_append" → "List_append"
+        const base_name = try self.computeGenericBaseName(inst_info.concrete_name);
+
+        // If already lowered under the base name, skip
+        if (self.builder.hasFunc(base_name)) return;
+
+        // Swap to defining file's AST
+        const saved_tree = self.tree;
+        const saved_chk_tree = self.chk.tree;
+        const saved_safe_mode = self.chk.safe_mode;
+        const saved_scope = self.chk.scope;
+        self.tree = inst_info.tree;
+        self.chk.tree = inst_info.tree;
+        if (inst_info.tree.file) |file| self.chk.safe_mode = file.safe_mode;
+        if (inst_info.scope) |s| self.chk.scope = s;
+        defer {
+            self.tree = saved_tree;
+            self.chk.tree = saved_chk_tree;
+            self.chk.safe_mode = saved_safe_mode;
+            self.chk.scope = saved_scope;
+        }
+
+        const fn_node = self.tree.getNode(inst_info.generic_node) orelse return;
+        const fn_decl_node = fn_node.asDecl() orelse return;
+        if (fn_decl_node != .fn_decl) return;
+        const f = fn_decl_node.fn_decl;
+
+        // Build type substitution map (still needed for resolving param/return types)
+        var sub_map = std.StringHashMap(TypeIndex).init(self.allocator);
+        defer sub_map.deinit();
+        const param_names = if (inst_info.type_param_names.len > 0) inst_info.type_param_names else f.type_params;
+        for (param_names, 0..) |param_name, i| {
+            if (i < inst_info.type_args.len) {
+                try sub_map.put(param_name, inst_info.type_args[i]);
+            }
+        }
+
+        // Use preserved expr_types from checker
+        const saved_expr_types = self.chk.expr_types;
+        if (inst_info.expr_types) |et| {
+            self.chk.expr_types = et;
+        } else {
+            self.chk.expr_types = std.AutoHashMap(ir.NodeIndex, TypeIndex).init(self.allocator);
+            self.chk.type_substitution = sub_map;
+            self.chk.checkFnDeclWithName(f, inst_info.generic_node, inst_info.concrete_name) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+            };
+            self.chk.type_substitution = null;
+        }
+        defer {
+            if (inst_info.expr_types == null) self.chk.expr_types.deinit();
+            self.chk.expr_types = saved_expr_types;
+        }
+
+        // Lower the function body with type substitution active
+        self.type_substitution = sub_map;
+        defer self.type_substitution = null;
+
+        const return_type = self.resolveTypeNode(f.return_type);
+        const uses_sret = self.needsSret(return_type);
+        const wasm_return_type = if (uses_sret) TypeRegistry.VOID else return_type;
+
+        // Emit function under BASE name with metadata params
+        self.builder.startFunc(base_name, TypeRegistry.VOID, wasm_return_type, f.span);
+        if (self.builder.func()) |fb| {
+            if (uses_sret) fb.sret_return_type = return_type;
+            fb.is_destructor = std.mem.eql(u8, f.name, "deinit");
+            self.current_func = fb;
+            self.cleanup_stack.clear();
+            self.comptime_value_vars.clearRetainingCapacity();
+            self.weak_locals.clearRetainingCapacity();
+            if (uses_sret) {
+                _ = try fb.addParam("__sret", TypeRegistry.I64, 8);
+            }
+
+            // VWT: Add *TypeMetadata params — one per type parameter
+            for (param_names) |pn| {
+                const meta_name = try std.fmt.allocPrint(self.allocator, "__metadata_{s}", .{pn});
+                _ = try fb.addParam(meta_name, TypeRegistry.I64, 8);
+            }
+
+            // @safe generic: inject self param
+            if (self.chk.safe_mode and !f.is_static and (f.params.len == 0 or !std.mem.eql(u8, f.params[0].name, "self"))) {
+                if (std.mem.lastIndexOf(u8, inst_info.concrete_name, "_")) |underscore| {
+                    const struct_name = inst_info.concrete_name[0..underscore];
+                    if (self.chk.resolveTypeByName(struct_name)) |struct_type| {
+                        const ptr_type = self.chk.types.makePointer(struct_type) catch struct_type;
+                        _ = try fb.addParam("self", ptr_type, self.type_reg.sizeOf(ptr_type));
+                    }
+                }
+            }
+
+            // Regular params
+            for (f.params) |param| {
+                var param_type = self.resolveTypeNode(param.type_expr);
+                const is_substituted = if (self.type_substitution) |sub| blk: {
+                    if (param.type_expr != ast.null_node) {
+                        if (self.tree.getNode(param.type_expr)) |node| {
+                            if (node.asExpr()) |expr_node| {
+                                if (expr_node == .ident) {
+                                    break :blk sub.contains(expr_node.ident.name);
+                                } else if (expr_node == .type_expr and expr_node.type_expr.kind == .named) {
+                                    break :blk sub.contains(expr_node.type_expr.kind.named);
+                                }
+                            }
+                        }
+                    }
+                    break :blk false;
+                } else false;
+                if (!is_substituted) param_type = self.chk.safeWrapType(param_type) catch param_type;
+                _ = try fb.addParam(param.name, param_type, self.type_reg.sizeOf(param_type));
+            }
+
+            if (f.body != null_node) {
+                _ = try self.lowerBlockNode(f.body);
+                if (return_type == TypeRegistry.VOID and fb.needsTerminator()) {
+                    try self.emitCleanups(0);
+                    _ = try fb.emitRet(null, f.span);
+                } else if (fb.needsTerminator()) {
+                    const rti4 = self.type_reg.get(return_type);
+                    if (rti4 == .error_union and rti4.error_union.elem == TypeRegistry.VOID) {
+                        try self.emitCleanups(0);
+                        try self.emitErrorVoidSuccessReturn(fb, return_type, f.span);
+                    }
+                }
+            }
+            self.current_func = null;
+        }
+        try self.builder.endFunc();
+
+        // Also emit a thin wrapper under the concrete name that calls the base with metadata.
+        // This maintains backward compatibility: existing call sites use "List(5)_append".
+        // The wrapper just prepends the concrete type's metadata and delegates.
+        try self.emitVWTWrapper(inst_info, base_name, f);
+    }
+
+    /// Compute the base generic name from a concrete name.
+    /// "List(5)_append" → "List_append", "Map(5;6)_get" → "Map_get"
+    fn computeGenericBaseName(self: *Lowerer, concrete_name: []const u8) ![]const u8 {
+        const paren_open = std.mem.indexOf(u8, concrete_name, "(") orelse return concrete_name;
+        const paren_close = std.mem.indexOf(u8, concrete_name, ")") orelse return concrete_name;
+        if (paren_close + 1 >= concrete_name.len) {
+            // No suffix after ")" — just strip the type args: "List(5)" → "List"
+            return try self.allocator.dupe(u8, concrete_name[0..paren_open]);
+        }
+        // "List(5)_append" → "List" + "_append" → "List_append"
+        const prefix = concrete_name[0..paren_open];
+        const suffix = concrete_name[paren_close + 1 ..];
+        return try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ prefix, suffix });
+    }
+
+    /// Emit a thin wrapper under the concrete name that calls the VWT base function
+    /// with the appropriate TypeMetadata prepended.
+    fn emitVWTWrapper(self: *Lowerer, inst_info: checker.GenericInstInfo, base_name: []const u8, f: ast.FnDecl) !void {
+        const return_type = self.resolveTypeNode(f.return_type);
+        const uses_sret = self.needsSret(return_type);
+        const wasm_return_type = if (uses_sret) TypeRegistry.VOID else return_type;
+
+        self.builder.startFunc(inst_info.concrete_name, TypeRegistry.VOID, wasm_return_type, f.span);
+        if (self.builder.func()) |fb| {
+            if (uses_sret) fb.sret_return_type = return_type;
+            self.current_func = fb;
+            self.cleanup_stack.clear();
+
+            // Mirror the base function's params (minus metadata, plus sret)
+            var call_args = std.ArrayListUnmanaged(ir.NodeIndex){};
+            defer call_args.deinit(self.allocator);
+
+            if (uses_sret) {
+                const sret_param = try fb.addParam("__sret", TypeRegistry.I64, 8);
+                const sret_val = try fb.emitLoadLocal(sret_param, TypeRegistry.I64, f.span);
+                try call_args.append(self.allocator, sret_val);
+            }
+
+            // Metadata args: pass 0 (placeholder) for each type param.
+            // TODO: When TypeMetadata globals exist, pass concrete type's metadata ptr.
+            const param_names = if (inst_info.type_param_names.len > 0) inst_info.type_param_names else f.type_params;
+            for (param_names) |_| {
+                const meta = try fb.emitConstInt(0, TypeRegistry.I64, f.span);
+                try call_args.append(self.allocator, meta);
+            }
+
+            // @safe self param
+            if (self.chk.safe_mode and !f.is_static and (f.params.len == 0 or !std.mem.eql(u8, f.params[0].name, "self"))) {
+                if (std.mem.lastIndexOf(u8, inst_info.concrete_name, "_")) |underscore| {
+                    const struct_name = inst_info.concrete_name[0..underscore];
+                    if (self.chk.resolveTypeByName(struct_name)) |struct_type| {
+                        const ptr_type = self.chk.types.makePointer(struct_type) catch struct_type;
+                        const p = try fb.addParam("self", ptr_type, self.type_reg.sizeOf(ptr_type));
+                        const v = try fb.emitLoadLocal(p, ptr_type, f.span);
+                        try call_args.append(self.allocator, v);
+                    }
+                }
+            }
+
+            // Regular params
+            for (f.params) |param| {
+                var param_type = self.resolveTypeNode(param.type_expr);
+                const is_substituted = if (self.type_substitution) |sub| blk: {
+                    if (param.type_expr != ast.null_node) {
+                        if (self.tree.getNode(param.type_expr)) |node| {
+                            if (node.asExpr()) |expr_node| {
+                                if (expr_node == .ident) {
+                                    break :blk sub.contains(expr_node.ident.name);
+                                } else if (expr_node == .type_expr and expr_node.type_expr.kind == .named) {
+                                    break :blk sub.contains(expr_node.type_expr.kind.named);
+                                }
+                            }
+                        }
+                    }
+                    break :blk false;
+                } else false;
+                if (!is_substituted) param_type = self.chk.safeWrapType(param_type) catch param_type;
+                const p = try fb.addParam(param.name, param_type, self.type_reg.sizeOf(param_type));
+                const v = try fb.emitLoadLocal(p, param_type, f.span);
+                try call_args.append(self.allocator, v);
+            }
+
+            // Call the base function
+            const result = try fb.emitCall(base_name, call_args.items, false, wasm_return_type, f.span);
+            if (wasm_return_type == TypeRegistry.VOID) {
+                _ = try fb.emitRet(null, f.span);
+            } else {
+                _ = try fb.emitRet(result, f.span);
+            }
+            self.current_func = null;
+        }
+        try self.builder.endFunc();
     }
 
     /// Lower one concrete generic function as a top-level function.
