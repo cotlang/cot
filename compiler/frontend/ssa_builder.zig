@@ -762,7 +762,7 @@ pub const SSABuilder = struct {
             const elem_info = self.type_registry.get(load_type.optional.elem);
             break :blk elem_info != .pointer;
         };
-        if (((load_type == .struct_type or load_type == .tuple or load_type == .union_type) and type_size > 8) or is_compound_optional) {
+        if (((load_type == .struct_type or load_type == .tuple or load_type == .union_type or load_type == .existential) and type_size > 8) or is_compound_optional) {
             addr_val.type_idx = type_idx;
             return addr_val;
         }
@@ -931,7 +931,7 @@ pub const SSABuilder = struct {
             const elem_info = self.type_registry.get(value_type.optional.elem);
             break :blk elem_info != .pointer;
         };
-        var is_large_struct = ((value_type == .struct_type or value_type == .tuple or value_type == .union_type) and type_size > 8) or is_compound_opt;
+        var is_large_struct = ((value_type == .struct_type or value_type == .tuple or value_type == .union_type or value_type == .existential) and type_size > 8) or is_compound_opt;
 
         // When the value is a VOID-typed address (from convertFieldValue/convertFieldLocal
         // for compound struct/array/union fields), check the TARGET local's type to determine
@@ -949,7 +949,7 @@ pub const SSABuilder = struct {
                 const elem_info = self.type_registry.get(local_type.optional.elem);
                 break :blk elem_info != .pointer;
             };
-            if ((local_type == .struct_type or local_type == .tuple or local_type == .union_type) or local_is_compound_opt) {
+            if ((local_type == .struct_type or local_type == .tuple or local_type == .union_type or local_type == .existential) or local_is_compound_opt) {
                 is_large_struct = true;
             }
         }
@@ -1090,7 +1090,7 @@ pub const SSABuilder = struct {
         };
 
         // Large struct/tuple/union: bulk .move copy (same as convertStoreLocal)
-        var is_large_struct = ((value_type == .struct_type or value_type == .tuple or value_type == .union_type) and type_size > 8) or is_compound_opt;
+        var is_large_struct = ((value_type == .struct_type or value_type == .tuple or value_type == .union_type or value_type == .existential) and type_size > 8) or is_compound_opt;
 
         // When the value is a VOID-typed address (from convertFieldValue/convertFieldLocal
         // for compound struct/array/union fields), check the TARGET global's type to determine
@@ -1106,7 +1106,7 @@ pub const SSABuilder = struct {
                     const elem_info = self.type_registry.get(global_type.optional.elem);
                     break :blk elem_info != .pointer;
                 };
-                if ((global_type == .struct_type or global_type == .tuple or global_type == .union_type) or global_is_compound_opt) {
+                if ((global_type == .struct_type or global_type == .tuple or global_type == .union_type or global_type == .existential) or global_is_compound_opt) {
                     is_large_struct = true;
                 }
             }
@@ -1510,7 +1510,7 @@ pub const SSABuilder = struct {
         // Large struct/tuple: use OpMove for bulk memory copy (same as convertStoreLocal).
         // Extract source address from load result, copy to dest field offset.
         const type_size = self.type_registry.sizeOf(value.type_idx);
-        var is_large = (value_type == .struct_type or value_type == .tuple or value_type == .union_type) and type_size > 8;
+        var is_large = (value_type == .struct_type or value_type == .tuple or value_type == .union_type or value_type == .existential) and type_size > 8;
 
         // When the value is a VOID-typed address (from convertFieldValue/convertFieldLocal
         // for compound struct/array/union fields), check the IR node's type to determine
@@ -1524,7 +1524,7 @@ pub const SSABuilder = struct {
                 const elem_info = self.type_registry.get(ir_type.optional.elem);
                 break :blk elem_info != .pointer;
             };
-            if (((ir_type == .struct_type or ir_type == .tuple or ir_type == .union_type) and ir_size > 8) or ir_is_compound_opt) {
+            if (((ir_type == .struct_type or ir_type == .tuple or ir_type == .union_type or ir_type == .existential) and ir_size > 8) or ir_is_compound_opt) {
                 is_large = true;
             }
         }
@@ -1718,7 +1718,7 @@ pub const SSABuilder = struct {
             const elem_info = self.type_registry.get(value_type.optional.elem);
             break :blk elem_info != .pointer;
         };
-        var is_large_struct = ((value_type == .struct_type or value_type == .tuple or value_type == .union_type) and type_size > 8) or is_compound_opt;
+        var is_large_struct = ((value_type == .struct_type or value_type == .tuple or value_type == .union_type or value_type == .existential) and type_size > 8) or is_compound_opt;
 
         // When the value is a VOID-typed address (from convertFieldValue/convertFieldLocal
         // for compound struct/array/union fields), check the IR node's type to determine
@@ -1732,7 +1732,7 @@ pub const SSABuilder = struct {
                 const elem_info = self.type_registry.get(ir_type.optional.elem);
                 break :blk elem_info != .pointer;
             };
-            if ((ir_type == .struct_type or ir_type == .tuple or ir_type == .union_type) or ir_is_compound_opt) {
+            if ((ir_type == .struct_type or ir_type == .tuple or ir_type == .union_type or ir_type == .existential) or ir_is_compound_opt) {
                 is_large_struct = true;
             }
         }
@@ -2076,7 +2076,7 @@ pub const SSABuilder = struct {
             const elem_info = self.type_registry.get(value_type.optional.elem);
             break :blk elem_info != .pointer;
         };
-        if (((value_type == .struct_type or value_type == .tuple or value_type == .union_type) and type_size > 8) or is_compound_opt_load) {
+        if (((value_type == .struct_type or value_type == .tuple or value_type == .union_type or value_type == .existential) and type_size > 8) or is_compound_opt_load) {
             if (ptr_val.op == .load) {
                 // Loaded pointer: wrap in .copy so convertStoreLocalField/getStructAddr
                 // use the loaded value (= struct address) directly, not .load's args[0].
@@ -2198,7 +2198,7 @@ pub const SSABuilder = struct {
             const elem_info = self.type_registry.get(value_type.optional.elem);
             break :blk elem_info != .pointer;
         };
-        var is_large_struct = ((value_type == .struct_type or value_type == .tuple or value_type == .union_type) and type_size > 8) or is_compound_opt_store;
+        var is_large_struct = ((value_type == .struct_type or value_type == .tuple or value_type == .union_type or value_type == .existential) and type_size > 8) or is_compound_opt_store;
 
         // When the value is a VOID-typed address (from convertFieldValue/convertFieldLocal
         // for compound struct/array/union fields), check the IR node's type to determine
@@ -2211,7 +2211,7 @@ pub const SSABuilder = struct {
                 const elem_info = self.type_registry.get(ir_type.optional.elem);
                 break :blk elem_info != .pointer;
             };
-            if (((ir_type == .struct_type or ir_type == .tuple or ir_type == .union_type) and ir_size > 8) or ir_is_compound_opt) {
+            if (((ir_type == .struct_type or ir_type == .tuple or ir_type == .union_type or ir_type == .existential) and ir_size > 8) or ir_is_compound_opt) {
                 is_large_struct = true;
             }
         }

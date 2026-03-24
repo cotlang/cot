@@ -2455,6 +2455,15 @@ pub const Lowerer = struct {
                     // Use lowerExprManaged as the SINGLE expression evaluation.
                     // Previously lowerExprNode was called separately, then lowerExprManaged
                     // was called again — causing double evaluation of function calls.
+                    // Existential coercion: concrete → any Trait (before ARC path)
+                                if (self.type_reg.get(type_idx) == .existential) {
+                        var value_node = try self.lowerExprNode(var_stmt.value);
+                        if (value_node == ir.null_node) return;
+                        const val_type = self.inferExprType(var_stmt.value);
+                        value_node = try self.emitExistentialErasure(fb, value_node, val_type, type_idx, var_stmt.span);
+                        _ = try fb.emitStoreLocal(local_idx, value_node, var_stmt.span);
+                        return;
+                    }
                     if (!self.target.isWasm() and !var_stmt.is_weak and !var_stmt.is_unowned and self.type_reg.couldBeARC(type_idx)) {
                         // ARC path: use lowerExprManaged for ownership tracking
                         const managed = try self.lowerExprManaged(var_stmt.value);
@@ -4612,14 +4621,11 @@ pub const Lowerer = struct {
         }
         if (method_idx == null) return ir.null_node;
 
-        // Lower the existential value (the receiver)
-        const exist_val = try self.lowerExprNode(fa.base);
-        if (exist_val == ir.null_node) return ir.null_node;
-
-        // Store existential to temp to access by address
-        const exist_tmp = try fb.addLocalWithSize("__exist_recv", TypeRegistry.I64, false, 40);
-        _ = try fb.emitStoreLocal(exist_tmp, exist_val, call.span);
-        const exist_addr = try fb.emitAddrLocal(exist_tmp, TypeRegistry.I64, call.span);
+        // Swift GenExistential.cpp: all container access is by address (CreateStructGEP).
+        // For existentials, lowerExprNode returns an ADDRESS (40 bytes > 8, SSA returns local_addr).
+        // Use this address directly — no copy needed.
+        const exist_addr = try self.lowerExprNode(fa.base);
+        if (exist_addr == ir.null_node) return ir.null_node;
 
         // Load PWT pointer from container offset 32
         const pwt_offset = try fb.emitConstInt(32, TypeRegistry.I64, call.span);
@@ -11460,6 +11466,14 @@ pub const Lowerer = struct {
                     elem_types.append(self.allocator, self.resolveTypeNode(e)) catch return TypeRegistry.VOID;
                 }
                 return self.type_reg.makeTuple(elem_types.items) catch TypeRegistry.VOID;
+            },
+            .existential => |exist_node| {
+                // Resolve existential type: look up trait in type registry
+                const trait_ident = self.tree.getNode(exist_node) orelse return TypeRegistry.VOID;
+                const trait_expr = trait_ident.asExpr() orelse return TypeRegistry.VOID;
+                const trait_name = if (trait_expr == .ident) trait_expr.ident.name else return TypeRegistry.VOID;
+                const trait_def = self.chk.generics.trait_defs.get(trait_name) orelse return TypeRegistry.VOID;
+                return self.type_reg.makeExistential(trait_name, trait_def.method_names) catch TypeRegistry.VOID;
             },
             .generic_instance => |gi| {
                 // Look up the concrete monomorphized type by cache key
