@@ -24,6 +24,17 @@ const TypeIndex = types.TypeIndex;
 const source = @import("source.zig");
 const Span = source.Span;
 
+/// Type category for VWT witness generation. Determines which witness pattern to use.
+const TypeCategory = enum {
+    pod, // All basic types, raw pointers, enums — noop destroy, memcpy copy
+    managed_ptr, // Managed pointer (*T from new) — retain/release
+    collection, // List, Map, monomorphized collections — retain/release buf
+    struct_with_arc, // Struct with at least one non-trivial field
+    union_with_arc, // Union with at least one non-trivial variant payload
+    optional_with_arc, // Optional wrapping a non-trivial type
+    error_union_with_arc, // Error union wrapping a non-trivial type
+};
+
 /// VWT generation context. Tracks which types have had VWTs emitted
 /// to avoid duplicate generation across files.
 pub const VWTGenerator = struct {
@@ -177,8 +188,29 @@ pub const VWTGenerator = struct {
     //   param 2: metadata pointer (i64) — *TypeMetadata (unused in generated code but ABI-required)
     //   return: dest pointer (i64) — for copy/assign; void for destroy
 
+    /// Classify a type into its VWT witness category.
+    fn classifyType(self: *VWTGenerator, type_idx: TypeIndex) TypeCategory {
+        const info = self.type_reg.get(type_idx);
+        const is_pod = self.type_reg.isTrivial(type_idx);
+
+        if (is_pod) return .pod;
+
+        if (info == .pointer and info.pointer.managed) return .managed_ptr;
+
+        if (info == .list or info == .map) return .collection;
+        if (info == .struct_type and types.TypeRegistry.isMonomorphizedCollection(info.struct_type.name)) return .collection;
+
+        if (info == .struct_type) return .struct_with_arc;
+        if (info == .union_type) return .union_with_arc;
+        if (info == .optional) return .optional_with_arc;
+        if (info == .error_union) return .error_union_with_arc;
+
+        return .pod; // fallback for types we don't know about
+    }
+
     /// Emit all VWT witness functions for a concrete type into the IR builder.
     /// Skips types that already have witnesses emitted (dedup via `emitted` set).
+    /// For composite types: recursively ensures sub-type witnesses are emitted first.
     pub fn emitWitnesses(self: *VWTGenerator, builder: *ir.Builder, type_idx: TypeIndex, type_name: []const u8) !VWTEntry {
         // Dedup: skip if already emitted
         if (self.emitted.contains(type_name)) {
@@ -187,27 +219,54 @@ pub const VWTGenerator = struct {
 
         const entry = try self.computeEntry(type_idx, type_name);
         const info = self.type_reg.get(type_idx);
-        const is_pod = self.type_reg.isTrivial(type_idx);
+        const cat = self.classifyType(type_idx);
 
-        // Determine type category for witness generation
-        const is_managed_ptr = (info == .pointer and info.pointer.managed);
-        const is_collection = (info == .list or info == .map) or
-            (info == .struct_type and types.TypeRegistry.isMonomorphizedCollection(info.struct_type.name));
+        // Recursively emit witnesses for non-trivial sub-types
+        switch (cat) {
+            .struct_with_arc => {
+                for (info.struct_type.fields) |field| {
+                    if (!self.type_reg.isTrivial(field.type_idx)) {
+                        _ = try self.emitWitnesses(builder, field.type_idx, self.type_reg.typeName(field.type_idx));
+                    }
+                }
+            },
+            .union_with_arc => {
+                for (info.union_type.variants) |variant| {
+                    if (variant.payload_type != types.invalid_type and !self.type_reg.isTrivial(variant.payload_type)) {
+                        _ = try self.emitWitnesses(builder, variant.payload_type, self.type_reg.typeName(variant.payload_type));
+                    }
+                }
+            },
+            .optional_with_arc => {
+                _ = try self.emitWitnesses(builder, info.optional.elem, self.type_reg.typeName(info.optional.elem));
+            },
+            .error_union_with_arc => {
+                _ = try self.emitWitnesses(builder, info.error_union.elem, self.type_reg.typeName(info.error_union.elem));
+            },
+            else => {},
+        }
 
         // --- destroy ---
-        try self.emitDestroyWitness(builder, entry, type_idx, is_pod, is_managed_ptr, is_collection);
+        try self.emitDestroyWitness(builder, entry, type_idx, cat);
 
         // --- initializeWithCopy ---
-        try self.emitInitializeWithCopyWitness(builder, entry, type_idx, is_pod, is_managed_ptr, is_collection);
+        try self.emitInitializeWithCopyWitness(builder, entry, type_idx, cat);
 
         // --- assignWithCopy ---
-        try self.emitAssignWithCopyWitness(builder, entry, type_idx, is_pod, is_managed_ptr, is_collection);
+        try self.emitAssignWithCopyWitness(builder, entry, cat);
 
         // --- initializeWithTake (always memcpy — all Cot types are bitwise-takable) ---
         try self.emitInitializeWithTakeWitness(builder, entry);
 
         // --- assignWithTake ---
-        try self.emitAssignWithTakeWitness(builder, entry, type_idx, is_pod, is_managed_ptr, is_collection);
+        try self.emitAssignWithTakeWitness(builder, entry, cat);
+
+        // --- enum witnesses (for unions, optionals, error unions) ---
+        if (info == .union_type or info == .optional) {
+            try self.emitGetEnumTagWitness(builder, entry);
+            try self.emitDestructiveProjectEnumDataWitness(builder, entry);
+            try self.emitDestructiveInjectEnumTagWitness(builder, entry);
+        }
 
         try self.emitted.put(type_name, {});
         try self.entries.put(type_name, entry);
@@ -223,49 +282,139 @@ pub const VWTGenerator = struct {
         builder: *ir.Builder,
         entry: VWTEntry,
         type_idx: TypeIndex,
-        is_pod: bool,
-        is_managed_ptr: bool,
-        is_collection: bool,
+        cat: TypeCategory,
     ) !void {
-        _ = self;
         builder.startFunc(entry.destroy_fn, TypeRegistry.VOID, TypeRegistry.VOID, Span.zero);
         const fb = builder.func() orelse return;
         _ = try fb.addParam("object_ptr", TypeRegistry.I64, 8); // pointer TO value
         _ = try fb.addParam("metadata", TypeRegistry.I64, 8);
 
-        if (is_pod) {
-            // POD: noop — nothing to release
-        } else if (is_managed_ptr) {
-            // Managed pointer: load the pointer value, then release it
-            // object_ptr points to memory containing the managed pointer
-            const obj_ptr = try fb.emitLoadLocal(0, TypeRegistry.I64, Span.zero);
-            const ptr_val = try fb.emitPtrLoadValue(obj_ptr, TypeRegistry.I64, Span.zero);
-            var args = [_]ir.NodeIndex{ptr_val};
-            _ = try fb.emitCall("release", &args, false, TypeRegistry.VOID, Span.zero);
-        } else if (is_collection) {
-            // Collection: object_ptr points to the collection struct.
-            // Load buf field (offset 0), if non-null release(buf).
-            const obj_ptr = try fb.emitLoadLocal(0, TypeRegistry.I64, Span.zero);
-            // Load buf directly from offset 0 of the pointed-to struct
-            const buf = try fb.emitPtrLoadValue(obj_ptr, TypeRegistry.I64, Span.zero);
-            const zero = try fb.emitConstInt(0, TypeRegistry.I64, Span.zero);
-            const is_non_null = try fb.emitBinary(.ne, buf, zero, TypeRegistry.BOOL, Span.zero);
-            const release_blk = try fb.newBlock("release");
-            const done_blk = try fb.newBlock("done");
-            _ = try fb.emitBranch(is_non_null, release_blk, done_blk, Span.zero);
-            fb.setBlock(release_blk);
-            var args = [_]ir.NodeIndex{buf};
-            _ = try fb.emitCall("release", &args, false, TypeRegistry.VOID, Span.zero);
-            _ = try fb.emitJump(done_blk, Span.zero);
-            fb.setBlock(done_blk);
-        } else {
-            // Struct/union: TODO — field-by-field destroy via sub-VWTs
-            // For now: noop (will be filled in when struct/union witness gen is implemented)
+        switch (cat) {
+            .pod => {}, // noop — nothing to release
+            .managed_ptr => {
+                // Load the pointer value, then release it
+                const obj_ptr = try fb.emitLoadLocal(0, TypeRegistry.I64, Span.zero);
+                const ptr_val = try fb.emitPtrLoadValue(obj_ptr, TypeRegistry.I64, Span.zero);
+                var args = [_]ir.NodeIndex{ptr_val};
+                _ = try fb.emitCall("release", &args, false, TypeRegistry.VOID, Span.zero);
+            },
+            .collection => {
+                // Load buf field (offset 0), if non-null release(buf).
+                const obj_ptr = try fb.emitLoadLocal(0, TypeRegistry.I64, Span.zero);
+                const buf = try fb.emitPtrLoadValue(obj_ptr, TypeRegistry.I64, Span.zero);
+                const zero = try fb.emitConstInt(0, TypeRegistry.I64, Span.zero);
+                const is_non_null = try fb.emitBinary(.ne, buf, zero, TypeRegistry.BOOL, Span.zero);
+                const release_blk = try fb.newBlock("release");
+                const done_blk = try fb.newBlock("done");
+                _ = try fb.emitBranch(is_non_null, release_blk, done_blk, Span.zero);
+                fb.setBlock(release_blk);
+                var args = [_]ir.NodeIndex{buf};
+                _ = try fb.emitCall("release", &args, false, TypeRegistry.VOID, Span.zero);
+                _ = try fb.emitJump(done_blk, Span.zero);
+                fb.setBlock(done_blk);
+            },
+            .struct_with_arc => {
+                // Destroy each non-trivial field in reverse order.
+                const info = self.type_reg.get(type_idx);
+                const fields = info.struct_type.fields;
+                const obj_ptr = try fb.emitLoadLocal(0, TypeRegistry.I64, Span.zero);
+                const metadata = try fb.emitLoadLocal(1, TypeRegistry.I64, Span.zero);
+
+                var i: usize = fields.len;
+                while (i > 0) {
+                    i -= 1;
+                    const field = fields[i];
+                    if (self.type_reg.isTrivial(field.type_idx)) continue;
+
+                    const offset = try fb.emitConstInt(@intCast(field.offset), TypeRegistry.I64, Span.zero);
+                    const field_ptr = try fb.emitBinary(.add, obj_ptr, offset, TypeRegistry.I64, Span.zero);
+
+                    const field_type_name = self.type_reg.typeName(field.type_idx);
+                    const destroy_name = try std.fmt.allocPrint(self.allocator, "__vwt_destroy_{s}", .{field_type_name});
+                    var destroy_args = [_]ir.NodeIndex{ field_ptr, metadata };
+                    _ = try fb.emitCall(destroy_name, &destroy_args, false, TypeRegistry.VOID, Span.zero);
+                }
+            },
+            .union_with_arc => {
+                // Load tag, branch to destroy active payload.
+                // Layout: tag (8 bytes at offset 0) + payload (at offset 8).
+                try self.emitTagSwitchDestroy(fb, type_idx);
+            },
+            .optional_with_arc, .error_union_with_arc => {
+                // Layout: tag (8 bytes at offset 0) + payload (at offset 8).
+                // Tag 0 = some/ok (has payload), tag 1 = none/error (no ARC payload).
+                try self.emitSinglePayloadDestroy(fb, type_idx, cat);
+            },
         }
-        _ = type_idx;
 
         _ = try fb.emitRet(null, Span.zero);
         try builder.endFunc();
+    }
+
+    /// Emit tag-switch destroy for union types.
+    fn emitTagSwitchDestroy(self: *VWTGenerator, fb: *ir.FuncBuilder, type_idx: TypeIndex) !void {
+        const info = self.type_reg.get(type_idx);
+        const variants = info.union_type.variants;
+        const obj_ptr = try fb.emitLoadLocal(0, TypeRegistry.I64, Span.zero);
+        const metadata = try fb.emitLoadLocal(1, TypeRegistry.I64, Span.zero);
+        const tag = try fb.emitPtrLoadValue(obj_ptr, TypeRegistry.I64, Span.zero);
+        const eight = try fb.emitConstInt(8, TypeRegistry.I64, Span.zero);
+        const payload_ptr = try fb.emitBinary(.add, obj_ptr, eight, TypeRegistry.I64, Span.zero);
+        const done_blk = try fb.newBlock("done");
+
+        for (variants, 0..) |variant, vi| {
+            if (variant.payload_type == types.invalid_type or self.type_reg.isTrivial(variant.payload_type)) continue;
+
+            const tag_val = try fb.emitConstInt(@intCast(vi), TypeRegistry.I64, Span.zero);
+            const is_this_tag = try fb.emitBinary(.eq, tag, tag_val, TypeRegistry.BOOL, Span.zero);
+            const destroy_blk = try fb.newBlock("destroy_variant");
+            const next_blk = try fb.newBlock("next");
+            _ = try fb.emitBranch(is_this_tag, destroy_blk, next_blk, Span.zero);
+
+            fb.setBlock(destroy_blk);
+            const vt_name = self.type_reg.typeName(variant.payload_type);
+            const destroy_name = try std.fmt.allocPrint(self.allocator, "__vwt_destroy_{s}", .{vt_name});
+            var destroy_args = [_]ir.NodeIndex{ payload_ptr, metadata };
+            _ = try fb.emitCall(destroy_name, &destroy_args, false, TypeRegistry.VOID, Span.zero);
+            _ = try fb.emitJump(done_blk, Span.zero);
+
+            fb.setBlock(next_blk);
+        }
+        _ = try fb.emitJump(done_blk, Span.zero);
+        fb.setBlock(done_blk);
+    }
+
+    /// Emit destroy for single-payload types (optional, error_union).
+    /// Tag 0 = some/ok (payload is valid), tag != 0 = none/error (no ARC payload).
+    fn emitSinglePayloadDestroy(self: *VWTGenerator, fb: *ir.FuncBuilder, type_idx: TypeIndex, cat: TypeCategory) !void {
+        const info = self.type_reg.get(type_idx);
+        const payload_type = switch (cat) {
+            .optional_with_arc => info.optional.elem,
+            .error_union_with_arc => info.error_union.elem,
+            else => unreachable,
+        };
+        const obj_ptr = try fb.emitLoadLocal(0, TypeRegistry.I64, Span.zero);
+        const metadata = try fb.emitLoadLocal(1, TypeRegistry.I64, Span.zero);
+
+        // Load tag from offset 0
+        const tag = try fb.emitPtrLoadValue(obj_ptr, TypeRegistry.I64, Span.zero);
+        const zero = try fb.emitConstInt(0, TypeRegistry.I64, Span.zero);
+        const is_some = try fb.emitBinary(.eq, tag, zero, TypeRegistry.BOOL, Span.zero);
+
+        const destroy_blk = try fb.newBlock("destroy_payload");
+        const done_blk = try fb.newBlock("done");
+        _ = try fb.emitBranch(is_some, destroy_blk, done_blk, Span.zero);
+
+        fb.setBlock(destroy_blk);
+        const eight = try fb.emitConstInt(8, TypeRegistry.I64, Span.zero);
+        const payload_ptr = try fb.emitBinary(.add, obj_ptr, eight, TypeRegistry.I64, Span.zero);
+        const pt_name = self.type_reg.typeName(payload_type);
+        const destroy_name = try std.fmt.allocPrint(self.allocator, "__vwt_destroy_{s}", .{pt_name});
+        var destroy_args = [_]ir.NodeIndex{ payload_ptr, metadata };
+        _ = try fb.emitCall(destroy_name, &destroy_args, false, TypeRegistry.VOID, Span.zero);
+        _ = try fb.emitJump(done_blk, Span.zero);
+
+        fb.setBlock(done_blk);
     }
 
     /// initializeWithCopy(dest_ptr, src_ptr, metadata) → dest_ptr
@@ -277,55 +426,147 @@ pub const VWTGenerator = struct {
         builder: *ir.Builder,
         entry: VWTEntry,
         type_idx: TypeIndex,
-        is_pod: bool,
-        is_managed_ptr: bool,
-        is_collection: bool,
+        cat: TypeCategory,
     ) !void {
-        _ = self;
-        _ = type_idx;
         builder.startFunc(entry.initializeWithCopy_fn, TypeRegistry.VOID, TypeRegistry.I64, Span.zero);
         const fb = builder.func() orelse return;
-        _ = try fb.addParam("dest_ptr", TypeRegistry.I64, 8); // pointer TO dest value
-        _ = try fb.addParam("src_ptr", TypeRegistry.I64, 8); // pointer TO src value
+        _ = try fb.addParam("dest_ptr", TypeRegistry.I64, 8);
+        _ = try fb.addParam("src_ptr", TypeRegistry.I64, 8);
         _ = try fb.addParam("metadata", TypeRegistry.I64, 8);
 
         const dest_ptr = try fb.emitLoadLocal(0, TypeRegistry.I64, Span.zero);
         const src_ptr = try fb.emitLoadLocal(1, TypeRegistry.I64, Span.zero);
 
-        // Step 1: memcpy(dest_ptr, src_ptr, size) — bitwise copy of the value
-        const size_val = try fb.emitConstInt(@intCast(entry.size), TypeRegistry.I64, Span.zero);
-        var memcpy_args = [_]ir.NodeIndex{ dest_ptr, src_ptr, size_val };
-        _ = try fb.emitCall("memcpy", &memcpy_args, false, TypeRegistry.VOID, Span.zero);
+        switch (cat) {
+            .struct_with_arc => {
+                // memcpy whole struct, then call initializeWithCopy for each non-trivial field.
+                const size_val = try fb.emitConstInt(@intCast(entry.size), TypeRegistry.I64, Span.zero);
+                var memcpy_args = [_]ir.NodeIndex{ dest_ptr, src_ptr, size_val };
+                _ = try fb.emitCall("memcpy", &memcpy_args, false, TypeRegistry.VOID, Span.zero);
 
-        // Step 2: retain ARC resources in the copied value
-        if (!is_pod) {
-            if (is_managed_ptr) {
-                // The value at *src_ptr is a managed pointer. Load it and retain.
-                const ptr_val = try fb.emitPtrLoadValue(src_ptr, TypeRegistry.I64, Span.zero);
-                var args = [_]ir.NodeIndex{ptr_val};
-                _ = try fb.emitCall("retain", &args, false, TypeRegistry.I64, Span.zero);
-            } else if (is_collection) {
-                // The value at *src_ptr is a collection struct. Load buf (offset 0), retain if non-null.
-                const buf = try fb.emitPtrLoadValue(src_ptr, TypeRegistry.I64, Span.zero);
-                const zero = try fb.emitConstInt(0, TypeRegistry.I64, Span.zero);
-                const is_non_null = try fb.emitBinary(.ne, buf, zero, TypeRegistry.BOOL, Span.zero);
-                const retain_blk = try fb.newBlock("retain");
-                const done_blk = try fb.newBlock("done");
-                _ = try fb.emitBranch(is_non_null, retain_blk, done_blk, Span.zero);
-                fb.setBlock(retain_blk);
-                var args = [_]ir.NodeIndex{buf};
-                _ = try fb.emitCall("retain", &args, false, TypeRegistry.I64, Span.zero);
-                _ = try fb.emitJump(done_blk, Span.zero);
-                fb.setBlock(done_blk);
-            } else {
-                // Struct/union: TODO — field-by-field copy via sub-VWTs
-            }
+                const info = self.type_reg.get(type_idx);
+                const metadata = try fb.emitLoadLocal(2, TypeRegistry.I64, Span.zero);
+
+                for (info.struct_type.fields) |field| {
+                    if (self.type_reg.isTrivial(field.type_idx)) continue;
+                    const offset = try fb.emitConstInt(@intCast(field.offset), TypeRegistry.I64, Span.zero);
+                    const field_dest = try fb.emitBinary(.add, dest_ptr, offset, TypeRegistry.I64, Span.zero);
+                    const field_src = try fb.emitBinary(.add, src_ptr, offset, TypeRegistry.I64, Span.zero);
+                    const ft_name = self.type_reg.typeName(field.type_idx);
+                    const copy_name = try std.fmt.allocPrint(self.allocator, "__vwt_initializeWithCopy_{s}", .{ft_name});
+                    var copy_args = [_]ir.NodeIndex{ field_dest, field_src, metadata };
+                    _ = try fb.emitCall(copy_name, &copy_args, false, TypeRegistry.I64, Span.zero);
+                }
+            },
+            .union_with_arc => {
+                // memcpy whole union, then retain active payload based on tag.
+                const size_val = try fb.emitConstInt(@intCast(entry.size), TypeRegistry.I64, Span.zero);
+                var memcpy_args = [_]ir.NodeIndex{ dest_ptr, src_ptr, size_val };
+                _ = try fb.emitCall("memcpy", &memcpy_args, false, TypeRegistry.VOID, Span.zero);
+                try self.emitTagSwitchCopy(fb, type_idx, src_ptr, dest_ptr);
+            },
+            .optional_with_arc, .error_union_with_arc => {
+                // memcpy whole value, then retain payload if tag == 0 (some/ok).
+                const size_val = try fb.emitConstInt(@intCast(entry.size), TypeRegistry.I64, Span.zero);
+                var memcpy_args = [_]ir.NodeIndex{ dest_ptr, src_ptr, size_val };
+                _ = try fb.emitCall("memcpy", &memcpy_args, false, TypeRegistry.VOID, Span.zero);
+                try self.emitSinglePayloadCopy(fb, type_idx, cat, src_ptr, dest_ptr);
+            },
+            else => {
+                // All other types: memcpy + type-specific retain
+                const size_val = try fb.emitConstInt(@intCast(entry.size), TypeRegistry.I64, Span.zero);
+                var memcpy_args = [_]ir.NodeIndex{ dest_ptr, src_ptr, size_val };
+                _ = try fb.emitCall("memcpy", &memcpy_args, false, TypeRegistry.VOID, Span.zero);
+
+                switch (cat) {
+                    .managed_ptr => {
+                        const ptr_val = try fb.emitPtrLoadValue(src_ptr, TypeRegistry.I64, Span.zero);
+                        var args = [_]ir.NodeIndex{ptr_val};
+                        _ = try fb.emitCall("retain", &args, false, TypeRegistry.I64, Span.zero);
+                    },
+                    .collection => {
+                        const buf = try fb.emitPtrLoadValue(src_ptr, TypeRegistry.I64, Span.zero);
+                        const zero = try fb.emitConstInt(0, TypeRegistry.I64, Span.zero);
+                        const is_non_null = try fb.emitBinary(.ne, buf, zero, TypeRegistry.BOOL, Span.zero);
+                        const retain_blk = try fb.newBlock("retain");
+                        const done_blk = try fb.newBlock("done");
+                        _ = try fb.emitBranch(is_non_null, retain_blk, done_blk, Span.zero);
+                        fb.setBlock(retain_blk);
+                        var args = [_]ir.NodeIndex{buf};
+                        _ = try fb.emitCall("retain", &args, false, TypeRegistry.I64, Span.zero);
+                        _ = try fb.emitJump(done_blk, Span.zero);
+                        fb.setBlock(done_blk);
+                    },
+                    else => {}, // POD: nothing to retain
+                }
+            },
         }
 
-        // Return dest_ptr
         const ret = try fb.emitLoadLocal(0, TypeRegistry.I64, Span.zero);
         _ = try fb.emitRet(ret, Span.zero);
         try builder.endFunc();
+    }
+
+    /// Emit tag-switch copy (retain) for union types. Called after memcpy.
+    fn emitTagSwitchCopy(self: *VWTGenerator, fb: *ir.FuncBuilder, type_idx: TypeIndex, src_ptr: ir.NodeIndex, dest_ptr: ir.NodeIndex) !void {
+        const info = self.type_reg.get(type_idx);
+        const variants = info.union_type.variants;
+        const tag = try fb.emitPtrLoadValue(src_ptr, TypeRegistry.I64, Span.zero);
+        const eight = try fb.emitConstInt(8, TypeRegistry.I64, Span.zero);
+        const payload_src = try fb.emitBinary(.add, src_ptr, eight, TypeRegistry.I64, Span.zero);
+        const payload_dest = try fb.emitBinary(.add, dest_ptr, eight, TypeRegistry.I64, Span.zero);
+        const metadata = try fb.emitLoadLocal(2, TypeRegistry.I64, Span.zero);
+        const done_blk = try fb.newBlock("done");
+
+        for (variants, 0..) |variant, vi| {
+            if (variant.payload_type == types.invalid_type or self.type_reg.isTrivial(variant.payload_type)) continue;
+
+            const tag_val = try fb.emitConstInt(@intCast(vi), TypeRegistry.I64, Span.zero);
+            const is_this_tag = try fb.emitBinary(.eq, tag, tag_val, TypeRegistry.BOOL, Span.zero);
+            const copy_blk = try fb.newBlock("copy_variant");
+            const next_blk = try fb.newBlock("next");
+            _ = try fb.emitBranch(is_this_tag, copy_blk, next_blk, Span.zero);
+
+            fb.setBlock(copy_blk);
+            const vt_name = self.type_reg.typeName(variant.payload_type);
+            const copy_name = try std.fmt.allocPrint(self.allocator, "__vwt_initializeWithCopy_{s}", .{vt_name});
+            var copy_args = [_]ir.NodeIndex{ payload_dest, payload_src, metadata };
+            _ = try fb.emitCall(copy_name, &copy_args, false, TypeRegistry.I64, Span.zero);
+            _ = try fb.emitJump(done_blk, Span.zero);
+
+            fb.setBlock(next_blk);
+        }
+        _ = try fb.emitJump(done_blk, Span.zero);
+        fb.setBlock(done_blk);
+    }
+
+    /// Emit single-payload copy (retain) for optional/error_union. Called after memcpy.
+    fn emitSinglePayloadCopy(self: *VWTGenerator, fb: *ir.FuncBuilder, type_idx: TypeIndex, cat: TypeCategory, src_ptr: ir.NodeIndex, dest_ptr: ir.NodeIndex) !void {
+        const info = self.type_reg.get(type_idx);
+        const payload_type = switch (cat) {
+            .optional_with_arc => info.optional.elem,
+            .error_union_with_arc => info.error_union.elem,
+            else => unreachable,
+        };
+        const tag = try fb.emitPtrLoadValue(src_ptr, TypeRegistry.I64, Span.zero);
+        const zero = try fb.emitConstInt(0, TypeRegistry.I64, Span.zero);
+        const is_some = try fb.emitBinary(.eq, tag, zero, TypeRegistry.BOOL, Span.zero);
+        const copy_blk = try fb.newBlock("copy_payload");
+        const done_blk = try fb.newBlock("done");
+        _ = try fb.emitBranch(is_some, copy_blk, done_blk, Span.zero);
+
+        fb.setBlock(copy_blk);
+        const eight = try fb.emitConstInt(8, TypeRegistry.I64, Span.zero);
+        const payload_src = try fb.emitBinary(.add, src_ptr, eight, TypeRegistry.I64, Span.zero);
+        const payload_dest = try fb.emitBinary(.add, dest_ptr, eight, TypeRegistry.I64, Span.zero);
+        const metadata = try fb.emitLoadLocal(2, TypeRegistry.I64, Span.zero);
+        const pt_name = self.type_reg.typeName(payload_type);
+        const copy_name = try std.fmt.allocPrint(self.allocator, "__vwt_initializeWithCopy_{s}", .{pt_name});
+        var copy_args = [_]ir.NodeIndex{ payload_dest, payload_src, metadata };
+        _ = try fb.emitCall(copy_name, &copy_args, false, TypeRegistry.I64, Span.zero);
+        _ = try fb.emitJump(done_blk, Span.zero);
+
+        fb.setBlock(done_blk);
     }
 
     /// assignWithCopy(dest_ptr, src_ptr, metadata) → dest_ptr
@@ -336,15 +577,9 @@ pub const VWTGenerator = struct {
         self: *VWTGenerator,
         builder: *ir.Builder,
         entry: VWTEntry,
-        type_idx: TypeIndex,
-        is_pod: bool,
-        is_managed_ptr: bool,
-        is_collection: bool,
+        cat: TypeCategory,
     ) !void {
-        _ = type_idx;
-        _ = is_collection;
-        _ = is_managed_ptr;
-        _ = is_pod;
+        _ = cat;
         _ = self;
         builder.startFunc(entry.assignWithCopy_fn, TypeRegistry.VOID, TypeRegistry.I64, Span.zero);
         const fb = builder.func() orelse return;
@@ -397,14 +632,8 @@ pub const VWTGenerator = struct {
         self: *VWTGenerator,
         builder: *ir.Builder,
         entry: VWTEntry,
-        type_idx: TypeIndex,
-        is_pod: bool,
-        is_managed_ptr: bool,
-        is_collection: bool,
+        cat: TypeCategory,
     ) !void {
-        _ = type_idx;
-        _ = is_collection;
-        _ = is_managed_ptr;
         _ = self;
         builder.startFunc(entry.assignWithTake_fn, TypeRegistry.VOID, TypeRegistry.I64, Span.zero);
         const fb = builder.func() orelse return;
@@ -416,8 +645,7 @@ pub const VWTGenerator = struct {
         const src_ptr = try fb.emitLoadLocal(1, TypeRegistry.I64, Span.zero);
         const metadata = try fb.emitLoadLocal(2, TypeRegistry.I64, Span.zero);
 
-        if (!is_pod) {
-            // destroy(dest_ptr, metadata) — release old value at dest
+        if (cat != .pod) {
             var destroy_args = [_]ir.NodeIndex{ dest_ptr, metadata };
             _ = try fb.emitCall(entry.destroy_fn, &destroy_args, false, TypeRegistry.VOID, Span.zero);
         }
@@ -429,6 +657,67 @@ pub const VWTGenerator = struct {
 
         const ret = try fb.emitLoadLocal(0, TypeRegistry.I64, Span.zero);
         _ = try fb.emitRet(ret, Span.zero);
+        try builder.endFunc();
+    }
+
+    // ========================================================================
+    // Enum-specific witnesses (only emitted for union types)
+    // ========================================================================
+
+    /// getEnumTag(object_ptr, metadata) → tag (i64)
+    /// Swift ABI: reads the discriminator tag from the union.
+    /// Cot union layout: tag at offset 0 (8 bytes), payload at offset 8.
+    fn emitGetEnumTagWitness(self: *VWTGenerator, builder: *ir.Builder, entry: VWTEntry) !void {
+        _ = self;
+        const name = entry.getEnumTag_fn orelse return;
+        builder.startFunc(name, TypeRegistry.VOID, TypeRegistry.I64, Span.zero);
+        const fb = builder.func() orelse return;
+        _ = try fb.addParam("object_ptr", TypeRegistry.I64, 8);
+        _ = try fb.addParam("metadata", TypeRegistry.I64, 8);
+
+        // Load tag from offset 0 of the union value
+        const obj_ptr = try fb.emitLoadLocal(0, TypeRegistry.I64, Span.zero);
+        const tag = try fb.emitPtrLoadValue(obj_ptr, TypeRegistry.I64, Span.zero);
+        _ = try fb.emitRet(tag, Span.zero);
+        try builder.endFunc();
+    }
+
+    /// destructiveProjectEnumData(object_ptr, metadata) → payload_ptr (i64)
+    /// Swift ABI: returns a pointer to the payload area, destructively (tag may be overwritten).
+    /// Cot union layout: payload starts at offset 8.
+    fn emitDestructiveProjectEnumDataWitness(self: *VWTGenerator, builder: *ir.Builder, entry: VWTEntry) !void {
+        _ = self;
+        const name = entry.destructiveProjectEnumData_fn orelse return;
+        builder.startFunc(name, TypeRegistry.VOID, TypeRegistry.I64, Span.zero);
+        const fb = builder.func() orelse return;
+        _ = try fb.addParam("object_ptr", TypeRegistry.I64, 8);
+        _ = try fb.addParam("metadata", TypeRegistry.I64, 8);
+
+        // payload_ptr = object_ptr + 8
+        const obj_ptr = try fb.emitLoadLocal(0, TypeRegistry.I64, Span.zero);
+        const eight = try fb.emitConstInt(8, TypeRegistry.I64, Span.zero);
+        const payload_ptr = try fb.emitBinary(.add, obj_ptr, eight, TypeRegistry.I64, Span.zero);
+        _ = try fb.emitRet(payload_ptr, Span.zero);
+        try builder.endFunc();
+    }
+
+    /// destructiveInjectEnumTag(object_ptr, tag, metadata) → void
+    /// Swift ABI: writes a tag into the union, potentially overwriting payload.
+    /// Cot union layout: tag at offset 0 (8 bytes).
+    fn emitDestructiveInjectEnumTagWitness(self: *VWTGenerator, builder: *ir.Builder, entry: VWTEntry) !void {
+        _ = self;
+        const name = entry.destructiveInjectEnumTag_fn orelse return;
+        builder.startFunc(name, TypeRegistry.VOID, TypeRegistry.VOID, Span.zero);
+        const fb = builder.func() orelse return;
+        _ = try fb.addParam("object_ptr", TypeRegistry.I64, 8);
+        _ = try fb.addParam("tag", TypeRegistry.I64, 8);
+        _ = try fb.addParam("metadata", TypeRegistry.I64, 8);
+
+        // Store tag at offset 0 of the union value
+        const obj_ptr = try fb.emitLoadLocal(0, TypeRegistry.I64, Span.zero);
+        const tag = try fb.emitLoadLocal(1, TypeRegistry.I64, Span.zero);
+        _ = try fb.emitPtrStoreValue(obj_ptr, tag, Span.zero);
+        _ = try fb.emitRet(null, Span.zero);
         try builder.endFunc();
     }
 };
@@ -534,4 +823,196 @@ test "VWTGenerator emitWitnesses for collection type" {
     try std.testing.expect(!entry.flags.isPOD());
     // destroy should have more than just a ret (has null check + release)
     try std.testing.expect(builder.funcs.items[0].blocks.len > 1);
+}
+
+test "VWTGenerator emitWitnesses for struct with ARC field" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var reg = try TypeRegistry.init(alloc);
+
+    var gen = VWTGenerator.init(alloc, &reg);
+    var builder = ir.Builder.init(alloc, &reg);
+
+    // Create a struct: Container { x: i64, items: List(i64) }
+    const list_type = try reg.makeList(TypeRegistry.I64);
+    const fields = try alloc.dupe(types.StructField, &[_]types.StructField{
+        .{ .name = "x", .type_idx = TypeRegistry.I64, .offset = 0 },
+        .{ .name = "items", .type_idx = list_type, .offset = 8 },
+    });
+    const container_type = try reg.add(.{ .struct_type = .{
+        .name = "Container",
+        .fields = fields,
+        .size = 32, // 8 (i64) + 24 (List)
+        .alignment = 8,
+    } });
+
+    const entry = try gen.emitWitnesses(&builder, container_type, "Container");
+
+    // Should have emitted witnesses for list (sub-type) first, then Container.
+    // list: 5 functions + Container: 5 functions = 10 total
+    try std.testing.expectEqual(@as(usize, 10), builder.funcs.items.len);
+
+    // Container is NOT POD (has List field)
+    try std.testing.expect(!entry.flags.isPOD());
+
+    // Container witnesses start at index 5 (after list's 5 witnesses)
+    const container_destroy = builder.funcs.items[5];
+    try std.testing.expect(std.mem.eql(u8, container_destroy.name, "__vwt_destroy_Container"));
+
+    const container_copy = builder.funcs.items[6];
+    try std.testing.expect(std.mem.eql(u8, container_copy.name, "__vwt_initializeWithCopy_Container"));
+
+    // Dedup: emitting again should not add more functions
+    _ = try gen.emitWitnesses(&builder, container_type, "Container");
+    try std.testing.expectEqual(@as(usize, 10), builder.funcs.items.len);
+}
+
+test "VWTGenerator emitWitnesses for struct with managed pointer field" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var reg = try TypeRegistry.init(alloc);
+
+    var gen = VWTGenerator.init(alloc, &reg);
+    var builder = ir.Builder.init(alloc, &reg);
+
+    // Create a struct type to get a managed pointer to it
+    const inner_fields = try alloc.dupe(types.StructField, &[_]types.StructField{
+        .{ .name = "val", .type_idx = TypeRegistry.I64, .offset = 0 },
+    });
+    const inner_type = try reg.add(.{ .struct_type = .{
+        .name = "Inner",
+        .fields = inner_fields,
+        .size = 8,
+        .alignment = 8,
+    } });
+    // makePointer to a struct creates a managed pointer
+    const ptr_type = try reg.makePointer(inner_type);
+
+    // Create: Holder { data: *Inner }
+    const fields = try alloc.dupe(types.StructField, &[_]types.StructField{
+        .{ .name = "data", .type_idx = ptr_type, .offset = 0 },
+    });
+    const holder_type = try reg.add(.{ .struct_type = .{
+        .name = "Holder",
+        .fields = fields,
+        .size = 8,
+        .alignment = 8,
+    } });
+
+    const entry = try gen.emitWitnesses(&builder, holder_type, "Holder");
+
+    // Sub-type (managed pointer): 5 + Holder: 5 = 10 functions
+    try std.testing.expectEqual(@as(usize, 10), builder.funcs.items.len);
+    try std.testing.expect(!entry.flags.isPOD());
+}
+
+test "VWTGenerator emitWitnesses for POD struct (all trivial fields)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var reg = try TypeRegistry.init(alloc);
+
+    var gen = VWTGenerator.init(alloc, &reg);
+    var builder = ir.Builder.init(alloc, &reg);
+
+    // Create: Point { x: i64, y: i64 } — all trivial
+    const fields = try alloc.dupe(types.StructField, &[_]types.StructField{
+        .{ .name = "x", .type_idx = TypeRegistry.I64, .offset = 0 },
+        .{ .name = "y", .type_idx = TypeRegistry.I64, .offset = 8 },
+    });
+    const point_type = try reg.add(.{ .struct_type = .{
+        .name = "Point",
+        .fields = fields,
+        .size = 16,
+        .alignment = 8,
+    } });
+
+    const entry = try gen.emitWitnesses(&builder, point_type, "Point");
+
+    // POD struct: 5 functions only (no sub-type witnesses needed)
+    try std.testing.expectEqual(@as(usize, 5), builder.funcs.items.len);
+    try std.testing.expect(entry.flags.isPOD());
+}
+
+test "VWTGenerator emitWitnesses for union with ARC variant" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var reg = try TypeRegistry.init(alloc);
+
+    var gen = VWTGenerator.init(alloc, &reg);
+    var builder = ir.Builder.init(alloc, &reg);
+
+    // Create a managed pointer type (pointer to struct = managed)
+    const inner_fields = try alloc.dupe(types.StructField, &[_]types.StructField{
+        .{ .name = "val", .type_idx = TypeRegistry.I64, .offset = 0 },
+    });
+    const inner_type = try reg.add(.{ .struct_type = .{
+        .name = "Node",
+        .fields = inner_fields,
+        .size = 8,
+        .alignment = 8,
+    } });
+    const managed_ptr = try reg.makePointer(inner_type);
+
+    // Union: Result { ok: *Node, err: i64 }
+    const variants = try alloc.dupe(types.UnionVariant, &[_]types.UnionVariant{
+        .{ .name = "ok", .payload_type = managed_ptr },
+        .{ .name = "err", .payload_type = TypeRegistry.I64 },
+    });
+    const union_type = try reg.add(.{ .union_type = .{
+        .name = "Result",
+        .variants = variants,
+        .tag_type = TypeRegistry.I64,
+    } });
+
+    const entry = try gen.emitWitnesses(&builder, union_type, "Result");
+
+    // Sub-type (managed pointer): 5 + Result: 5 base + 3 enum = 8 total = 13
+    try std.testing.expectEqual(@as(usize, 13), builder.funcs.items.len);
+    try std.testing.expect(!entry.flags.isPOD());
+    try std.testing.expect(entry.has_enum_witnesses);
+
+    // Check enum witness function names
+    try std.testing.expect(entry.getEnumTag_fn != null);
+    try std.testing.expect(entry.destructiveProjectEnumData_fn != null);
+    try std.testing.expect(entry.destructiveInjectEnumTag_fn != null);
+
+    // Verify the destroy witness is index 5 (after pointer's 5 witnesses)
+    try std.testing.expect(std.mem.eql(u8, builder.funcs.items[5].name, "__vwt_destroy_Result"));
+
+    // Enum witnesses are last (indices 10, 11, 12)
+    try std.testing.expect(std.mem.eql(u8, builder.funcs.items[10].name, entry.getEnumTag_fn.?));
+    try std.testing.expect(std.mem.eql(u8, builder.funcs.items[11].name, entry.destructiveProjectEnumData_fn.?));
+    try std.testing.expect(std.mem.eql(u8, builder.funcs.items[12].name, entry.destructiveInjectEnumTag_fn.?));
+}
+
+test "VWTGenerator emitWitnesses for POD union (all trivial variants)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var reg = try TypeRegistry.init(alloc);
+
+    var gen = VWTGenerator.init(alloc, &reg);
+    var builder = ir.Builder.init(alloc, &reg);
+
+    // Union: IntOrFloat { i: i64, f: f64 } — all trivial payloads
+    const variants = try alloc.dupe(types.UnionVariant, &[_]types.UnionVariant{
+        .{ .name = "i", .payload_type = TypeRegistry.I64 },
+        .{ .name = "f", .payload_type = TypeRegistry.F64 },
+    });
+    const union_type = try reg.add(.{ .union_type = .{
+        .name = "IntOrFloat",
+        .variants = variants,
+        .tag_type = TypeRegistry.I64,
+    } });
+
+    const entry = try gen.emitWitnesses(&builder, union_type, "IntOrFloat");
+
+    // POD union: 5 base + 3 enum = 8 functions (no sub-type witnesses needed)
+    try std.testing.expectEqual(@as(usize, 8), builder.funcs.items.len);
+    try std.testing.expect(entry.flags.isPOD());
+    try std.testing.expect(entry.has_enum_witnesses);
 }

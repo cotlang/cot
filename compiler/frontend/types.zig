@@ -305,13 +305,17 @@ pub const TypeRegistry = struct {
             .enum_type => |e| e.name,
             .union_type => |u| u.name,
             .pointer => "pointer",
+            .list => "list",
+            .map => "map",
+            .optional => "optional",
+            .error_union => "error_union",
+            .error_set => "error_set",
             .slice => "slice",
             .array => "array",
             .tuple => "tuple",
             .future => "Future",
             .func => "function",
             .distinct => |d| d.name,
-            else => "unknown",
         };
     }
 

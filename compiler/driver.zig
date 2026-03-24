@@ -9,6 +9,7 @@ const types_mod = @import("frontend/types.zig");
 const checker_mod = @import("frontend/checker.zig");
 const lower_mod = @import("frontend/lower.zig");
 const ir_mod = @import("frontend/ir.zig");
+const vwt_gen_mod = @import("frontend/vwt_gen.zig");
 const ssa_builder_mod = @import("frontend/ssa_builder.zig");
 const source_mod = @import("frontend/source.zig");
 // Native codegen imports (AOT compiler path)
@@ -385,6 +386,10 @@ pub const Driver = struct {
             try lowerer.generateTestRunner();
         }
 
+        // VWT Phase 1.3: Emit witness functions for all non-trivial concrete types.
+        // These go through the same IR → SSA → codegen pipeline as user functions.
+        try self.emitVWTWitnesses(&lowerer.builder, &type_reg);
+
         var ir_result = try lowerer.builder.getIR();
         defer ir_result.deinit();
 
@@ -392,6 +397,36 @@ pub const Driver = struct {
         self.dict_arg_names = &lowerer.dict_arg_names;
 
         return self.generateCode(ir_result.funcs, ir_result.globals, &type_reg, "<input>", source_text);
+    }
+
+    /// Emit VWT witness functions for all non-trivial concrete types in the registry.
+    /// Witnesses are emitted as IR functions into the builder and flow through the
+    /// standard SSA → codegen pipeline alongside user functions.
+    fn emitVWTWitnesses(self: *Driver, builder: *ir_mod.Builder, type_reg: *types_mod.TypeRegistry) !void {
+        _ = self;
+        var gen = vwt_gen_mod.VWTGenerator.init(builder.allocator, type_reg);
+        defer gen.deinit();
+
+        // Iterate all registered types, emit witnesses for non-trivial ones.
+        // The generator handles dedup — calling emitWitnesses twice for the same
+        // type name is a no-op.
+        for (type_reg.types.items, 0..) |t, i| {
+            const type_idx: types_mod.TypeIndex = @intCast(i);
+            if (type_reg.isTrivial(type_idx)) continue;
+
+            // Get a stable type name for witness function naming
+            const type_name = switch (t) {
+                .struct_type => |s| s.name,
+                .union_type => |u| u.name,
+                .enum_type => |e| e.name,
+                else => type_reg.typeName(type_idx),
+            };
+
+            _ = gen.emitWitnesses(builder, type_idx, type_name) catch |err| switch (err) {
+                error.MissingVWTEntry => continue, // skip types that fail
+                else => return err,
+            };
+        }
     }
 
     /// Compile a source file (supports imports).
@@ -746,6 +781,9 @@ pub const Driver = struct {
             shared_builder = runner.builder;
             runner.deinitWithoutBuilder();
         }
+
+        // VWT Phase 1.3: Emit witness functions for all non-trivial types (multi-file path).
+        try self.emitVWTWitnesses(&shared_builder, &type_reg);
 
         var final_ir = try shared_builder.getIR();
         defer final_ir.deinit();
