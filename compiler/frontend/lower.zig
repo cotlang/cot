@@ -9274,16 +9274,20 @@ pub const Lowerer = struct {
         while (made_progress) {
             made_progress = false;
             pending.clearRetainingCapacity();
-            // Snapshot: collect all inst_infos that need lowering
+            // Snapshot: collect all inst_infos that need lowering.
+            // Swift pattern: only process if the BASE name doesn't exist yet
+            // (one body per generic definition, shared by all instantiations).
             var it = self.chk.generics.generic_inst_by_name.valueIterator();
             while (it.next()) |inst_info| {
                 if (!self.lowered_generics.contains(inst_info.concrete_name)) continue;
-                if (self.builder.hasFunc(inst_info.concrete_name)) continue;
+                const bn = self.computeGenericBaseName(inst_info.concrete_name) catch continue;
+                if (self.builder.hasFunc(bn)) continue;
                 try pending.append(self.allocator, inst_info.*);
             }
-            // Process collected snapshot (safe — no iterator active)
+            // Process collected snapshot
             for (pending.items) |inst_info| {
-                if (self.builder.hasFunc(inst_info.concrete_name)) continue;
+                const bn = self.computeGenericBaseName(inst_info.concrete_name) catch continue;
+                if (self.builder.hasFunc(bn)) continue;
                 try self.lowerGenericFnInstanceVWT(inst_info);
                 made_progress = true;
             }
@@ -9294,11 +9298,39 @@ pub const Lowerer = struct {
     /// Emits ONE body per base generic name (e.g., "List_append") that takes
     /// *TypeMetadata params for each type parameter. ARC operations dispatch
     /// through VWT witnesses instead of inlined concrete code.
+    /// Check if an AST return type node refers to a generic type parameter.
+    /// E.g., `fn pop() T` where T is in type_params → returns true.
+    fn isGenericReturnType(self: *Lowerer, return_type_node: ast.NodeIndex, type_param_names: []const []const u8) bool {
+        const node = self.tree.getNode(return_type_node) orelse return false;
+        const expr = node.asExpr() orelse return false;
+        const name = switch (expr) {
+            .ident => |id| id.name,
+            .type_expr => |te| if (te.kind == .named) te.kind.named else return false,
+            else => return false,
+        };
+        for (type_param_names) |pn| {
+            if (std.mem.eql(u8, name, pn)) return true;
+        }
+        return false;
+    }
+
     fn lowerGenericFnInstanceVWT(self: *Lowerer, inst_info: checker.GenericInstInfo) !void {
-        // Compute base name: "List(5)_append" → "List_append"
+        // Swift pattern: ONE body per generic definition under base name.
+        // All instantiations share this body. Uniform calling convention via
+        // indirect returns for generic return types.
         const base_name = try self.computeGenericBaseName(inst_info.concrete_name);
 
-        // Swap to defining file's AST (needed for both base lowering and wrapper-only path)
+        // If base already emitted, this instantiation shares it — nothing to do.
+        // The caller calls the base name directly with metadata.
+        if (self.builder.hasFunc(base_name)) return;
+
+        // Also register that the concrete name maps to the base
+        // (for hasFunc checks in the queue processor)
+        if (!self.builder.hasFunc(inst_info.concrete_name)) {
+            // We'll register it after emitting the base
+        }
+
+        // Swap to defining file's AST
         const saved_tree = self.tree;
         const saved_chk_tree = self.chk.tree;
         const saved_safe_mode = self.chk.safe_mode;
@@ -9319,7 +9351,7 @@ pub const Lowerer = struct {
         if (fn_decl_node != .fn_decl) return;
         const f = fn_decl_node.fn_decl;
 
-        // Build type substitution map (still needed for resolving param/return types)
+        // Build type substitution map
         var sub_map = std.StringHashMap(TypeIndex).init(self.allocator);
         defer sub_map.deinit();
         const param_names = if (inst_info.type_param_names.len > 0) inst_info.type_param_names else f.type_params;
@@ -9328,13 +9360,6 @@ pub const Lowerer = struct {
                 try sub_map.put(param_name, inst_info.type_args[i]);
             }
         }
-
-        // Already emitted under the concrete name — skip
-        if (self.builder.hasFunc(inst_info.concrete_name)) return;
-
-        // Skip: base_name sharing deferred to future optimization.
-        // Each instantiation gets its own body (same as old monomorphization).
-        _ = base_name;
 
         // Use preserved expr_types from checker
         const saved_expr_types = self.chk.expr_types;
@@ -9358,13 +9383,17 @@ pub const Lowerer = struct {
         defer self.type_substitution = null;
 
         const return_type = self.resolveTypeNode(f.return_type);
-        const uses_sret = self.needsSret(return_type);
+
+        // Swift pattern: ALL generic return types use indirect return (SRET).
+        // This ensures uniform calling convention — List<Int>.pop() and
+        // List<BigStruct>.pop() both return through a pointer, enabling one
+        // shared body. Reference: GenCall.cpp line 677-685 addIndirectResult()
+        const has_generic_return = self.isGenericReturnType(f.return_type, param_names);
+        const uses_sret = has_generic_return or self.needsSret(return_type);
         const wasm_return_type = if (uses_sret) TypeRegistry.VOID else return_type;
 
-        // Emit function under concrete name (each instantiation gets its own body
-        // because return type convention can differ per T — e.g., i64 vs SRET struct).
-        // The body uses VWT witnesses for ARC operations.
-        self.builder.startFunc(inst_info.concrete_name, TypeRegistry.VOID, wasm_return_type, f.span);
+        // Emit function under BASE name — one body shared by all instantiations.
+        self.builder.startFunc(base_name, TypeRegistry.VOID, wasm_return_type, f.span);
         if (self.builder.func()) |fb| {
             if (uses_sret) fb.sret_return_type = return_type;
             fb.is_destructor = std.mem.eql(u8, f.name, "deinit");
@@ -9818,17 +9847,28 @@ pub const Lowerer = struct {
         const return_type = if (func_type == .func) func_type.func.return_type else TypeRegistry.VOID;
 
         // Go LinkFuncName: qualify method call target (skip for generic instances)
-        const method_link_name_raw = if (self.chk.generics.generic_inst_by_name.contains(method_info.func_name))
-            method_info.func_name // generic instance: keep bare (TypeIndex makes it unique)
+        // Swift pattern: generic instance methods call the BASE name (shared body).
+        // Non-generic methods use their qualified name.
+        const method_link_name = if (self.chk.generics.generic_inst_by_name.contains(method_info.func_name))
+            self.computeGenericBaseName(method_info.func_name) catch method_info.func_name
         else
             try self.resolveMethodName(receiver_type_name, method_info.func_name, method_info.source_tree);
 
-        // Shape stenciling: call sites use the concrete name.
-        // Concrete name → wrapper → stencil (with dict args if needed).
-        const method_link_name = method_link_name_raw;
-
-        // SRET for method calls returning large types — reuse shared SRET local
-        if (self.needsSret(return_type)) {
+        // SRET for method calls: use indirect return if the type is large OR if the
+        // callee is a generic function with generic return type (Swift: ALL generic
+        // returns are indirect to ensure uniform calling convention).
+        const is_generic_call = self.chk.generics.generic_inst_by_name.contains(method_info.func_name);
+        const callee_has_generic_return = if (is_generic_call) blk: {
+            if (self.chk.generics.generic_inst_by_name.get(method_info.func_name)) |gi| {
+                const fn_n = self.tree.getNode(gi.generic_node) orelse break :blk false;
+                const fn_d = fn_n.asDecl() orelse break :blk false;
+                if (fn_d != .fn_decl) break :blk false;
+                const tp = if (gi.type_param_names.len > 0) gi.type_param_names else fn_d.fn_decl.type_params;
+                break :blk self.isGenericReturnType(fn_d.fn_decl.return_type, tp);
+            }
+            break :blk false;
+        } else false;
+        if (self.needsSret(return_type) or callee_has_generic_return) {
             const ret_size = self.type_reg.sizeOf(return_type);
             const sret_local = try fb.getOrCreateSretLocal(return_type, ret_size);
             const sret_addr = try fb.emitAddrLocal(sret_local, TypeRegistry.I64, call.span);
