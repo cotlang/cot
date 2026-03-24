@@ -4624,8 +4624,9 @@ pub const Lowerer = struct {
                 try fb.emitConstInt(0, TypeRegistry.I64, span);
             var args = [_]ir.NodeIndex{ dst_addr, src_addr, metadata };
             _ = try fb.emitCall(copy_name, &args, false, TypeRegistry.I64, span);
-            // Load the copied value from dest
-            return try fb.emitLoadLocal(dst_tmp, type_idx, span);
+            // Load the copied value from dest via pointer (not load_local — the witness
+            // wrote through a pointer, which SSA local value numbering can't track).
+            return try fb.emitPtrLoadValue(dst_addr, type_idx, span);
         }
         if (info == .pointer and info.pointer.managed) {
             var args = [_]ir.NodeIndex{value};
@@ -9497,6 +9498,12 @@ pub const Lowerer = struct {
     /// Emit a thin wrapper under the concrete name that calls the VWT base function
     /// with the appropriate TypeMetadata prepended.
     fn emitVWTWrapper(self: *Lowerer, inst_info: checker.GenericInstInfo, base_name: []const u8, f: ast.FnDecl) !void {
+        // Use inst_info's expr_types if available (same as base function lowering),
+        // otherwise resolve fresh. This ensures return type matches the base function.
+        const saved_expr_types = self.chk.expr_types;
+        if (inst_info.expr_types) |et| self.chk.expr_types = et;
+        defer self.chk.expr_types = saved_expr_types;
+
         const return_type = self.resolveTypeNode(f.return_type);
         const uses_sret = self.needsSret(return_type);
         const wasm_return_type = if (uses_sret) TypeRegistry.VOID else return_type;
