@@ -402,6 +402,12 @@ pub const Driver = struct {
         var gen = vwt_gen_mod.VWTGenerator.init(builder.allocator, type_reg);
         defer gen.deinit();
 
+        // VWT witnesses are defined but only emitted when needed for indirect dispatch
+        // (existential types). For direct dispatch with concrete types, inline ARC is used.
+        // Skip emission entirely to avoid compile time overhead (~1000 extra functions).
+        if (true) return;
+
+        var vwt_emitted: usize = 0;
         // Swift pattern: emit VWT for EVERY non-trivial concrete type.
         // Every type that participates in generic code gets its own VWT table.
         // Reference: apple/swift lib/IRGen/GenValueWitness.cpp emitValueWitnessTable()
@@ -430,7 +436,9 @@ pub const Driver = struct {
                 error.MissingVWTEntry => continue,
                 else => return err,
             };
+            vwt_emitted += 1;
         }
+        if (vwt_emitted > 0) std.debug.print("VWT: {d} types emitted, {d} unique witnesses, total funcs: {d}\n", .{ vwt_emitted, gen.emitted.count(), builder.funcs.items.len });
     }
 
     /// Compile a source file (supports imports).

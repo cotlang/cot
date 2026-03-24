@@ -4604,30 +4604,8 @@ pub const Lowerer = struct {
         // Trivial types: no copy needed
         if (self.type_reg.isTrivial(type_idx)) return value;
 
-        // VWT dispatch: call __vwt_initializeWithCopy_{typeName} instead of inlining.
-        // Store src value to temp, allocate dest temp, pass both addresses to witness.
-        // Witness copies src → dest and retains ARC resources.
-        {
-            const type_name = self.type_reg.typeName(type_idx);
-            const copy_name = try std.fmt.allocPrint(self.allocator, "__vwt_initializeWithCopy_{s}", .{type_name});
-            const val_size = self.type_reg.sizeOf(type_idx);
-            const src_tmp = try fb.addLocalWithSize("__vwt_src", type_idx, false, val_size);
-            _ = try fb.emitStoreLocal(src_tmp, value, span);
-            const src_addr = try fb.emitAddrLocal(src_tmp, TypeRegistry.I64, span);
-            const dst_tmp = try fb.addLocalWithSize("__vwt_dst", type_idx, false, val_size);
-            const dst_addr = try fb.emitAddrLocal(dst_tmp, TypeRegistry.I64, span);
-            // Load TypeMetadata global address for this type
-            const meta_name = try std.fmt.allocPrint(self.allocator, "__type_metadata_{s}", .{type_name});
-            const metadata = if (self.builder.lookupGlobal(meta_name)) |gi|
-                try fb.emitAddrGlobal(gi.idx, meta_name, TypeRegistry.I64, span)
-            else
-                try fb.emitConstInt(0, TypeRegistry.I64, span);
-            var args = [_]ir.NodeIndex{ dst_addr, src_addr, metadata };
-            _ = try fb.emitCall(copy_name, &args, false, TypeRegistry.I64, span);
-            // Load the copied value from dest via pointer (not load_local — the witness
-            // wrote through a pointer, which SSA local value numbering can't track).
-            return try fb.emitPtrLoadValue(dst_addr, type_idx, span);
-        }
+        // Inline ARC for concrete types (VWT witnesses exist but are called only
+        // through indirect dispatch for existential/truly-generic contexts).
         if (info == .pointer and info.pointer.managed) {
             var args = [_]ir.NodeIndex{value};
             return try fb.emitCall("retain", &args, false, type_idx, span);
@@ -4844,25 +4822,7 @@ pub const Lowerer = struct {
         // Trivial types: no destroy needed
         if (self.type_reg.isTrivial(type_idx)) return;
 
-        // VWT dispatch: call __vwt_destroy_{typeName} instead of inlining.
-        // Store value to temp, pass its address to the witness (OpaqueValue* convention).
-        {
-            const type_name = self.type_reg.typeName(type_idx);
-            const destroy_name = try std.fmt.allocPrint(self.allocator, "__vwt_destroy_{s}", .{type_name});
-            const val_size = self.type_reg.sizeOf(type_idx);
-            const tmp = try fb.addLocalWithSize("__vwt_tmp", type_idx, false, val_size);
-            _ = try fb.emitStoreLocal(tmp, value, span);
-            const addr = try fb.emitAddrLocal(tmp, TypeRegistry.I64, span);
-            // Load TypeMetadata global address for this type
-            const meta_name = try std.fmt.allocPrint(self.allocator, "__type_metadata_{s}", .{type_name});
-            const metadata = if (self.builder.lookupGlobal(meta_name)) |gi|
-                try fb.emitAddrGlobal(gi.idx, meta_name, TypeRegistry.I64, span)
-            else
-                try fb.emitConstInt(0, TypeRegistry.I64, span);
-            var args = [_]ir.NodeIndex{ addr, metadata };
-            _ = try fb.emitCall(destroy_name, &args, false, TypeRegistry.VOID, span);
-            return;
-        }
+        // Inline ARC for concrete types (VWT witnesses called only via indirect dispatch).
         if (info == .pointer and info.pointer.managed) {
             var args = [_]ir.NodeIndex{value};
             _ = try fb.emitCall("release", &args, false, TypeRegistry.VOID, span);
