@@ -11198,12 +11198,26 @@ pub const Lowerer = struct {
                 // Wasm: no ARC runtime (bump allocator, no reference counting)
                 if (self.target.isWasm()) return arg;
                 const arg_type = self.inferExprType(bc.args[0]);
-                if (self.type_reg.couldBeARC(arg_type)) {
-                    // Swift value witness copy: use emitCopyValue for all type categories.
-                    // retain() only works for single managed pointers. Structs with ARC
-                    // fields (e.g. struct containing List) need recursive field-by-field copy.
+                const arg_info = self.type_reg.get(arg_type);
+                // @arcRetain semantics: retain ARC-managed resources.
+                // - Managed pointer (*T from new): retain(ptr) — bump refcount
+                // - Monomorphized collection (List(T)/Map(K,V)): retain(buf)
+                // - @safe pointer to value: load pointee, then retain its ARC resources
+                // - Struct/union containing ARC fields: NO-OP. The @arcRetain in list.cot
+                //   is for elements stored by memcpy — the buf pointers are already shared.
+                //   Swift: copy_value for value types is memberwise, not a single retain.
+                //   We handle this at store sites (emitCopyValue in struct init), not here.
+                if (arg_info == .pointer and arg_info.pointer.managed) {
+                    // Managed pointer: retain the pointer directly
+                    var args = [_]ir.NodeIndex{arg};
+                    _ = try fb.emitCall("retain", &args, false, arg_type, bc.span);
+                } else if (arg_info == .struct_type and types.TypeRegistry.isMonomorphizedCollection(arg_info.struct_type.name)) {
+                    // Monomorphized collection value: retain the buf
                     _ = try self.emitCopyValue(fb, arg, arg_type, bc.span);
                 }
+                // Struct/union values with nested ARC: no-op.
+                // The nested List bufs are raw i64 pointers that get copied with memcpy.
+                // Their refcounts are managed at construction/destruction scope boundaries.
                 return arg;
             },
             .arc_release => {
@@ -11211,10 +11225,11 @@ pub const Lowerer = struct {
                 if (self.target.isWasm()) return ir.null_node;
                 const arg = try self.lowerExprNode(bc.args[0]);
                 const arg_type = self.inferExprType(bc.args[0]);
-                if (self.type_reg.couldBeARC(arg_type)) {
-                    // Swift value witness destroy: use emitDestroyValue for all type categories.
-                    // release() only works for single managed pointers. Structs with ARC
-                    // fields need recursive field-by-field destroy.
+                const rel_info = self.type_reg.get(arg_type);
+                if (rel_info == .pointer and rel_info.pointer.managed) {
+                    var args = [_]ir.NodeIndex{arg};
+                    _ = try fb.emitCall("release", &args, false, TypeRegistry.VOID, bc.span);
+                } else if (rel_info == .struct_type and types.TypeRegistry.isMonomorphizedCollection(rel_info.struct_type.name)) {
                     try self.emitDestroyValue(fb, arg, arg_type, bc.span);
                 }
                 return ir.null_node;
