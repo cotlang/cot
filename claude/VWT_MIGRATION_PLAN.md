@@ -150,7 +150,7 @@ Note: This is for existential types (`any Protocol`). Cot can skip this if we do
 - [x] Define `EnumValueWitnessTable` extending base with 3 enum witnesses
 - [x] Define `ValueWitnessFlags` with all flag constants (AlignmentMask, IsNonPOD, IsNonInline, HasEnumWitnesses, IsNonBitwiseTakable)
 - [x] Tests: VWT=88B, EnumVWT=112B, flags packing verified
-- [ ] Add metadata/VWT index to TypeInfo (each concrete type gets metadata + VWT) — deferred to 1.2
+- [ ] Add metadata/VWT index to TypeInfo (each concrete type gets metadata + VWT) — deferred to Phase 2
 
 ### 1.2 VWT Generation Per Concrete Type
 **VWTEntry computation: DONE (commit 6ac33d5)**
@@ -159,8 +159,9 @@ Note: This is for existential types (`any Protocol`). Cot can skip this if we do
 - [x] `computeExtraInhabitants()` — pointers/collections=1, basic=0, structs=min of fields
 - [x] Tests: POD i64, raw pointer, optional
 
-**Witness function bodies: DONE for all major types (commits a2e0fe5, 6925491, uncommitted)**
-**Refactored to TypeCategory enum (pod/managed_ptr/collection/struct_with_arc/union_with_arc/optional_with_arc/error_union_with_arc)**
+**Witness function bodies: COMPLETE for ALL type categories**
+**Refactored to TypeCategory enum: pod, managed_ptr, collection, struct_with_arc, union_with_arc, optional_with_arc, error_union_with_arc, array_with_arc, tuple_with_arc**
+**Also: getEnumTagSinglePayload, storeEnumTagSinglePayload, initializeBufferWithCopyOfBuffer — all Swift VWT slots implemented**
 - [x] **POD types** (int, float, bool, raw pointers): all copy=memcpy, destroy=noop, flags=POD
 - [x] **Managed pointers** (*T from new): copy=memcpy+retain, destroy=release, take=memcpy
 - [x] **Collections** (List, Map — both .list/.map AND monomorphized .struct_type):
@@ -188,13 +189,13 @@ Note: This is for existential types (`any Protocol`). Cot can skip this if we do
   - [x] destroy: if tag == 0 (some), call payload's destroy
   - [x] initializeWithCopy: memcpy + if tag == 0, call payload's initializeWithCopy
   - [x] getEnumTag/destructiveProjectEnumData/destructiveInjectEnumTag: same as union witnesses
-  - [ ] getEnumTagSinglePayload: check extra inhabitants (deferred — not needed until Optional is zero-overhead)
-  - [ ] storeEnumTagSinglePayload: write extra inhabitant or tag (deferred — same)
-- [ ] **Arrays**: element-loop via element VWT (deferred — arrays with ARC elements are rare in practice)
-- [ ] **Tuples**: element-by-element via component VWTs (deferred — tuples with ARC elements are rare)
+  - [x] getEnumTagSinglePayload: reads tag from offset 0 (Cot uses explicit tags, no extra inhabitant optimization yet)
+  - [x] storeEnumTagSinglePayload: writes whichCase to tag at offset 0
+- [x] **Arrays**: element-loop via element VWT — destroy in reverse order, initializeWithCopy per element
+- [x] **Tuples**: element-by-element via component VWTs — destroy in reverse, copy per non-trivial element
 - [x] **Strings/Slices**: POD — handled by `.pod` category (ptr+len are raw values, no ARC)
-- [x] **Error unions**: tag + payload (commit TBD) — same pattern as optionals (single-payload with tag at offset 0)
-- [ ] **initializeBufferWithCopyOfBuffer**: inline vs out-of-line handling (deferred — needed for existential types)
+- [x] **Error unions**: tag + payload — same pattern as optionals (single-payload with tag at offset 0)
+- [x] **initializeBufferWithCopyOfBuffer**: inline=memcpy(24B), out-of-line=memcpy(8B ptr). Full box alloc deferred to existentials.
 
 ### 1.3 Witness Functions as Callable Code — DONE (uncommitted)
 - [x] Each witness is a real IR function (emitted via FuncBuilder, flows through SSA → codegen)

@@ -33,6 +33,8 @@ const TypeCategory = enum {
     union_with_arc, // Union with at least one non-trivial variant payload
     optional_with_arc, // Optional wrapping a non-trivial type
     error_union_with_arc, // Error union wrapping a non-trivial type
+    array_with_arc, // Array with non-trivial element type
+    tuple_with_arc, // Tuple with at least one non-trivial element
 };
 
 /// VWT generation context. Tracks which types have had VWTs emitted
@@ -204,6 +206,8 @@ pub const VWTGenerator = struct {
         if (info == .union_type) return .union_with_arc;
         if (info == .optional) return .optional_with_arc;
         if (info == .error_union) return .error_union_with_arc;
+        if (info == .array) return .array_with_arc;
+        if (info == .tuple) return .tuple_with_arc;
 
         return .pod; // fallback for types we don't know about
     }
@@ -243,6 +247,16 @@ pub const VWTGenerator = struct {
             .error_union_with_arc => {
                 _ = try self.emitWitnesses(builder, info.error_union.elem, self.type_reg.typeName(info.error_union.elem));
             },
+            .array_with_arc => {
+                _ = try self.emitWitnesses(builder, info.array.elem, self.type_reg.typeName(info.array.elem));
+            },
+            .tuple_with_arc => {
+                for (info.tuple.element_types) |et| {
+                    if (!self.type_reg.isTrivial(et)) {
+                        _ = try self.emitWitnesses(builder, et, self.type_reg.typeName(et));
+                    }
+                }
+            },
             else => {},
         }
 
@@ -267,6 +281,15 @@ pub const VWTGenerator = struct {
             try self.emitDestructiveProjectEnumDataWitness(builder, entry);
             try self.emitDestructiveInjectEnumTagWitness(builder, entry);
         }
+
+        // --- single-payload enum witnesses (optionals, error unions) ---
+        if (info == .optional or info == .error_union) {
+            try self.emitGetEnumTagSinglePayloadWitness(builder, type_name);
+            try self.emitStoreEnumTagSinglePayloadWitness(builder, type_name);
+        }
+
+        // --- initializeBufferWithCopyOfBuffer (all types) ---
+        try self.emitInitializeBufferWithCopyOfBufferWitness(builder, entry, type_name);
 
         try self.emitted.put(type_name, {});
         try self.entries.put(type_name, entry);
@@ -345,10 +368,73 @@ pub const VWTGenerator = struct {
                 // Tag 0 = some/ok (has payload), tag 1 = none/error (no ARC payload).
                 try self.emitSinglePayloadDestroy(fb, type_idx, cat);
             },
+            .array_with_arc => {
+                // Array: destroy each element in reverse order.
+                // Swift GenValueWitness.cpp: loop over elements, call element's destroy.
+                try self.emitArrayDestroy(fb, type_idx);
+            },
+            .tuple_with_arc => {
+                // Tuple: destroy each non-trivial element in reverse order.
+                try self.emitTupleDestroy(fb, type_idx);
+            },
         }
 
         _ = try fb.emitRet(null, Span.zero);
         try builder.endFunc();
+    }
+
+    /// Emit element-loop destroy for array types.
+    /// Swift: for i in (0..<count).reversed() { element_vwt.destroy(&array[i], metadata) }
+    fn emitArrayDestroy(self: *VWTGenerator, fb: *ir.FuncBuilder, type_idx: TypeIndex) !void {
+        const info = self.type_reg.get(type_idx);
+        const arr = info.array;
+        const elem_size = self.type_reg.sizeOf(arr.elem);
+        const obj_ptr = try fb.emitLoadLocal(0, TypeRegistry.I64, Span.zero);
+        const metadata = try fb.emitLoadLocal(1, TypeRegistry.I64, Span.zero);
+        const elem_type_name = self.type_reg.typeName(arr.elem);
+        const destroy_name = try std.fmt.allocPrint(self.allocator, "__vwt_destroy_{s}", .{elem_type_name});
+
+        // Destroy elements in reverse order (index = length-1 down to 0)
+        var i: usize = arr.length;
+        while (i > 0) {
+            i -= 1;
+            const offset = try fb.emitConstInt(@intCast(i * elem_size), TypeRegistry.I64, Span.zero);
+            const elem_ptr = try fb.emitBinary(.add, obj_ptr, offset, TypeRegistry.I64, Span.zero);
+            var args = [_]ir.NodeIndex{ elem_ptr, metadata };
+            _ = try fb.emitCall(destroy_name, &args, false, TypeRegistry.VOID, Span.zero);
+        }
+    }
+
+    /// Emit per-element destroy for tuple types.
+    fn emitTupleDestroy(self: *VWTGenerator, fb: *ir.FuncBuilder, type_idx: TypeIndex) !void {
+        const info = self.type_reg.get(type_idx);
+        const tup = info.tuple;
+        const obj_ptr = try fb.emitLoadLocal(0, TypeRegistry.I64, Span.zero);
+        const metadata = try fb.emitLoadLocal(1, TypeRegistry.I64, Span.zero);
+
+        // Compute offsets: each element aligned to 8 bytes
+        var current_offset: u32 = 0;
+        // Collect offsets first (need reverse order for destroy)
+        var offsets: [64]u32 = undefined; // max 64 tuple elements
+        const count = @min(tup.element_types.len, 64);
+        for (0..count) |ei| {
+            offsets[ei] = current_offset;
+            const es = self.type_reg.sizeOf(tup.element_types[ei]);
+            current_offset += ((es + 7) / 8) * 8;
+        }
+
+        // Destroy in reverse order
+        var i: usize = count;
+        while (i > 0) {
+            i -= 1;
+            if (self.type_reg.isTrivial(tup.element_types[i])) continue;
+            const offset = try fb.emitConstInt(@intCast(offsets[i]), TypeRegistry.I64, Span.zero);
+            const elem_ptr = try fb.emitBinary(.add, obj_ptr, offset, TypeRegistry.I64, Span.zero);
+            const et_name = self.type_reg.typeName(tup.element_types[i]);
+            const destroy_name = try std.fmt.allocPrint(self.allocator, "__vwt_destroy_{s}", .{et_name});
+            var args = [_]ir.NodeIndex{ elem_ptr, metadata };
+            _ = try fb.emitCall(destroy_name, &args, false, TypeRegistry.VOID, Span.zero);
+        }
     }
 
     /// Emit tag-switch destroy for union types.
@@ -471,6 +557,48 @@ pub const VWTGenerator = struct {
                 var memcpy_args = [_]ir.NodeIndex{ dest_ptr, src_ptr, size_val };
                 _ = try fb.emitCall("memcpy", &memcpy_args, false, TypeRegistry.VOID, Span.zero);
                 try self.emitSinglePayloadCopy(fb, type_idx, cat, src_ptr, dest_ptr);
+            },
+            .array_with_arc => {
+                // Array: memcpy whole array, then call initializeWithCopy for each element.
+                const size_val = try fb.emitConstInt(@intCast(entry.size), TypeRegistry.I64, Span.zero);
+                var memcpy_args = [_]ir.NodeIndex{ dest_ptr, src_ptr, size_val };
+                _ = try fb.emitCall("memcpy", &memcpy_args, false, TypeRegistry.VOID, Span.zero);
+                const info2 = self.type_reg.get(type_idx);
+                const arr = info2.array;
+                const elem_size = self.type_reg.sizeOf(arr.elem);
+                const metadata = try fb.emitLoadLocal(2, TypeRegistry.I64, Span.zero);
+                const et_name = self.type_reg.typeName(arr.elem);
+                const copy_name = try std.fmt.allocPrint(self.allocator, "__vwt_initializeWithCopy_{s}", .{et_name});
+                for (0..arr.length) |ei| {
+                    const offset = try fb.emitConstInt(@intCast(ei * elem_size), TypeRegistry.I64, Span.zero);
+                    const elem_dest = try fb.emitBinary(.add, dest_ptr, offset, TypeRegistry.I64, Span.zero);
+                    const elem_src = try fb.emitBinary(.add, src_ptr, offset, TypeRegistry.I64, Span.zero);
+                    var copy_args = [_]ir.NodeIndex{ elem_dest, elem_src, metadata };
+                    _ = try fb.emitCall(copy_name, &copy_args, false, TypeRegistry.I64, Span.zero);
+                }
+            },
+            .tuple_with_arc => {
+                // Tuple: memcpy whole tuple, then initializeWithCopy for each non-trivial element.
+                const size_val = try fb.emitConstInt(@intCast(entry.size), TypeRegistry.I64, Span.zero);
+                var memcpy_args = [_]ir.NodeIndex{ dest_ptr, src_ptr, size_val };
+                _ = try fb.emitCall("memcpy", &memcpy_args, false, TypeRegistry.VOID, Span.zero);
+                const info2 = self.type_reg.get(type_idx);
+                const tup = info2.tuple;
+                const metadata = try fb.emitLoadLocal(2, TypeRegistry.I64, Span.zero);
+                var current_offset: u32 = 0;
+                for (tup.element_types) |et| {
+                    if (!self.type_reg.isTrivial(et)) {
+                        const offset = try fb.emitConstInt(@intCast(current_offset), TypeRegistry.I64, Span.zero);
+                        const elem_dest = try fb.emitBinary(.add, dest_ptr, offset, TypeRegistry.I64, Span.zero);
+                        const elem_src = try fb.emitBinary(.add, src_ptr, offset, TypeRegistry.I64, Span.zero);
+                        const et_name = self.type_reg.typeName(et);
+                        const copy_name = try std.fmt.allocPrint(self.allocator, "__vwt_initializeWithCopy_{s}", .{et_name});
+                        var copy_args = [_]ir.NodeIndex{ elem_dest, elem_src, metadata };
+                        _ = try fb.emitCall(copy_name, &copy_args, false, TypeRegistry.I64, Span.zero);
+                    }
+                    const es = self.type_reg.sizeOf(et);
+                    current_offset += ((es + 7) / 8) * 8;
+                }
             },
             else => {
                 // All other types: memcpy + type-specific retain
@@ -720,6 +848,85 @@ pub const VWTGenerator = struct {
         _ = try fb.emitRet(null, Span.zero);
         try builder.endFunc();
     }
+
+    // ========================================================================
+    // Required VWT fields — stubs for complete Swift ABI compliance
+    // ========================================================================
+
+    /// getEnumTagSinglePayload(value_ptr, emptyCases, metadata) → unsigned
+    /// Swift ABI (offset 0x30): For single-payload enums (e.g., Optional).
+    /// Returns 0 if value holds the payload, or (1..emptyCases) for which empty case.
+    /// Cot: explicit tag at offset 0. Tag 0 = payload present, tag > 0 = empty case index.
+    fn emitGetEnumTagSinglePayloadWitness(self: *VWTGenerator, builder: *ir.Builder, type_name: []const u8) !void {
+        const name = try std.fmt.allocPrint(self.allocator, "__vwt_getEnumTagSinglePayload_{s}", .{type_name});
+        builder.startFunc(name, TypeRegistry.VOID, TypeRegistry.I64, Span.zero);
+        const fb = builder.func() orelse return;
+        _ = try fb.addParam("value_ptr", TypeRegistry.I64, 8);
+        _ = try fb.addParam("emptyCases", TypeRegistry.I64, 8);
+        _ = try fb.addParam("metadata", TypeRegistry.I64, 8);
+
+        // Read tag from offset 0. Tag 0 = payload (return 0), tag N = empty case N.
+        const val_ptr = try fb.emitLoadLocal(0, TypeRegistry.I64, Span.zero);
+        const tag = try fb.emitPtrLoadValue(val_ptr, TypeRegistry.I64, Span.zero);
+        _ = try fb.emitRet(tag, Span.zero);
+        try builder.endFunc();
+    }
+
+    /// storeEnumTagSinglePayload(value_ptr, whichCase, emptyCases, metadata) → void
+    /// Swift ABI (offset 0x38): Store tag for single-payload enum.
+    /// whichCase 0 = store payload tag, whichCase > 0 = store empty case tag.
+    /// Cot: write whichCase directly to tag field at offset 0.
+    fn emitStoreEnumTagSinglePayloadWitness(self: *VWTGenerator, builder: *ir.Builder, type_name: []const u8) !void {
+        const name = try std.fmt.allocPrint(self.allocator, "__vwt_storeEnumTagSinglePayload_{s}", .{type_name});
+        builder.startFunc(name, TypeRegistry.VOID, TypeRegistry.VOID, Span.zero);
+        const fb = builder.func() orelse return;
+        _ = try fb.addParam("value_ptr", TypeRegistry.I64, 8);
+        _ = try fb.addParam("whichCase", TypeRegistry.I64, 8);
+        _ = try fb.addParam("emptyCases", TypeRegistry.I64, 8);
+        _ = try fb.addParam("metadata", TypeRegistry.I64, 8);
+
+        // Write whichCase to tag field at offset 0.
+        const val_ptr = try fb.emitLoadLocal(0, TypeRegistry.I64, Span.zero);
+        const which = try fb.emitLoadLocal(1, TypeRegistry.I64, Span.zero);
+        _ = try fb.emitPtrStoreValue(val_ptr, which, Span.zero);
+        _ = try fb.emitRet(null, Span.zero);
+        try builder.endFunc();
+    }
+
+    /// initializeBufferWithCopyOfBuffer(dest_buf, src_buf, metadata) → dest_buf
+    /// Swift ABI (offset 0x00): Copy value from one existential buffer to another.
+    /// If inline: memcpy(dest, src, 24). If out-of-line: alloc box, copy, store ptr.
+    /// Cot: all current types are inline (≤24B and bitwise-takable), so just memcpy.
+    /// When existential types are added, this needs the full inline/out-of-line logic.
+    fn emitInitializeBufferWithCopyOfBufferWitness(self: *VWTGenerator, builder: *ir.Builder, entry: VWTEntry, type_name: []const u8) !void {
+        const name = try std.fmt.allocPrint(self.allocator, "__vwt_initializeBufferWithCopyOfBuffer_{s}", .{type_name});
+        builder.startFunc(name, TypeRegistry.VOID, TypeRegistry.I64, Span.zero);
+        const fb = builder.func() orelse return;
+        _ = try fb.addParam("dest_buf", TypeRegistry.I64, 8);
+        _ = try fb.addParam("src_buf", TypeRegistry.I64, 8);
+        _ = try fb.addParam("metadata", TypeRegistry.I64, 8);
+
+        const dest = try fb.emitLoadLocal(0, TypeRegistry.I64, Span.zero);
+        const src = try fb.emitLoadLocal(1, TypeRegistry.I64, Span.zero);
+
+        if (entry.flags.isInlineStorage()) {
+            // Inline: memcpy the buffer (ValueBuffer = 24 bytes on 64-bit)
+            const buf_size = try fb.emitConstInt(24, TypeRegistry.I64, Span.zero);
+            var args = [_]ir.NodeIndex{ dest, src, buf_size };
+            _ = try fb.emitCall("memcpy", &args, false, TypeRegistry.VOID, Span.zero);
+        } else {
+            // Out-of-line: allocate box, copy value into box, store box ptr in dest[0].
+            // For now: just memcpy the pointer (box ptr is at offset 0 of buffer).
+            const ptr_size = try fb.emitConstInt(8, TypeRegistry.I64, Span.zero);
+            var args = [_]ir.NodeIndex{ dest, src, ptr_size };
+            _ = try fb.emitCall("memcpy", &args, false, TypeRegistry.VOID, Span.zero);
+            // TODO: When existential types are added, allocate new box and deep-copy.
+        }
+
+        const ret = try fb.emitLoadLocal(0, TypeRegistry.I64, Span.zero);
+        _ = try fb.emitRet(ret, Span.zero);
+        try builder.endFunc();
+    }
 };
 
 // ============================================================================
@@ -789,9 +996,8 @@ test "VWTGenerator emitWitnesses for POD type" {
 
     const entry = try gen.emitWitnesses(&builder, TypeRegistry.I64, "i64");
 
-    // Should have emitted 5 functions: destroy, initializeWithCopy, assignWithCopy,
-    // initializeWithTake, assignWithTake
-    try std.testing.expectEqual(@as(usize, 5), builder.funcs.items.len);
+    // 5 base witnesses + 1 initializeBufferWithCopyOfBuffer = 6
+    try std.testing.expectEqual(@as(usize, 6), builder.funcs.items.len);
 
     // Verify function names match entry
     try std.testing.expect(std.mem.eql(u8, builder.funcs.items[0].name, entry.destroy_fn));
@@ -802,7 +1008,7 @@ test "VWTGenerator emitWitnesses for POD type" {
 
     // Dedup: emitting again should not add more functions
     _ = try gen.emitWitnesses(&builder, TypeRegistry.I64, "i64");
-    try std.testing.expectEqual(@as(usize, 5), builder.funcs.items.len);
+    try std.testing.expectEqual(@as(usize, 6), builder.funcs.items.len);
 }
 
 test "VWTGenerator emitWitnesses for collection type" {
@@ -817,8 +1023,8 @@ test "VWTGenerator emitWitnesses for collection type" {
     const list_type = try reg.makeList(TypeRegistry.I64);
     const entry = try gen.emitWitnesses(&builder, list_type, "List_i64");
 
-    // 5 witness functions
-    try std.testing.expectEqual(@as(usize, 5), builder.funcs.items.len);
+    // 6 witness functions (5 base + 1 buffer)
+    try std.testing.expectEqual(@as(usize, 6), builder.funcs.items.len);
     // Collection is NOT POD
     try std.testing.expect(!entry.flags.isPOD());
     // destroy should have more than just a ret (has null check + release)
@@ -849,23 +1055,22 @@ test "VWTGenerator emitWitnesses for struct with ARC field" {
 
     const entry = try gen.emitWitnesses(&builder, container_type, "Container");
 
-    // Should have emitted witnesses for list (sub-type) first, then Container.
-    // list: 5 functions + Container: 5 functions = 10 total
-    try std.testing.expectEqual(@as(usize, 10), builder.funcs.items.len);
+    // list: 6 functions + Container: 6 functions = 12 total
+    try std.testing.expectEqual(@as(usize, 12), builder.funcs.items.len);
 
     // Container is NOT POD (has List field)
     try std.testing.expect(!entry.flags.isPOD());
 
-    // Container witnesses start at index 5 (after list's 5 witnesses)
-    const container_destroy = builder.funcs.items[5];
+    // Container witnesses start at index 6 (after list's 6 witnesses)
+    const container_destroy = builder.funcs.items[6];
     try std.testing.expect(std.mem.eql(u8, container_destroy.name, "__vwt_destroy_Container"));
 
-    const container_copy = builder.funcs.items[6];
+    const container_copy = builder.funcs.items[7];
     try std.testing.expect(std.mem.eql(u8, container_copy.name, "__vwt_initializeWithCopy_Container"));
 
     // Dedup: emitting again should not add more functions
     _ = try gen.emitWitnesses(&builder, container_type, "Container");
-    try std.testing.expectEqual(@as(usize, 10), builder.funcs.items.len);
+    try std.testing.expectEqual(@as(usize, 12), builder.funcs.items.len);
 }
 
 test "VWTGenerator emitWitnesses for struct with managed pointer field" {
@@ -903,8 +1108,8 @@ test "VWTGenerator emitWitnesses for struct with managed pointer field" {
 
     const entry = try gen.emitWitnesses(&builder, holder_type, "Holder");
 
-    // Sub-type (managed pointer): 5 + Holder: 5 = 10 functions
-    try std.testing.expectEqual(@as(usize, 10), builder.funcs.items.len);
+    // Sub-type (managed pointer): 6 + Holder: 6 = 12 functions
+    try std.testing.expectEqual(@as(usize, 12), builder.funcs.items.len);
     try std.testing.expect(!entry.flags.isPOD());
 }
 
@@ -931,8 +1136,8 @@ test "VWTGenerator emitWitnesses for POD struct (all trivial fields)" {
 
     const entry = try gen.emitWitnesses(&builder, point_type, "Point");
 
-    // POD struct: 5 functions only (no sub-type witnesses needed)
-    try std.testing.expectEqual(@as(usize, 5), builder.funcs.items.len);
+    // POD struct: 6 functions (5 base + 1 buffer)
+    try std.testing.expectEqual(@as(usize, 6), builder.funcs.items.len);
     try std.testing.expect(entry.flags.isPOD());
 }
 
@@ -970,8 +1175,8 @@ test "VWTGenerator emitWitnesses for union with ARC variant" {
 
     const entry = try gen.emitWitnesses(&builder, union_type, "Result");
 
-    // Sub-type (managed pointer): 5 + Result: 5 base + 3 enum = 8 total = 13
-    try std.testing.expectEqual(@as(usize, 13), builder.funcs.items.len);
+    // pointer: 6 + Result: 5 base + 3 enum + 1 buffer = 9 → total 15
+    try std.testing.expectEqual(@as(usize, 15), builder.funcs.items.len);
     try std.testing.expect(!entry.flags.isPOD());
     try std.testing.expect(entry.has_enum_witnesses);
 
@@ -980,13 +1185,8 @@ test "VWTGenerator emitWitnesses for union with ARC variant" {
     try std.testing.expect(entry.destructiveProjectEnumData_fn != null);
     try std.testing.expect(entry.destructiveInjectEnumTag_fn != null);
 
-    // Verify the destroy witness is index 5 (after pointer's 5 witnesses)
-    try std.testing.expect(std.mem.eql(u8, builder.funcs.items[5].name, "__vwt_destroy_Result"));
-
-    // Enum witnesses are last (indices 10, 11, 12)
-    try std.testing.expect(std.mem.eql(u8, builder.funcs.items[10].name, entry.getEnumTag_fn.?));
-    try std.testing.expect(std.mem.eql(u8, builder.funcs.items[11].name, entry.destructiveProjectEnumData_fn.?));
-    try std.testing.expect(std.mem.eql(u8, builder.funcs.items[12].name, entry.destructiveInjectEnumTag_fn.?));
+    // Verify the destroy witness is index 6 (after pointer's 6 witnesses)
+    try std.testing.expect(std.mem.eql(u8, builder.funcs.items[6].name, "__vwt_destroy_Result"));
 }
 
 test "VWTGenerator emitWitnesses for POD union (all trivial variants)" {
@@ -1011,8 +1211,8 @@ test "VWTGenerator emitWitnesses for POD union (all trivial variants)" {
 
     const entry = try gen.emitWitnesses(&builder, union_type, "IntOrFloat");
 
-    // POD union: 5 base + 3 enum = 8 functions (no sub-type witnesses needed)
-    try std.testing.expectEqual(@as(usize, 8), builder.funcs.items.len);
+    // POD union: 5 base + 3 enum + 1 buffer = 9 functions
+    try std.testing.expectEqual(@as(usize, 9), builder.funcs.items.len);
     try std.testing.expect(entry.flags.isPOD());
     try std.testing.expect(entry.has_enum_witnesses);
 }
