@@ -493,6 +493,15 @@ pub const TypeRegistry = struct {
 
     pub fn alignOf(self: *const TypeRegistry, idx: TypeIndex) u32 { return self.alignmentOf(idx); }
 
+    /// Returns true if the struct is a monomorphized List(T) or Map(K,V) generic.
+    /// These are created by resolveGenericInstance as .struct_type with names like
+    /// "List(5)" or "Map(5,17)", but semantically they are collection types with
+    /// ARC-managed buffers that need retain/release on copy/destroy.
+    pub fn isMonomorphizedCollection(name: []const u8) bool {
+        return (name.len > 5 and std.mem.startsWith(u8, name, "List(")) or
+            (name.len > 4 and std.mem.startsWith(u8, name, "Map("));
+    }
+
     /// Returns true if the type is "trivial" (doesn't need ARC).
     /// Copies Swift's TypeLowering::isTrivial() pattern.
     /// Trivial types: primitives, raw pointers, void
@@ -522,7 +531,9 @@ pub const TypeRegistry = struct {
             // Struct types: trivial only if ALL fields are trivial.
             // Swift TypeLowering.cpp: LoadableStructTypeLowering extends
             // NonTrivialLoadableTypeLowering when any child is non-trivial.
+            // Monomorphized List(T)/Map(K,V) are non-trivial (ARC-managed buf pointer).
             .struct_type => |s| {
+                if (isMonomorphizedCollection(s.name)) return false;
                 for (s.fields) |field| {
                     if (!self.isTrivial(field.type_idx)) return false;
                 }
@@ -569,7 +580,9 @@ pub const TypeRegistry = struct {
         if (t == .pointer) return t.pointer.managed;
         if (t == .optional) return self.couldBeARC(t.optional.elem);
         // Struct: check if any field is ARC-managed (Swift LoadableStructTypeLowering)
+        // Monomorphized List(T)/Map(K,V) are always ARC (refcounted buffer).
         if (t == .struct_type) {
+            if (isMonomorphizedCollection(t.struct_type.name)) return true;
             for (t.struct_type.fields) |field| {
                 if (self.couldBeARC(field.type_idx)) return true;
             }

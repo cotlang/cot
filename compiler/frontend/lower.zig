@@ -2477,9 +2477,11 @@ pub const Lowerer = struct {
                                 var mv = managed;
                                 break :blk mv.forward(&self.cleanup_stack);
                             };
-                            _ = try fb.emitStoreLocal(local_idx, fwd_value, var_stmt.span);
-                            const cleanup = arc.Cleanup.initForLocal(.release, fwd_value, type_idx, local_idx);
-                            _ = try self.cleanup_stack.push(cleanup);
+                            if (fwd_value != ir.null_node) {
+                                _ = try fb.emitStoreLocal(local_idx, fwd_value, var_stmt.span);
+                                const cleanup = arc.Cleanup.initForLocal(.release, fwd_value, type_idx, local_idx);
+                                _ = try self.cleanup_stack.push(cleanup);
+                            }
                         } else if (managed.getValue() != ir.null_node) {
                             // +0 value: copy to produce +1 for the local
                             _ = try self.emitCopyValue(fb, managed.getValue(), type_idx, var_stmt.span);
@@ -4610,6 +4612,7 @@ pub const Lowerer = struct {
     /// Returns the retained value (may be same as input for trivial types).
     fn emitCopyValue(self: *Lowerer, fb: *ir.FuncBuilder, value: ir.NodeIndex, type_idx: TypeIndex, span: Span) !ir.NodeIndex {
         if (self.target.isWasm()) return value;
+        if (value == ir.null_node) return value;
         const info = self.type_reg.get(type_idx);
 
         // Trivial types: no copy needed
@@ -4644,7 +4647,11 @@ pub const Lowerer = struct {
         // COW ensures mutations copy the buffer if shared, so elements
         // are safe — no per-element retain needed on copy.
         // Swift ref: _ContiguousArrayBuffer copy = swift_retain(storage).
-        if (info == .list or info == .map) {
+        // Also handles monomorphized generic List(T)/Map(K,V) which are .struct_type
+        // with names like "List(5)" — these have the same buf layout.
+        const is_collection = (info == .list or info == .map) or
+            (info == .struct_type and types.TypeRegistry.isMonomorphizedCollection(info.struct_type.name));
+        if (is_collection) {
             const coll_size = self.type_reg.sizeOf(type_idx);
             const tmp = try fb.addLocalWithSize("__copy_coll", type_idx, false, coll_size);
             _ = try fb.emitStoreLocal(tmp, value, span);
@@ -4822,6 +4829,7 @@ pub const Lowerer = struct {
     /// Trivial types: no-op. Managed pointers: release. Optional managed: unwrap-then-release.
     fn emitDestroyValue(self: *Lowerer, fb: *ir.FuncBuilder, value: ir.NodeIndex, type_idx: TypeIndex, span: Span) !void {
         if (self.target.isWasm()) return;
+        if (value == ir.null_node) return;
         const info = self.type_reg.get(type_idx);
 
         // Trivial types: no destroy needed
@@ -4877,7 +4885,10 @@ pub const Lowerer = struct {
         // When buf is uniquely owned: destroy each element, then release buf.
         // When buf is shared: just release buf (other owners handle their elements).
         // Swift ref: ContiguousArrayBuffer.deinit → _fixLifetime + _deallocateUninitializedArray
-        if (info == .list or info == .map) {
+        // Also handles monomorphized generic List(T)/Map(K,V) (.struct_type named "List(...)" etc.)
+        const is_collection = (info == .list or info == .map) or
+            (info == .struct_type and types.TypeRegistry.isMonomorphizedCollection(info.struct_type.name));
+        if (is_collection) {
             const coll_size = self.type_reg.sizeOf(type_idx);
             const tmp = try fb.addLocalWithSize("__destroy_coll", type_idx, false, coll_size);
             _ = try fb.emitStoreLocal(tmp, value, span);
@@ -5122,7 +5133,7 @@ pub const Lowerer = struct {
         // which determines the convention. The callee's lowerReturn uses the function's
         // declared return type for retain, ensuring symmetry.
         if (expr == .new_expr or expr == .call) {
-            if (self.type_reg.couldBeARC(type_idx) and !self.target.isWasm()) {
+            if (value != ir.null_node and self.type_reg.couldBeARC(type_idx) and !self.target.isWasm()) {
                 const cleanup = arc.Cleanup.init(.release, value, type_idx);
                 const handle = try self.cleanup_stack.push(cleanup);
                 return arc.ManagedValue.forOwned(value, type_idx, handle);
@@ -6971,6 +6982,8 @@ pub const Lowerer = struct {
                             _ = try fb.emitPtrStoreValue(field_addr, value_node, ne.span);
                             // Copy (retain) non-trivial +0 values (Swift store [init]: emitCopyValue).
                             // Matches lowerStructInitExpr pattern — all type categories, not just managed pointers.
+                            // Also retain monomorphized List(T)/Map(K,V) structs — their buf field is ARC-managed
+                            // even though isTrivial returns true (buf is declared as i64, not a managed pointer).
                             if (!self.target.isWasm() and !self.type_reg.isTrivial(struct_field.type_idx)) {
                                 const fi_node = self.tree.getNode(field_init.value);
                                 const fi_expr = if (fi_node) |n| n.asExpr() else null;
