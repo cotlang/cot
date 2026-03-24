@@ -562,7 +562,7 @@ test "existential copy" {
 
 ## Implementation Status (2026-03-25)
 
-### Completed (Phases 1-4):
+### Completed (Phases 1-4 + fixes):
 
 | Component | Status | Swift Reference | Proof |
 |-----------|--------|-----------------|-------|
@@ -579,26 +579,34 @@ test "existential copy" {
 | Method dispatch | DONE | GenProto.cpp emitWitnessMethodRef | PWT[idx*8] → call_indirect |
 | Self-stripping in checker | DONE | Protocol method signatures | Remove self param for caller |
 | resolveTypeNode | DONE | — | Existential case added to lowerer |
-| Native dispatch | WORKING | — | `a.age()` returns 7 correctly |
+| Native dispatch | DONE | GenExistential.cpp CreateStructGEP | Address-based 40B container access via SSA large-type |
+| Wasm dispatch | DONE | — | `first=100 second=200` through PWT indirect call |
+| CSE aux comparison | DONE | Go cse.go:419-457 cmpVal | Hash + compare Aux field (string, symbol, etc.) |
 
-### Known Bugs:
+### Resolved Bugs:
 
-1. **Wasm multi-method PWT ordering** — `first()` returns `second()`'s value on wasm. The PWT entries are correct in memory but `func_table_indices` may map function names to wrong table indices. Single-method traits work on both native and wasm.
+1. **Wasm multi-method PWT ordering** — FIXED. Root cause: CSE pass compared `aux_int` (both 0) but not `aux.string` (different function names), incorrectly merging two distinct `func_addr` values. Fix: ported Go's `cmpVal` Aux comparison to Cot's `valuesEqual` + `hashValue`.
 
-2. **Out-of-line storage incomplete** — `emitExistentialErasure` line 4688 copies only 8 bytes for types > 24B. Should allocate box and store box pointer. Currently all Cot types used with existentials are ≤ 24 bytes so this doesn't trigger in practice.
+2. **Native SIGSEGV on dispatch** — FIXED. Root cause: SSA `convertLoadLocal` only recognized struct/union/tuple as large types (>8B) needing address-based access. Existential (40B) was loaded as 8B scalar. Fix: added `.existential` to all 13 large-type checks in `ssa_builder.zig`.
 
-3. **Global PWT init not called** — `emitProtocolWitnessTables` in driver.zig emits `__pwt_init_{Trait}_{Type}` functions but they are never registered in `__cot_init_globals`. The inline PWT in `emitExistentialErasure` works as a fallback, but the global approach is dead code.
+### Known Limitations:
+
+1. **Out-of-line storage incomplete** — `emitExistentialErasure` copies only 8 bytes for types > 24B. Should allocate box and store box pointer. Currently all Cot types used with existentials are ≤ 24 bytes so this doesn't trigger in practice.
+
+2. **Global PWT init not called** — `emitProtocolWitnessTables` in driver.zig emits `__pwt_init_{Trait}_{Type}` functions but they are never registered in `__cot_init_globals`. The inline PWT in `emitExistentialErasure` works instead. Global PWT is dead code — may be useful for future optimization (shared PWTs across call sites).
 
 ### Not Yet Implemented:
 
-| Feature | Phase | Depends on |
-|---------|-------|------------|
-| Existential reassignment (`a = c`) | 3 | Assignment coercion in lowerer |
-| Function parameter coercion | 3 | Call argument coercion in lowerer |
-| Existential ARC lifecycle | 5 | VWT dispatch for containers |
-| Dynamic casting (`as?`, `is`) | 6 | Metadata type_idx check |
-| Self-hosted port | 7 | All above |
-| Real metadata at generic call sites | 8 | Existential infrastructure |
+| Feature | Phase | Depends on | Swift Reference |
+|---------|-------|------------|-----------------|
+| Existential reassignment (`a = c`) | 3 | Coercion in assignment lowering | GenExistential.cpp emitExistentialErasure at assign sites |
+| Function parameter coercion | 3 | Coercion in call arg lowering | GenExistential.cpp emitExistentialErasure at call sites |
+| Existential ARC lifecycle (copy) | 5 | VWT initializeBufferWithCopyOfBuffer | TypeLowering.cpp emitCopyValue for existentials |
+| Existential ARC lifecycle (destroy) | 5 | VWT destroy through metadata | TypeLowering.cpp emitDestroyValue for existentials |
+| Dynamic casting (`as?`) | 6 | Metadata type_idx check | GenCast.cpp emitConditionalCheckedCast |
+| `is` type check | 6 | Metadata type_idx comparison | GenCast.cpp emitIsType |
+| Self-hosted port | 7 | All above | — |
+| Real metadata at generic call sites | 8 | Existential infrastructure complete | GenOpaque.cpp emitLoadOfSize |
 
 ### Audit Proof: Swift 1:1 Mapping
 
@@ -612,6 +620,7 @@ test "existential copy" {
 | Address-based access | GenExistential.cpp CreateStructGEP pattern | ✓ Exact (SSA large-type) |
 | Method dispatch | GenProto.cpp emitWitnessMethodRef() → indirect call | ✓ Exact |
 | Self as buffer ptr | GenExistential.cpp projectValue() → address | ✓ Exact |
+| CSE aux comparison | Go cse.go:419-457 cmpVal with auxmap | ✓ Exact (hash + equality) |
 
 ---
 
