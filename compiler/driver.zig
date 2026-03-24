@@ -1542,6 +1542,7 @@ pub const Driver = struct {
         }
 
         // Phase 2: For each function, build SSA → run passes → translate → compile
+        debug.log(.codegen, "driver: Phase 2 start — compile {d} user functions", .{funcs.len});
         for (funcs, 0..) |*ir_func, func_idx| {
             debug.log(.codegen, "driver: direct native: compiling '{s}' ({d}/{d})", .{
                 ir_func.name, func_idx + 1, funcs.len,
@@ -1650,6 +1651,7 @@ pub const Driver = struct {
             });
         }
 
+        debug.log(.codegen, "driver: Phase 2 done — {d} functions compiled", .{compiled_funcs.items.len});
         // Phase 3: Generate runtime functions as CLIF IR
         // Reference: cg_clif abi/mod.rs (lib_call pattern), Swift HeapObject.cpp (ARC semantics)
         {
@@ -1715,9 +1717,11 @@ pub const Driver = struct {
             debug.log(.codegen, "driver: compiled {d} total functions (user + runtime)", .{compiled_funcs.items.len});
         }
 
+        debug.log(.codegen, "driver: Phase 3 done — runtime compiled, total {d} functions", .{compiled_funcs.items.len});
         // Phase 4: Generate object file
         debug.log(.codegen, "driver: generating object file for {d} direct-native functions", .{compiled_funcs.items.len});
 
+        debug.log(.codegen, "driver: Phase 4 start — generate object file", .{});
         const object_bytes = try self.generateMachODirect(
             compiled_funcs.items,
             func_names.items,
@@ -1739,6 +1743,7 @@ pub const Driver = struct {
             globals,
             globals_base_idx,
         );
+        debug.log(.codegen, "driver: Phase 4 done — object file generated ({d} bytes)", .{object_bytes.len});
         return object_bytes;
     }
 
@@ -1780,6 +1785,7 @@ pub const Driver = struct {
         var module = object_module.ObjectModule.initWithTarget(self.allocator, os_fmt, arch);
         defer module.deinit();
 
+        debug.log(.codegen, "generateMachODirect: start", .{});
         // Pass 1: Declare all functions
         const is_macos_obj = self.target.os == .macos;
         var func_ids = try self.allocator.alloc(object_module.FuncId, compiled_funcs.len);
@@ -1814,11 +1820,13 @@ pub const Driver = struct {
             try module.declareExternalName(@intCast(i), mangled_name);
         }
 
+        debug.log(.codegen, "generateMachODirect: pass 1 done (declare {d} funcs)", .{func_names.len});
         // Pass 2: Define all functions
         for (compiled_funcs, 0..) |*cf, i| {
             try module.defineFunction(func_ids[i], cf);
         }
 
+        debug.log(.codegen, "generateMachODirect: pass 2 done (define {d} funcs)", .{compiled_funcs.len});
         // Pass 3: Add string data section
         // Reference: cg_clif constant.rs:461 — data.define(bytes)
         if (string_data.len > 0) {
@@ -1963,6 +1971,7 @@ pub const Driver = struct {
             }
         }
 
+        debug.log(.codegen, "generateMachODirect: pass 3+4 done (data + externals)", .{});
         // Generate _main entry point if we have a main function
         if (main_func_index != null) {
             const entry_name = if (self.target.os == .macos) "_main" else "main";
@@ -2081,6 +2090,7 @@ pub const Driver = struct {
             }
         }
 
+        debug.log(.codegen, "generateMachODirect: main wrapper done, starting Phase 5 (DWARF)", .{});
         // Phase 5: Generate DWARF debug line info + runtime source map
         // Wire srclocs from compiled user functions into DWARF .debug_line entries.
         // Also build a runtime source map data section for the signal handler.
@@ -2088,6 +2098,23 @@ pub const Driver = struct {
             if (self.debug_source_file.len > 0 and self.debug_source_text.len > 0) {
                 module.setDebugInfo(self.debug_source_file, self.debug_source_text);
             }
+
+            // Build line tables for O(log n) line lookups (replaces O(n) lineFromByteOffset).
+            // One table per source file. Binary search instead of scanning from byte 0.
+            var line_tables = std.ArrayListUnmanaged(LineTable){};
+            defer {
+                for (line_tables.items) |*lt| lt.deinit();
+                line_tables.deinit(self.allocator);
+            }
+            for (self.parsed_file_texts) |text| {
+                try line_tables.append(self.allocator, try LineTable.build(self.allocator, text));
+            }
+            // Fallback table for single-file builds
+            var fallback_table = if (self.debug_source_text.len > 0)
+                try LineTable.build(self.allocator, self.debug_source_text)
+            else
+                LineTable{ .line_starts = &.{}, .allocator = self.allocator };
+            defer if (self.debug_source_text.len > 0) fallback_table.deinit();
 
             // Collect function debug info for DWARF DW_TAG_subprogram DIEs
             if (self.debug_source_text.len > 0) {
@@ -2099,19 +2126,16 @@ pub const Driver = struct {
                     const func_code_offset = module.getFuncCodeOffset(func_ids[func_idx]);
                     const func_code_size: u32 = @intCast(cf.buffer.data.items.len);
 
-                    // Multi-file: resolve correct source text for this function
+                    // Multi-file: resolve correct file index for this function
                     const dwarf_file_idx: u16 = if (func_idx < self.func_file_indices.len) self.func_file_indices[func_idx] else 0;
-                    const dwarf_source_text = if (dwarf_file_idx < self.parsed_file_texts.len)
-                        self.parsed_file_texts[dwarf_file_idx]
-                    else
-                        self.debug_source_text;
 
-                    // Find declaration line from first srcloc
+                    // Find declaration line from first srcloc (O(log n) via line table)
                     var decl_line: u32 = 0;
                     if (cf.buffer.srclocs.items.len > 0) {
                         const first_src = cf.buffer.srclocs.items[0].loc.offset;
                         if (first_src > 0) {
-                            decl_line = lineFromByteOffset(dwarf_source_text, first_src);
+                            const lt = if (dwarf_file_idx < line_tables.items.len) &line_tables.items[dwarf_file_idx] else &fallback_table;
+                            decl_line = lt.lineFromOffset(first_src);
                         }
                     }
 
@@ -2178,13 +2202,7 @@ pub const Driver = struct {
                     if (func_idx >= func_names.len) continue;
                     const func_code_offset = module.getFuncCodeOffset(func_ids[func_idx]);
 
-                    // Multi-file source map: resolve source text for this function's file.
-                    // Reference: Go runtime/symtab.go:funcfile() — per-CU file tables.
                     const file_idx: u16 = if (func_idx < self.func_file_indices.len) self.func_file_indices[func_idx] else 0;
-                    const source_text_for_func = if (file_idx < self.parsed_file_texts.len)
-                        self.parsed_file_texts[file_idx]
-                    else
-                        self.debug_source_text;
 
                     // Collect (pc_offset, line) pairs sorted by pc_offset for this function.
                     // Also emit DWARF line entries.
@@ -2192,10 +2210,11 @@ pub const Driver = struct {
                     var pc_lines = std.ArrayListUnmanaged(PcLine){};
                     defer pc_lines.deinit(self.allocator);
 
+                    const srcloc_lt = if (file_idx < line_tables.items.len) &line_tables.items[file_idx] else &fallback_table;
                     for (cf.buffer.srclocs.items) |srcloc| {
                         const src_byte_offset = srcloc.loc.offset;
                         if (src_byte_offset == 0) continue;
-                        const line = lineFromByteOffset(source_text_for_func, src_byte_offset);
+                        const line = srcloc_lt.lineFromOffset(src_byte_offset);
                         if (line == 0) continue;
 
                         // DWARF: absolute code offset in text section
@@ -2326,10 +2345,12 @@ pub const Driver = struct {
             }
         }
 
+        debug.log(.codegen, "generateMachODirect: Phase 5 done (DWARF + pctab)", .{});
         // Serialize object file to bytes
         var output = std.ArrayListUnmanaged(u8){};
         defer output.deinit(self.allocator);
         try module.finish(output.writer(self.allocator));
+        debug.log(.codegen, "generateMachODirect: serialized {d} bytes", .{output.items.len});
         return try output.toOwnedSlice(self.allocator);
     }
 
@@ -2353,6 +2374,43 @@ pub const Driver = struct {
         }
         return line;
     }
+
+    /// Precomputed line offset table for O(log n) line lookups.
+    /// Build once per source file, then binary search for any byte offset.
+    const LineTable = struct {
+        line_starts: []const u32, // byte offset of each line start
+        allocator: std.mem.Allocator,
+
+        fn build(allocator: std.mem.Allocator, source: []const u8) !LineTable {
+            var starts = std.ArrayListUnmanaged(u32){};
+            try starts.append(allocator, 0); // line 1 starts at byte 0
+            for (source, 0..) |c, i| {
+                if (c == '\n' and i + 1 < source.len) {
+                    try starts.append(allocator, @intCast(i + 1));
+                }
+            }
+            return .{ .line_starts = try starts.toOwnedSlice(allocator), .allocator = allocator };
+        }
+
+        fn deinit(self: *LineTable) void {
+            self.allocator.free(self.line_starts);
+        }
+
+        fn lineFromOffset(self: *const LineTable, byte_offset: u32) u32 {
+            // Binary search: find the last line_start <= byte_offset
+            var lo: usize = 0;
+            var hi: usize = self.line_starts.len;
+            while (lo < hi) {
+                const mid = lo + (hi - lo) / 2;
+                if (self.line_starts[mid] <= byte_offset) {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            return @intCast(lo); // 1-based line number
+        }
+    };
 
     /// FNV-1a hash for function name matching in the source map.
     /// Used by both the compiler (to build the map) and the signal handler (to look up).
