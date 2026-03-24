@@ -371,6 +371,11 @@ pub const Driver = struct {
         var lowerer = lower_mod.Lowerer.init(self.allocator, &tree, &type_reg, &err_reporter, &chk, self.target);
         defer lowerer.deinit();
         lowerer.release_mode = self.release_mode;
+        // VWT Phase 1.4: Enable VWT dispatch for ARC operations.
+        // Set COT_VWT=1 to use VWT witness calls instead of inline ARC.
+        if (std.posix.getenv("COT_VWT")) |v| {
+            if (std.mem.eql(u8, v, "1")) lowerer.use_vwt = true;
+        }
         if (self.test_mode) lowerer.setTestMode(true);
         if (self.fail_fast) lowerer.setFailFast(true);
         try lowerer.lowerToBuilder();

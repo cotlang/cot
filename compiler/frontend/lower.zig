@@ -83,6 +83,10 @@ pub const Lowerer = struct {
     /// Release mode: when false (default/debug), emit runtime safety checks.
     /// When true (--release), skip safety checks for performance.
     release_mode: bool = false,
+    /// VWT Phase 1.4: When true, emitCopyValue/emitDestroyValue dispatch through VWT
+    /// witness functions (__vwt_destroy_T, __vwt_initializeWithCopy_T) instead of
+    /// inlining ARC operations. Witnesses must be emitted into the builder (driver does this).
+    use_vwt: bool = false,
     /// Zig Sema pattern: current switch subject enum type for .variant shorthand resolution
     current_switch_enum_type: TypeIndex = types.invalid_type,
     /// Comptime structured value bindings — for inline for over comptime arrays (Phase 5)
@@ -4636,6 +4640,25 @@ pub const Lowerer = struct {
         // Trivial types: no copy needed
         if (self.type_reg.isTrivial(type_idx)) return value;
 
+        // VWT dispatch: call __vwt_initializeWithCopy_{typeName} instead of inlining.
+        // Store src value to temp, allocate dest temp, pass both addresses to witness.
+        // Witness copies src → dest and retains ARC resources.
+        if (self.use_vwt) {
+            const type_name = self.type_reg.typeName(type_idx);
+            const copy_name = try std.fmt.allocPrint(self.allocator, "__vwt_initializeWithCopy_{s}", .{type_name});
+            const val_size = self.type_reg.sizeOf(type_idx);
+            const src_tmp = try fb.addLocalWithSize("__vwt_src", type_idx, false, val_size);
+            _ = try fb.emitStoreLocal(src_tmp, value, span);
+            const src_addr = try fb.emitAddrLocal(src_tmp, TypeRegistry.I64, span);
+            const dst_tmp = try fb.addLocalWithSize("__vwt_dst", type_idx, false, val_size);
+            const dst_addr = try fb.emitAddrLocal(dst_tmp, TypeRegistry.I64, span);
+            const metadata = try fb.emitConstInt(0, TypeRegistry.I64, span); // placeholder
+            var args = [_]ir.NodeIndex{ dst_addr, src_addr, metadata };
+            _ = try fb.emitCall(copy_name, &args, false, TypeRegistry.I64, span);
+            // Load the copied value from dest
+            return try fb.emitLoadLocal(dst_tmp, type_idx, span);
+        }
+
         // Managed pointer: retain
         if (info == .pointer and info.pointer.managed) {
             var args = [_]ir.NodeIndex{value};
@@ -4852,6 +4875,21 @@ pub const Lowerer = struct {
 
         // Trivial types: no destroy needed
         if (self.type_reg.isTrivial(type_idx)) return;
+
+        // VWT dispatch: call __vwt_destroy_{typeName} instead of inlining.
+        // Store value to temp, pass its address to the witness (OpaqueValue* convention).
+        if (self.use_vwt) {
+            const type_name = self.type_reg.typeName(type_idx);
+            const destroy_name = try std.fmt.allocPrint(self.allocator, "__vwt_destroy_{s}", .{type_name});
+            const val_size = self.type_reg.sizeOf(type_idx);
+            const tmp = try fb.addLocalWithSize("__vwt_tmp", type_idx, false, val_size);
+            _ = try fb.emitStoreLocal(tmp, value, span);
+            const addr = try fb.emitAddrLocal(tmp, TypeRegistry.I64, span);
+            const metadata = try fb.emitConstInt(0, TypeRegistry.I64, span); // placeholder
+            var args = [_]ir.NodeIndex{ addr, metadata };
+            _ = try fb.emitCall(destroy_name, &args, false, TypeRegistry.VOID, span);
+            return;
+        }
 
         // Managed pointer: release
         if (info == .pointer and info.pointer.managed) {
