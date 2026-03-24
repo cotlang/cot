@@ -214,8 +214,10 @@ pub const VWTGenerator = struct {
         return entry;
     }
 
-    /// destroy(object, metadata) → void
-    /// POD: noop. Managed ptr: release(object). Collection: release(buf).
+    /// destroy(object_ptr, metadata) → void
+    /// Swift ABI: object_ptr is OpaqueValue* — a pointer TO the value's memory.
+    /// For a managed pointer type, the value at *object_ptr is the pointer itself.
+    /// POD: noop. Managed ptr: release(*object_ptr). Collection: release(buf field).
     fn emitDestroyWitness(
         self: *VWTGenerator,
         builder: *ir.Builder,
@@ -225,26 +227,27 @@ pub const VWTGenerator = struct {
         is_managed_ptr: bool,
         is_collection: bool,
     ) !void {
+        _ = self;
         builder.startFunc(entry.destroy_fn, TypeRegistry.VOID, TypeRegistry.VOID, Span.zero);
         const fb = builder.func() orelse return;
-        _ = try fb.addParam("object", TypeRegistry.I64, 8);
+        _ = try fb.addParam("object_ptr", TypeRegistry.I64, 8); // pointer TO value
         _ = try fb.addParam("metadata", TypeRegistry.I64, 8);
 
         if (is_pod) {
             // POD: noop — nothing to release
         } else if (is_managed_ptr) {
-            // Managed pointer: release(object)
-            const obj = try fb.emitLoadLocal(0, TypeRegistry.I64, Span.zero);
-            var args = [_]ir.NodeIndex{obj};
+            // Managed pointer: load the pointer value, then release it
+            // object_ptr points to memory containing the managed pointer
+            const obj_ptr = try fb.emitLoadLocal(0, TypeRegistry.I64, Span.zero);
+            const ptr_val = try fb.emitPtrLoadValue(obj_ptr, TypeRegistry.I64, Span.zero);
+            var args = [_]ir.NodeIndex{ptr_val};
             _ = try fb.emitCall("release", &args, false, TypeRegistry.VOID, Span.zero);
         } else if (is_collection) {
-            // Collection: load buf, if non-null release(buf)
-            const obj = try fb.emitLoadLocal(0, TypeRegistry.I64, Span.zero);
-            // buf is at offset 0 in the collection struct
-            const buf_size = self.type_reg.sizeOf(type_idx);
-            const tmp = try fb.addLocalWithSize("__tmp", type_idx, false, buf_size);
-            _ = try fb.emitStoreLocal(tmp, obj, Span.zero);
-            const buf = try fb.emitFieldLocal(tmp, 0, 0, TypeRegistry.I64, Span.zero);
+            // Collection: object_ptr points to the collection struct.
+            // Load buf field (offset 0), if non-null release(buf).
+            const obj_ptr = try fb.emitLoadLocal(0, TypeRegistry.I64, Span.zero);
+            // Load buf directly from offset 0 of the pointed-to struct
+            const buf = try fb.emitPtrLoadValue(obj_ptr, TypeRegistry.I64, Span.zero);
             const zero = try fb.emitConstInt(0, TypeRegistry.I64, Span.zero);
             const is_non_null = try fb.emitBinary(.ne, buf, zero, TypeRegistry.BOOL, Span.zero);
             const release_blk = try fb.newBlock("release");
@@ -259,13 +262,16 @@ pub const VWTGenerator = struct {
             // Struct/union: TODO — field-by-field destroy via sub-VWTs
             // For now: noop (will be filled in when struct/union witness gen is implemented)
         }
+        _ = type_idx;
 
         _ = try fb.emitRet(null, Span.zero);
         try builder.endFunc();
     }
 
-    /// initializeWithCopy(dest, src, metadata) → dest
-    /// POD: memcpy. Managed ptr: retain(src), store to dest. Collection: retain(buf).
+    /// initializeWithCopy(dest_ptr, src_ptr, metadata) → dest_ptr
+    /// Swift ABI: dest_ptr and src_ptr are OpaqueValue* — pointers TO value memory.
+    /// Copies the value from *src_ptr into uninitialized *dest_ptr.
+    /// POD: memcpy. Managed ptr: memcpy + retain(*src_ptr). Collection: memcpy + retain(buf).
     fn emitInitializeWithCopyWitness(
         self: *VWTGenerator,
         builder: *ir.Builder,
@@ -275,33 +281,32 @@ pub const VWTGenerator = struct {
         is_managed_ptr: bool,
         is_collection: bool,
     ) !void {
+        _ = self;
+        _ = type_idx;
         builder.startFunc(entry.initializeWithCopy_fn, TypeRegistry.VOID, TypeRegistry.I64, Span.zero);
         const fb = builder.func() orelse return;
-        _ = try fb.addParam("dest", TypeRegistry.I64, 8);
-        _ = try fb.addParam("src", TypeRegistry.I64, 8);
+        _ = try fb.addParam("dest_ptr", TypeRegistry.I64, 8); // pointer TO dest value
+        _ = try fb.addParam("src_ptr", TypeRegistry.I64, 8); // pointer TO src value
         _ = try fb.addParam("metadata", TypeRegistry.I64, 8);
 
-        const dest = try fb.emitLoadLocal(0, TypeRegistry.I64, Span.zero);
-        const src = try fb.emitLoadLocal(1, TypeRegistry.I64, Span.zero);
+        const dest_ptr = try fb.emitLoadLocal(0, TypeRegistry.I64, Span.zero);
+        const src_ptr = try fb.emitLoadLocal(1, TypeRegistry.I64, Span.zero);
 
-        if (is_pod or is_collection or is_managed_ptr) {
-            // All cases: memcpy(dest, src, size) first
-            const size_val = try fb.emitConstInt(@intCast(entry.size), TypeRegistry.I64, Span.zero);
-            var memcpy_args = [_]ir.NodeIndex{ dest, src, size_val };
-            _ = try fb.emitCall("memcpy", &memcpy_args, false, TypeRegistry.VOID, Span.zero);
-        }
+        // Step 1: memcpy(dest_ptr, src_ptr, size) — bitwise copy of the value
+        const size_val = try fb.emitConstInt(@intCast(entry.size), TypeRegistry.I64, Span.zero);
+        var memcpy_args = [_]ir.NodeIndex{ dest_ptr, src_ptr, size_val };
+        _ = try fb.emitCall("memcpy", &memcpy_args, false, TypeRegistry.VOID, Span.zero);
 
+        // Step 2: retain ARC resources in the copied value
         if (!is_pod) {
             if (is_managed_ptr) {
-                // retain(src) — bump refcount on the pointer we just copied
-                var args = [_]ir.NodeIndex{src};
+                // The value at *src_ptr is a managed pointer. Load it and retain.
+                const ptr_val = try fb.emitPtrLoadValue(src_ptr, TypeRegistry.I64, Span.zero);
+                var args = [_]ir.NodeIndex{ptr_val};
                 _ = try fb.emitCall("retain", &args, false, TypeRegistry.I64, Span.zero);
             } else if (is_collection) {
-                // retain(buf) if non-null
-                const buf_size = self.type_reg.sizeOf(type_idx);
-                const tmp = try fb.addLocalWithSize("__tmp", type_idx, false, buf_size);
-                _ = try fb.emitStoreLocal(tmp, src, Span.zero);
-                const buf = try fb.emitFieldLocal(tmp, 0, 0, TypeRegistry.I64, Span.zero);
+                // The value at *src_ptr is a collection struct. Load buf (offset 0), retain if non-null.
+                const buf = try fb.emitPtrLoadValue(src_ptr, TypeRegistry.I64, Span.zero);
                 const zero = try fb.emitConstInt(0, TypeRegistry.I64, Span.zero);
                 const is_non_null = try fb.emitBinary(.ne, buf, zero, TypeRegistry.BOOL, Span.zero);
                 const retain_blk = try fb.newBlock("retain");
@@ -317,14 +322,16 @@ pub const VWTGenerator = struct {
             }
         }
 
+        // Return dest_ptr
         const ret = try fb.emitLoadLocal(0, TypeRegistry.I64, Span.zero);
         _ = try fb.emitRet(ret, Span.zero);
         try builder.endFunc();
     }
 
-    /// assignWithCopy(dest, src, metadata) → dest
-    /// Same as initializeWithCopy but must destroy old dest value first.
-    /// Swift: destroy(dest); initializeWithCopy(dest, src)
+    /// assignWithCopy(dest_ptr, src_ptr, metadata) → dest_ptr
+    /// Swift ABI: dest_ptr holds a VALID value that must be destroyed before overwriting.
+    /// Naive correct impl: destroy(dest_ptr); initializeWithCopy(dest_ptr, src_ptr).
+    /// Swift optimizes for common cases but this is semantically correct.
     fn emitAssignWithCopyWitness(
         self: *VWTGenerator,
         builder: *ir.Builder,
@@ -339,23 +346,21 @@ pub const VWTGenerator = struct {
         _ = is_managed_ptr;
         _ = is_pod;
         _ = self;
-        // For now: emit as a call to destroy(dest) then initializeWithCopy(dest, src).
-        // Swift optimizes this for common cases but the naive impl is correct.
         builder.startFunc(entry.assignWithCopy_fn, TypeRegistry.VOID, TypeRegistry.I64, Span.zero);
         const fb = builder.func() orelse return;
-        _ = try fb.addParam("dest", TypeRegistry.I64, 8);
-        _ = try fb.addParam("src", TypeRegistry.I64, 8);
+        _ = try fb.addParam("dest_ptr", TypeRegistry.I64, 8);
+        _ = try fb.addParam("src_ptr", TypeRegistry.I64, 8);
         _ = try fb.addParam("metadata", TypeRegistry.I64, 8);
 
-        const dest = try fb.emitLoadLocal(0, TypeRegistry.I64, Span.zero);
-        const src = try fb.emitLoadLocal(1, TypeRegistry.I64, Span.zero);
+        const dest_ptr = try fb.emitLoadLocal(0, TypeRegistry.I64, Span.zero);
+        const src_ptr = try fb.emitLoadLocal(1, TypeRegistry.I64, Span.zero);
         const metadata = try fb.emitLoadLocal(2, TypeRegistry.I64, Span.zero);
 
-        // destroy(dest, metadata)
-        var destroy_args = [_]ir.NodeIndex{ dest, metadata };
+        // destroy(dest_ptr, metadata) — release old value
+        var destroy_args = [_]ir.NodeIndex{ dest_ptr, metadata };
         _ = try fb.emitCall(entry.destroy_fn, &destroy_args, false, TypeRegistry.VOID, Span.zero);
-        // initializeWithCopy(dest, src, metadata)
-        var copy_args = [_]ir.NodeIndex{ dest, src, metadata };
+        // initializeWithCopy(dest_ptr, src_ptr, metadata) — copy new value with retain
+        var copy_args = [_]ir.NodeIndex{ dest_ptr, src_ptr, metadata };
         _ = try fb.emitCall(entry.initializeWithCopy_fn, &copy_args, false, TypeRegistry.I64, Span.zero);
 
         const ret = try fb.emitLoadLocal(0, TypeRegistry.I64, Span.zero);
@@ -363,21 +368,22 @@ pub const VWTGenerator = struct {
         try builder.endFunc();
     }
 
-    /// initializeWithTake(dest, src, metadata) → dest
+    /// initializeWithTake(dest_ptr, src_ptr, metadata) → dest_ptr
+    /// Swift ABI: move src value into uninitialized dest. Source is invalidated.
     /// All Cot types are bitwise-takable: just memcpy, no retain/release.
-    /// Source is invalidated (moved).
+    /// This is the most efficient transfer — no refcount changes.
     fn emitInitializeWithTakeWitness(self: *VWTGenerator, builder: *ir.Builder, entry: VWTEntry) !void {
         _ = self;
         builder.startFunc(entry.initializeWithTake_fn, TypeRegistry.VOID, TypeRegistry.I64, Span.zero);
         const fb = builder.func() orelse return;
-        _ = try fb.addParam("dest", TypeRegistry.I64, 8);
-        _ = try fb.addParam("src", TypeRegistry.I64, 8);
+        _ = try fb.addParam("dest_ptr", TypeRegistry.I64, 8);
+        _ = try fb.addParam("src_ptr", TypeRegistry.I64, 8);
         _ = try fb.addParam("metadata", TypeRegistry.I64, 8);
 
-        const dest = try fb.emitLoadLocal(0, TypeRegistry.I64, Span.zero);
-        const src = try fb.emitLoadLocal(1, TypeRegistry.I64, Span.zero);
+        const dest_ptr = try fb.emitLoadLocal(0, TypeRegistry.I64, Span.zero);
+        const src_ptr = try fb.emitLoadLocal(1, TypeRegistry.I64, Span.zero);
         const size_val = try fb.emitConstInt(@intCast(entry.size), TypeRegistry.I64, Span.zero);
-        var args = [_]ir.NodeIndex{ dest, src, size_val };
+        var args = [_]ir.NodeIndex{ dest_ptr, src_ptr, size_val };
         _ = try fb.emitCall("memcpy", &args, false, TypeRegistry.VOID, Span.zero);
 
         const ret = try fb.emitLoadLocal(0, TypeRegistry.I64, Span.zero);
@@ -385,8 +391,8 @@ pub const VWTGenerator = struct {
         try builder.endFunc();
     }
 
-    /// assignWithTake(dest, src, metadata) → dest
-    /// Destroy old dest, then memcpy from src (take = move, no retain).
+    /// assignWithTake(dest_ptr, src_ptr, metadata) → dest_ptr
+    /// Swift ABI: destroy old dest value, then memcpy from src (take=move, no retain).
     fn emitAssignWithTakeWitness(
         self: *VWTGenerator,
         builder: *ir.Builder,
@@ -402,23 +408,23 @@ pub const VWTGenerator = struct {
         _ = self;
         builder.startFunc(entry.assignWithTake_fn, TypeRegistry.VOID, TypeRegistry.I64, Span.zero);
         const fb = builder.func() orelse return;
-        _ = try fb.addParam("dest", TypeRegistry.I64, 8);
-        _ = try fb.addParam("src", TypeRegistry.I64, 8);
+        _ = try fb.addParam("dest_ptr", TypeRegistry.I64, 8);
+        _ = try fb.addParam("src_ptr", TypeRegistry.I64, 8);
         _ = try fb.addParam("metadata", TypeRegistry.I64, 8);
 
-        const dest = try fb.emitLoadLocal(0, TypeRegistry.I64, Span.zero);
-        const src = try fb.emitLoadLocal(1, TypeRegistry.I64, Span.zero);
+        const dest_ptr = try fb.emitLoadLocal(0, TypeRegistry.I64, Span.zero);
+        const src_ptr = try fb.emitLoadLocal(1, TypeRegistry.I64, Span.zero);
         const metadata = try fb.emitLoadLocal(2, TypeRegistry.I64, Span.zero);
 
         if (!is_pod) {
-            // destroy(dest, metadata) first
-            var destroy_args = [_]ir.NodeIndex{ dest, metadata };
+            // destroy(dest_ptr, metadata) — release old value at dest
+            var destroy_args = [_]ir.NodeIndex{ dest_ptr, metadata };
             _ = try fb.emitCall(entry.destroy_fn, &destroy_args, false, TypeRegistry.VOID, Span.zero);
         }
 
-        // memcpy(dest, src, size) — take = move, no retain
+        // memcpy(dest_ptr, src_ptr, size) — take = move, no retain
         const size_val = try fb.emitConstInt(@intCast(entry.size), TypeRegistry.I64, Span.zero);
-        var memcpy_args = [_]ir.NodeIndex{ dest, src, size_val };
+        var memcpy_args = [_]ir.NodeIndex{ dest_ptr, src_ptr, size_val };
         _ = try fb.emitCall("memcpy", &memcpy_args, false, TypeRegistry.VOID, Span.zero);
 
         const ret = try fb.emitLoadLocal(0, TypeRegistry.I64, Span.zero);
