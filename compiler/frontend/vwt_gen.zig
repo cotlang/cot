@@ -21,7 +21,8 @@ const ir = @import("ir.zig");
 const types = @import("types.zig");
 const TypeRegistry = types.TypeRegistry;
 const TypeIndex = types.TypeIndex;
-const Span = @import("ast.zig").Span;
+const source = @import("source.zig");
+const Span = source.Span;
 
 /// VWT generation context. Tracks which types have had VWTs emitted
 /// to avoid duplicate generation across files.
@@ -161,6 +162,269 @@ pub const VWTGenerator = struct {
             else => 0,
         };
     }
+
+    // ========================================================================
+    // Witness Function Emission
+    // ========================================================================
+    // Each witness is emitted as a real IR function using the same FuncBuilder
+    // API that the lowerer uses. These go through SSA → native/wasm pipeline.
+    //
+    // Swift reference: lib/IRGen/GenValueWitness.cpp
+    //
+    // Parameter convention (all witnesses):
+    //   param 0: dest/object pointer (i64)
+    //   param 1: src pointer (i64) — for copy/assign witnesses
+    //   param 2: metadata pointer (i64) — *TypeMetadata (unused in generated code but ABI-required)
+    //   return: dest pointer (i64) — for copy/assign; void for destroy
+
+    /// Emit all VWT witness functions for a concrete type into the IR builder.
+    /// Skips types that already have witnesses emitted (dedup via `emitted` set).
+    pub fn emitWitnesses(self: *VWTGenerator, builder: *ir.Builder, type_idx: TypeIndex, type_name: []const u8) !VWTEntry {
+        // Dedup: skip if already emitted
+        if (self.emitted.contains(type_name)) {
+            return self.entries.get(type_name) orelse return error.MissingVWTEntry;
+        }
+
+        const entry = try self.computeEntry(type_idx, type_name);
+        const info = self.type_reg.get(type_idx);
+        const is_pod = self.type_reg.isTrivial(type_idx);
+
+        // Determine type category for witness generation
+        const is_managed_ptr = (info == .pointer and info.pointer.managed);
+        const is_collection = (info == .list or info == .map) or
+            (info == .struct_type and types.TypeRegistry.isMonomorphizedCollection(info.struct_type.name));
+
+        // --- destroy ---
+        try self.emitDestroyWitness(builder, entry, type_idx, is_pod, is_managed_ptr, is_collection);
+
+        // --- initializeWithCopy ---
+        try self.emitInitializeWithCopyWitness(builder, entry, type_idx, is_pod, is_managed_ptr, is_collection);
+
+        // --- assignWithCopy ---
+        try self.emitAssignWithCopyWitness(builder, entry, type_idx, is_pod, is_managed_ptr, is_collection);
+
+        // --- initializeWithTake (always memcpy — all Cot types are bitwise-takable) ---
+        try self.emitInitializeWithTakeWitness(builder, entry);
+
+        // --- assignWithTake ---
+        try self.emitAssignWithTakeWitness(builder, entry, type_idx, is_pod, is_managed_ptr, is_collection);
+
+        try self.emitted.put(type_name, {});
+        try self.entries.put(type_name, entry);
+        return entry;
+    }
+
+    /// destroy(object, metadata) → void
+    /// POD: noop. Managed ptr: release(object). Collection: release(buf).
+    fn emitDestroyWitness(
+        self: *VWTGenerator,
+        builder: *ir.Builder,
+        entry: VWTEntry,
+        type_idx: TypeIndex,
+        is_pod: bool,
+        is_managed_ptr: bool,
+        is_collection: bool,
+    ) !void {
+        builder.startFunc(entry.destroy_fn, TypeRegistry.VOID, TypeRegistry.VOID, Span.zero);
+        const fb = builder.func() orelse return;
+        _ = try fb.addParam("object", TypeRegistry.I64, 8);
+        _ = try fb.addParam("metadata", TypeRegistry.I64, 8);
+
+        if (is_pod) {
+            // POD: noop — nothing to release
+        } else if (is_managed_ptr) {
+            // Managed pointer: release(object)
+            const obj = try fb.emitLoadLocal(0, TypeRegistry.I64, Span.zero);
+            var args = [_]ir.NodeIndex{obj};
+            _ = try fb.emitCall("release", &args, false, TypeRegistry.VOID, Span.zero);
+        } else if (is_collection) {
+            // Collection: load buf, if non-null release(buf)
+            const obj = try fb.emitLoadLocal(0, TypeRegistry.I64, Span.zero);
+            // buf is at offset 0 in the collection struct
+            const buf_size = self.type_reg.sizeOf(type_idx);
+            const tmp = try fb.addLocalWithSize("__tmp", type_idx, false, buf_size);
+            _ = try fb.emitStoreLocal(tmp, obj, Span.zero);
+            const buf = try fb.emitFieldLocal(tmp, 0, 0, TypeRegistry.I64, Span.zero);
+            const zero = try fb.emitConstInt(0, TypeRegistry.I64, Span.zero);
+            const is_non_null = try fb.emitBinary(.ne, buf, zero, TypeRegistry.BOOL, Span.zero);
+            const release_blk = try fb.newBlock("release");
+            const done_blk = try fb.newBlock("done");
+            _ = try fb.emitBranch(is_non_null, release_blk, done_blk, Span.zero);
+            fb.setBlock(release_blk);
+            var args = [_]ir.NodeIndex{buf};
+            _ = try fb.emitCall("release", &args, false, TypeRegistry.VOID, Span.zero);
+            _ = try fb.emitJump(done_blk, Span.zero);
+            fb.setBlock(done_blk);
+        } else {
+            // Struct/union: TODO — field-by-field destroy via sub-VWTs
+            // For now: noop (will be filled in when struct/union witness gen is implemented)
+        }
+
+        _ = try fb.emitRet(null, Span.zero);
+        try builder.endFunc();
+    }
+
+    /// initializeWithCopy(dest, src, metadata) → dest
+    /// POD: memcpy. Managed ptr: retain(src), store to dest. Collection: retain(buf).
+    fn emitInitializeWithCopyWitness(
+        self: *VWTGenerator,
+        builder: *ir.Builder,
+        entry: VWTEntry,
+        type_idx: TypeIndex,
+        is_pod: bool,
+        is_managed_ptr: bool,
+        is_collection: bool,
+    ) !void {
+        builder.startFunc(entry.initializeWithCopy_fn, TypeRegistry.VOID, TypeRegistry.I64, Span.zero);
+        const fb = builder.func() orelse return;
+        _ = try fb.addParam("dest", TypeRegistry.I64, 8);
+        _ = try fb.addParam("src", TypeRegistry.I64, 8);
+        _ = try fb.addParam("metadata", TypeRegistry.I64, 8);
+
+        const dest = try fb.emitLoadLocal(0, TypeRegistry.I64, Span.zero);
+        const src = try fb.emitLoadLocal(1, TypeRegistry.I64, Span.zero);
+
+        if (is_pod or is_collection or is_managed_ptr) {
+            // All cases: memcpy(dest, src, size) first
+            const size_val = try fb.emitConstInt(@intCast(entry.size), TypeRegistry.I64, Span.zero);
+            var memcpy_args = [_]ir.NodeIndex{ dest, src, size_val };
+            _ = try fb.emitCall("memcpy", &memcpy_args, false, TypeRegistry.VOID, Span.zero);
+        }
+
+        if (!is_pod) {
+            if (is_managed_ptr) {
+                // retain(src) — bump refcount on the pointer we just copied
+                var args = [_]ir.NodeIndex{src};
+                _ = try fb.emitCall("retain", &args, false, TypeRegistry.I64, Span.zero);
+            } else if (is_collection) {
+                // retain(buf) if non-null
+                const buf_size = self.type_reg.sizeOf(type_idx);
+                const tmp = try fb.addLocalWithSize("__tmp", type_idx, false, buf_size);
+                _ = try fb.emitStoreLocal(tmp, src, Span.zero);
+                const buf = try fb.emitFieldLocal(tmp, 0, 0, TypeRegistry.I64, Span.zero);
+                const zero = try fb.emitConstInt(0, TypeRegistry.I64, Span.zero);
+                const is_non_null = try fb.emitBinary(.ne, buf, zero, TypeRegistry.BOOL, Span.zero);
+                const retain_blk = try fb.newBlock("retain");
+                const done_blk = try fb.newBlock("done");
+                _ = try fb.emitBranch(is_non_null, retain_blk, done_blk, Span.zero);
+                fb.setBlock(retain_blk);
+                var args = [_]ir.NodeIndex{buf};
+                _ = try fb.emitCall("retain", &args, false, TypeRegistry.I64, Span.zero);
+                _ = try fb.emitJump(done_blk, Span.zero);
+                fb.setBlock(done_blk);
+            } else {
+                // Struct/union: TODO — field-by-field copy via sub-VWTs
+            }
+        }
+
+        const ret = try fb.emitLoadLocal(0, TypeRegistry.I64, Span.zero);
+        _ = try fb.emitRet(ret, Span.zero);
+        try builder.endFunc();
+    }
+
+    /// assignWithCopy(dest, src, metadata) → dest
+    /// Same as initializeWithCopy but must destroy old dest value first.
+    /// Swift: destroy(dest); initializeWithCopy(dest, src)
+    fn emitAssignWithCopyWitness(
+        self: *VWTGenerator,
+        builder: *ir.Builder,
+        entry: VWTEntry,
+        type_idx: TypeIndex,
+        is_pod: bool,
+        is_managed_ptr: bool,
+        is_collection: bool,
+    ) !void {
+        _ = type_idx;
+        _ = is_collection;
+        _ = is_managed_ptr;
+        _ = is_pod;
+        _ = self;
+        // For now: emit as a call to destroy(dest) then initializeWithCopy(dest, src).
+        // Swift optimizes this for common cases but the naive impl is correct.
+        builder.startFunc(entry.assignWithCopy_fn, TypeRegistry.VOID, TypeRegistry.I64, Span.zero);
+        const fb = builder.func() orelse return;
+        _ = try fb.addParam("dest", TypeRegistry.I64, 8);
+        _ = try fb.addParam("src", TypeRegistry.I64, 8);
+        _ = try fb.addParam("metadata", TypeRegistry.I64, 8);
+
+        const dest = try fb.emitLoadLocal(0, TypeRegistry.I64, Span.zero);
+        const src = try fb.emitLoadLocal(1, TypeRegistry.I64, Span.zero);
+        const metadata = try fb.emitLoadLocal(2, TypeRegistry.I64, Span.zero);
+
+        // destroy(dest, metadata)
+        var destroy_args = [_]ir.NodeIndex{ dest, metadata };
+        _ = try fb.emitCall(entry.destroy_fn, &destroy_args, false, TypeRegistry.VOID, Span.zero);
+        // initializeWithCopy(dest, src, metadata)
+        var copy_args = [_]ir.NodeIndex{ dest, src, metadata };
+        _ = try fb.emitCall(entry.initializeWithCopy_fn, &copy_args, false, TypeRegistry.I64, Span.zero);
+
+        const ret = try fb.emitLoadLocal(0, TypeRegistry.I64, Span.zero);
+        _ = try fb.emitRet(ret, Span.zero);
+        try builder.endFunc();
+    }
+
+    /// initializeWithTake(dest, src, metadata) → dest
+    /// All Cot types are bitwise-takable: just memcpy, no retain/release.
+    /// Source is invalidated (moved).
+    fn emitInitializeWithTakeWitness(self: *VWTGenerator, builder: *ir.Builder, entry: VWTEntry) !void {
+        _ = self;
+        builder.startFunc(entry.initializeWithTake_fn, TypeRegistry.VOID, TypeRegistry.I64, Span.zero);
+        const fb = builder.func() orelse return;
+        _ = try fb.addParam("dest", TypeRegistry.I64, 8);
+        _ = try fb.addParam("src", TypeRegistry.I64, 8);
+        _ = try fb.addParam("metadata", TypeRegistry.I64, 8);
+
+        const dest = try fb.emitLoadLocal(0, TypeRegistry.I64, Span.zero);
+        const src = try fb.emitLoadLocal(1, TypeRegistry.I64, Span.zero);
+        const size_val = try fb.emitConstInt(@intCast(entry.size), TypeRegistry.I64, Span.zero);
+        var args = [_]ir.NodeIndex{ dest, src, size_val };
+        _ = try fb.emitCall("memcpy", &args, false, TypeRegistry.VOID, Span.zero);
+
+        const ret = try fb.emitLoadLocal(0, TypeRegistry.I64, Span.zero);
+        _ = try fb.emitRet(ret, Span.zero);
+        try builder.endFunc();
+    }
+
+    /// assignWithTake(dest, src, metadata) → dest
+    /// Destroy old dest, then memcpy from src (take = move, no retain).
+    fn emitAssignWithTakeWitness(
+        self: *VWTGenerator,
+        builder: *ir.Builder,
+        entry: VWTEntry,
+        type_idx: TypeIndex,
+        is_pod: bool,
+        is_managed_ptr: bool,
+        is_collection: bool,
+    ) !void {
+        _ = type_idx;
+        _ = is_collection;
+        _ = is_managed_ptr;
+        _ = self;
+        builder.startFunc(entry.assignWithTake_fn, TypeRegistry.VOID, TypeRegistry.I64, Span.zero);
+        const fb = builder.func() orelse return;
+        _ = try fb.addParam("dest", TypeRegistry.I64, 8);
+        _ = try fb.addParam("src", TypeRegistry.I64, 8);
+        _ = try fb.addParam("metadata", TypeRegistry.I64, 8);
+
+        const dest = try fb.emitLoadLocal(0, TypeRegistry.I64, Span.zero);
+        const src = try fb.emitLoadLocal(1, TypeRegistry.I64, Span.zero);
+        const metadata = try fb.emitLoadLocal(2, TypeRegistry.I64, Span.zero);
+
+        if (!is_pod) {
+            // destroy(dest, metadata) first
+            var destroy_args = [_]ir.NodeIndex{ dest, metadata };
+            _ = try fb.emitCall(entry.destroy_fn, &destroy_args, false, TypeRegistry.VOID, Span.zero);
+        }
+
+        // memcpy(dest, src, size) — take = move, no retain
+        const size_val = try fb.emitConstInt(@intCast(entry.size), TypeRegistry.I64, Span.zero);
+        var memcpy_args = [_]ir.NodeIndex{ dest, src, size_val };
+        _ = try fb.emitCall("memcpy", &memcpy_args, false, TypeRegistry.VOID, Span.zero);
+
+        const ret = try fb.emitLoadLocal(0, TypeRegistry.I64, Span.zero);
+        _ = try fb.emitRet(ret, Span.zero);
+        try builder.endFunc();
+    }
 };
 
 // ============================================================================
@@ -217,4 +481,51 @@ test "VWTGenerator computeEntry for optional" {
     try std.testing.expectEqual(@as(u64, 16), entry.size);
     try std.testing.expect(entry.has_enum_witnesses);
     try std.testing.expect(entry.flags.hasEnumWitnesses());
+}
+
+test "VWTGenerator emitWitnesses for POD type" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var reg = try TypeRegistry.init(alloc);
+
+    var gen = VWTGenerator.init(alloc, &reg);
+    var builder = ir.Builder.init(alloc, &reg);
+
+    const entry = try gen.emitWitnesses(&builder, TypeRegistry.I64, "i64");
+
+    // Should have emitted 5 functions: destroy, initializeWithCopy, assignWithCopy,
+    // initializeWithTake, assignWithTake
+    try std.testing.expectEqual(@as(usize, 5), builder.funcs.items.len);
+
+    // Verify function names match entry
+    try std.testing.expect(std.mem.eql(u8, builder.funcs.items[0].name, entry.destroy_fn));
+    try std.testing.expect(std.mem.eql(u8, builder.funcs.items[1].name, entry.initializeWithCopy_fn));
+    try std.testing.expect(std.mem.eql(u8, builder.funcs.items[2].name, entry.assignWithCopy_fn));
+    try std.testing.expect(std.mem.eql(u8, builder.funcs.items[3].name, entry.initializeWithTake_fn));
+    try std.testing.expect(std.mem.eql(u8, builder.funcs.items[4].name, entry.assignWithTake_fn));
+
+    // Dedup: emitting again should not add more functions
+    _ = try gen.emitWitnesses(&builder, TypeRegistry.I64, "i64");
+    try std.testing.expectEqual(@as(usize, 5), builder.funcs.items.len);
+}
+
+test "VWTGenerator emitWitnesses for collection type" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var reg = try TypeRegistry.init(alloc);
+
+    var gen = VWTGenerator.init(alloc, &reg);
+    var builder = ir.Builder.init(alloc, &reg);
+
+    const list_type = try reg.makeList(TypeRegistry.I64);
+    const entry = try gen.emitWitnesses(&builder, list_type, "List_i64");
+
+    // 5 witness functions
+    try std.testing.expectEqual(@as(usize, 5), builder.funcs.items.len);
+    // Collection is NOT POD
+    try std.testing.expect(!entry.flags.isPOD());
+    // destroy should have more than just a ret (has null check + release)
+    try std.testing.expect(builder.funcs.items[0].blocks.len > 1);
 }
