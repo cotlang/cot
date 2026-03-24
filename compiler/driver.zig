@@ -402,7 +402,6 @@ pub const Driver = struct {
         var gen = vwt_gen_mod.VWTGenerator.init(builder.allocator, type_reg);
         defer gen.deinit();
 
-        var vwt_count: usize = 0;
         // Swift pattern: emit VWT for EVERY non-trivial concrete type.
         // Every type that participates in generic code gets its own VWT table.
         // Reference: apple/swift lib/IRGen/GenValueWitness.cpp emitValueWitnessTable()
@@ -431,9 +430,7 @@ pub const Driver = struct {
                 error.MissingVWTEntry => continue,
                 else => return err,
             };
-            vwt_count += 1;
         }
-        std.debug.print("VWT: emitted for {d} types out of {d} total\n", .{ vwt_count, type_reg.types.items.len });
     }
 
     /// Compile a source file (supports imports).

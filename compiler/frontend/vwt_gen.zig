@@ -1118,8 +1118,8 @@ test "VWTGenerator emitWitnesses for POD type" {
 
     const entry = try gen.emitWitnesses(&builder, TypeRegistry.I64, "i64");
 
-    // 5 base witnesses + 1 initializeBufferWithCopyOfBuffer = 6
-    try std.testing.expectEqual(@as(usize, 6), builder.funcs.items.len);
+    // 5 base + 1 buffer + 1 metadata init = 7
+    try std.testing.expectEqual(@as(usize, 7), builder.funcs.items.len);
 
     // Verify function names match entry
     try std.testing.expect(std.mem.eql(u8, builder.funcs.items[0].name, entry.destroy_fn));
@@ -1130,7 +1130,7 @@ test "VWTGenerator emitWitnesses for POD type" {
 
     // Dedup: emitting again should not add more functions
     _ = try gen.emitWitnesses(&builder, TypeRegistry.I64, "i64");
-    try std.testing.expectEqual(@as(usize, 6), builder.funcs.items.len);
+    try std.testing.expectEqual(@as(usize, 7), builder.funcs.items.len);
 }
 
 test "VWTGenerator emitWitnesses for collection type" {
@@ -1145,8 +1145,8 @@ test "VWTGenerator emitWitnesses for collection type" {
     const list_type = try reg.makeList(TypeRegistry.I64);
     const entry = try gen.emitWitnesses(&builder, list_type, "List_i64");
 
-    // 6 witness functions (5 base + 1 buffer)
-    try std.testing.expectEqual(@as(usize, 6), builder.funcs.items.len);
+    // 7 functions (5 base + 1 buffer + 1 metadata init)
+    try std.testing.expectEqual(@as(usize, 7), builder.funcs.items.len);
     // Collection is NOT POD
     try std.testing.expect(!entry.flags.isPOD());
     // destroy should have more than just a ret (has null check + release)
@@ -1177,22 +1177,22 @@ test "VWTGenerator emitWitnesses for struct with ARC field" {
 
     const entry = try gen.emitWitnesses(&builder, container_type, "Container");
 
-    // list: 6 functions + Container: 6 functions = 12 total
-    try std.testing.expectEqual(@as(usize, 12), builder.funcs.items.len);
+    // list: 7 functions + Container: 7 functions = 14 total
+    try std.testing.expectEqual(@as(usize, 14), builder.funcs.items.len);
 
     // Container is NOT POD (has List field)
     try std.testing.expect(!entry.flags.isPOD());
 
-    // Container witnesses start at index 6 (after list's 6 witnesses)
-    const container_destroy = builder.funcs.items[6];
+    // Container witnesses start at index 7 (after list's 7 functions)
+    const container_destroy = builder.funcs.items[7];
     try std.testing.expect(std.mem.eql(u8, container_destroy.name, "__vwt_destroy_Container"));
 
-    const container_copy = builder.funcs.items[7];
+    const container_copy = builder.funcs.items[8];
     try std.testing.expect(std.mem.eql(u8, container_copy.name, "__vwt_initializeWithCopy_Container"));
 
     // Dedup: emitting again should not add more functions
     _ = try gen.emitWitnesses(&builder, container_type, "Container");
-    try std.testing.expectEqual(@as(usize, 12), builder.funcs.items.len);
+    try std.testing.expectEqual(@as(usize, 14), builder.funcs.items.len);
 }
 
 test "VWTGenerator emitWitnesses for struct with managed pointer field" {
@@ -1230,8 +1230,8 @@ test "VWTGenerator emitWitnesses for struct with managed pointer field" {
 
     const entry = try gen.emitWitnesses(&builder, holder_type, "Holder");
 
-    // Sub-type (managed pointer): 6 + Holder: 6 = 12 functions
-    try std.testing.expectEqual(@as(usize, 12), builder.funcs.items.len);
+    // Sub-type (managed pointer): 7 + Holder: 7 = 14 functions
+    try std.testing.expectEqual(@as(usize, 14), builder.funcs.items.len);
     try std.testing.expect(!entry.flags.isPOD());
 }
 
@@ -1258,8 +1258,8 @@ test "VWTGenerator emitWitnesses for POD struct (all trivial fields)" {
 
     const entry = try gen.emitWitnesses(&builder, point_type, "Point");
 
-    // POD struct: 6 functions (5 base + 1 buffer)
-    try std.testing.expectEqual(@as(usize, 6), builder.funcs.items.len);
+    // POD struct: 7 functions (5 base + 1 buffer + 1 init)
+    try std.testing.expectEqual(@as(usize, 7), builder.funcs.items.len);
     try std.testing.expect(entry.flags.isPOD());
 }
 
@@ -1297,8 +1297,8 @@ test "VWTGenerator emitWitnesses for union with ARC variant" {
 
     const entry = try gen.emitWitnesses(&builder, union_type, "Result");
 
-    // pointer: 6 + Result: 5 base + 3 enum + 1 buffer = 9 → total 15
-    try std.testing.expectEqual(@as(usize, 15), builder.funcs.items.len);
+    // pointer: 7 + Result: 5 base + 3 enum + 1 buffer + 1 init = 10 → total 17
+    try std.testing.expectEqual(@as(usize, 17), builder.funcs.items.len);
     try std.testing.expect(!entry.flags.isPOD());
     try std.testing.expect(entry.has_enum_witnesses);
 
@@ -1307,8 +1307,8 @@ test "VWTGenerator emitWitnesses for union with ARC variant" {
     try std.testing.expect(entry.destructiveProjectEnumData_fn != null);
     try std.testing.expect(entry.destructiveInjectEnumTag_fn != null);
 
-    // Verify the destroy witness is index 6 (after pointer's 6 witnesses)
-    try std.testing.expect(std.mem.eql(u8, builder.funcs.items[6].name, "__vwt_destroy_Result"));
+    // Verify the destroy witness is index 7 (after pointer's 7 functions)
+    try std.testing.expect(std.mem.eql(u8, builder.funcs.items[7].name, "__vwt_destroy_Result"));
 }
 
 test "VWTGenerator emitWitnesses for POD union (all trivial variants)" {
@@ -1333,8 +1333,8 @@ test "VWTGenerator emitWitnesses for POD union (all trivial variants)" {
 
     const entry = try gen.emitWitnesses(&builder, union_type, "IntOrFloat");
 
-    // POD union: 5 base + 3 enum + 1 buffer = 9 functions
-    try std.testing.expectEqual(@as(usize, 9), builder.funcs.items.len);
+    // POD union: 5 base + 3 enum + 1 buffer + 1 init = 10 functions
+    try std.testing.expectEqual(@as(usize, 10), builder.funcs.items.len);
     try std.testing.expect(entry.flags.isPOD());
     try std.testing.expect(entry.has_enum_witnesses);
 }
