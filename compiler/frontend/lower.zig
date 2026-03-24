@@ -4652,7 +4652,12 @@ pub const Lowerer = struct {
             const src_addr = try fb.emitAddrLocal(src_tmp, TypeRegistry.I64, span);
             const dst_tmp = try fb.addLocalWithSize("__vwt_dst", type_idx, false, val_size);
             const dst_addr = try fb.emitAddrLocal(dst_tmp, TypeRegistry.I64, span);
-            const metadata = try fb.emitConstInt(0, TypeRegistry.I64, span); // placeholder
+            // Load TypeMetadata global address for this type
+            const meta_name = try std.fmt.allocPrint(self.allocator, "__type_metadata_{s}", .{type_name});
+            const metadata = if (self.builder.lookupGlobal(meta_name)) |gi|
+                try fb.emitAddrGlobal(gi.idx, meta_name, TypeRegistry.I64, span)
+            else
+                try fb.emitConstInt(0, TypeRegistry.I64, span);
             var args = [_]ir.NodeIndex{ dst_addr, src_addr, metadata };
             _ = try fb.emitCall(copy_name, &args, false, TypeRegistry.I64, span);
             // Load the copied value from dest
@@ -4885,7 +4890,12 @@ pub const Lowerer = struct {
             const tmp = try fb.addLocalWithSize("__vwt_tmp", type_idx, false, val_size);
             _ = try fb.emitStoreLocal(tmp, value, span);
             const addr = try fb.emitAddrLocal(tmp, TypeRegistry.I64, span);
-            const metadata = try fb.emitConstInt(0, TypeRegistry.I64, span); // placeholder
+            // Load TypeMetadata global address for this type
+            const meta_name = try std.fmt.allocPrint(self.allocator, "__type_metadata_{s}", .{type_name});
+            const metadata = if (self.builder.lookupGlobal(meta_name)) |gi|
+                try fb.emitAddrGlobal(gi.idx, meta_name, TypeRegistry.I64, span)
+            else
+                try fb.emitConstInt(0, TypeRegistry.I64, span);
             var args = [_]ir.NodeIndex{ addr, metadata };
             _ = try fb.emitCall(destroy_name, &args, false, TypeRegistry.VOID, span);
             return;
@@ -9764,11 +9774,20 @@ pub const Lowerer = struct {
             }
 
             // Metadata args: pass 0 (placeholder) for each type param.
-            // TODO: When TypeMetadata globals exist, pass concrete type's metadata ptr.
-            const param_names = if (inst_info.type_param_names.len > 0) inst_info.type_param_names else f.type_params;
-            for (param_names) |_| {
-                const meta = try fb.emitConstInt(0, TypeRegistry.I64, f.span);
-                try call_args.append(self.allocator, meta);
+            // Pass concrete type's TypeMetadata global address for each type param.
+            const param_names_w = if (inst_info.type_param_names.len > 0) inst_info.type_param_names else f.type_params;
+            for (param_names_w, 0..) |_, pi| {
+                if (pi < inst_info.type_args.len) {
+                    const arg_type_name = self.type_reg.typeName(inst_info.type_args[pi]);
+                    const meta_global = try std.fmt.allocPrint(self.allocator, "__type_metadata_{s}", .{arg_type_name});
+                    const meta = if (self.builder.lookupGlobal(meta_global)) |gi|
+                        try fb.emitAddrGlobal(gi.idx, meta_global, TypeRegistry.I64, f.span)
+                    else
+                        try fb.emitConstInt(0, TypeRegistry.I64, f.span);
+                    try call_args.append(self.allocator, meta);
+                } else {
+                    try call_args.append(self.allocator, try fb.emitConstInt(0, TypeRegistry.I64, f.span));
+                }
             }
 
             // @safe self param

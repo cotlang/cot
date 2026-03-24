@@ -291,9 +291,131 @@ pub const VWTGenerator = struct {
         // --- initializeBufferWithCopyOfBuffer (all types) ---
         try self.emitInitializeBufferWithCopyOfBufferWitness(builder, entry, type_name);
 
+        // --- TypeMetadata + VWT globals ---
+        try self.emitMetadataGlobals(builder, entry, type_name, info);
+
         try self.emitted.put(type_name, {});
         try self.entries.put(type_name, entry);
         return entry;
+    }
+
+    /// Emit global data for VWT table and TypeMetadata for a concrete type.
+    /// Swift pattern: VWT is a global constant struct with function pointers + data.
+    /// TypeMetadata is a global constant with VWT pointer + kind + type-specific fields.
+    ///
+    /// VWT layout (88 bytes on 64-bit):
+    ///   [0]  initializeBufferWithCopyOfBuffer  (fn ptr, 8B)
+    ///   [1]  destroy                           (fn ptr, 8B)
+    ///   [2]  initializeWithCopy                (fn ptr, 8B)
+    ///   [3]  assignWithCopy                    (fn ptr, 8B)
+    ///   [4]  initializeWithTake                (fn ptr, 8B)
+    ///   [5]  assignWithTake                    (fn ptr, 8B)
+    ///   [6]  getEnumTagSinglePayload           (fn ptr, 8B)
+    ///   [7]  storeEnumTagSinglePayload         (fn ptr, 8B)
+    ///   [8]  size                              (u64, 8B)
+    ///   [9]  stride                            (u64, 8B)
+    ///   [10] flags:u32 + extraInhabitantCount:u32 (packed, 8B)
+    ///
+    /// TypeMetadata layout (24 bytes):
+    ///   [0]  vwt pointer                       (ptr to VWT global, 8B)
+    ///   [1]  kind                              (TypeMetadataKind, 8B)
+    ///   [2]  type_idx                          (TypeIndex, 8B)
+    fn emitMetadataGlobals(self: *VWTGenerator, builder: *ir.Builder, entry: VWTEntry, type_name: []const u8, info: types.Type) !void {
+        const vwt_global_name = try std.fmt.allocPrint(self.allocator, "__vwt_table_{s}", .{type_name});
+        const metadata_global_name = try std.fmt.allocPrint(self.allocator, "__type_metadata_{s}", .{type_name});
+        const init_fn_name = try std.fmt.allocPrint(self.allocator, "__vwt_init_{s}", .{type_name});
+
+        // Global for VWT table: 11 i64 slots = 88 bytes
+        try builder.addGlobal(ir.Global.initWithSize(vwt_global_name, TypeRegistry.I64, false, Span.zero, 88));
+
+        // Global for TypeMetadata: 3 i64 slots = 24 bytes
+        try builder.addGlobal(ir.Global.initWithSize(metadata_global_name, TypeRegistry.I64, false, Span.zero, 24));
+
+        // Emit init function that populates VWT with function addresses + data
+        builder.startFunc(init_fn_name, TypeRegistry.VOID, TypeRegistry.VOID, Span.zero);
+        const fb = builder.func() orelse return;
+
+        // Look up VWT global index
+        const vwt_info = builder.lookupGlobal(vwt_global_name) orelse return;
+        const meta_info = builder.lookupGlobal(metadata_global_name) orelse return;
+
+        // VWT base address
+        const vwt_addr = try fb.emitAddrGlobal(vwt_info.idx, vwt_global_name, TypeRegistry.I64, Span.zero);
+
+        // Store function pointers at VWT offsets [0]-[7]
+        const buffer_copy_name = try std.fmt.allocPrint(self.allocator, "__vwt_initializeBufferWithCopyOfBuffer_{s}", .{type_name});
+        try self.storeWitnessSlot(fb, vwt_addr, 0, buffer_copy_name);
+        try self.storeWitnessSlot(fb, vwt_addr, 1, entry.destroy_fn);
+        try self.storeWitnessSlot(fb, vwt_addr, 2, entry.initializeWithCopy_fn);
+        try self.storeWitnessSlot(fb, vwt_addr, 3, entry.assignWithCopy_fn);
+        try self.storeWitnessSlot(fb, vwt_addr, 4, entry.initializeWithTake_fn);
+        try self.storeWitnessSlot(fb, vwt_addr, 5, entry.assignWithTake_fn);
+
+        // Single-payload witnesses [6]-[7]: use type-specific or noop
+        const get_single_name = try std.fmt.allocPrint(self.allocator, "__vwt_getEnumTagSinglePayload_{s}", .{type_name});
+        const store_single_name = try std.fmt.allocPrint(self.allocator, "__vwt_storeEnumTagSinglePayload_{s}", .{type_name});
+        if (info == .optional or info == .error_union) {
+            try self.storeWitnessSlot(fb, vwt_addr, 6, get_single_name);
+            try self.storeWitnessSlot(fb, vwt_addr, 7, store_single_name);
+        } else {
+            // Non-optional types: store 0 (no single-payload witnesses)
+            try self.storeDataSlot(fb, vwt_addr, 6, 0);
+            try self.storeDataSlot(fb, vwt_addr, 7, 0);
+        }
+
+        // Data witnesses [8]-[10]
+        try self.storeDataSlot(fb, vwt_addr, 8, @intCast(entry.size));
+        try self.storeDataSlot(fb, vwt_addr, 9, @intCast(entry.stride));
+        // Pack flags (u32) + extraInhabitantCount (u32) into one i64
+        const packed_flags: i64 = @intCast(@as(u64, entry.flags.data) | (@as(u64, entry.extra_inhabitant_count) << 32));
+        try self.storeDataSlot(fb, vwt_addr, 10, packed_flags);
+
+        // TypeMetadata: [0]=vwt_ptr, [1]=kind, [2]=type_idx
+        const meta_addr = try fb.emitAddrGlobal(meta_info.idx, metadata_global_name, TypeRegistry.I64, Span.zero);
+        // Store VWT pointer (address of VWT global)
+        _ = try fb.emitPtrStoreValue(meta_addr, vwt_addr, Span.zero);
+        // Store kind
+        const kind_val: i64 = switch (info) {
+            .struct_type => 0x200,
+            .enum_type => 0x201,
+            .optional => 0x202,
+            .tuple => 0x301,
+            .func => 0x302,
+            .list => 0x400,
+            .map => 0x401,
+            .union_type => 0x201,
+            else => 0x200,
+        };
+        const eight = try fb.emitConstInt(8, TypeRegistry.I64, Span.zero);
+        const meta_kind_addr = try fb.emitBinary(.add, meta_addr, eight, TypeRegistry.I64, Span.zero);
+        const kind_const = try fb.emitConstInt(kind_val, TypeRegistry.I64, Span.zero);
+        _ = try fb.emitPtrStoreValue(meta_kind_addr, kind_const, Span.zero);
+        // Store type_idx
+        const sixteen = try fb.emitConstInt(16, TypeRegistry.I64, Span.zero);
+        const meta_tidx_addr = try fb.emitBinary(.add, meta_addr, sixteen, TypeRegistry.I64, Span.zero);
+        const tidx_const = try fb.emitConstInt(@intCast(entry.type_idx), TypeRegistry.I64, Span.zero);
+        _ = try fb.emitPtrStoreValue(meta_tidx_addr, tidx_const, Span.zero);
+
+        _ = try fb.emitRet(null, Span.zero);
+        try builder.endFunc();
+    }
+
+    /// Store a function address into a VWT slot.
+    fn storeWitnessSlot(self: *VWTGenerator, fb: *ir.FuncBuilder, vwt_addr: ir.NodeIndex, slot: u32, fn_name: []const u8) !void {
+        _ = self;
+        const fn_addr = try fb.emitFuncAddr(fn_name, TypeRegistry.I64, Span.zero);
+        const offset = try fb.emitConstInt(@intCast(@as(u64, slot) * 8), TypeRegistry.I64, Span.zero);
+        const slot_addr = try fb.emitBinary(.add, vwt_addr, offset, TypeRegistry.I64, Span.zero);
+        _ = try fb.emitPtrStoreValue(slot_addr, fn_addr, Span.zero);
+    }
+
+    /// Store a data value into a VWT slot.
+    fn storeDataSlot(self: *VWTGenerator, fb: *ir.FuncBuilder, vwt_addr: ir.NodeIndex, slot: u32, value: i64) !void {
+        _ = self;
+        const val = try fb.emitConstInt(value, TypeRegistry.I64, Span.zero);
+        const offset = try fb.emitConstInt(@intCast(@as(u64, slot) * 8), TypeRegistry.I64, Span.zero);
+        const slot_addr = try fb.emitBinary(.add, vwt_addr, offset, TypeRegistry.I64, Span.zero);
+        _ = try fb.emitPtrStoreValue(slot_addr, val, Span.zero);
     }
 
     /// destroy(object_ptr, metadata) → void
