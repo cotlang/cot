@@ -6029,18 +6029,34 @@ pub const Lowerer = struct {
                 // For types ≤ 8 bytes, the scalar comparison (already computed as `left`/`right`)
                 // is correct. Only dispatch through memcmp/string_eq for multi-word types.
                 // Swift: scalar types use direct comparison, address-only types use PWT.
+                // Use the SPECIFIC type param for the T-indirect operand, not the first one.
                 const concrete_size: u32 = if (self.type_substitution) |sub| blk_cs: {
-                    var si = sub.valueIterator();
-                    break :blk_cs if (si.next()) |v| self.type_reg.sizeOf(v.*) else 8;
+                    // Find the type param name from the T-indirect ident
+                    const t_ident_name = if (rhs_is_t and rhs_expr.? == .ident)
+                        rhs_expr.?.ident.name
+                    else if (lhs_is_t and lhs_expr.? == .ident)
+                        lhs_expr.?.ident.name
+                    else
+                        break :blk_cs 8;
+                    const tp_for_cmp = self.indirect_t_params.get(t_ident_name) orelse break :blk_cs 8;
+                    const concrete_type = sub.get(tp_for_cmp) orelse break :blk_cs 8;
+                    break :blk_cs self.type_reg.sizeOf(concrete_type);
                 } else 8;
                 if (concrete_size <= 8) {
                     // Scalar comparison: use the already-lowered left/right values
                     debug.log(.lower, "Phase 8.8: T-indirect scalar comparison (size={d} ≤ 8)", .{concrete_size});
                     return try fb.emitBinary(tokenToBinaryOp(bin.op), left, right, result_type, bin.span);
                 }
-                // Get runtime type param name first (needed for address extraction)
-                var tp_iter = self.indirect_t_params.valueIterator();
-                const tp_name = if (tp_iter.next()) |v| v.* else "T";
+                // Get runtime type param name from the T-indirect operand (not just first).
+                const tp_name: []const u8 = blk_tp: {
+                    const t_name = if (rhs_is_t and rhs_expr.? == .ident)
+                        rhs_expr.?.ident.name
+                    else if (lhs_is_t and lhs_expr.? == .ident)
+                        lhs_expr.?.ident.name
+                    else
+                        break :blk_tp "T";
+                    break :blk_tp self.indirect_t_params.get(t_name) orelse "T";
+                };
                 // Get addresses for memcmp. Use runtime size for temp allocation.
                 // T-indirect ident: forward __ptr_ pointer directly.
                 // Other: store loaded value to runtime-sized temp, take address.
@@ -9415,6 +9431,25 @@ pub const Lowerer = struct {
                     if (type_name) |n| n else "(null)",
                 });
 
+                // Phase 8.8: Runtime protocol dispatch in shared generic bodies.
+                // When calling protocol methods (hash, etc.) on T-typed receivers,
+                // the method must be dispatched at runtime — not devirtualized from the
+                // first instantiation. Otherwise Map(string,int) + Map(int,string)
+                // would both call string_hash via the same shared body.
+                if (self.type_substitution != null and std.mem.eql(u8, fa.field, "hash")) {
+                    if (self.type_substitution) |sub| {
+                        var sub_it = sub.iterator();
+                        while (sub_it.next()) |entry| {
+                            if (entry.value_ptr.* == base_type_idx) {
+                                const tp_name = entry.key_ptr.*;
+                                const result = try self.emitRuntimeHashDispatch(call, fa, tp_name, base_type_idx);
+                                if (result != ir.null_node) return result;
+                                break; // fall through to direct call
+                            }
+                        }
+                    }
+                }
+
                 if (type_name) |name| {
                     if (self.chk.lookupMethod(name, fa.field)) |method_info| {
                         return try self.lowerMethodCall(call, fa, method_info, name);
@@ -10368,6 +10403,54 @@ pub const Lowerer = struct {
         }
         debug.log(.lower, "emitTypeMetadataRef: type='{s}' → no global found, passing 0", .{type_name});
         return try fb.emitConstInt(0, TypeRegistry.I64, span);
+    }
+
+    /// Phase 8.8: Runtime hash dispatch in shared generic bodies.
+    /// Swift pattern: load witness function pointer from metadata, call indirectly.
+    /// TypeMetadata layout: [0]=vwt_ptr, [8]=size, [16]=stride, [24]=type_idx, [32]=hash_fn_ptr
+    fn emitRuntimeHashDispatch(self: *Lowerer, call: ast.Call, fa: ast.FieldAccess, tp_name: []const u8, base_type_idx: TypeIndex) Error!ir.NodeIndex {
+        const fb = self.current_func orelse return ir.null_node;
+        const span = call.span;
+
+        // Load hash_fn_ptr from __metadata_{tp_name}[32]
+        const meta_local_name = try std.fmt.allocPrint(self.allocator, "__metadata_{s}", .{tp_name});
+        const meta_local_idx = fb.lookupLocal(meta_local_name) orelse {
+            // No metadata — fall back to compile-time resolution
+            debug.log(.lower, "Phase 8.8: no metadata for '{s}', falling back to direct call", .{tp_name});
+            return ir.null_node;
+        };
+        const meta_val = try fb.emitLoadLocal(meta_local_idx, TypeRegistry.I64, span);
+        const hash_offset = try fb.emitConstInt(32, TypeRegistry.I64, span);
+        const hash_fn_addr = try fb.emitBinary(.add, meta_val, hash_offset, TypeRegistry.I64, span);
+        const hash_fn_ptr = try fb.emitPtrLoadValue(hash_fn_addr, TypeRegistry.I64, span);
+
+        // Lower receiver: take address of the base expression
+        const base = try self.lowerExprNode(fa.base);
+        _ = base_type_idx;
+        // The receiver must be passed as a pointer (address-only, Swift @in convention).
+        // If base is a local, take its address. Otherwise store to temp and take address.
+        const receiver_addr = blk: {
+            // Check if base expression is an ident → look up local and take address
+            if (self.tree.getNode(fa.base)) |base_node| {
+                if (base_node.asExpr()) |base_expr| {
+                    if (base_expr == .ident) {
+                        if (fb.lookupLocal(base_expr.ident.name)) |local_idx| {
+                            break :blk try fb.emitAddrLocal(local_idx, TypeRegistry.I64, span);
+                        }
+                    }
+                }
+            }
+            // Fallback: store to temp local and take address
+            const tmp = try fb.addLocalWithSize("__hash_recv", TypeRegistry.I64, false, 24);
+            _ = try fb.emitStoreLocal(tmp, base, span);
+            break :blk try fb.emitAddrLocal(tmp, TypeRegistry.I64, span);
+        };
+
+        // Call indirect: hash_fn_ptr(receiver_addr) → i64
+        var hash_args = [_]ir.NodeIndex{receiver_addr};
+        const result = try fb.emitCallIndirect(hash_fn_ptr, &hash_args, TypeRegistry.I64, span);
+        debug.log(.lower, "Phase 8.8: runtime hash dispatch via metadata[32] for type param '{s}'", .{tp_name});
+        return result;
     }
 
     /// Compute the base generic name from a concrete name.

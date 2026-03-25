@@ -1117,6 +1117,28 @@ struct Lowerer {
             const local_idx = fb.addLocalWithSize(v.name, type_idx, !v.is_const, size)
 
             if (v.value != null_node) {
+                // Phase 8.5: T-indirect var init takes priority over type-specific paths.
+                // When initializing from a T-indirect param, memcpy the full value.
+                // Ref: lower.zig:2506-2525
+                if (self.extractIdentName(v.value)) |init_ident| {
+                    if (self.indirect_t_params.has(init_ident) != 0) {
+                        const tp_name = self.indirect_t_params.get(init_ident)
+                        const ptr_local_name = "__ptr_" + init_ident
+                        const ptr_li = fb.lookupLocal(ptr_local_name)
+                        if (ptr_li >= 0) {
+                            const src_ptr = fb.emitLoadLocal(@intCast(i64, ptr_li), I64, v.span)
+                            const dst_addr = fb.emitAddrLocal(local_idx, I64, v.span)
+                            const rt_size = self.emitRuntimeSizeOf(tp_name, v.span)
+                            var mc_args: List(int) = .{}
+                            mc_args.append(dst_addr)
+                            mc_args.append(src_ptr)
+                            mc_args.append(rt_size)
+                            fb.emitCall("memcpy", mc_args, false, VOID, v.span)
+                            return
+                        }
+                    }
+                }
+
                 // Type-specific init paths — store directly into local slots
                 // Ref: lower.zig:2382-2439
                 const is_array = self.types.isArray(type_idx)

@@ -332,8 +332,9 @@ pub const VWTGenerator = struct {
         // Global for VWT table: 11 i64 slots = 88 bytes
         try builder.addGlobal(ir.Global.initWithSize(vwt_global_name, TypeRegistry.I64, false, Span.zero, 88));
 
-        // Global for TypeMetadata: 4 i64 slots = 32 bytes
-        try builder.addGlobal(ir.Global.initWithSize(metadata_global_name, TypeRegistry.I64, false, Span.zero, 32));
+        // Global for TypeMetadata: 5 i64 slots = 40 bytes
+        // [0]=vwt_ptr, [1]=size, [2]=stride, [3]=type_idx, [4]=hash_fn_ptr
+        try builder.addGlobal(ir.Global.initWithSize(metadata_global_name, TypeRegistry.I64, false, Span.zero, 40));
 
         // Emit init function that populates VWT with function addresses + data
         builder.startFunc(init_fn_name, TypeRegistry.VOID, TypeRegistry.VOID, Span.zero);
@@ -395,8 +396,46 @@ pub const VWTGenerator = struct {
         const kind_const = try fb.emitConstInt(@intCast(type_idx), TypeRegistry.I64, Span.zero);
         _ = try fb.emitPtrStoreValue(meta_kind_addr, kind_const, Span.zero);
 
+        // [4] Store hash_fn_ptr — Swift PWT pattern: protocol witness stored in metadata.
+        // For Hashable types (i64, string), store their hash function address.
+        // For non-Hashable types, store 0 (unused).
+        const thirtytwo = try fb.emitConstInt(32, TypeRegistry.I64, Span.zero);
+        const meta_hash_addr = try fb.emitBinary(.add, meta_addr, thirtytwo, TypeRegistry.I64, Span.zero);
+        const hash_fn_name = self.getHashFnName(type_idx, type_name);
+        if (hash_fn_name) |hfn| {
+            if (builder.hasFunc(hfn)) {
+                const hash_fn_addr = try fb.emitFuncAddr(hfn, TypeRegistry.I64, Span.zero);
+                _ = try fb.emitPtrStoreValue(meta_hash_addr, hash_fn_addr, Span.zero);
+            } else {
+                const zero_hash = try fb.emitConstInt(0, TypeRegistry.I64, Span.zero);
+                _ = try fb.emitPtrStoreValue(meta_hash_addr, zero_hash, Span.zero);
+            }
+        } else {
+            const zero_hash = try fb.emitConstInt(0, TypeRegistry.I64, Span.zero);
+            _ = try fb.emitPtrStoreValue(meta_hash_addr, zero_hash, Span.zero);
+        }
+
         _ = try fb.emitRet(null, Span.zero);
         try builder.endFunc();
+    }
+
+    /// Get the hash function name for a type (Hashable protocol witness).
+    /// Returns null for types that don't implement Hashable.
+    fn getHashFnName(_: *VWTGenerator, type_idx: TypeIndex, type_name: []const u8) ?[]const u8 {
+        // i64/int types use i64_hash
+        if (type_idx == TypeRegistry.I64 or type_idx == TypeRegistry.I32 or
+            type_idx == TypeRegistry.I16 or type_idx == TypeRegistry.I8 or
+            type_idx == TypeRegistry.U64 or type_idx == TypeRegistry.U32 or
+            type_idx == TypeRegistry.U16 or type_idx == TypeRegistry.U8)
+            return "std.map.i64_hash";
+        // String uses string_hash
+        if (type_idx == TypeRegistry.STRING) return "std.map.string_hash";
+        // Check for known type names (for types not matched by index)
+        if (std.mem.eql(u8, type_name, "i64") or std.mem.eql(u8, type_name, "int"))
+            return "std.map.i64_hash";
+        if (std.mem.eql(u8, type_name, "string"))
+            return "std.map.string_hash";
+        return null;
     }
 
     /// Store a function address into a VWT slot.

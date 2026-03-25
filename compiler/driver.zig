@@ -502,6 +502,30 @@ pub const Driver = struct {
                     const kind_val = try fb.emitConstInt(@intCast(type_arg), types_mod.TypeRegistry.I64, Span.zero);
                     _ = try fb.emitPtrStoreValue(kind_addr, kind_val, Span.zero);
 
+                    // [4] hash_fn_ptr — Swift PWT pattern: protocol witness in metadata.
+                    // Only store if the hash function exists in the program (Map imported).
+                    const thirtytwo = try fb.emitConstInt(32, types_mod.TypeRegistry.I64, Span.zero);
+                    const hash_addr = try fb.emitBinary(.add, meta_addr, thirtytwo, types_mod.TypeRegistry.I64, Span.zero);
+                    const hash_fn: ?[]const u8 = if (type_arg == types_mod.TypeRegistry.STRING)
+                        "std.map.string_hash"
+                    else if (type_arg == types_mod.TypeRegistry.I64 or type_arg == types_mod.TypeRegistry.I32 or
+                        type_arg == types_mod.TypeRegistry.I16 or type_arg == types_mod.TypeRegistry.I8 or
+                        type_arg == types_mod.TypeRegistry.U64 or type_arg == types_mod.TypeRegistry.U32 or
+                        type_arg == types_mod.TypeRegistry.U16 or type_arg == types_mod.TypeRegistry.U8)
+                        "std.map.i64_hash"
+                    else
+                        null;
+                    if (hash_fn) |hfn| {
+                        if (builder.hasFunc(hfn)) {
+                            const fn_addr = try fb.emitFuncAddr(hfn, types_mod.TypeRegistry.I64, Span.zero);
+                            _ = try fb.emitPtrStoreValue(hash_addr, fn_addr, Span.zero);
+                        } else {
+                            _ = try fb.emitPtrStoreValue(hash_addr, zero, Span.zero);
+                        }
+                    } else {
+                        _ = try fb.emitPtrStoreValue(hash_addr, zero, Span.zero);
+                    }
+
                     _ = try fb.emitRet(null, Span.zero);
                 }
                 try builder.endFunc();
@@ -529,8 +553,8 @@ pub const Driver = struct {
                 const type_name = type_reg.typeName(type_arg);
                 const meta_name = try std.fmt.allocPrint(builder.allocator, "__type_metadata_{s}", .{type_name});
                 if (builder.lookupGlobal(meta_name) != null) continue;
-                // 32 bytes = 4 i64 slots: [vwt_ptr, size, stride, kind]
-                try builder.addGlobal(ir_mod.Global.initWithSize(meta_name, types_mod.TypeRegistry.I64, false, Span.zero, 32));
+                // 40 bytes = 5 i64 slots: [vwt_ptr, size, stride, kind, hash_fn_ptr]
+                try builder.addGlobal(ir_mod.Global.initWithSize(meta_name, types_mod.TypeRegistry.I64, false, Span.zero, 40));
                 debug.log(.codegen, "preallocate metadata: '{s}' size={d}", .{ meta_name, type_reg.sizeOf(type_arg) });
                 count += 1;
             }
