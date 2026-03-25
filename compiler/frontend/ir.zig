@@ -198,6 +198,12 @@ pub const Local = struct {
     size: u32 = 8,
     alignment: u32 = 8,
     offset: i32 = 0,
+    /// Swift TypeLowering::isAddressOnly() — true when this local's type is a
+    /// generic type parameter in a shared generic body. Address-only locals are
+    /// NEVER decomposed into components (no ptr+len for strings, no tag+payload
+    /// for optionals). All operations go through VWT witnesses or memcpy.
+    /// Reference: Swift GenOpaque.cpp, TypeInfo.h.
+    is_address_only: bool = false,
     /// Overlap group for stack slot sharing. Locals with the same overlap_group > 0
     /// but different overlap_arm are in mutually-exclusive switch/if-else arms and
     /// can share the same stack region. 0 = no overlap (independent slot).
@@ -301,6 +307,15 @@ pub const FuncBuilder = struct {
         try self.shadow_stack.append(self.allocator, .{ .name = name, .old_idx = self.local_map.get(name) });
         try self.local_map.put(name, idx);
         return idx;
+    }
+
+    /// Swift TypeLowering::isAddressOnly() — mark a local as address-only.
+    /// Address-only locals are never decomposed by the SSA builder; all operations
+    /// go through VWT witnesses or memcpy with runtime size.
+    pub fn markAddressOnly(self: *FuncBuilder, local_idx: LocalIdx) void {
+        if (local_idx < self.locals.items.len) {
+            self.locals.items[local_idx].is_address_only = true;
+        }
     }
 
     pub fn lookupLocal(self: *const FuncBuilder, name: []const u8) ?LocalIdx { return self.local_map.get(name); }

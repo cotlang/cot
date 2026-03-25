@@ -2519,7 +2519,10 @@ pub const Lowerer = struct {
                     const rt_size = try self.emitRuntimeSizeOf(fb, tp_name, var_stmt.span);
                     var mc_args = [_]ir.NodeIndex{ dst_addr, src_ptr, rt_size };
                     _ = try fb.emitCall("memcpy", &mc_args, false, TypeRegistry.VOID, var_stmt.span);
-                    debug.log(.lower, "Phase 8.5: var '{s}' init from T-indirect '{s}' via memcpy (early)", .{ var_stmt.name, init_ident });
+                    // Swift GenOpaque.cpp — mark as address-only so SSA builder
+                    // won't decompose this local (no ptr+len for strings, etc.)
+                    fb.markAddressOnly(local_idx);
+                    debug.log(.lower, "Phase 8.5: var '{s}' init from T-indirect '{s}' via memcpy (early, address-only)", .{ var_stmt.name, init_ident });
                     return;
                 }
             }

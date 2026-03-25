@@ -676,6 +676,13 @@ pub const SSABuilder = struct {
     }
 
     fn convertLoadLocal(self: *SSABuilder, local_idx: ir.LocalIdx, type_idx: TypeIndex, cur: *Block) !*Value {
+        // Swift GenOpaque.cpp — address-only types are never decomposed.
+        // Return the local's address directly; consumers use memcpy/VWT witnesses.
+        if (local_idx < self.ir_func.locals.len and self.ir_func.locals[local_idx].is_address_only) {
+            const addr_val = try self.emitLocalAddr(local_idx, type_idx, cur);
+            return addr_val;
+        }
+
         const load_type = self.type_registry.get(type_idx);
 
         // WasmGC: struct and managed pointer-to-struct locals hold GC refs — return SSA value directly.
@@ -781,6 +788,25 @@ pub const SSABuilder = struct {
     fn convertStoreLocal(self: *SSABuilder, local_idx: ir.LocalIdx, value_idx: ir.NodeIndex, cur: *Block) !*Value {
         const value = try self.convertNode(value_idx) orelse return error.MissingValue;
         const value_type = self.type_registry.get(value.type_idx);
+
+        // Swift GenOpaque.cpp — address-only stores use memcpy, not type-specific decomposition.
+        // The value is an address (from convertLoadLocal on another address-only local).
+        // Store via memcpy(local_addr, value_addr, local.size).
+        if (local_idx < self.ir_func.locals.len and self.ir_func.locals[local_idx].is_address_only) {
+            const dst = try self.emitLocalAddr(local_idx, TypeRegistry.VOID, cur);
+            const local_size = self.ir_func.locals[local_idx].size;
+            const size_val = try self.func.newValue(.const_int, TypeRegistry.I64, cur, self.cur_pos);
+            size_val.aux_int = @intCast(local_size);
+            try cur.addValue(self.allocator, size_val);
+            const mc = try self.func.newValue(.call, TypeRegistry.VOID, cur, self.cur_pos);
+            mc.aux = .{ .string = "memcpy" };
+            try mc.addArgAlloc(dst, self.allocator);
+            try mc.addArgAlloc(value, self.allocator);
+            try mc.addArgAlloc(size_val, self.allocator);
+            try cur.addValue(self.allocator, mc);
+            self.assign(local_idx, value);
+            return value;
+        }
 
         // WasmGC: struct/array values are GC refs — assign directly to local, no memory store.
         // The Wasm codegen (setReg) emits local.set for the assigned value.
@@ -1817,6 +1843,17 @@ pub const SSABuilder = struct {
 
     /// Choose the correct load operation based on type size and signedness.
     /// Follows Go's loadOp pattern from wasm/ssa.go:535-566.
+    /// Swift TypeLowering::isAddressOnly() — check if a type should be treated
+    /// as opaque in this function. True when any local with this type_idx is
+    /// marked is_address_only (i.e., the type is a generic type parameter in a
+    /// shared generic body). Reference: Swift TypeInfo.h.
+    fn isAddressOnlyType(self: *SSABuilder, type_idx: TypeIndex) bool {
+        for (self.ir_func.locals) |local| {
+            if (local.is_address_only and local.type_idx == type_idx) return true;
+        }
+        return false;
+    }
+
     fn getLoadOp(self: *SSABuilder, type_idx: TypeIndex) Op {
         const type_info = self.type_registry.get(type_idx);
         if (type_info == .basic) {
@@ -2101,6 +2138,10 @@ pub const SSABuilder = struct {
     fn convertPtrStoreValue(self: *SSABuilder, p: ir.PtrStoreValue, cur: *Block) !*Value {
         const ptr_val = try self.convertNode(p.ptr) orelse return error.MissingValue;
         const value = try self.convertNode(p.value) orelse return error.MissingValue;
+
+        // Note: address-only ptr stores for T-typed values are handled by lower.zig
+        // Phase 8.5 VWT dispatch (T-indirect store path). The SSA builder handles
+        // address-only only for LOCAL load/store where we know the exact local_idx.
 
         const value_type = self.type_registry.get(value.type_idx);
         const type_size = self.type_registry.sizeOf(value.type_idx);
