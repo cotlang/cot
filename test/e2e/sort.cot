@@ -3,14 +3,14 @@ import "std/sort"
 
 test "sort empty" {
     var list: List(i64) = .{}
-    sort(i64)(list)
+    sort(i64)(&list)
     @assertEq(list.len(), 0)
 }
 
 test "sort single" {
     var list: List(i64) = .{}
     list.append(42)
-    sort(i64)(list)
+    sort(i64)(&list)
     @assertEq(list.get(0), 42)
 }
 
@@ -19,7 +19,7 @@ test "sort already sorted" {
     list.append(1)
     list.append(2)
     list.append(3)
-    sort(i64)(list)
+    sort(i64)(&list)
     @assertEq(list.get(0), 1)
     @assertEq(list.get(1), 2)
     @assertEq(list.get(2), 3)
@@ -32,7 +32,7 @@ test "sort reversed" {
     list.append(3)
     list.append(2)
     list.append(1)
-    sort(i64)(list)
+    sort(i64)(&list)
     @assertEq(list.get(0), 1)
     @assertEq(list.get(1), 2)
     @assertEq(list.get(2), 3)
@@ -50,7 +50,7 @@ test "sort mixed" {
     list.append(9)
     list.append(2)
     list.append(6)
-    sort(i64)(list)
+    sort(i64)(&list)
     @assertEq(list.get(0), 1)
     @assertEq(list.get(1), 1)
     @assertEq(list.get(2), 2)
@@ -84,7 +84,7 @@ test "sort duplicates" {
     list.append(1)
     list.append(2)
     list.append(2)
-    sort(i64)(list)
+    sort(i64)(&list)
     @assertEq(list.get(0), 1)
     @assertEq(list.get(1), 1)
     @assertEq(list.get(2), 2)

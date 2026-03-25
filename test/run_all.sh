@@ -23,13 +23,13 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 cd "$REPO_ROOT"
 
-# Use cot from zig-out if not on PATH
+# Prefer dev build (zig-out) over PATH (Homebrew release may be outdated)
 COT="${COT:-}"
 if [ -z "$COT" ]; then
-    if command -v cot &>/dev/null; then
-        COT="cot"
-    elif [ -x "$REPO_ROOT/zig-out/bin/cot" ]; then
+    if [ -x "$REPO_ROOT/zig-out/bin/cot" ]; then
         COT="$REPO_ROOT/zig-out/bin/cot"
+    elif command -v cot &>/dev/null; then
+        COT="cot"
     else
         echo "Error: cot not found. Run 'zig build' first or set COT=/path/to/cot"
         exit 1
