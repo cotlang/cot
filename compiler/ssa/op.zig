@@ -365,6 +365,18 @@ const op_info_table = blk: {
     for ([_]Op{ .load8, .load16, .load32, .load64 }) |op| {
         table[@intFromEnum(op)] = .{ .name = @tagName(op), .arg_len = 2, .reads_memory = true };
     }
+    // Sign/zero-extending loads (from IR, before lower_wasm converts to wasm_* ops)
+    for ([_]Op{ .load8s, .load16s, .load32s }) |op| {
+        table[@intFromEnum(op)] = .{ .name = @tagName(op), .arg_len = 1, .reads_memory = true };
+    }
+    // Float arithmetic (2 args)
+    for ([_]Op{ .add32f, .sub32f, .mul32f, .div32f, .add64f, .sub64f, .mul64f, .div64f }) |op| {
+        table[@intFromEnum(op)] = .{ .name = @tagName(op), .arg_len = 2 };
+    }
+    // Float unary (1 arg)
+    for ([_]Op{ .neg32f, .sqrt32f, .neg64f, .sqrt64f }) |op| {
+        table[@intFromEnum(op)] = .{ .name = @tagName(op), .arg_len = 1 };
+    }
     for ([_]Op{ .store8, .store16, .store32, .store64 }) |op| {
         table[@intFromEnum(op)] = .{ .name = @tagName(op), .arg_len = 3, .writes_memory = true, .has_side_effects = true };
     }
