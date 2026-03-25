@@ -280,10 +280,12 @@ fn removePred(b: *Block, j: usize) void {
 /// MUST be called after removePred so len(preds) is correct.
 fn removePhiArg(c: *Block, phi: *Value, i: usize) void {
     const n = c.preds.len; // already decremented by removePred
-    // Go validation: numPhiArgs - 1 must equal n
     // phi.Args[i].Uses--
     if (i < phi.args.len) {
         phi.args[i].uses -= 1;
+        if (phi.args[i].uses < 0) {
+            debug.log(.deadcode, "  USE WATCH: removePhiArg v{d} decremented v{d} to uses={d} (block b{d}, idx={d}, n={d})", .{ phi.id, phi.args[i].id, phi.args[i].uses, c.id, i, n });
+        }
     }
     // phi.Args[i] = phi.Args[n] (swap with the element at NEW pred count position)
     if (n < phi.args.len) {

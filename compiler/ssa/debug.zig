@@ -6,6 +6,7 @@ const Block = @import("block.zig").Block;
 const Value = @import("value.zig").Value;
 const Op = @import("op.zig").Op;
 const TypeRegistry = @import("../frontend/types.zig").TypeRegistry;
+const pipeline_debug = @import("../pipeline_debug.zig");
 const ID = u32;
 
 pub const Format = enum { text, dot };
@@ -318,6 +319,22 @@ pub fn verify(f: *const Func, allocator: std.mem.Allocator) ![]const []const u8 
 
             // Go check.go:486 — Use count must not be negative
             if (v.uses < 0) {
+                // Enhanced debug: show what the value is, what uses it, and its args
+                const op_name = @tagName(v.op);
+                var arg_ids_buf: [128]u8 = undefined;
+                var arg_pos: usize = 0;
+                for (v.args) |arg| {
+                    if (arg_pos > 0 and arg_pos < arg_ids_buf.len - 5) {
+                        arg_ids_buf[arg_pos] = ',';
+                        arg_pos += 1;
+                    }
+                    const written = std.fmt.bufPrint(arg_ids_buf[arg_pos..], "v{d}", .{arg.id}) catch break;
+                    arg_pos += written.len;
+                }
+                const arg_str = arg_ids_buf[0..arg_pos];
+                pipeline_debug.log(.codegen, "  NEGATIVE USE: v{d} op={s} uses={d} args=[{s}] block=b{d}", .{
+                    v.id, op_name, v.uses, arg_str, b.id,
+                });
                 try errors.append(allocator, try std.fmt.allocPrint(allocator, "v{d}: negative use count ({d})", .{ v.id, v.uses }));
             }
         }
@@ -357,7 +374,6 @@ pub fn verify(f: *const Func, allocator: std.mem.Allocator) ![]const []const u8 
 /// Reference: Go compile.go:139 — checkFunc(f) called after each pass.
 /// Only runs when COT_DEBUG is enabled (zero cost in production).
 pub fn checkFunc(f: *const Func, pass_name: []const u8, allocator: std.mem.Allocator) void {
-    const pipeline_debug = @import("../pipeline_debug.zig");
     if (!pipeline_debug.isEnabled(.codegen) and !pipeline_debug.isEnabled(.ssa)) return;
 
     const errs = verify(f, allocator) catch return;

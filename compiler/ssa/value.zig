@@ -176,20 +176,38 @@ pub const Value = struct {
     }
 
     pub fn setArg(self: *Value, idx: usize, new_arg: *Value) void {
-        if (idx < self.args.len) self.args[idx].uses -= 1;
+        if (idx < self.args.len) {
+            self.args[idx].uses -= 1;
+            if (self.args[idx].uses < 0) {
+                const debug = @import("../pipeline_debug.zig");
+                debug.log(.codegen, "  USE WATCH: v{d}.setArg[{d}] decremented v{d} to uses={d}", .{ self.id, idx, self.args[idx].id, self.args[idx].uses });
+            }
+        }
         new_arg.uses += 1;
         self.args[idx] = new_arg;
     }
 
     pub fn resetArgs(self: *Value) void {
-        for (self.args) |arg| arg.uses -= 1;
+        const debug = @import("../pipeline_debug.zig");
+        for (self.args) |arg| {
+            arg.uses -= 1;
+            if (arg.uses < 0) {
+                debug.log(.codegen, "  USE WATCH: v{d}.resetArgs decremented v{d} to uses={d} (caller v{d} op={s})", .{ self.id, arg.id, arg.uses, self.id, @tagName(self.op) });
+            }
+        }
         self.args = &.{};
         self.args_dynamic = false;
         self.args_capacity = 0;
     }
 
     pub fn resetArgsFree(self: *Value, allocator: ?std.mem.Allocator) void {
-        for (self.args) |arg| arg.uses -= 1;
+        const debug = @import("../pipeline_debug.zig");
+        for (self.args) |arg| {
+            arg.uses -= 1;
+            if (arg.uses < 0) {
+                debug.log(.codegen, "  USE WATCH: v{d}.resetArgsFree decremented v{d} to uses={d}", .{ self.id, arg.id, arg.uses });
+            }
+        }
         if (self.args_dynamic and self.args_capacity > 0) {
             if (allocator) |alloc| alloc.free(self.args.ptr[0..self.args_capacity]);
         }
