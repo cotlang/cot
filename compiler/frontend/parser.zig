@@ -211,11 +211,23 @@ pub const Parser = struct {
             },
             .kw_export => self.parseExportFn(),
             .kw_packed => self.parseStructDeclWithLayout(.@"packed"),
-            .kw_fn => self.parseFnDecl(false, false, false, false),
+            .kw_fn => self.parseFnDecl(false, false, false, false, false),
             .kw_static => blk: {
                 self.advance();
                 if (!self.check(.kw_fn)) { self.syntaxError("expected 'fn' after 'static'"); break :blk null; }
-                break :blk self.parseFnDecl(false, false, true, false);
+                break :blk self.parseFnDecl(false, false, true, false, false);
+            },
+            .at => blk: {
+                // @inlinable fn ... — Swift @inlinable: monomorphize generic function
+                const peek = self.peekToken();
+                if (peek.tok == .ident and std.mem.eql(u8, peek.text, "inlinable")) {
+                    self.advance(); // consume @
+                    self.advance(); // consume inlinable
+                    if (!self.check(.kw_fn)) { self.syntaxError("expected 'fn' after '@inlinable'"); break :blk null; }
+                    break :blk self.parseFnDecl(false, false, false, false, true);
+                }
+                self.syntaxError("expected declaration");
+                break :blk null;
             },
             .kw_async => self.parseAsyncFn(),
             .kw_var => self.parseVarDecl(false),
@@ -236,22 +248,22 @@ pub const Parser = struct {
     fn parseExternFn(self: *Parser) ParseError!?NodeIndex {
         self.advance();
         if (!self.check(.kw_fn)) { self.syntaxError("expected 'fn' after 'extern'"); return null; }
-        return self.parseFnDecl(true, false, false, false);
+        return self.parseFnDecl(true, false, false, false, false);
     }
 
     fn parseExportFn(self: *Parser) ParseError!?NodeIndex {
         self.advance(); // consume 'export'
         if (!self.check(.kw_fn)) { self.syntaxError("expected 'fn' after 'export'"); return null; }
-        return self.parseFnDecl(false, false, false, true);
+        return self.parseFnDecl(false, false, false, true, false);
     }
 
     fn parseAsyncFn(self: *Parser) ParseError!?NodeIndex {
         self.advance(); // consume 'async'
         if (!self.check(.kw_fn)) { self.syntaxError("expected 'fn' after 'async'"); return null; }
-        return self.parseFnDecl(false, true, false, false);
+        return self.parseFnDecl(false, true, false, false, false);
     }
 
-    fn parseFnDecl(self: *Parser, is_extern: bool, is_async: bool, is_static: bool, is_export: bool) ParseError!?NodeIndex {
+    fn parseFnDecl(self: *Parser, is_extern: bool, is_async: bool, is_static: bool, is_export: bool, is_inlinable: bool) ParseError!?NodeIndex {
         const doc_comment = self.consumeDocComment();
         const start = self.pos();
         self.advance();
@@ -341,7 +353,7 @@ pub const Parser = struct {
             body = try self.parseBlock() orelse return null;
         }
 
-        return try self.tree.addDecl(.{ .fn_decl = .{ .name = name, .type_params = type_params, .type_param_bounds = type_param_bounds, .params = params, .return_type = return_type, .body = body, .is_extern = is_extern, .is_export = is_export, .is_async = is_async, .is_static = is_static, .doc_comment = doc_comment, .span = Span.init(start, self.pos()) } });
+        return try self.tree.addDecl(.{ .fn_decl = .{ .name = name, .type_params = type_params, .type_param_bounds = type_param_bounds, .params = params, .return_type = return_type, .body = body, .is_extern = is_extern, .is_export = is_export, .is_async = is_async, .is_static = is_static, .is_inlinable = is_inlinable, .doc_comment = doc_comment, .span = Span.init(start, self.pos()) } });
     }
 
     fn parseFieldList(self: *Parser, end_tok: Token) ParseError![]const ast.Field {
@@ -535,7 +547,7 @@ pub const Parser = struct {
             self.collectDocComment();
             // Nested decls start with declaration keywords; fields start with ident followed by ':'
             if (self.check(.kw_const) or self.check(.kw_enum) or self.check(.kw_type) or
-                self.check(.kw_fn) or self.check(.kw_static) or
+                self.check(.kw_fn) or self.check(.kw_static) or self.check(.at) or
                 (self.check(.kw_struct) and self.peekToken().tok == .ident))
             {
                 if (try self.parseDecl()) |nested_idx| {
@@ -551,7 +563,7 @@ pub const Parser = struct {
             // Collect doc comments before checking for decl keywords
             self.collectDocComment();
             if (self.check(.kw_const) or self.check(.kw_enum) or self.check(.kw_type) or
-                self.check(.kw_fn) or self.check(.kw_static) or
+                self.check(.kw_fn) or self.check(.kw_static) or self.check(.at) or
                 (self.check(.kw_struct) and self.peekToken().tok == .ident))
             {
                 if (try self.parseDecl()) |nested_idx| {
@@ -620,9 +632,14 @@ pub const Parser = struct {
             if (self.check(.kw_static)) {
                 self.advance(); // consume 'static'
                 if (!self.check(.kw_fn)) { self.syntaxError("expected 'fn' after 'static'"); self.advance(); continue; }
-                if (try self.parseFnDecl(false, false, true, false)) |idx| try methods.append(self.allocator, idx);
+                if (try self.parseFnDecl(false, false, true, false, false)) |idx| try methods.append(self.allocator, idx);
+            } else if (self.check(.at) and self.peekToken().tok == .ident and std.mem.eql(u8, self.peekToken().text, "inlinable")) {
+                self.advance(); // @
+                self.advance(); // inlinable
+                if (!self.check(.kw_fn)) { self.syntaxError("expected 'fn' after '@inlinable'"); self.advance(); continue; }
+                if (try self.parseFnDecl(false, false, false, false, true)) |idx| try methods.append(self.allocator, idx);
             } else if (self.check(.kw_fn)) {
-                if (try self.parseFnDecl(false, false, false, false)) |idx| try methods.append(self.allocator, idx);
+                if (try self.parseFnDecl(false, false, false, false, false)) |idx| try methods.append(self.allocator, idx);
             } else if (self.check(.kw_const)) {
                 if (try self.parseVarDecl(true)) |idx| try consts.append(self.allocator, idx);
             } else { self.syntaxError("expected 'fn', 'static fn', or 'const' in impl block"); self.advance(); }
@@ -646,7 +663,7 @@ pub const Parser = struct {
             self.collectDocComment();
             if (self.check(.kw_fn)) {
                 // Parse method signature (fn_decl with body = null_node)
-                if (try self.parseFnDecl(false, false, false, false)) |idx| try methods.append(self.allocator, idx);
+                if (try self.parseFnDecl(false, false, false, false, false)) |idx| try methods.append(self.allocator, idx);
             } else { self.syntaxError("expected 'fn' in trait declaration"); self.advance(); }
         }
         if (!self.expect(.rbrace)) return null;
@@ -684,7 +701,7 @@ pub const Parser = struct {
         while (!self.check(.rbrace) and !self.check(.eof)) {
             self.collectDocComment();
             if (self.check(.kw_fn)) {
-                if (try self.parseFnDecl(false, false, false, false)) |idx| try methods.append(self.allocator, idx);
+                if (try self.parseFnDecl(false, false, false, false, false)) |idx| try methods.append(self.allocator, idx);
             } else { self.syntaxError("expected 'fn' in impl block"); self.advance(); }
         }
         if (!self.expect(.rbrace)) return null;

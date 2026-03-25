@@ -55,6 +55,10 @@ pub const FnDecl = struct {
     is_export: bool = false,
     is_async: bool = false,
     is_static: bool = false,
+    /// Swift @inlinable @inline(__always): monomorphize this generic function.
+    /// Each concrete instantiation gets its own function body with concrete types.
+    /// No shared body, no type_substitution, no metadata params.
+    is_inlinable: bool = false,
     doc_comment: []const u8 = "",
     span: Span,
 };

@@ -9695,11 +9695,23 @@ pub const Lowerer = struct {
                 // Swift pattern: generic functions emit one body under the base name,
                 // all instantiations call that shared body with metadata args appended.
                 // Reference: lowerMethodCall does the same at line ~10166.
-                const call_target = self.computeGenericBaseName(inst_info.concrete_name) catch inst_info.concrete_name;
-                // Swift convention: append metadata args after user args for generic calls.
-                // Forward enclosing __metadata_T when inside a shared body.
-                // Reference: GenProto.cpp:3947-4001 emitPolymorphicArguments()
-                try self.appendMetadataArgs(fb, inst_info, &gen_args, call.span);
+                // Check if callee is @inlinable
+                const free_fn_inlinable = blk_fi: {
+                    const saved = self.tree;
+                    self.tree = inst_info.tree;
+                    defer self.tree = saved;
+                    const fn_n = self.tree.getNode(inst_info.generic_node) orelse break :blk_fi false;
+                    const fn_d = fn_n.asDecl() orelse break :blk_fi false;
+                    if (fn_d != .fn_decl) break :blk_fi false;
+                    break :blk_fi fn_d.fn_decl.is_inlinable;
+                };
+                const call_target = if (free_fn_inlinable)
+                    inst_info.concrete_name
+                else
+                    self.computeGenericBaseName(inst_info.concrete_name) catch inst_info.concrete_name;
+                // Metadata args only for shared body calls
+                if (!free_fn_inlinable)
+                    try self.appendMetadataArgs(fb, inst_info, &gen_args, call.span);
                 // SRET for generic function calls — reuse shared SRET local.
                 // Swift ResultConvention: use indirect return if the callee has
                 // has_indirect_result (generic return type = type parameter), not just
@@ -10049,20 +10061,51 @@ pub const Lowerer = struct {
             made_progress = false;
             pending.clearRetainingCapacity();
             // Snapshot: collect all inst_infos that need lowering.
-            // Swift pattern: only process if the BASE name doesn't exist yet
-            // (one body per generic definition, shared by all instantiations).
             var it = self.chk.generics.generic_inst_by_name.valueIterator();
             while (it.next()) |inst_info| {
                 if (!self.lowered_generics.contains(inst_info.concrete_name)) continue;
-                const bn = self.computeGenericBaseName(inst_info.concrete_name) catch continue;
-                if (self.builder.hasFunc(bn)) continue;
+                // For @inlinable: check concrete name. For shared: check base name.
+                const is_inl = blk_chk: {
+                    const saved = self.tree;
+                    self.tree = inst_info.tree;
+                    defer self.tree = saved;
+                    const fn_n = self.tree.getNode(inst_info.generic_node) orelse break :blk_chk false;
+                    const fn_d = fn_n.asDecl() orelse break :blk_chk false;
+                    if (fn_d != .fn_decl) break :blk_chk false;
+                    break :blk_chk fn_d.fn_decl.is_inlinable;
+                };
+                if (is_inl) {
+                    if (self.builder.hasFunc(inst_info.concrete_name)) continue;
+                } else {
+                    const bn = self.computeGenericBaseName(inst_info.concrete_name) catch continue;
+                    if (self.builder.hasFunc(bn)) continue;
+                }
                 try pending.append(self.allocator, inst_info.*);
             }
             // Process collected snapshot
             for (pending.items) |inst_info| {
-                const bn = self.computeGenericBaseName(inst_info.concrete_name) catch continue;
-                if (self.builder.hasFunc(bn)) continue;
-                try self.lowerGenericFnInstanceVWT(inst_info);
+                // Check if the generic function has @inlinable annotation.
+                // Swift: @inlinable @inline(__always) on Dictionary methods means
+                // each concrete (K,V) gets its own specialized function body.
+                const is_inlinable = blk: {
+                    const saved = self.tree;
+                    self.tree = inst_info.tree;
+                    defer self.tree = saved;
+                    const fn_node = self.tree.getNode(inst_info.generic_node) orelse break :blk false;
+                    const fn_decl = fn_node.asDecl() orelse break :blk false;
+                    if (fn_decl != .fn_decl) break :blk false;
+                    break :blk fn_decl.fn_decl.is_inlinable;
+                };
+                if (is_inlinable) {
+                    // Monomorphize: emit one function per concrete instantiation
+                    if (self.builder.hasFunc(inst_info.concrete_name)) continue;
+                    try self.lowerGenericFnMonomorphized(inst_info);
+                } else {
+                    // Shared body: one function for all instantiations
+                    const bn = self.computeGenericBaseName(inst_info.concrete_name) catch continue;
+                    if (self.builder.hasFunc(bn)) continue;
+                    try self.lowerGenericFnInstanceVWT(inst_info);
+                }
                 made_progress = true;
             }
         }
@@ -10265,6 +10308,109 @@ pub const Lowerer = struct {
                 } else if (fb.needsTerminator()) {
                     const rti4 = self.type_reg.get(return_type);
                     if (rti4 == .error_union and rti4.error_union.elem == TypeRegistry.VOID) {
+                        try self.emitCleanups(0);
+                        try self.emitErrorVoidSuccessReturn(fb, return_type, f.span);
+                    }
+                }
+            }
+            self.current_func = null;
+        }
+        try self.builder.endFunc();
+    }
+
+    /// Swift @inlinable: monomorphize a generic function with concrete types.
+    /// Emits one function per concrete instantiation (e.g., "Map(17;5)_set").
+    /// No type_substitution, no indirect_t_params, no metadata params.
+    /// Each function has concrete types baked in — direct calls, direct loads/stores.
+    fn lowerGenericFnMonomorphized(self: *Lowerer, inst_info: checker.GenericInstInfo) !void {
+        if (self.builder.hasFunc(inst_info.concrete_name)) return;
+
+        const saved_tree = self.tree;
+        const saved_chk_tree = self.chk.tree;
+        const saved_safe_mode = self.chk.safe_mode;
+        const saved_scope = self.chk.scope;
+        self.tree = inst_info.tree;
+        self.chk.tree = inst_info.tree;
+        if (inst_info.tree.file) |file| self.chk.safe_mode = file.safe_mode;
+        if (inst_info.scope) |s| self.chk.scope = s;
+        defer {
+            self.tree = saved_tree;
+            self.chk.tree = saved_chk_tree;
+            self.chk.safe_mode = saved_safe_mode;
+            self.chk.scope = saved_scope;
+        }
+
+        const fn_node = self.tree.getNode(inst_info.generic_node) orelse return;
+        const fn_decl_node = fn_node.asDecl() orelse return;
+        if (fn_decl_node != .fn_decl) return;
+        const f = fn_decl_node.fn_decl;
+
+        // Re-check with concrete types (type_substitution used only for checking, not lowering)
+        const saved_expr_types = self.chk.expr_types;
+        if (inst_info.expr_types) |et| {
+            self.chk.expr_types = et;
+        } else {
+            var sub_map = std.StringHashMap(TypeIndex).init(self.allocator);
+            defer sub_map.deinit();
+            const param_names = if (inst_info.type_param_names.len > 0) inst_info.type_param_names else f.type_params;
+            for (param_names, 0..) |param_name, i| {
+                if (i < inst_info.type_args.len) try sub_map.put(param_name, inst_info.type_args[i]);
+            }
+            self.chk.expr_types = std.AutoHashMap(ir.NodeIndex, TypeIndex).init(self.allocator);
+            self.chk.type_substitution = sub_map;
+            self.chk.checkFnDeclWithName(f, inst_info.generic_node, inst_info.concrete_name) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+            };
+            self.chk.type_substitution = null;
+        }
+        defer {
+            if (inst_info.expr_types == null) self.chk.expr_types.deinit();
+            self.chk.expr_types = saved_expr_types;
+        }
+
+        // NO type_substitution set during lowering — concrete types used directly.
+        // This is the key difference from lowerGenericFnInstanceVWT.
+        const return_type = self.resolveTypeNode(f.return_type);
+        const uses_sret = self.needsSret(return_type);
+        const wasm_return_type = if (uses_sret) TypeRegistry.VOID else return_type;
+
+        self.builder.startFunc(inst_info.concrete_name, TypeRegistry.VOID, wasm_return_type, f.span);
+        if (self.builder.func()) |fb| {
+            if (uses_sret) fb.sret_return_type = return_type;
+            fb.is_destructor = std.mem.eql(u8, f.name, "deinit");
+            self.current_func = fb;
+            self.cleanup_stack.clear();
+            self.comptime_value_vars.clearRetainingCapacity();
+            self.weak_locals.clearRetainingCapacity();
+
+            if (uses_sret) _ = try fb.addParam("__sret", TypeRegistry.I64, 8);
+
+            // @safe self param
+            if (self.chk.safe_mode and !f.is_static and (f.params.len == 0 or !std.mem.eql(u8, f.params[0].name, "self"))) {
+                if (std.mem.lastIndexOf(u8, inst_info.concrete_name, "_")) |underscore| {
+                    const struct_name = inst_info.concrete_name[0..underscore];
+                    if (self.chk.resolveTypeByName(struct_name)) |struct_type| {
+                        const ptr_type = self.chk.types.makePointer(struct_type) catch struct_type;
+                        _ = try fb.addParam("self", ptr_type, self.type_reg.sizeOf(ptr_type));
+                    }
+                }
+            }
+
+            // Regular params — concrete types, no T-indirect
+            for (f.params) |param| {
+                var param_type = self.resolveTypeNode(param.type_expr);
+                param_type = self.chk.safeWrapType(param_type) catch param_type;
+                _ = try fb.addParam(param.name, param_type, self.type_reg.sizeOf(param_type));
+            }
+
+            if (f.body != null_node) {
+                _ = try self.lowerBlockNode(f.body);
+                if (return_type == TypeRegistry.VOID and fb.needsTerminator()) {
+                    try self.emitCleanups(0);
+                    _ = try fb.emitRet(null, f.span);
+                } else if (fb.needsTerminator()) {
+                    const rti = self.type_reg.get(return_type);
+                    if (rti == .error_union and rti.error_union.elem == TypeRegistry.VOID) {
                         try self.emitCleanups(0);
                         try self.emitErrorVoidSuccessReturn(fb, return_type, f.span);
                     }
@@ -10577,6 +10723,21 @@ pub const Lowerer = struct {
             try self.ensureGenericFnQueued(inst_info);
         }
 
+        // Check @inlinable early — affects arg passing, call target, metadata
+        const is_generic_call = self.chk.generics.generic_inst_by_name.contains(method_info.func_name);
+        const callee_inlinable = if (is_generic_call) blk_inl: {
+            if (self.chk.generics.generic_inst_by_name.get(method_info.func_name)) |gi| {
+                const saved = self.tree;
+                self.tree = gi.tree;
+                defer self.tree = saved;
+                const fn_node = self.tree.getNode(gi.generic_node) orelse break :blk_inl false;
+                const fn_decl = fn_node.asDecl() orelse break :blk_inl false;
+                if (fn_decl != .fn_decl) break :blk_inl false;
+                break :blk_inl fn_decl.fn_decl.is_inlinable;
+            }
+            break :blk_inl false;
+        } else false;
+
         var args = std.ArrayListUnmanaged(ir.NodeIndex){};
         defer args.deinit(self.allocator);
 
@@ -10790,9 +10951,9 @@ pub const Lowerer = struct {
             }
 
             // Swift Phase 8.7: T-typed args passed indirectly for generic method calls.
-            // Check if this arg corresponds to a T-typed param in the generic definition.
+            // Skip for @inlinable callees — they use concrete types directly.
             const method_gi = self.chk.generics.generic_inst_by_name.get(method_info.func_name);
-            const is_method_t_indirect = if (method_gi) |gi| blk: {
+            const is_method_t_indirect = if (callee_inlinable) false else if (method_gi) |gi| blk: {
                 // Save/restore tree for isGenericParamIndirect (needs generic's tree)
                 const st = self.tree;
                 self.tree = gi.tree;
@@ -10893,9 +11054,10 @@ pub const Lowerer = struct {
 
         // Go LinkFuncName: qualify method call target (skip for generic instances)
         // Swift pattern: generic instance methods call the BASE name (shared body).
-        // Non-generic methods use their qualified name.
-        const is_generic_call = self.chk.generics.generic_inst_by_name.contains(method_info.func_name);
-        const method_link_name = if (is_generic_call)
+        // is_generic_call and callee_inlinable computed at function entry above.
+        const method_link_name = if (is_generic_call and callee_inlinable)
+            method_info.func_name // @inlinable: concrete name directly
+        else if (is_generic_call)
             self.computeGenericBaseName(method_info.func_name) catch method_info.func_name
         else
             try self.resolveMethodName(receiver_type_name, method_info.func_name, method_info.source_tree);
@@ -10903,7 +11065,8 @@ pub const Lowerer = struct {
         // Swift ResultConvention: use indirect return if type is large OR if the
         // callee has has_indirect_result (generic return type). Read the stored flag,
         // don't recompute from AST. Reference: Types.h isIndirectFormalResult()
-        const callee_has_indirect = if (is_generic_call)
+        // @inlinable callees don't have indirect results — they use concrete return types
+        const callee_has_indirect = if (is_generic_call and !callee_inlinable)
             (if (self.chk.generics.generic_inst_by_name.get(method_info.func_name)) |gi| gi.has_indirect_result else false)
         else
             false;
@@ -10913,7 +11076,8 @@ pub const Lowerer = struct {
         // must FORWARD the enclosing function's __metadata_T parameter — NOT look up fresh
         // metadata globals from the first instantiation's type args.
         // Swift: metadata flows through the entire call chain via parameters.
-        if (is_generic_call) {
+        // Append metadata args ONLY for shared body calls (not @inlinable)
+        if (is_generic_call and !callee_inlinable) {
             if (self.chk.generics.generic_inst_by_name.get(method_info.func_name)) |gi| {
                 try self.appendMetadataArgs(fb, gi, &args, call.span);
             }
