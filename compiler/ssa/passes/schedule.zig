@@ -92,38 +92,21 @@ fn scheduleBlock(allocator: std.mem.Allocator, block: *Block, f: *Func) !void {
     }
 
     // Memory ordering: chain stores and calls linearly via last_mem.
-    // Memory ordering: linear chain using writesMemory()/readsMemory() flags.
-    // Cot's SSA doesn't thread memory explicitly (unlike Go's), so we use a linear
-    // chain: stores chain to last_mem, loads get edge from last_mem but don't update it.
-    // Uses op info flags instead of hardcoded op names to cover all memory ops.
-    // Reference: Go schedule.go lines 257-278 (adapted for Cot's non-threaded model).
-    // Memory ordering: chain stores to last store/barrier. Loads from local_addr
-    // only chain to the last CALL/BARRIER (not local stores), since local stores
-    // to different stack slots are independent.
-    // Go reference: schedule.go uses explicit memory threading for precise ordering.
-    // Cot adapts: local loads are independent of local stores to different bases.
-    var last_barrier: ?*Value = null; // calls, moves, zeros — true memory barriers
-    var last_store: ?*Value = null; // stores to memory (may alias)
+    // Memory ordering: linear chain using writesMemory()/readsMemory()/hasSideEffects()
+    // flags. Uses op info flags instead of hardcoded op names.
+    // TODO: Port Go's explicit memory threading (MEMORY_THREADING_SPEC.md) for
+    // precise ordering that avoids false dependencies between independent locals.
+    var last_mem: ?*Value = null;
     for (values) |v| {
         if (v.op == .phi) continue;
-        if (v.hasSideEffects() and v.op != .store and v.op != .store8 and
-            v.op != .store16 and v.op != .store32 and v.op != .store64 and
-            v.op != .store_reg)
-        {
-            // Calls and bulk ops are true memory barriers — everything chains through them
-            if (last_barrier) |lb| try edges.append(allocator, .{ .x = lb, .y = v });
-            if (last_store) |ls| try edges.append(allocator, .{ .x = ls, .y = v });
-            last_barrier = v;
-            last_store = null; // barrier subsumes stores
-        } else if (v.writesMemory()) {
-            // Store: chain from last barrier or last store
-            if (last_barrier) |lb| try edges.append(allocator, .{ .x = lb, .y = v });
-            if (last_store) |ls| try edges.append(allocator, .{ .x = ls, .y = v });
-            last_store = v;
+        if (v.writesMemory()) {
+            if (last_mem) |lm| try edges.append(allocator, .{ .x = lm, .y = v });
+            last_mem = v;
         } else if (v.readsMemory()) {
-            // Load: only chain from last barrier (calls), NOT from local stores.
-            // Local stores to different stack slots are independent of loads.
-            if (last_barrier) |lb| try edges.append(allocator, .{ .x = lb, .y = v });
+            if (last_mem) |lm| try edges.append(allocator, .{ .x = lm, .y = v });
+        } else if (v.hasSideEffects()) {
+            if (last_mem) |lm| try edges.append(allocator, .{ .x = lm, .y = v });
+            last_mem = v;
         }
     }
 

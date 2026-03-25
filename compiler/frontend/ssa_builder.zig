@@ -45,6 +45,10 @@ pub const SSABuilder = struct {
     node_values: std.AutoHashMap(ir.NodeIndex, *Value),
     loop_stack: std.ArrayListUnmanaged(LoopContext),
     cur_pos: Pos,
+    /// Go explicit memory threading: tracks the current memory state value.
+    /// Every store/call takes this as last arg and produces a new memory state.
+    /// Loads take this as last arg for ordering. Reference: Go ssa/compile.go.
+    current_mem: ?*Value = null,
     /// Maps IR local_idx → frame slot offset (in 8-byte units).
     /// Accounts for multi-word locals (structs, tuples) occupying multiple slots.
     local_slot_offsets: []u32,
@@ -362,6 +366,28 @@ pub const SSABuilder = struct {
         self.vars.put(local_idx, value) catch {};
     }
 
+    /// Go memory threading: create a store with memory arg, update current_mem.
+    /// Store takes (addr, value, mem) — type stays VOID (no runtime result).
+    /// The memory ordering is purely compile-time for the schedule pass.
+    fn emitMemStore(self: *SSABuilder, addr: *Value, value: *Value, cur: *Block) !*Value {
+        const store = try self.func.newValue(.store, TypeRegistry.VOID, cur, self.cur_pos);
+        store.addArg2(addr, value);
+        if (self.current_mem) |mem| try store.addArgAlloc(mem, self.allocator);
+        try cur.addValue(self.allocator, store);
+        self.current_mem = store;
+        return store;
+    }
+
+    /// Go memory threading: create a load with memory arg for ordering.
+    /// Load takes (addr, mem) — reads memory but doesn't produce new state.
+    fn emitMemLoad(self: *SSABuilder, op: Op, addr: *Value, type_idx: TypeIndex, cur: *Block) !*Value {
+        const load = try self.func.newValue(op, type_idx, cur, self.cur_pos);
+        load.addArg(addr);
+        if (self.current_mem) |mem| try load.addArgAlloc(mem, self.allocator);
+        try cur.addValue(self.allocator, load);
+        return load;
+    }
+
     fn variable(self: *SSABuilder, local_idx: ir.LocalIdx, type_idx: TypeIndex) !*Value {
         if (self.vars.get(local_idx)) |v| return v;
         if (self.fwd_vars.get(local_idx)) |v| return v;
@@ -420,6 +446,12 @@ pub const SSABuilder = struct {
         for (self.ir_func.blocks, 0..) |ir_block, i| {
             const ssa_block_ptr = try self.getOrCreateBlock(@intCast(i));
             if (i != 0) self.startBlock(ssa_block_ptr);
+            // Go: InitMem at entry block — initial memory state for threading
+            if (i == 0) {
+                const init_mem = try self.func.newValue(.init_mem, TypeRegistry.SSA_MEM, ssa_block_ptr, self.cur_pos);
+                try ssa_block_ptr.addValue(self.allocator, init_mem);
+                self.current_mem = init_mem;
+            }
             for (ir_block.nodes) |node_idx| {
                 if (logical_operands.contains(node_idx)) continue;
                 _ = try self.convertNode(node_idx);
