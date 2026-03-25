@@ -3574,6 +3574,37 @@ struct Lowerer {
                 arg_node = self.maybeAutoRef(arg_node, arg_idx, param_type_idx, call.span)
             }
 
+            // Phase 8.7: T-typed args passed indirectly for method calls
+            const method_gi = self.lookupGenericInst(method_info.func_name)
+            if (method_gi) |mgi| {
+                // Save/restore tree for isGenericParamIndirect
+                const saved_tree_m = self.tree
+                self.tree = mgi.getAst()
+                const is_m_t_indirect = self.isGenericParamIndirect(mgi, i)
+                self.tree = saved_tree_m
+                if (is_m_t_indirect) {
+                    // Forward T-indirect ptr if available
+                    var m_forwarded = false
+                    if (self.extractIdentName(arg_idx)) |aname| {
+                        if (self.indirect_t_params.has(aname) != 0) {
+                            const m_ptr_n = "__ptr_" + aname
+                            const m_ptr_li = fb.lookupLocal(m_ptr_n)
+                            if (m_ptr_li >= 0) {
+                                args.append(fb.emitLoadLocal(@intCast(i64, m_ptr_li), I64, call.span))
+                                m_forwarded = true
+                            }
+                        }
+                    }
+                    if (!m_forwarded) {
+                        const m_arg_sz = self.types.sizeOf(param_type_idx)
+                        const m_tmp = fb.addLocalWithSize("__t_indirect", param_type_idx, false, m_arg_sz)
+                        fb.emitStoreLocal(m_tmp, arg_node, call.span)
+                        args.append(fb.emitAddrLocal(m_tmp, I64, call.span))
+                    }
+                    continue
+                }
+            }
+
             // Decompose compound args
             if (param_is_compound) {
                 const ptr_val = fb.emitSlicePtr(arg_node, I64, call.span)
@@ -3735,7 +3766,8 @@ struct Lowerer {
         concrete_name = key
 
         // Queue for lowering
-        if (self.lookupGenericInst(concrete_name)) |inst| {
+        const gen_inst = self.lookupGenericInst(concrete_name)
+        if (gen_inst) |inst| {
             self.ensureGenericFnQueued(inst)
         }
 
@@ -3751,6 +3783,37 @@ struct Lowerer {
             const arg_idx = call.args.get(i)
             var arg_node = self.lowerExprNode(arg_idx)
             if (arg_node == null_node) { continue }
+
+            // Phase 8.7: T-typed args passed indirectly
+            if (gen_inst) |gi| {
+                if (self.isGenericParamIndirect(gi, i)) {
+                    // If arg is already T-indirect, forward __ptr_ directly
+                    var forwarded = false
+                    if (self.extractIdentName(arg_idx)) |aname| {
+                        if (self.indirect_t_params.has(aname) != 0) {
+                            const ptr_n = "__ptr_" + aname
+                            const ptr_li = fb.lookupLocal(ptr_n)
+                            if (ptr_li >= 0) {
+                                gen_args.append(fb.emitLoadLocal(@intCast(i64, ptr_li), I64, call.span))
+                                forwarded = true
+                            }
+                        }
+                    }
+                    if (!forwarded) {
+                        // Store to temp, pass address
+                        var arg_ti = VOID
+                        if (cfunc_info_raw.tag == TAG_FUNC and i < c_param_count) {
+                            switch (cfunc_info_raw) { Type.func |ft| => { arg_ti = ft.getParam(i).type_idx }, else => {} }
+                        }
+                        if (arg_ti == VOID) { arg_ti = I64 }
+                        const arg_sz = self.types.sizeOf(arg_ti)
+                        const tmp = fb.addLocalWithSize("__t_indirect", arg_ti, false, arg_sz)
+                        fb.emitStoreLocal(tmp, arg_node, call.span)
+                        gen_args.append(fb.emitAddrLocal(tmp, I64, call.span))
+                    }
+                    continue
+                }
+            }
 
             // Decompose large compound args
             if (cfunc_info_raw.tag == TAG_FUNC and i < c_param_count) {
@@ -7892,6 +7955,66 @@ struct Lowerer {
             }
         }
         return result
+    }
+
+    /// Check if param at index in a generic function is T-typed (type parameter).
+    /// Port of Zig isGenericParamIndirect. Checks both fn-level and struct-level type params.
+    fn isGenericParamIndirect(inst: GenericInstInfo, param_idx: int) bool {
+        // Get the generic function's AST
+        const inst_ast = inst.getAst()
+        const fn_node_idx = inst.generic_node
+        if (fn_node_idx == null_node) { return false }
+        // Extract FnDecl
+        var fn_params_list: List(int) = .{}
+        var fn_type_params: List(string) = .{}
+        switch (inst_ast.getNode(fn_node_idx)) { Node.decl |d| => switch (d) {
+            Decl.fn_decl |fd| => { fn_params_list = fd.params; fn_type_params = fd.type_params },
+            else => { return false },
+        }, else => { return false } }
+        if (param_idx >= fn_params_list.len()) { return false }
+        // Get param's type expression
+        const param_node = fn_params_list.get(param_idx)
+        var ptype_expr = null_node
+        switch (inst_ast.getNode(param_node)) { Node.expr |e| => switch (e) {
+            Expr.field_def |fd| => { ptype_expr = fd.type_expr },
+            else => {},
+        }, else => {} }
+        if (ptype_expr == null_node) { return false }
+        // Get the type name from the expression
+        var param_type_name = ""
+        switch (inst_ast.getNode(ptype_expr)) { Node.expr |e| => switch (e) {
+            Expr.ident |id| => { param_type_name = id.name },
+            Expr.type_expr |te| => {
+                if (te.kind == TYPE_NAMED and te.data1 != null_node) {
+                    switch (inst_ast.getNode(te.data1)) { Node.expr |ie| => switch (ie) {
+                        Expr.ident |iid| => { param_type_name = iid.name },
+                        else => {},
+                    }, else => {} }
+                }
+            },
+            else => {},
+        }, else => {} }
+        if (@lenOf(param_type_name) == 0) { return false }
+        // Check fn-level type params
+        for ti in 0..fn_type_params.len() {
+            if (fn_type_params.get(ti) == param_type_name) { return true }
+        }
+        // Check struct-level type params (from inst.type_param_names)
+        const tpn = inst.type_param_names
+        if (tpn.len > 0) {
+            // Parse semicolon-separated names
+            var start: int = 0
+            for ci in 0..tpn.len {
+                if (tpn[ci] == 59) {
+                    const seg = @string(tpn.ptr + start, ci - start)
+                    if (seg == param_type_name) { return true }
+                    start = ci + 1
+                }
+            }
+            const last_seg = @string(tpn.ptr + start, tpn.len - start)
+            if (last_seg == param_type_name) { return true }
+        }
+        return false
     }
 
     // AST query helpers
