@@ -727,7 +727,7 @@ i64 (3 slots), `__metadata_T` was at slot 3 instead of slot 2 → read garbage.
 |------|-----------|-------|-------|--------|
 | 8.1 Call sites pass metadata | — | Small | lower.zig (4 sites) | **DONE** |
 | 8.2 Trivial type metadata | — | Small | driver.zig, vwt_gen.zig | **DONE** |
-| 8.5+8.7 Opaque T body + indirect params | 8.1, 8.2 | **LARGE** | lower.zig | **NEXT** |
+| 8.5+8.7 Opaque T body + indirect params | 8.1, 8.2 | **LARGE** | lower.zig | **DONE** (commit 8c7276c, 36d3e98) |
 | 8.3 @sizeOf from metadata | 8.5+8.7 | Small | lower.zig | Ready (blocked) |
 | 8.4 Dynamic stack alloc | 8.3 | Medium | ir.zig, ssa_builder, codegen | Pending |
 | 8.6 Opaque return (SRET memcpy) | 8.5 | Small | lower.zig | Mostly done |

@@ -6,9 +6,10 @@
 
 ---
 
-## Current Status: selfcot2.wasm Builds (1.9MB)
+## Current Status: selfcot2.wasm Builds (1.9MB), Zig Compiler at 370/370
 
-**Audited 2026-03-23** — verified with clean selfcot build + full test suite + selfcot2.wasm build.
+**Audited 2026-03-25** — Zig compiler: 370/370 features pass, 22/22 cases pass (Phase 8 VWT complete).
+Selfcot: builds, all test cases pass, selfcot2.wasm builds. Next: selfcot2 runtime bugs.
 
 **Build chain:**
 1. `./zig-out/bin/cot build self/main.cot -o /tmp/selfcot` → native binary (Success)

@@ -9,7 +9,7 @@ Cot uses inline test blocks (Zig syntax) with error-union-based test isolation. 
 | Tier | Command | What it runs | Speed |
 |------|---------|-------------|-------|
 | **Zig compiler tests** | `zig build test` | ~163 Zig-level tests with inline Cot snippets | Fast (<10s) |
-| **Cot language tests** | `./test/run_all.sh` | ~1,790 Cot tests across 84 `.cot` files (83/83 passing) | Slower (~60s) |
+| **Cot language tests** | `./test/run_all.sh` | ~1,790+ Cot tests across 84 `.cot` files (features.cot: 370/370) | Slower (~60s) |
 | **Single file** | `cot test file.cot` | Tests in one file | Fast |
 
 ### `zig build test` — Compiler internals

@@ -486,7 +486,8 @@ cursor --uninstall-extension cot-lang.cot-lang 2>/dev/null; cursor --install-ext
 | `VISION.md` | Language vision, design principles, execution roadmap |
 | `claude/BUSINESS_MODEL.md` | Licensing, trademark, revenue model, funding strategy |
 | `claude/RELEASE_PLAN.md` | 0.4 release plan: branding, distribution, polish, criteria |
-| `claude/TESTING.md` | Test system: 84 files, ~1,790 tests, error-union isolation |
-| `claude/SELFCOT_CRASH_INVESTIGATION.md` | Selfcot crash root cause analysis (alloc/dealloc + Map state bugs) |
+| `claude/TESTING.md` | Test system: 84 files, ~1,790+ tests, error-union isolation |
+| `claude/VWT_COMPLETION_SUMMARY.md` | **Phase 8 VWT completion: 370/370 tests, Swift audit** |
+| `claude/EXISTENTIAL_TYPES_PLAN.md` | Existential types (any Trait) execution plan |
 | `claude/LINUX_X64_PARITY.md` | Linux x86_64 backend investigation notes |
-| `claude/archive/` | Historical: archived docs (completed milestones, past plans) |
+| `claude/archive/` | Historical: 77 archived docs (completed milestones, past plans) |
