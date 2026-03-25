@@ -1842,31 +1842,78 @@ pub const Lowerer = struct {
                     break :blk_tp null;
                 } else null;
                 if (sret_tp_name) |tp_name| {
-                        const lowered = try self.lowerExprNode(ret.value);
-                        if (lowered != ir.null_node) {
-                            // The lowered expression may be a ptrLoadValue (deref) or a scalar.
-                            // For deref expressions like `ptr.*`, the expression evaluates to
-                            // the element address. But lowerExprNode on a deref loads the value.
-                            // We need the ADDRESS for memcpy. Check if ret.value is a deref.
-                            const ret_is_deref = blk_deref: {
-                                const rn = self.tree.getNode(ret.value) orelse break :blk_deref false;
-                                const re = rn.asExpr() orelse break :blk_deref false;
-                                break :blk_deref (re == .deref);
-                            };
-                            if (ret_is_deref) {
-                                // `return ptr.*` — get the source address, memcpy to sret
-                                const deref_node = self.tree.getNode(ret.value).?;
-                                const deref_expr = deref_node.asExpr().?;
-                                const src_addr = try self.lowerExprNode(deref_expr.deref.operand);
-                                const runtime_size = try self.emitRuntimeSizeOf(fb, tp_name, ret.span);
-                                var mc_args = [_]ir.NodeIndex{ sret_ptr, src_addr, runtime_size };
-                                _ = try fb.emitCall("memcpy", &mc_args, false, TypeRegistry.VOID, ret.span);
-                                debug.log(.lower, "Phase 8.5: T-indirect SRET return via memcpy (deref)", .{});
-                            } else {
-                                // Scalar return (e.g., `return value` where value is i64)
-                                // Store to sret using fixed-size word copy (scalar ≤ 8 bytes)
-                                _ = try fb.emitStoreField(sret_ptr, 0, 0, lowered, ret.span);
-                                debug.log(.lower, "Phase 8.5: T-indirect SRET return via scalar store", .{});
+                        // Swift GenCall.cpp: T-typed SRET return uses runtime-sized copy.
+                        // Detect the source expression type to choose the best copy strategy:
+                        // - deref (ptr.*): memcpy from ptr address
+                        // - field access (self.value): memcpy from field address
+                        // - ident or scalar: store to temp, memcpy from temp
+                        const ret_ast = self.tree.getNode(ret.value);
+                        const ret_expr_kind = if (ret_ast) |n| n.asExpr() else null;
+                        const ret_is_deref = if (ret_expr_kind) |e| (e == .deref) else false;
+                        const ret_is_field = if (ret_expr_kind) |e| (e == .field_access) else false;
+                        const runtime_size = try self.emitRuntimeSizeOf(fb, tp_name, ret.span);
+
+                        if (ret_is_deref) {
+                            // `return ptr.*` → memcpy from ptr address to sret
+                            const deref_expr = ret_expr_kind.?.deref;
+                            const src_addr = try self.lowerExprNode(deref_expr.operand);
+                            var mc_args = [_]ir.NodeIndex{ sret_ptr, src_addr, runtime_size };
+                            _ = try fb.emitCall("memcpy", &mc_args, false, TypeRegistry.VOID, ret.span);
+                            debug.log(.lower, "Phase 8.5: T-indirect SRET return via memcpy (deref)", .{});
+                        } else if (ret_is_field) {
+                            // `return self.value` → get field address, memcpy to sret
+                            // Swift GenStruct.cpp: field address = base + offset from metadata
+                            const fa = ret_expr_kind.?.field_access;
+                            const base_addr = try self.lowerExprNode(fa.base);
+                            // Compute field address: base pointer + field offset
+                            // For single-field structs like Box(T), offset is 0
+                            const base_type_idx = self.inferExprType(fa.base);
+                            const base_type = self.type_reg.get(base_type_idx);
+                            var field_offset: i64 = 0;
+                            if (base_type == .pointer) {
+                                const pointee = self.type_reg.get(base_type.pointer.elem);
+                                if (pointee == .struct_type) {
+                                    for (pointee.struct_type.fields) |f| {
+                                        if (std.mem.eql(u8, f.name, fa.field)) break;
+                                        field_offset += @intCast(self.type_reg.sizeOf(f.type_idx));
+                                    }
+                                }
+                            } else if (base_type == .struct_type) {
+                                for (base_type.struct_type.fields) |f| {
+                                    if (std.mem.eql(u8, f.name, fa.field)) break;
+                                    field_offset += @intCast(self.type_reg.sizeOf(f.type_idx));
+                                }
+                            }
+                            const src_addr = if (field_offset > 0) blk_off: {
+                                const off = try fb.emitConstInt(field_offset, TypeRegistry.I64, ret.span);
+                                break :blk_off try fb.emitBinary(.add, base_addr, off, TypeRegistry.I64, ret.span);
+                            } else base_addr;
+                            var mc_args = [_]ir.NodeIndex{ sret_ptr, src_addr, runtime_size };
+                            _ = try fb.emitCall("memcpy", &mc_args, false, TypeRegistry.VOID, ret.span);
+                            debug.log(.lower, "Phase 8.5: T-indirect SRET return via memcpy (field '{s}' offset={d})", .{ fa.field, field_offset });
+                        } else {
+                            // Scalar or T-indirect param return → store to temp, memcpy
+                            const lowered = try self.lowerExprNode(ret.value);
+                            if (lowered != ir.null_node) {
+                                // Check if it's a T-indirect param (has __ptr_ version)
+                                const ret_ident_name: ?[]const u8 = if (ret_expr_kind) |e| (if (e == .ident) e.ident.name else null) else null;
+                                const ret_ptr_name = if (ret_ident_name) |name| self.indirect_t_params.get(name) else null;
+                                if (ret_ptr_name != null and ret_ident_name != null) {
+                                    // T-indirect param: load pointer, memcpy from it
+                                    const ptr_local_name = try std.fmt.allocPrint(self.allocator, "__ptr_{s}", .{ret_ident_name.?});
+                                    if (fb.lookupLocal(ptr_local_name)) |ptr_idx| {
+                                        const src_ptr = try fb.emitLoadLocal(ptr_idx, TypeRegistry.I64, ret.span);
+                                        var mc_args = [_]ir.NodeIndex{ sret_ptr, src_ptr, runtime_size };
+                                        _ = try fb.emitCall("memcpy", &mc_args, false, TypeRegistry.VOID, ret.span);
+                                        debug.log(.lower, "Phase 8.5: T-indirect SRET return via memcpy (T-indirect param)", .{});
+                                    } else {
+                                        _ = try fb.emitStoreField(sret_ptr, 0, 0, lowered, ret.span);
+                                    }
+                                } else {
+                                    // Pure scalar — store directly
+                                    _ = try fb.emitStoreField(sret_ptr, 0, 0, lowered, ret.span);
+                                    debug.log(.lower, "Phase 8.5: T-indirect SRET return via scalar store", .{});
+                                }
                             }
                         }
                 } else {
