@@ -240,19 +240,22 @@ fn removeEdge(b: *Block, i: usize) void {
     const c = e.b;
     const j = e.i; // index into c.preds
 
+    // Go order: remove succs first, then preds, then phi args.
+    // Reference: block.go:311-327 removeEdge
+    removeSucc(b, i);
+
+    // Remove c.preds[j]
+    removePred(c, j);
+
     // Remove phi args from c's phis at position j.
+    // Must be AFTER removePred so len(preds) reflects the new count.
+    // Reference: block.go:322-327
     for (c.values.items) |v| {
         if (v.op != .phi) continue;
         if (j < v.args.len) {
             removePhiArg(v, j);
         }
     }
-
-    // Remove b.succs[i]
-    removeSucc(b, i);
-
-    // Remove c.preds[j]
-    removePred(c, j);
 
     // Fix up cross-references after swap-remove.
     if (i < b.succs.len) {
