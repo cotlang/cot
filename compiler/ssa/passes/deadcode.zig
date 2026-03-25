@@ -151,6 +151,56 @@ pub fn deadcode(f: *Func) !void {
     });
 }
 
+/// Swift removeUnreachableBlocks: remove only unreachable blocks, don't touch values.
+/// Lighter than full deadcode — safe for native pipeline where use counts may
+/// not be fully consistent yet.
+pub fn removeUnreachableBlocksOnly(f: *Func) !void {
+    const allocator = f.allocator;
+
+    const reachable = try allocator.alloc(bool, f.numBlocks());
+    defer allocator.free(reachable);
+    @memset(reachable, false);
+
+    try reachableBlocks(f, reachable);
+
+    var n_unreachable: usize = 0;
+    for (f.blocks.items) |b| {
+        if (!reachable[b.id]) n_unreachable += 1;
+    }
+    if (n_unreachable == 0) return;
+
+    // Remove edges from dead blocks to live blocks (phi consistency).
+    for (f.blocks.items) |b| {
+        if (reachable[b.id]) continue;
+        var i: usize = 0;
+        while (i < b.succs.len) {
+            const e = b.succs[i];
+            if (reachable[e.b.id]) {
+                removeEdge(b, i);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    // Remove unreachable blocks.
+    var write: usize = 0;
+    for (f.blocks.items) |b| {
+        if (reachable[b.id]) {
+            f.blocks.items[write] = b;
+            write += 1;
+        } else {
+            b.deinit(allocator);
+            b.next_free = f.free_blocks;
+            f.free_blocks = b;
+        }
+    }
+    f.blocks.shrinkRetainingCapacity(write);
+    f.invalidateCFG();
+
+    debug.log(.deadcode, "removeUnreachableBlocksOnly '{s}': removed {d} blocks", .{ f.name, n_unreachable });
+}
+
 /// BFS from entry block to find all reachable blocks.
 fn reachableBlocks(f: *Func, reachable: []bool) !void {
     const allocator = f.allocator;

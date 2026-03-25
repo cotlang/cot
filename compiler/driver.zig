@@ -1826,6 +1826,12 @@ pub const Driver = struct {
             try rewritedec.rewrite(func_alloc, ssa_func);
             if (html_writer_native != null) html_writer_native.?.writePhase("rewritedec", "rewritedec", ssa_func);
 
+            // Go compile.go + Swift GenericCloner.cpp: remove unreachable blocks
+            // before schedule. Lighter than full deadcode — only removes blocks,
+            // not values, to avoid use-count issues in the native pipeline.
+            try deadcode.removeUnreachableBlocksOnly(ssa_func);
+            if (html_writer_native != null) html_writer_native.?.writePhase("deadcode", "deadcode", ssa_func);
+
             schedule.schedule(ssa_func) catch |err| {
                 std.debug.print("SCHEDULE FAIL: func '{s}' err={s} blocks={d}\n", .{ ir_func.name, @errorName(err), ssa_func.blocks.items.len });
                 // Dump block info for debugging
