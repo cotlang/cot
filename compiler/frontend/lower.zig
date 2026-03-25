@@ -5879,7 +5879,8 @@ pub const Lowerer = struct {
         }
         // String equality: decompose to ptr/len and call cot_string_eq
         // Same pattern as @assertEq string handling (line 3528)
-        if ((bin.op == .eql or bin.op == .neq) and self.inferExprType(bin.left) == TypeRegistry.STRING) {
+        // Skip in shared generic bodies — T-typed string comparison goes through Phase 8.8 memcmp.
+        if ((bin.op == .eql or bin.op == .neq) and self.inferExprType(bin.left) == TypeRegistry.STRING and self.indirect_t_params.count() == 0) {
             const ptr_type = try self.type_reg.makePointer(TypeRegistry.U8);
             const l_ptr = try fb.emitSlicePtr(left, ptr_type, bin.span);
             const l_len = try fb.emitSliceLen(left, bin.span);
@@ -5960,6 +5961,144 @@ pub const Lowerer = struct {
                     // x != val: null OR payload_neq → NOT (non_null AND payload_eq)
                     const eq_result = try fb.emitBinary(.@"and", is_non_null, payload_eq, TypeRegistry.BOOL, bin.span);
                     return try fb.emitUnary(.not, eq_result, TypeRegistry.BOOL, bin.span);
+                }
+            }
+        }
+
+        // Swift Phase 8.8: T-typed equality → memcmp with runtime size.
+        // In shared generic bodies, `a == b` where either operand came from a
+        // T-typed expression must compare all bytes (T may be > 8 bytes).
+        // Swift dispatches through Equatable PWT; Cot uses memcmp (structural equality).
+        // Reference: Swift GenProto.cpp emitWitnessMethodRef for T: Equatable.
+        if ((bin.op == .eql or bin.op == .neq) and self.indirect_t_params.count() > 0) {
+            // Check if either operand is T-indirect (ident in indirect_t_params)
+            debug.log(.lower, "Phase 8.8 check: op={s} indirect_count={d}", .{ if (bin.op == .eql) "==" else "!=", self.indirect_t_params.count() });
+            const lhs_node = self.tree.getNode(bin.left);
+            const rhs_node = self.tree.getNode(bin.right);
+            const lhs_expr = if (lhs_node) |n| n.asExpr() else null;
+            const rhs_expr = if (rhs_node) |n| n.asExpr() else null;
+            const lhs_is_t = if (lhs_expr) |e| (if (e == .ident) self.indirect_t_params.contains(e.ident.name) else false) else false;
+            const rhs_is_t = if (rhs_expr) |e| (if (e == .ident) self.indirect_t_params.contains(e.ident.name) else false) else false;
+            if (lhs_is_t or rhs_is_t) {
+                // For types ≤ 8 bytes, the scalar comparison (already computed as `left`/`right`)
+                // is correct. Only dispatch through memcmp/string_eq for multi-word types.
+                // Swift: scalar types use direct comparison, address-only types use PWT.
+                const concrete_size: u32 = if (self.type_substitution) |sub| blk_cs: {
+                    var si = sub.valueIterator();
+                    break :blk_cs if (si.next()) |v| self.type_reg.sizeOf(v.*) else 8;
+                } else 8;
+                if (concrete_size <= 8) {
+                    // Scalar comparison: use the already-lowered left/right values
+                    debug.log(.lower, "Phase 8.8: T-indirect scalar comparison (size={d} ≤ 8)", .{concrete_size});
+                    return try fb.emitBinary(tokenToBinaryOp(bin.op), left, right, result_type, bin.span);
+                }
+                // Get runtime type param name first (needed for address extraction)
+                var tp_iter = self.indirect_t_params.valueIterator();
+                const tp_name = if (tp_iter.next()) |v| v.* else "T";
+                // Get addresses for memcmp. Use runtime size for temp allocation.
+                // T-indirect ident: forward __ptr_ pointer directly.
+                // Other: store loaded value to runtime-sized temp, take address.
+                // AVOID re-evaluating expressions (deref double-eval bug).
+                const lhs_addr = blk_la: {
+                    if (lhs_expr) |e| {
+                        if (e == .ident and self.indirect_t_params.contains(e.ident.name)) {
+                            const pn = try std.fmt.allocPrint(self.allocator, "__ptr_{s}", .{e.ident.name});
+                            if (fb.lookupLocal(pn)) |pi| break :blk_la try fb.emitLoadLocal(pi, TypeRegistry.I64, bin.span);
+                        }
+                    }
+                    // Store the already-lowered value to temp, take address.
+                    // Use runtime size so multi-word types (string) are fully stored.
+                    const tmp_size = try self.emitRuntimeSizeOf(fb, tp_name, bin.span);
+                    _ = tmp_size; // size is known at alloc time from first instantiation
+                    const first_size = if (self.type_substitution) |sub| blk_sz: {
+                        if (sub.get(tp_name)) |ti| break :blk_sz self.type_reg.sizeOf(ti);
+                        break :blk_sz @as(u32, 8);
+                    } else 8;
+                    const tmp = try fb.addLocalWithSize("__cmp_l", TypeRegistry.I64, false, first_size);
+                    _ = try fb.emitStoreLocal(tmp, left, bin.span);
+                    break :blk_la try fb.emitAddrLocal(tmp, TypeRegistry.I64, bin.span);
+                };
+                const rhs_addr = blk_ra: {
+                    if (rhs_expr) |e| {
+                        if (e == .ident and self.indirect_t_params.contains(e.ident.name)) {
+                            const pn = try std.fmt.allocPrint(self.allocator, "__ptr_{s}", .{e.ident.name});
+                            if (fb.lookupLocal(pn)) |pi| break :blk_ra try fb.emitLoadLocal(pi, TypeRegistry.I64, bin.span);
+                        }
+                    }
+                    const first_size = if (self.type_substitution) |sub| blk_sz: {
+                        if (sub.get(tp_name)) |ti| break :blk_sz self.type_reg.sizeOf(ti);
+                        break :blk_sz @as(u32, 8);
+                    } else 8;
+                    const tmp = try fb.addLocalWithSize("__cmp_r", TypeRegistry.I64, false, first_size);
+                    _ = try fb.emitStoreLocal(tmp, right, bin.span);
+                    break :blk_ra try fb.emitAddrLocal(tmp, TypeRegistry.I64, bin.span);
+                };
+                // Runtime dispatch: check metadata.kind to determine comparison strategy.
+                // Runtime dispatch: check metadata type_idx for comparison strategy.
+                // Swift: Equatable PWT dispatch. Cot: type_idx-based dispatch.
+                // TypeMetadata layout: [0]=vwt_ptr, [8]=size, [16]=stride, [24]=type_idx
+                const runtime_size = try self.emitRuntimeSizeOf(fb, tp_name, bin.span);
+                // Load kind from metadata[24]
+                const meta_local_name = try std.fmt.allocPrint(self.allocator, "__metadata_{s}", .{tp_name});
+                const meta_idx = fb.lookupLocal(meta_local_name) orelse {
+                    // No metadata — use memcmp
+                    var cmp_args = [_]ir.NodeIndex{ lhs_addr, rhs_addr, runtime_size };
+                    const cmp_result = try fb.emitCall("memcmp", &cmp_args, false, TypeRegistry.I64, bin.span);
+                    const zero_val = try fb.emitConstInt(0, TypeRegistry.I64, bin.span);
+                    if (bin.op == .eql)
+                        return try fb.emitBinary(.eq, cmp_result, zero_val, TypeRegistry.BOOL, bin.span)
+                    else
+                        return try fb.emitBinary(.ne, cmp_result, zero_val, TypeRegistry.BOOL, bin.span);
+                };
+                const meta_val = try fb.emitLoadLocal(meta_idx, TypeRegistry.I64, bin.span);
+                const kind_off = try fb.emitConstInt(24, TypeRegistry.I64, bin.span);
+                const kind_addr = try fb.emitBinary(.add, meta_val, kind_off, TypeRegistry.I64, bin.span);
+                const kind = try fb.emitPtrLoadValue(kind_addr, TypeRegistry.I64, bin.span);
+                // STRING type_idx = 17 (TypeRegistry.STRING). Check kind == 17.
+                const string_kind = try fb.emitConstInt(@intCast(TypeRegistry.STRING), TypeRegistry.I64, bin.span);
+                const is_string = try fb.emitBinary(.eq, kind, string_kind, TypeRegistry.BOOL, bin.span);
+                // Result local for both branches
+                const result_local = try fb.addLocalWithSize("__cmp_result", TypeRegistry.I64, true, 8);
+                const str_blk = try fb.newBlock("cmp.string");
+                const mem_blk = try fb.newBlock("cmp.memcmp");
+                const cmp_done = try fb.newBlock("cmp.done");
+                _ = try fb.emitBranch(is_string, str_blk, mem_blk, bin.span);
+                // String path: string_eq(ptr1, len1, ptr2, len2)
+                fb.setBlock(str_blk);
+                {
+                    const ptr_type = try self.type_reg.makePointer(TypeRegistry.U8);
+                    const l_ptr = try fb.emitPtrLoadValue(lhs_addr, ptr_type, bin.span);
+                    const eight_c = try fb.emitConstInt(8, TypeRegistry.I64, bin.span);
+                    const l_len_addr = try fb.emitBinary(.add, lhs_addr, eight_c, TypeRegistry.I64, bin.span);
+                    const l_len = try fb.emitPtrLoadValue(l_len_addr, TypeRegistry.I64, bin.span);
+                    const r_ptr = try fb.emitPtrLoadValue(rhs_addr, ptr_type, bin.span);
+                    const r_len_addr = try fb.emitBinary(.add, rhs_addr, eight_c, TypeRegistry.I64, bin.span);
+                    const r_len = try fb.emitPtrLoadValue(r_len_addr, TypeRegistry.I64, bin.span);
+                    var eq_args = [_]ir.NodeIndex{ l_ptr, l_len, r_ptr, r_len };
+                    const eq_result = try fb.emitCall("string_eq", &eq_args, false, TypeRegistry.I64, bin.span);
+                    _ = try fb.emitStoreLocal(result_local, eq_result, bin.span);
+                }
+                _ = try fb.emitJump(cmp_done, bin.span);
+                // Memcmp path
+                fb.setBlock(mem_blk);
+                {
+                    var cmp_args = [_]ir.NodeIndex{ lhs_addr, rhs_addr, runtime_size };
+                    const cmp_result = try fb.emitCall("memcmp", &cmp_args, false, TypeRegistry.I64, bin.span);
+                    // memcmp returns 0 for equal → invert: (result == 0) gives 1 for equal
+                    const zero_c = try fb.emitConstInt(0, TypeRegistry.I64, bin.span);
+                    const is_eq = try fb.emitBinary(.eq, cmp_result, zero_c, TypeRegistry.I64, bin.span);
+                    _ = try fb.emitStoreLocal(result_local, is_eq, bin.span);
+                }
+                _ = try fb.emitJump(cmp_done, bin.span);
+                // Merge
+                fb.setBlock(cmp_done);
+                const result_val = try fb.emitLoadLocal(result_local, TypeRegistry.I64, bin.span);
+                const zero_final = try fb.emitConstInt(0, TypeRegistry.I64, bin.span);
+                debug.log(.lower, "Phase 8.8: T-indirect comparison via runtime dispatch (string_eq / memcmp)", .{});
+                if (bin.op == .eql) {
+                    return try fb.emitBinary(.ne, result_val, zero_final, TypeRegistry.BOOL, bin.span);
+                } else {
+                    return try fb.emitBinary(.eq, result_val, zero_final, TypeRegistry.BOOL, bin.span);
                 }
             }
         }
@@ -9378,15 +9517,30 @@ pub const Lowerer = struct {
                     // Reference: Swift GenCall.cpp address-only convention.
                     const is_t_indirect = self.isGenericParamIndirect(inst_info, arg_i);
                     if (is_t_indirect) {
-                        // Store arg to temp local, pass address
-                        const arg_type_idx = if (cparam_types) |params| (if (arg_i < params.len) params[arg_i].type_idx else fb.nodes.items[arg_node].type_idx) else fb.nodes.items[arg_node].type_idx;
-                        const arg_size = self.type_reg.sizeOf(arg_type_idx);
-                        const tmp_name = try std.fmt.allocPrint(self.allocator, "__t_indirect_{d}", .{arg_i});
-                        const tmp = try fb.addLocalWithSize(tmp_name, arg_type_idx, false, arg_size);
-                        _ = try fb.emitStoreLocal(tmp, arg_node, call.span);
-                        const addr = try fb.emitAddrLocal(tmp, TypeRegistry.I64, call.span);
-                        try gen_args.append(self.allocator, addr);
-                        debug.log(.lower, "Phase 8.7: free-fn call arg {d} passed indirectly (size={d})", .{ arg_i, arg_size });
+                        // If arg is already T-indirect, forward __ptr_ directly
+                        const arg_ast = self.tree.getNode(arg_idx);
+                        const arg_ae = if (arg_ast) |n| n.asExpr() else null;
+                        const fwd_ptr = if (arg_ae) |ae| blk_ff: {
+                            if (ae == .ident and self.indirect_t_params.contains(ae.ident.name)) {
+                                const pn = try std.fmt.allocPrint(self.allocator, "__ptr_{s}", .{ae.ident.name});
+                                if (fb.lookupLocal(pn)) |pi|
+                                    break :blk_ff try fb.emitLoadLocal(pi, TypeRegistry.I64, call.span);
+                            }
+                            break :blk_ff @as(?ir.NodeIndex, null);
+                        } else @as(?ir.NodeIndex, null);
+                        if (fwd_ptr) |fwd| {
+                            try gen_args.append(self.allocator, fwd);
+                            debug.log(.lower, "Phase 8.7: free-fn call arg {d} forwarded T-indirect ptr", .{arg_i});
+                        } else {
+                            const arg_type_idx = if (cparam_types) |params| (if (arg_i < params.len) params[arg_i].type_idx else fb.nodes.items[arg_node].type_idx) else fb.nodes.items[arg_node].type_idx;
+                            const arg_size = self.type_reg.sizeOf(arg_type_idx);
+                            const tmp_name = try std.fmt.allocPrint(self.allocator, "__t_indirect_{d}", .{arg_i});
+                            const tmp = try fb.addLocalWithSize(tmp_name, arg_type_idx, false, arg_size);
+                            _ = try fb.emitStoreLocal(tmp, arg_node, call.span);
+                            const addr = try fb.emitAddrLocal(tmp, TypeRegistry.I64, call.span);
+                            try gen_args.append(self.allocator, addr);
+                            debug.log(.lower, "Phase 8.7: free-fn call arg {d} passed indirectly (size={d})", .{ arg_i, arg_size });
+                        }
                     } else {
                         // Non-T args: decompose large compound args as before
                         var is_large_compound = false;
@@ -10498,18 +10652,35 @@ pub const Lowerer = struct {
             } else false;
 
             if (is_method_t_indirect) {
-                // Store arg to temp local, pass address (uniform 8-byte slot)
-                const arg_type_idx_m = if (param_types) |params| blk: {
-                    const pidx = arg_i + receiver_offset;
-                    break :blk if (pidx < params.len) params[pidx].type_idx else fb.nodes.items[arg_node].type_idx;
-                } else fb.nodes.items[arg_node].type_idx;
-                const arg_size_m = self.type_reg.sizeOf(arg_type_idx_m);
-                const tmp_name_m = try std.fmt.allocPrint(self.allocator, "__t_indirect_{d}", .{arg_i});
-                const tmp_m = try fb.addLocalWithSize(tmp_name_m, arg_type_idx_m, false, arg_size_m);
-                _ = try fb.emitStoreLocal(tmp_m, arg_node, call.span);
-                const addr_m = try fb.emitAddrLocal(tmp_m, TypeRegistry.I64, call.span);
-                try args.append(self.allocator, addr_m);
-                debug.log(.lower, "Phase 8.7: method call arg {d} passed indirectly (size={d})", .{ arg_i, arg_size_m });
+                // If the arg is already a T-indirect param (has __ptr_ version),
+                // forward the __ptr_ pointer directly. This avoids truncating
+                // multi-word T values to 8-byte scalars.
+                const arg_ast_expr = if (self.tree.getNode(arg_idx)) |n| n.asExpr() else null;
+                const forwarded_ptr = if (arg_ast_expr) |ae| blk_fwd: {
+                    if (ae == .ident and self.indirect_t_params.contains(ae.ident.name)) {
+                        const pn = try std.fmt.allocPrint(self.allocator, "__ptr_{s}", .{ae.ident.name});
+                        if (fb.lookupLocal(pn)) |pi|
+                            break :blk_fwd try fb.emitLoadLocal(pi, TypeRegistry.I64, call.span);
+                    }
+                    break :blk_fwd @as(?ir.NodeIndex, null);
+                } else @as(?ir.NodeIndex, null);
+                if (forwarded_ptr) |fwd| {
+                    try args.append(self.allocator, fwd);
+                    debug.log(.lower, "Phase 8.7: method call arg {d} forwarded T-indirect ptr", .{arg_i});
+                } else {
+                    // Non-T-indirect arg: store to temp, pass address
+                    const arg_type_idx_m = if (param_types) |params| blk: {
+                        const pidx = arg_i + receiver_offset;
+                        break :blk if (pidx < params.len) params[pidx].type_idx else fb.nodes.items[arg_node].type_idx;
+                    } else fb.nodes.items[arg_node].type_idx;
+                    const arg_size_m = self.type_reg.sizeOf(arg_type_idx_m);
+                    const tmp_name_m = try std.fmt.allocPrint(self.allocator, "__t_indirect_{d}", .{arg_i});
+                    const tmp_m = try fb.addLocalWithSize(tmp_name_m, arg_type_idx_m, false, arg_size_m);
+                    _ = try fb.emitStoreLocal(tmp_m, arg_node, call.span);
+                    const addr_m = try fb.emitAddrLocal(tmp_m, TypeRegistry.I64, call.span);
+                    try args.append(self.allocator, addr_m);
+                    debug.log(.lower, "Phase 8.7: method call arg {d} passed indirectly (size={d})", .{ arg_i, arg_size_m });
+                }
             } else if (param_is_compound) {
                 // Go pattern: decompose compound types (slice/string) into (ptr, len)
                 const ptr_val = try fb.emitSlicePtr(arg_node, TypeRegistry.I64, call.span);

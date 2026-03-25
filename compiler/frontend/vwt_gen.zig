@@ -292,7 +292,7 @@ pub const VWTGenerator = struct {
         try self.emitInitializeBufferWithCopyOfBufferWitness(builder, entry, type_name);
 
         // --- TypeMetadata + VWT globals ---
-        try self.emitMetadataGlobals(builder, entry, type_name, info);
+        try self.emitMetadataGlobals(builder, entry, type_name, type_idx, info);
 
         try self.emitted.put(type_name, {});
         try self.entries.put(type_name, entry);
@@ -324,7 +324,7 @@ pub const VWTGenerator = struct {
     ///
     /// Swift ref: Metadata.h — size/stride are directly in metadata for fast access.
     /// @sizeOf(T) in generic bodies loads metadata[1] (offset 0x08).
-    fn emitMetadataGlobals(self: *VWTGenerator, builder: *ir.Builder, entry: VWTEntry, type_name: []const u8, info: types.Type) !void {
+    fn emitMetadataGlobals(self: *VWTGenerator, builder: *ir.Builder, entry: VWTEntry, type_name: []const u8, type_idx: TypeIndex, info: types.Type) !void {
         const vwt_global_name = try std.fmt.allocPrint(self.allocator, "__vwt_table_{s}", .{type_name});
         const metadata_global_name = try std.fmt.allocPrint(self.allocator, "__type_metadata_{s}", .{type_name});
         const init_fn_name = try std.fmt.allocPrint(self.allocator, "__vwt_init_{s}", .{type_name});
@@ -388,21 +388,11 @@ pub const VWTGenerator = struct {
         const meta_stride_addr = try fb.emitBinary(.add, meta_addr, sixteen, TypeRegistry.I64, Span.zero);
         const stride_const = try fb.emitConstInt(@intCast(entry.stride), TypeRegistry.I64, Span.zero);
         _ = try fb.emitPtrStoreValue(meta_stride_addr, stride_const, Span.zero);
-        // [3] Store kind
-        const kind_val: i64 = switch (info) {
-            .struct_type => 0x200,
-            .enum_type => 0x201,
-            .optional => 0x202,
-            .tuple => 0x301,
-            .func => 0x302,
-            .list => 0x400,
-            .map => 0x401,
-            .union_type => 0x201,
-            else => 0x200,
-        };
+        // [3] Store type_idx — Swift Metadata.Kind equivalent.
+        // Stores the actual TypeIndex for runtime type identity and dispatch.
         const twentyfour = try fb.emitConstInt(24, TypeRegistry.I64, Span.zero);
         const meta_kind_addr = try fb.emitBinary(.add, meta_addr, twentyfour, TypeRegistry.I64, Span.zero);
-        const kind_const = try fb.emitConstInt(kind_val, TypeRegistry.I64, Span.zero);
+        const kind_const = try fb.emitConstInt(@intCast(type_idx), TypeRegistry.I64, Span.zero);
         _ = try fb.emitPtrStoreValue(meta_kind_addr, kind_const, Span.zero);
 
         _ = try fb.emitRet(null, Span.zero);

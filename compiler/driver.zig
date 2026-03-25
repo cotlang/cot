@@ -495,10 +495,11 @@ pub const Driver = struct {
                     const stride_val = try fb.emitConstInt(@intCast(stride), types_mod.TypeRegistry.I64, Span.zero);
                     _ = try fb.emitPtrStoreValue(stride_addr, stride_val, Span.zero);
 
-                    // [3] kind = 0x100 (trivial)
+                    // [3] type_idx — store actual TypeIndex for runtime dispatch
+                    // Swift: metadata stores type identity. Cot: stores TypeIndex.
                     const twentyfour = try fb.emitConstInt(24, types_mod.TypeRegistry.I64, Span.zero);
                     const kind_addr = try fb.emitBinary(.add, meta_addr, twentyfour, types_mod.TypeRegistry.I64, Span.zero);
-                    const kind_val = try fb.emitConstInt(0x100, types_mod.TypeRegistry.I64, Span.zero);
+                    const kind_val = try fb.emitConstInt(@intCast(type_arg), types_mod.TypeRegistry.I64, Span.zero);
                     _ = try fb.emitPtrStoreValue(kind_addr, kind_val, Span.zero);
 
                     _ = try fb.emitRet(null, Span.zero);
