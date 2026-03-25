@@ -572,6 +572,9 @@ pub const Lowerer = struct {
         // in generic_inst_by_name). This avoids lowering unused methods.
         // Zig pattern: process queued generic instantiations as top-level functions
         // (deferred, not inline — avoids corrupting builder state during nested lowering)
+        // Swift GenDecl.cpp: pre-declare @inlinable generic functions so callers
+        // can reference them before bodies are emitted (forward declaration pattern).
+        try self.predeclareInlinableGenerics();
         try self.lowerQueuedGenericFunctions();
         debug.log(.lower, "=== Lowering complete: {d} IR functions generated ===", .{
             self.builder.funcs.items.len,
@@ -10040,6 +10043,26 @@ pub const Lowerer = struct {
     /// Go pattern: deferred actions run after all call sites processed (types2/call.go).
     /// Zig pattern: ensureFuncBodyAnalysisQueued (Zcu.zig:3522) queues analysis jobs.
     /// We process all queued generic instantiations as top-level functions.
+    /// Swift GenDecl.cpp getAddrOfSILFunction(NotForDefinition) — pre-declare all
+    /// @inlinable generic function names so hasFunc() returns true during lowering.
+    /// Bodies are emitted later by lowerQueuedGenericFunctions.
+    fn predeclareInlinableGenerics(self: *Lowerer) !void {
+        var it = self.chk.generics.generic_inst_by_name.valueIterator();
+        while (it.next()) |inst_info| {
+            if (!self.lowered_generics.contains(inst_info.concrete_name)) continue;
+            if (self.builder.hasFunc(inst_info.concrete_name)) continue;
+            // Check @inlinable
+            const saved = self.tree;
+            self.tree = inst_info.tree;
+            defer self.tree = saved;
+            const fn_node = self.tree.getNode(inst_info.generic_node) orelse continue;
+            const fn_decl = fn_node.asDecl() orelse continue;
+            if (fn_decl != .fn_decl) continue;
+            if (!fn_decl.fn_decl.is_inlinable) continue;
+            try self.builder.declareFunc(inst_info.concrete_name);
+        }
+    }
+
     fn lowerQueuedGenericFunctions(self: *Lowerer) !void {
         // Use generic_inst_by_name which has ALL instantiations (never overwritten).
         // The generic_instantiations map is keyed by AST node index, so the second
@@ -10076,6 +10099,7 @@ pub const Lowerer = struct {
                 };
                 if (is_inl) {
                     if (self.builder.hasFunc(inst_info.concrete_name)) continue;
+                    debug.log(.lower, "queue @inlinable: '{s}'", .{inst_info.concrete_name});
                 } else {
                     const bn = self.computeGenericBaseName(inst_info.concrete_name) catch continue;
                     if (self.builder.hasFunc(bn)) continue;
@@ -10097,9 +10121,14 @@ pub const Lowerer = struct {
                     break :blk fn_decl.fn_decl.is_inlinable;
                 };
                 if (is_inlinable) {
-                    // Monomorphize: emit one function per concrete instantiation
                     if (self.builder.hasFunc(inst_info.concrete_name)) continue;
-                    try self.lowerGenericFnMonomorphized(inst_info);
+                    const before = self.builder.funcs.items.len;
+                    self.lowerGenericFnInstance(inst_info, true) catch |err| {
+                        debug.log(.lower, "ERROR: @inlinable '{s}' failed: {s}", .{ inst_info.concrete_name, @errorName(err) });
+                        continue;
+                    };
+                    const after = self.builder.funcs.items.len;
+                    debug.log(.lower, "@inlinable '{s}': funcs {d} → {d}", .{ inst_info.concrete_name, before, after });
                 } else {
                     // Shared body: one function for all instantiations
                     const bn = self.computeGenericBaseName(inst_info.concrete_name) catch continue;
@@ -10132,20 +10161,20 @@ pub const Lowerer = struct {
     }
 
     fn lowerGenericFnInstanceVWT(self: *Lowerer, inst_info: checker.GenericInstInfo) !void {
-        // Swift pattern: ONE body per generic definition under base name.
-        // All instantiations share this body. Uniform calling convention via
-        // indirect returns for generic return types.
-        const base_name = try self.computeGenericBaseName(inst_info.concrete_name);
+        return self.lowerGenericFnInstance(inst_info, false);
+    }
 
-        // If base already emitted, this instantiation shares it — nothing to do.
-        // The caller calls the base name directly with metadata.
-        if (self.builder.hasFunc(base_name)) return;
+    /// Swift GenericCloner pattern: lower a generic function instance.
+    /// When is_inlinable=false: shared body under base name (VWT convention).
+    /// When is_inlinable=true: monomorphized under concrete name (direct types).
+    /// Same lowering path for both — the flag controls naming, params, and type handling.
+    fn lowerGenericFnInstance(self: *Lowerer, inst_info: checker.GenericInstInfo, is_inlinable: bool) !void {
+        const func_name = if (is_inlinable)
+            inst_info.concrete_name
+        else
+            try self.computeGenericBaseName(inst_info.concrete_name);
 
-        // Also register that the concrete name maps to the base
-        // (for hasFunc checks in the queue processor)
-        if (!self.builder.hasFunc(inst_info.concrete_name)) {
-            // We'll register it after emitting the base
-        }
+        if (self.builder.hasFunc(func_name)) return;
 
         // Swap to defining file's AST
         const saved_tree = self.tree;
@@ -10195,8 +10224,11 @@ pub const Lowerer = struct {
             self.chk.expr_types = saved_expr_types;
         }
 
-        // Lower the function body with type substitution active
-        self.type_substitution = sub_map;
+        // @inlinable: concrete types directly, no type_substitution during lowering.
+        // Shared body: type_substitution active for address-only handling.
+        if (!is_inlinable) {
+            self.type_substitution = sub_map;
+        }
         defer {
             self.type_substitution = null;
             self.indirect_t_params.clearRetainingCapacity();
@@ -10204,16 +10236,15 @@ pub const Lowerer = struct {
 
         const return_type = self.resolveTypeNode(f.return_type);
 
-        // Swift ResultConvention: use indirect return when the checker determined
-        // the return type is a generic type parameter (has_indirect_result), OR
-        // when the concrete return type is too large for register return.
-        // This ensures uniform calling convention across all instantiations.
-        // Reference: swift/lib/IRGen/GenCall.cpp:677-685 addIndirectResult()
-        const uses_sret = inst_info.has_indirect_result or self.needsSret(return_type);
+        // Swift ResultConvention: shared bodies use indirect return for generic return types.
+        // @inlinable: concrete return type determines SRET (no has_indirect_result).
+        const uses_sret = if (is_inlinable)
+            self.needsSret(return_type)
+        else
+            inst_info.has_indirect_result or self.needsSret(return_type);
         const wasm_return_type = if (uses_sret) TypeRegistry.VOID else return_type;
 
-        // Emit function under BASE name — one body shared by all instantiations.
-        self.builder.startFunc(base_name, TypeRegistry.VOID, wasm_return_type, f.span);
+        self.builder.startFunc(func_name, TypeRegistry.VOID, wasm_return_type, f.span);
         if (self.builder.func()) |fb| {
             if (uses_sret) fb.sret_return_type = return_type;
             fb.is_destructor = std.mem.eql(u8, f.name, "deinit");
@@ -10236,57 +10267,55 @@ pub const Lowerer = struct {
                 }
             }
 
-            // Regular params — Swift Phase 8.5+8.7: T-typed params are address-only.
-            // Pass as indirect pointer (i64, 8 bytes) regardless of T's concrete size.
-            // This ensures uniform param layout across all instantiations sharing this body.
-            // Reference: Swift GenCall.cpp:747-764 address-only convention.
+            // Param setup: @inlinable uses direct concrete params.
+            // Shared body uses T-indirect (Swift @in convention) + metadata params.
             self.indirect_t_params.clearRetainingCapacity();
-            for (f.params) |param| {
-                var param_type = self.resolveTypeNode(param.type_expr);
-                // Detect T-typed params: check if param's type name is a type parameter.
-                // Also capture the type param name for metadata lookup.
-                const type_param_name: ?[]const u8 = if (self.type_substitution) |sub| blk: {
-                    if (param.type_expr != ast.null_node) {
-                        if (self.tree.getNode(param.type_expr)) |node| {
-                            if (node.asExpr()) |expr_node| {
-                                if (expr_node == .ident) {
-                                    if (sub.contains(expr_node.ident.name))
-                                        break :blk expr_node.ident.name;
-                                } else if (expr_node == .type_expr and expr_node.type_expr.kind == .named) {
-                                    if (sub.contains(expr_node.type_expr.kind.named))
-                                        break :blk expr_node.type_expr.kind.named;
-                                }
-                            }
-                        }
-                    }
-                    break :blk null;
-                } else null;
-                if (type_param_name) |tp_name| {
-                    // Swift @in convention: T-typed param is always an indirect pointer (8 bytes).
-                    // Param is named __ptr_{name}; after all params, we load the i64 scalar
-                    // value from the pointer into a shadow local named {name} so the body
-                    // can use it for arithmetic/comparison. Stores/returns use the pointer.
-                    const ptr_name = try std.fmt.allocPrint(self.allocator, "__ptr_{s}", .{param.name});
-                    _ = try fb.addParam(ptr_name, TypeRegistry.I64, 8);
-                    try self.indirect_t_params.put(param.name, tp_name);
-                    debug.log(.lower, "Phase 8.7: param '{s}' → '__ptr_{s}' (T-indirect, type param '{s}')", .{ param.name, param.name, tp_name });
-                } else {
+            if (is_inlinable) {
+                // Swift @inlinable: concrete params directly, no indirection.
+                for (f.params) |param| {
+                    var param_type = self.resolveTypeNode(param.type_expr);
                     param_type = self.chk.safeWrapType(param_type) catch param_type;
                     _ = try fb.addParam(param.name, param_type, self.type_reg.sizeOf(param_type));
                 }
+                // No metadata params, no scalar shadows.
+            } else {
+                // Shared body: T-typed params are address-only (Swift Phase 8.5+8.7).
+                for (f.params) |param| {
+                    var param_type = self.resolveTypeNode(param.type_expr);
+                    const type_param_name: ?[]const u8 = if (self.type_substitution) |sub| blk: {
+                        if (param.type_expr != ast.null_node) {
+                            if (self.tree.getNode(param.type_expr)) |node| {
+                                if (node.asExpr()) |expr_node| {
+                                    if (expr_node == .ident) {
+                                        if (sub.contains(expr_node.ident.name))
+                                            break :blk expr_node.ident.name;
+                                    } else if (expr_node == .type_expr and expr_node.type_expr.kind == .named) {
+                                        if (sub.contains(expr_node.type_expr.kind.named))
+                                            break :blk expr_node.type_expr.kind.named;
+                                    }
+                                }
+                            }
+                        }
+                        break :blk null;
+                    } else null;
+                    if (type_param_name) |tp_name| {
+                        const ptr_name = try std.fmt.allocPrint(self.allocator, "__ptr_{s}", .{param.name});
+                        _ = try fb.addParam(ptr_name, TypeRegistry.I64, 8);
+                        try self.indirect_t_params.put(param.name, tp_name);
+                        debug.log(.lower, "Phase 8.7: param '{s}' → '__ptr_{s}' (T-indirect, type param '{s}')", .{ param.name, param.name, tp_name });
+                    } else {
+                        param_type = self.chk.safeWrapType(param_type) catch param_type;
+                        _ = try fb.addParam(param.name, param_type, self.type_reg.sizeOf(param_type));
+                    }
+                }
+                // Metadata params AFTER user params.
+                for (param_names) |pn| {
+                    const meta_name = try std.fmt.allocPrint(self.allocator, "__metadata_{s}", .{pn});
+                    _ = try fb.addParam(meta_name, TypeRegistry.I64, 8);
+                }
             }
 
-            // Swift convention: metadata params AFTER user params.
-            // One *TypeMetadata per type parameter.
-            // Reference: GenProto.cpp:4312-4377 expandPolymorphicSignature()
-            for (param_names) |pn| {
-                const meta_name = try std.fmt.allocPrint(self.allocator, "__metadata_{s}", .{pn});
-                _ = try fb.addParam(meta_name, TypeRegistry.I64, 8);
-            }
-
-            // Phase 8.5: Create scalar shadow locals for T-indirect params.
-            // Load the first 8 bytes from each T-indirect pointer so the body can
-            // use the value for arithmetic/comparison. Stores/returns use the pointer.
+            // Phase 8.5: Create scalar shadow locals for T-indirect params (shared body only).
             for (f.params) |param| {
                 if (self.indirect_t_params.contains(param.name)) {
                     const ptr_name = try std.fmt.allocPrint(self.allocator, "__ptr_{s}", .{param.name});

@@ -618,6 +618,9 @@ pub const Builder = struct {
     structs: std.ArrayListUnmanaged(StructDef) = .{},
     /// O(1) function name lookup (populated by endFunc).
     func_names: std.StringHashMapUnmanaged(void) = .{},
+    /// Forward-declared function names (declared but body not yet emitted).
+    /// Swift GenDecl.cpp: getAddrOfSILFunction(NotForDefinition).
+    declared_names: std.StringHashMapUnmanaged(void) = .{},
 
     pub fn init(allocator: Allocator, type_reg: *TypeRegistry) Builder { return .{ .ir = IR.init(allocator, type_reg), .allocator = allocator }; }
 
@@ -626,6 +629,7 @@ pub const Builder = struct {
         self.globals.deinit(self.allocator);
         self.structs.deinit(self.allocator);
         self.func_names.deinit(self.allocator);
+        self.declared_names.deinit(self.allocator);
         if (self.current_func) |*fb| fb.deinit();
     }
 
@@ -641,8 +645,23 @@ pub const Builder = struct {
         }
     }
 
+    /// Swift GenDecl.cpp getAddrOfSILFunction(NotForDefinition) — forward-declare
+    /// a function name so call sites can reference it before the body is emitted.
+    /// Does NOT make hasFunc() return true — only hasDeclaredFunc().
+    pub fn declareFunc(self: *Builder, name: []const u8) !void {
+        if (!self.declared_names.contains(name)) {
+            try self.declared_names.put(self.allocator, name, {});
+        }
+    }
+
+    /// True if function body has been emitted (via endFunc).
     pub fn hasFunc(self: *const Builder, name: []const u8) bool {
         return self.func_names.contains(name);
+    }
+
+    /// True if function has been forward-declared OR defined.
+    pub fn hasDeclaredFunc(self: *const Builder, name: []const u8) bool {
+        return self.func_names.contains(name) or self.declared_names.contains(name);
     }
 
     pub fn addGlobal(self: *Builder, g: Global) !void { try self.globals.append(self.allocator, g); }
