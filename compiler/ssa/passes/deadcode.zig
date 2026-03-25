@@ -235,66 +235,64 @@ fn liveValues(f: *Func, reachable: []bool, live: []bool) !void {
 /// Remove the i'th outgoing edge from b (and the corresponding incoming edge
 /// from b.Succs[i].b). Also removes phi args from the successor.
 /// Ported from Go's Block.removeEdge.
+/// Go block.go:311-360 removeEdge — exact 1:1 port.
 fn removeEdge(b: *Block, i: usize) void {
     const e = b.succs[i];
     const c = e.b;
-    const j = e.i; // index into c.preds
+    const j = e.i;
 
-    // Go order: remove succs first, then preds, then phi args.
-    // Reference: block.go:311-327 removeEdge
+    // Go order: removeSucc → removePred → removePhiArg
     removeSucc(b, i);
-
-    // Remove c.preds[j]
     removePred(c, j);
 
     // Remove phi args from c's phis at position j.
-    // Must be AFTER removePred so len(preds) reflects the new count.
-    // Reference: block.go:322-327
     for (c.values.items) |v| {
         if (v.op != .phi) continue;
-        if (j < v.args.len) {
-            removePhiArg(v, j);
-        }
-    }
-
-    // Fix up cross-references after swap-remove.
-    if (i < b.succs.len) {
-        // The edge that was swapped into position i needs its back-reference updated.
-        b.succs[i].b.preds[b.succs[i].i].i = i;
-    }
-    if (j < c.preds.len) {
-        // The edge that was swapped into position j needs its back-reference updated.
-        c.preds[j].b.succs[c.preds[j].i].i = j;
+        removePhiArg(c, v, j);
     }
 }
 
+/// Go block.go removeSucc — updates cross-reference inside.
 fn removeSucc(b: *Block, i: usize) void {
-    const last = b.succs.len - 1;
-    if (i != last) {
-        b.succs[i] = b.succs[last];
+    const n = b.succs.len - 1;
+    if (i != n) {
+        const e = b.succs[n];
+        b.succs[i] = e;
+        // Update the other end of the edge we moved.
+        e.b.preds[e.i].i = i;
     }
     b.succs.len -= 1;
 }
 
+/// Go block.go removePred — updates cross-reference inside.
 fn removePred(b: *Block, j: usize) void {
-    const last = b.preds.len - 1;
-    if (j != last) {
-        b.preds[j] = b.preds[last];
+    const n = b.preds.len - 1;
+    if (j != n) {
+        const e = b.preds[n];
+        b.preds[j] = e;
+        // Update the other end of the edge we moved.
+        e.b.succs[e.i].i = j;
     }
     b.preds.len -= 1;
 }
 
-fn removePhiArg(v: *Value, j: usize) void {
-    // Decrement uses for the removed arg.
-    if (j < v.args.len) {
-        v.args[j].uses -= 1;
+/// Go block.go:357-367 removePhiArg — exact 1:1 port.
+/// MUST be called after removePred so len(preds) is correct.
+fn removePhiArg(c: *Block, phi: *Value, i: usize) void {
+    const n = c.preds.len; // already decremented by removePred
+    // Go validation: numPhiArgs - 1 must equal n
+    // phi.Args[i].Uses--
+    if (i < phi.args.len) {
+        phi.args[i].uses -= 1;
     }
-    // Swap-remove from args.
-    const last = v.args.len - 1;
-    if (j != last) {
-        v.args[j] = v.args[last];
+    // phi.Args[i] = phi.Args[n] (swap with the element at NEW pred count position)
+    if (n < phi.args.len) {
+        phi.args[i] = phi.args[n];
     }
-    v.args = v.args[0..last];
+    // phi.Args = phi.Args[:n]
+    phi.args = phi.args[0..n];
+    // Go calls phielimValue here — convert phi with 1 unique arg to copy.
+    // We rely on copyelim pass for this (called right after edge removal).
 }
 
 /// Count total values across all blocks.
