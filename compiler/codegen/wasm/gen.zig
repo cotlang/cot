@@ -71,6 +71,7 @@ pub const GenState = struct {
 
     /// Number of f64 locals (at end of declared local range, after all i64 locals)
     float_local_count: u32 = 0,
+    float_local_start: u32 = 0,
 
     /// GC ref locals: each entry is a GC struct type index.
     /// These locals are declared after f64 locals, as (ref null $typeidx).
@@ -281,10 +282,18 @@ pub const GenState = struct {
                 if (v.op != .phi) continue;
                 if (pred_idx >= v.args.len) continue;
                 const arg = v.args[pred_idx];
-                // Get arg value on stack (getValue64 handles i32→i64 extend for cmp values)
+                // Get arg value on stack
                 try self.getValue64(arg);
-                // Store to phi's local
+                // Convert between f64↔i64 if source and dest locals have different types
                 if (self.value_to_local.get(v.id)) |local_idx| {
+                    const src_local = self.value_to_local.get(arg.id);
+                    const src_is_f64 = if (src_local) |sl| self.isFloatLocal(sl) else isFloatType(arg.type_idx);
+                    const dst_is_f64 = self.isFloatLocal(local_idx);
+                    if (src_is_f64 and !dst_is_f64) {
+                        _ = try self.builder.append(.i64_reinterpret_f64);
+                    } else if (!src_is_f64 and dst_is_f64) {
+                        _ = try self.builder.append(.f64_reinterpret_i64);
+                    }
                     _ = try self.builder.appendTo(.local_set, prog_mod.constAddr(local_idx));
                 }
             }
@@ -320,6 +329,12 @@ pub const GenState = struct {
     }
 
     /// Get 64-bit value onto wasm stack
+    /// Check if a Wasm local index is an f64 local.
+    fn isFloatLocal(self: *const GenState, local_idx: u32) bool {
+        return local_idx >= self.float_local_start and
+            local_idx < self.float_local_start + self.float_local_count;
+    }
+
     /// Go: getValue64 (lines 491-503)
     pub fn getValue64(self: *GenState, v: *const SsaValue) GenError!void {
         // Check if rematerializable (constants)
@@ -345,9 +360,9 @@ pub const GenState = struct {
 
     /// Store top of stack to local
     /// Go: setReg (lines 530-533)
+    /// Go: setReg (lines 530-533) — just local.set.
     pub fn setReg(self: *GenState, v: *const SsaValue) GenError!void {
         if (self.value_to_local.get(v.id)) |local_idx| {
-            // Use local_set directly with local index
             _ = try self.builder.appendTo(.local_set, prog_mod.constAddr(local_idx));
         }
     }
@@ -898,14 +913,19 @@ pub const GenState = struct {
             },
 
             // Copy
+            // Copy — Go ssa.go:454: getValue64(s, v.Args[0]).
+            // Go uses register allocator to keep float values in F regs and int in R regs.
+            // Cot checks the actual Wasm local types (f64 vs i64) and converts at boundaries.
             .copy => {
                 try self.getValue64(v.args[0]);
-                // If source is float but copy is not, reinterpret f64 bits to i64
-                const src = v.args[0];
-                if (isFloatType(src.type_idx) and !isFloatType(v.type_idx)) {
+                // If source local is f64 but dest local is i64: f64 on stack → need i64
+                const src_local = self.value_to_local.get(v.args[0].id);
+                const dst_local = self.value_to_local.get(v.id);
+                const src_is_f64 = if (src_local) |sl| self.isFloatLocal(sl) else false;
+                const dst_is_f64 = if (dst_local) |dl| self.isFloatLocal(dl) else false;
+                if (src_is_f64 and !dst_is_f64) {
                     _ = try self.builder.append(.i64_reinterpret_f64);
-                }
-                if (!isFloatType(src.type_idx) and isFloatType(v.type_idx)) {
+                } else if (!src_is_f64 and dst_is_f64) {
                     _ = try self.builder.append(.f64_reinterpret_i64);
                 }
             },
@@ -1539,6 +1559,7 @@ pub const GenState = struct {
         }
 
         // Pass 2: Allocate f64 locals (float values - contiguous at end)
+        self.float_local_start = self.next_local;
         var float_count: u32 = 0;
         for (self.func.blocks.items) |block| {
             for (block.values.items) |v| {
