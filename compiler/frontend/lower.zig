@@ -7881,6 +7881,7 @@ pub const Lowerer = struct {
                 const ch_type_idx = self.inferExprType(case.channel);
                 const ch_info = self.type_reg.get(ch_type_idx);
                 var method_name: []const u8 = "tryRecv";
+                var concrete_method_name: []const u8 = "tryRecv";
                 var opt_type: TypeIndex = self.type_reg.makeOptional(TypeRegistry.I64) catch TypeRegistry.I64;
                 var elem_type: TypeIndex = TypeRegistry.I64;
                 // Find struct type name — channel can be struct value or pointer to struct
@@ -7893,9 +7894,10 @@ pub const Lowerer = struct {
                 }
                 if (struct_name.len > 0) {
                     if (self.type_reg.lookupMethod(struct_name, "tryRecv")) |m| {
-                        // Get qualified name (same pattern as lowerMethodCall line 7944-7948)
+                        concrete_method_name = m.func_name;
+                        // VWT base-name sharing: use base name for generic methods
                         method_name = if (self.chk.generics.generic_inst_by_name.contains(m.func_name))
-                            m.func_name
+                            self.computeGenericBaseName(m.func_name) catch m.func_name
                         else
                             try self.resolveMethodName(struct_name, m.func_name, m.source_tree);
                         // Get return type from method signature
@@ -7926,13 +7928,24 @@ pub const Lowerer = struct {
                 var args = [_]ir.NodeIndex{receiver};
                 const is_compound = !self.isPtrLikeOptional(opt_type);
 
-                // SRET for compound optional return (same as lowerMethodCall)
-                const result = if (self.needsSret(opt_type)) blk: {
+                // SRET for compound optional return + metadata args for VWT shared body
+                // Check if this is a generic with indirect result (use concrete name for lookup)
+                const gi_for_select = self.chk.generics.generic_inst_by_name.get(concrete_method_name);
+                const callee_indirect = if (gi_for_select) |gi| gi.has_indirect_result else false;
+                const result = if (self.needsSret(opt_type) or callee_indirect) blk: {
                     const ret_size = self.type_reg.sizeOf(opt_type);
                     const sret_local = try fb.addLocalWithSize("__sret_tryrecv", opt_type, false, ret_size);
                     const sret_addr = try fb.emitAddrLocal(sret_local, TypeRegistry.I64, span);
-                    var sret_args = [_]ir.NodeIndex{ sret_addr, receiver };
-                    _ = try fb.emitCall(method_name, &sret_args, false, TypeRegistry.VOID, span);
+                    // Build args: [sret_addr, receiver, metadata...]
+                    var call_args = std.ArrayListUnmanaged(ir.NodeIndex){};
+                    defer call_args.deinit(self.allocator);
+                    try call_args.append(self.allocator, sret_addr);
+                    try call_args.append(self.allocator, receiver);
+                    // Append metadata args for generic instance
+                    if (self.chk.generics.generic_inst_by_name.get(concrete_method_name)) |gi| {
+                        try self.appendMetadataArgs(fb, gi, &call_args, span);
+                    }
+                    _ = try fb.emitCall(method_name, call_args.items, false, TypeRegistry.VOID, span);
                     break :blk try fb.emitLoadLocal(sret_local, opt_type, span);
                 } else try fb.emitCall(method_name, &args, false, opt_type, span);
 

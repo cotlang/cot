@@ -68,7 +68,7 @@ test "reverse" {
     list.append(3)
     list.append(4)
     list.append(5)
-    reverse(i64)(list)
+    reverse(i64)(&list)
     @assertEq(list.get(0), 5)
     @assertEq(list.get(1), 4)
     @assertEq(list.get(2), 3)
