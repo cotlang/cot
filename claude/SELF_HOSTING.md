@@ -67,7 +67,13 @@ type mismatch: expected i32, found i64
 
 **Progress (2026-03-25):** Fixed silent func_idx=0 fallback, added memcmp/retain/release to Wasm runtime. Zero unresolved function warnings now.
 
-**Current error:** `expected f64 but nothing on stack` at function 643 (`Checker_evalComptimeValue`, 32KB). Two consecutive `local.set` without a value between them — SSA gen emits extra local.set for a value with no stack operand. Pre-existing Wasm codegen bug in complex functions with float operations.
+**MILESTONE (2026-03-25):** selfcot2.wasm VALIDATES and RUNS.
+```
+wasmtime run selfcot2.wasm version → cot 0.3.7 (self-hosted)
+wasmtime run selfcot2.wasm build self/test_tiny.cot → starts compiling, crashes at Map hash
+```
+
+**Current blocker:** Runtime codegen bug — Map string hash receives corrupt string (ptr=0, len=0) during checker's type declaration pass. The Wasm binary runs but produces incorrect data for string operations in some codepaths.
 
 ---
 
