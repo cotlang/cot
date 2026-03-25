@@ -92,41 +92,23 @@ fn scheduleBlock(allocator: std.mem.Allocator, block: *Block, f: *Func) !void {
     }
 
     // Memory ordering: chain stores and calls linearly via last_mem.
-    // Loads get an edge from last_mem but do NOT update it (loads don't chain
-    // to each other). Go reference: schedule.go uses nextMem for store chain,
-    // loads only get edges to the next store.
+    // Memory ordering: linear chain using writesMemory()/readsMemory() flags.
+    // Cot's SSA doesn't thread memory explicitly (unlike Go's), so we use a linear
+    // chain: stores chain to last_mem, loads get edge from last_mem but don't update it.
+    // Uses op info flags instead of hardcoded op names to cover all memory ops.
+    // Reference: Go schedule.go lines 257-278 (adapted for Cot's non-threaded model).
     var last_mem: ?*Value = null;
     for (values) |v| {
-        // IR-level sized ops (load8..load64, store8..store64) exist at schedule time.
-        // Wasm-level ops (wasm_i64_load8_u, etc.) exist after lower_wasm (schedule
-        // runs first, so these are listed for completeness but rarely match here).
-        if (v.op == .store or v.op == .store_reg or
-            v.op == .store8 or v.op == .store16 or v.op == .store32 or v.op == .store64 or
-            v.op == .wasm_i64_store or v.op == .wasm_i64_store8 or
-            v.op == .wasm_i64_store16 or v.op == .wasm_i64_store32)
-        {
+        if (v.op == .phi) continue;
+        if (v.writesMemory()) {
+            // Store/call/barrier: chain from last_mem, update last_mem
             if (last_mem) |lm| try edges.append(allocator, .{ .x = lm, .y = v });
             last_mem = v;
-        } else if (v.op == .load or v.op == .load_reg or
-            v.op == .load8 or v.op == .load16 or v.op == .load32 or v.op == .load64 or
-            v.op == .load8s or v.op == .load16s or v.op == .load32s or
-            v.op == .wasm_i64_load or v.op == .wasm_i64_load8_u or
-            v.op == .wasm_i64_load16_u or v.op == .wasm_i64_load32_u or
-            v.op == .wasm_i64_load8_s or v.op == .wasm_i64_load16_s or
-            v.op == .wasm_i64_load32_s)
-        {
+        } else if (v.readsMemory()) {
+            // Load: edge from last_mem, do NOT update (loads don't chain to each other)
             if (last_mem) |lm| try edges.append(allocator, .{ .x = lm, .y = v });
-        } else if (v.op == .static_call or v.op == .wasm_lowered_static_call or
-            v.op == .call or v.op == .wasm_call or
-            v.op == .closure_call or v.op == .wasm_lowered_closure_call or
-            v.op == .inter_call or v.op == .wasm_lowered_inter_call or
-            v.op == .move or v.op == .wasm_lowered_move or
-            v.op == .zero or v.op == .wasm_lowered_zero)
-        {
-            // Calls are memory barriers: must order after prior stores/loads
-            // and before subsequent loads/stores.
-            // move (memory.copy) and zero (memory.fill) are bulk memory ops
-            // that both read and write — treat as barriers.
+        } else if (v.hasSideEffects()) {
+            // Side effects (calls without explicit memory flags): treat as barriers
             if (last_mem) |lm| try edges.append(allocator, .{ .x = lm, .y = v });
             last_mem = v;
         }
