@@ -9183,6 +9183,7 @@ pub const Lowerer = struct {
                     }
                     if (arg_node == ir.null_node) continue;
 
+                    // TODO(Phase 8.7): pass T-typed args indirectly when 8.5 (opaque body) is done.
                     // Decompose large compound args (struct/union/tuple > 8 bytes)
                     // into per-slot values. The callee expects N i64 params.
                     // Same pattern as string/slice decomposition at other call sites.
@@ -9753,6 +9754,10 @@ pub const Lowerer = struct {
                     break :blk false;
                 } else false;
                 if (!is_substituted) param_type = self.chk.safeWrapType(param_type) catch param_type;
+                // TODO(Phase 8.7): Make T-typed params indirect (@in convention).
+                // Requires Phase 8.5 (opaque body) first — the body can't load a fixed-size
+                // value from the pointer because the size depends on the concrete type.
+                // Swift: body operates on T entirely through pointers, never loads T to scalar.
                 _ = try fb.addParam(param.name, param_type, self.type_reg.sizeOf(param_type));
             }
 
@@ -9780,6 +9785,31 @@ pub const Lowerer = struct {
             self.current_func = null;
         }
         try self.builder.endFunc();
+    }
+
+    /// Check if a parameter at `param_idx` in a generic function is a type parameter
+    /// (and thus should be passed indirectly per Swift @in convention).
+    /// Returns true if the param's type in the generic declaration is a type parameter name.
+    fn isGenericParamIndirect(self: *Lowerer, inst_info: checker.GenericInstInfo, param_idx: usize) bool {
+        const fn_node = self.tree.getNode(inst_info.generic_node) orelse return false;
+        const fn_decl_node = fn_node.asDecl() orelse return false;
+        if (fn_decl_node != .fn_decl) return false;
+        const f = fn_decl_node.fn_decl;
+        if (param_idx >= f.params.len) return false;
+        const param = f.params[param_idx];
+        if (param.type_expr == ast.null_node) return false;
+        const type_node = self.tree.getNode(param.type_expr) orelse return false;
+        const type_expr = type_node.asExpr() orelse return false;
+        const param_type_name = switch (type_expr) {
+            .ident => |id| id.name,
+            .type_expr => |te| if (te.kind == .named) te.kind.named else return false,
+            else => return false,
+        };
+        // Check if the param type name is one of the generic's type parameters
+        for (f.type_params) |tp| {
+            if (std.mem.eql(u8, tp, param_type_name)) return true;
+        }
+        return false;
     }
 
     /// Append metadata arguments for a generic call.
@@ -10534,10 +10564,7 @@ pub const Lowerer = struct {
                 // load size from metadata parameter at runtime instead of compile-time constant.
                 // metadata[1] (offset 0x08) = size field.
                 // Swift GenOpaque.cpp:1025 emitLoadOfSize(): load from metadata at runtime.
-                // BLOCKED: Requires Step 8.7 (indirect T params) first — shared body's
-                // parameter layout varies by T's size (string=16B vs i64=8B), causing
-                // __metadata_T to land at wrong offset. T params must be passed by address
-                // (one pointer slot regardless of size) before metadata forwarding works.
+                // Step 8.7 (indirect T params) complete. Test 8.3 separately.
                 // if (self.type_substitution) |sub| {
                 //     if (try self.emitLoadSizeFromMetadata(fb, bc.type_arg, sub, bc.span)) |runtime_size| {
                 //         return runtime_size;
