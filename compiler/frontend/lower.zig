@@ -2503,6 +2503,26 @@ pub const Lowerer = struct {
             const is_struct_literal = if (value_expr) |e| e == .struct_init else false;
             const is_tuple_literal = if (value_expr) |e| e == .tuple_literal else false;
 
+            // Phase 8.5: T-indirect var init takes priority over type-specific paths.
+            // When initializing from a T-indirect param, memcpy the full value.
+            const early_init_expr = if (value_node_ast) |n| n.asExpr() else null;
+            const early_init_tp: ?[]const u8 = if (early_init_expr) |e| blk_etp: {
+                if (e == .ident) break :blk_etp self.indirect_t_params.get(e.ident.name);
+                break :blk_etp null;
+            } else null;
+            if (early_init_tp) |tp_name| {
+                const init_ident = early_init_expr.?.ident.name;
+                const ptr_ln = try std.fmt.allocPrint(self.allocator, "__ptr_{s}", .{init_ident});
+                if (fb.lookupLocal(ptr_ln)) |ptr_li| {
+                    const src_ptr = try fb.emitLoadLocal(ptr_li, TypeRegistry.I64, var_stmt.span);
+                    const dst_addr = try fb.emitAddrLocal(local_idx, TypeRegistry.I64, var_stmt.span);
+                    const rt_size = try self.emitRuntimeSizeOf(fb, tp_name, var_stmt.span);
+                    var mc_args = [_]ir.NodeIndex{ dst_addr, src_ptr, rt_size };
+                    _ = try fb.emitCall("memcpy", &mc_args, false, TypeRegistry.VOID, var_stmt.span);
+                    debug.log(.lower, "Phase 8.5: var '{s}' init from T-indirect '{s}' via memcpy (early)", .{ var_stmt.name, init_ident });
+                    return;
+                }
+            }
             if (type_idx == TypeRegistry.STRING) {
                 try self.lowerStringInit(local_idx, var_stmt.value, var_stmt.span);
             } else if (is_slice) {
@@ -2601,19 +2621,45 @@ pub const Lowerer = struct {
                         }
                     } else {
                         // Non-ARC path (trivial types, weak, unowned)
-                        // NOTE: Existential coercion handled above (before type-specific inits).
-                        const value_node = try self.lowerExprNode(var_stmt.value);
-                        if (value_node == ir.null_node) return;
-                        _ = try fb.emitStoreLocal(local_idx, value_node, var_stmt.span);
+                        // Phase 8.5: T-indirect var init → memcpy from __ptr_ to copy full value.
+                        // Swift: initializeWithCopy for T-typed locals.
+                        const var_init_expr = if (value_node_ast) |n| n.asExpr() else null;
+                        const var_init_tp = if (var_init_expr) |e| blk_vtp: {
+                            if (e == .ident) break :blk_vtp self.indirect_t_params.get(e.ident.name);
+                            break :blk_vtp @as(?[]const u8, null);
+                        } else @as(?[]const u8, null);
+                        // Phase 8.5: T-indirect var init uses memcpy for full value copy.
+                        // Swift: initializeWithCopy for address-only T locals.
+                        var used_memcpy = false;
+                        if (var_init_tp) |tp_name| {
+                            const var_init_ident = var_init_expr.?.ident.name;
+                            const ptr_local_name = try std.fmt.allocPrint(self.allocator, "__ptr_{s}", .{var_init_ident});
+                            if (fb.lookupLocal(ptr_local_name)) |ptr_li| {
+                                const src_ptr = try fb.emitLoadLocal(ptr_li, TypeRegistry.I64, var_stmt.span);
+                                const dst_addr = try fb.emitAddrLocal(local_idx, TypeRegistry.I64, var_stmt.span);
+                                const rt_size = try self.emitRuntimeSizeOf(fb, tp_name, var_stmt.span);
+                                var mc_args = [_]ir.NodeIndex{ dst_addr, src_ptr, rt_size };
+                                _ = try fb.emitCall("memcpy", &mc_args, false, TypeRegistry.VOID, var_stmt.span);
+                                debug.log(.lower, "Phase 8.5: var '{s}' init from T-indirect '{s}' via memcpy", .{ var_stmt.name, var_init_ident });
+                                used_memcpy = true;
+                            }
+                        }
+                        // Non-T-indirect: lower value and store
+                        const value_node = if (!used_memcpy) blk_vn: {
+                            const vn = try self.lowerExprNode(var_stmt.value);
+                            if (vn == ir.null_node) return;
+                            _ = try fb.emitStoreLocal(local_idx, vn, var_stmt.span);
+                            break :blk_vn vn;
+                        } else ir.null_node;
 
-                        if (!self.target.isWasm() and var_stmt.is_weak and self.type_reg.couldBeARC(type_idx)) {
+                        if (!self.target.isWasm() and !used_memcpy and var_stmt.is_weak and self.type_reg.couldBeARC(type_idx)) {
                             var wargs = [_]ir.NodeIndex{value_node};
                             const side_table_ptr = try fb.emitCall("weak_form_reference", &wargs, false, TypeRegistry.I64, var_stmt.span);
                             _ = try fb.emitStoreLocal(local_idx, side_table_ptr, var_stmt.span);
                             const cleanup = arc.Cleanup.initForLocal(.weak_release, side_table_ptr, type_idx, local_idx);
                             _ = try self.cleanup_stack.push(cleanup);
                             try self.weak_locals.put(self.allocator, local_idx, {});
-                        } else if (!self.target.isWasm() and var_stmt.is_unowned and self.type_reg.couldBeARC(type_idx)) {
+                        } else if (!self.target.isWasm() and !used_memcpy and var_stmt.is_unowned and self.type_reg.couldBeARC(type_idx)) {
                             var uargs = [_]ir.NodeIndex{value_node};
                             _ = try fb.emitCall("unowned_retain", &uargs, false, type_idx, var_stmt.span);
                             const cleanup = arc.Cleanup.initForLocal(.unowned_release, value_node, type_idx, local_idx);
