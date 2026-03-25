@@ -6070,11 +6070,15 @@ pub const Lowerer = struct {
                             const pn = try std.fmt.allocPrint(self.allocator, "__ptr_{s}", .{e.ident.name});
                             if (fb.lookupLocal(pn)) |pi| break :blk_la try fb.emitLoadLocal(pi, TypeRegistry.I64, bin.span);
                         }
+                        // Phase 8.9: For T-typed deref (e.g., self.keyPtr(idx).*), use
+                        // the pointer operand directly as the comparison address.
+                        // Swift GenOpaque.cpp — address-only values are compared via their
+                        // addresses, never decomposed into components.
+                        if (e == .deref) {
+                            break :blk_la try self.lowerExprNode(e.deref.operand);
+                        }
                     }
                     // Store the already-lowered value to temp, take address.
-                    // Use runtime size so multi-word types (string) are fully stored.
-                    const tmp_size = try self.emitRuntimeSizeOf(fb, tp_name, bin.span);
-                    _ = tmp_size; // size is known at alloc time from first instantiation
                     const first_size = if (self.type_substitution) |sub| blk_sz: {
                         if (sub.get(tp_name)) |ti| break :blk_sz self.type_reg.sizeOf(ti);
                         break :blk_sz @as(u32, 8);
