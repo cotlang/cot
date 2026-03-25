@@ -52,17 +52,20 @@ Both the Zig compiler and selfcot compile the same source (`self/main.cot`) to W
 
 ---
 
-## Current Blocker: Duplicate Export Name (Zig Compiler Bug)
+## Current Blocker: Wasm Validation Error (i32/i64 type mismatch)
 
-Both the Zig compiler and selfcot produce Wasm binaries with duplicate export names:
-- `Checker_resolveComptimeFieldAccess` (6 instances in both)
-- `Checker_evalComptimeValueTag` (6 instances in both)
+`wasmtime compile /tmp/selfcot2.wasm` fails at function 130 (`List_ensureUnique`):
+```
+type mismatch: expected i32, found i64
+```
 
-This is caused by the Zig compiler's generic instantiation or comptime evaluation creating multiple functions with the same name. Since selfcot mirrors the Zig compiler 1:1, it reproduces the same bug.
+**Root cause:** WASI import `fd_write` expects `(i32, i32, i32, i32) -> i32` but the Wasm codegen passes i64 values without wrapping to i32. This is in `List_ensureUnique`'s COW copy path which calls `alloc` (which internally uses `fd_write`).
 
-**Fix required in:** `compiler/frontend/lower.zig` — deduplicate or rename generic instantiations that produce the same qualified name.
+**This is a pre-existing Wasm codegen issue** — NOT caused by Phase 8 VWT changes. The i32/i64 mismatch occurs whenever a shared generic body calls runtime functions that use WASI imports.
 
-**Once fixed:** Both Zig and selfcot Wasm outputs will validate, and we can test selfcot2.wasm runtime behavior.
+**Fix required in:** `compiler/codegen/wasm/wasm_gen.zig` — ensure all WASI import call sites wrap i64 values to i32.
+
+**Previous blocker** (duplicate export names) may also still exist but this type mismatch is hit first.
 
 ---
 
@@ -168,10 +171,11 @@ Old inline ARC code deleted (~450 lines). Dict/stenciling infrastructure deleted
 - The arg parsing bug from the previous milestone may still exist
 
 **Critical path:**
-1. Fix duplicate export in Zig compiler → both Wasm outputs validate
-2. Test selfcot2.wasm runtime → fix 5-15 codegen bugs as they surface
-3. `selfcot2.wasm build self/test_tiny.cot` → first bootstrap test
-4. `selfcot2.wasm build self/main.cot -o selfcot3.wasm` → full bootstrap = 0.4
+1. Fix i32/i64 type mismatch in Wasm codegen for WASI imports → selfcot2.wasm validates
+2. Fix duplicate export names if still present → clean validation
+3. Test selfcot2.wasm runtime → fix 5-15 codegen bugs as they surface
+4. `wasmtime run selfcot2.wasm build self/test_tiny.cot` → first bootstrap test
+5. `wasmtime run selfcot2.wasm build self/main.cot -o selfcot3.wasm` → full bootstrap = 0.4
 
 ---
 
