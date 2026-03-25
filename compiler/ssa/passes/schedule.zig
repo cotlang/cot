@@ -97,20 +97,33 @@ fn scheduleBlock(allocator: std.mem.Allocator, block: *Block, f: *Func) !void {
     // chain: stores chain to last_mem, loads get edge from last_mem but don't update it.
     // Uses op info flags instead of hardcoded op names to cover all memory ops.
     // Reference: Go schedule.go lines 257-278 (adapted for Cot's non-threaded model).
-    var last_mem: ?*Value = null;
+    // Memory ordering: chain stores to last store/barrier. Loads from local_addr
+    // only chain to the last CALL/BARRIER (not local stores), since local stores
+    // to different stack slots are independent.
+    // Go reference: schedule.go uses explicit memory threading for precise ordering.
+    // Cot adapts: local loads are independent of local stores to different bases.
+    var last_barrier: ?*Value = null; // calls, moves, zeros — true memory barriers
+    var last_store: ?*Value = null; // stores to memory (may alias)
     for (values) |v| {
         if (v.op == .phi) continue;
-        if (v.writesMemory()) {
-            // Store/call/barrier: chain from last_mem, update last_mem
-            if (last_mem) |lm| try edges.append(allocator, .{ .x = lm, .y = v });
-            last_mem = v;
+        if (v.hasSideEffects() and v.op != .store and v.op != .store8 and
+            v.op != .store16 and v.op != .store32 and v.op != .store64 and
+            v.op != .store_reg)
+        {
+            // Calls and bulk ops are true memory barriers — everything chains through them
+            if (last_barrier) |lb| try edges.append(allocator, .{ .x = lb, .y = v });
+            if (last_store) |ls| try edges.append(allocator, .{ .x = ls, .y = v });
+            last_barrier = v;
+            last_store = null; // barrier subsumes stores
+        } else if (v.writesMemory()) {
+            // Store: chain from last barrier or last store
+            if (last_barrier) |lb| try edges.append(allocator, .{ .x = lb, .y = v });
+            if (last_store) |ls| try edges.append(allocator, .{ .x = ls, .y = v });
+            last_store = v;
         } else if (v.readsMemory()) {
-            // Load: edge from last_mem, do NOT update (loads don't chain to each other)
-            if (last_mem) |lm| try edges.append(allocator, .{ .x = lm, .y = v });
-        } else if (v.hasSideEffects()) {
-            // Side effects (calls without explicit memory flags): treat as barriers
-            if (last_mem) |lm| try edges.append(allocator, .{ .x = lm, .y = v });
-            last_mem = v;
+            // Load: only chain from last barrier (calls), NOT from local stores.
+            // Local stores to different stack slots are independent of loads.
+            if (last_barrier) |lb| try edges.append(allocator, .{ .x = lb, .y = v });
         }
     }
 
@@ -162,7 +175,22 @@ fn scheduleBlock(allocator: std.mem.Allocator, block: *Block, f: *Func) !void {
     }
 
     if (result.items.len != values.len) {
-        debug.log(.schedule, "ERROR: scheduled {d} of {d} values", .{ result.items.len, values.len });
+        debug.log(.schedule, "ERROR in block b{d}: scheduled {d} of {d} values", .{ block.id, result.items.len, values.len });
+        // Print stuck values (in_edges > 0)
+        for (values) |v| {
+            if (in_edges[v.id] > 0) {
+                debug.log(.schedule, "  STUCK v{d} (op={s}, in_edges={d}, args={d})", .{
+                    v.id, @tagName(v.op), in_edges[v.id], v.args.len,
+                });
+                for (v.args, 0..) |arg, ai| {
+                    debug.log(.schedule, "    arg[{d}] = v{d} (op={s}, block=b{d}, in_edges={d})", .{
+                        ai, arg.id, @tagName(arg.op),
+                        if (arg.block) |ab| ab.id else 999,
+                        in_edges[arg.id],
+                    });
+                }
+            }
+        }
         return error.ScheduleIncomplete;
     }
 
