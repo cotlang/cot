@@ -51,6 +51,11 @@ pub const Lowerer = struct {
     spawn_counter: u32 = 0,
     lowered_generics: std.StringHashMap(void),
     type_substitution: ?std.StringHashMap(TypeIndex) = null,
+    /// Swift Phase 8.5: Track T-typed params that are passed indirectly (as pointers)
+    /// in shared generic bodies. Maps param name → type param name (e.g., "value" → "T")
+    /// so we can find the right __metadata_{T} local for runtime size lookups.
+    /// Reference: Swift GenCall.cpp address-only convention.
+    indirect_t_params: std.StringHashMap([]const u8) = std.StringHashMap([]const u8).init(std.heap.page_allocator),
     /// Compilation target — used for @targetOs(), @targetArch(), @target() comptime builtins
     target: target_mod.Target = target_mod.Target.native(),
     /// Async state machine: local index of the state pointer param for the current async poll function.
@@ -492,6 +497,7 @@ pub const Lowerer = struct {
             .bench_names = .{},
             .bench_display_names = .{},
             .lowered_generics = std.StringHashMap(void).init(allocator),
+            .indirect_t_params = std.StringHashMap([]const u8).init(allocator),
             .target = target,
             .global_error_table = std.StringHashMap(i64).init(allocator),
             .async_poll_names = std.StringHashMap([]const u8).init(allocator),
@@ -1813,49 +1819,89 @@ pub const Lowerer = struct {
                 // SRET: write return value to caller-allocated buffer via __sret pointer.
                 // Zig pattern: firstParamSRet() — callee writes, returns void.
                 const sret_size = self.type_reg.sizeOf(sret_type);
-                const num_words = sret_size / 8;
                 const sret_idx = fb.lookupLocal("__sret").?;
                 const sret_ptr = try fb.emitLoadLocal(sret_idx, TypeRegistry.I64, ret.span);
 
-                // Swift ensurePlusOne for SRET: retain ARC fields before copy.
-                // The SRET copy creates aliases of managed pointers in the caller's buffer.
-                // Without retain, the source local's cleanup releases the fields, leaving
-                // the caller with dangling pointers.
-                const ret_expr = if (ret_node) |n| n.asExpr() else null;
-                if (ret_expr != null and ret_expr.? == .ident) {
-                    // Direct local reference → copy fields from local to SRET
-                    if (fb.lookupLocal(ret_expr.?.ident.name)) |src_local| {
-                        // Retain ARC fields before copy (Swift ensurePlusOne)
-                        if (!self.target.isWasm() and self.type_reg.couldBeARC(sret_type)) {
-                            const src_val = try fb.emitLoadLocal(src_local, sret_type, ret.span);
-                            _ = try self.emitCopyValue(fb, src_val, sret_type, ret.span);
-                        }
-                        for (0..num_words) |i| {
-                            const offset: i64 = @intCast(i * 8);
-                            const field = try fb.emitFieldLocal(src_local, @intCast(i), offset, TypeRegistry.I64, ret.span);
-                            _ = try fb.emitStoreField(sret_ptr, @intCast(i), offset, field, ret.span);
-                        }
+                // Phase 8.5: In a shared generic body, the return type may be T (type param).
+                // Use memcpy with runtime size from metadata instead of word-by-word copy.
+                // This handles `return ptr.*` where ptr points to a T-sized value.
+                // Detect: type_substitution active = shared generic body. Find the type
+                // param name that the return type maps to.
+                const sret_tp_name: ?[]const u8 = if (self.type_substitution) |sub| blk_tp: {
+                    // Check if any type param maps to the current sret_type
+                    var sub_it = sub.iterator();
+                    while (sub_it.next()) |entry| {
+                        if (entry.value_ptr.* == sret_type)
+                            break :blk_tp entry.key_ptr.*;
                     }
-                } else {
-                    // Expression result → lower, store to temp, copy temp fields to SRET.
-                    // Swift convention: if the expression is +1 (struct literal, new, call),
-                    // the fields are already retained. Just copy the words — no extra retain.
-                    // If the expression is +0 (ident/field access), retain before copy.
-                    const lowered = try self.lowerExprNode(ret.value);
-                    if (lowered != ir.null_node) {
-                        // Check if expression is +0 (not owned) — needs retain for SRET transfer
-                        const ret_src_node = self.tree.getNode(ret.value);
-                        const ret_src_expr = if (ret_src_node) |n| n.asExpr() else null;
-                        const is_owned_expr = if (ret_src_expr) |e| (e == .struct_init or e == .new_expr or e == .call) else false;
-                        if (!is_owned_expr and !self.target.isWasm() and self.type_reg.couldBeARC(sret_type)) {
-                            _ = try self.emitCopyValue(fb, lowered, sret_type, ret.span);
+                    // Fallback: if indirect_t_params has entries, use the first type param
+                    if (self.indirect_t_params.count() > 0) {
+                        var tp_it = self.indirect_t_params.valueIterator();
+                        if (tp_it.next()) |v| break :blk_tp v.*;
+                    }
+                    break :blk_tp null;
+                } else null;
+                if (sret_tp_name) |tp_name| {
+                        const lowered = try self.lowerExprNode(ret.value);
+                        if (lowered != ir.null_node) {
+                            // The lowered expression may be a ptrLoadValue (deref) or a scalar.
+                            // For deref expressions like `ptr.*`, the expression evaluates to
+                            // the element address. But lowerExprNode on a deref loads the value.
+                            // We need the ADDRESS for memcpy. Check if ret.value is a deref.
+                            const ret_is_deref = blk_deref: {
+                                const rn = self.tree.getNode(ret.value) orelse break :blk_deref false;
+                                const re = rn.asExpr() orelse break :blk_deref false;
+                                break :blk_deref (re == .deref);
+                            };
+                            if (ret_is_deref) {
+                                // `return ptr.*` — get the source address, memcpy to sret
+                                const deref_node = self.tree.getNode(ret.value).?;
+                                const deref_expr = deref_node.asExpr().?;
+                                const src_addr = try self.lowerExprNode(deref_expr.deref.operand);
+                                const runtime_size = try self.emitRuntimeSizeOf(fb, tp_name, ret.span);
+                                var mc_args = [_]ir.NodeIndex{ sret_ptr, src_addr, runtime_size };
+                                _ = try fb.emitCall("memcpy", &mc_args, false, TypeRegistry.VOID, ret.span);
+                                debug.log(.lower, "Phase 8.5: T-indirect SRET return via memcpy (deref)", .{});
+                            } else {
+                                // Scalar return (e.g., `return value` where value is i64)
+                                // Store to sret using fixed-size word copy (scalar ≤ 8 bytes)
+                                _ = try fb.emitStoreField(sret_ptr, 0, 0, lowered, ret.span);
+                                debug.log(.lower, "Phase 8.5: T-indirect SRET return via scalar store", .{});
+                            }
                         }
-                        const tmp_local = try fb.addLocalWithSize("__ret_sret_src", sret_type, false, sret_size);
-                        _ = try fb.emitStoreLocal(tmp_local, lowered, ret.span);
-                        for (0..num_words) |i| {
-                            const offset: i64 = @intCast(i * 8);
-                            const field = try fb.emitFieldLocal(tmp_local, @intCast(i), offset, TypeRegistry.I64, ret.span);
-                            _ = try fb.emitStoreField(sret_ptr, @intCast(i), offset, field, ret.span);
+                } else {
+                    const num_words = sret_size / 8;
+
+                    // Swift ensurePlusOne for SRET: retain ARC fields before copy.
+                    const ret_expr = if (ret_node) |n| n.asExpr() else null;
+                    if (ret_expr != null and ret_expr.? == .ident) {
+                        if (fb.lookupLocal(ret_expr.?.ident.name)) |src_local| {
+                            if (!self.target.isWasm() and self.type_reg.couldBeARC(sret_type)) {
+                                const src_val = try fb.emitLoadLocal(src_local, sret_type, ret.span);
+                                _ = try self.emitCopyValue(fb, src_val, sret_type, ret.span);
+                            }
+                            for (0..num_words) |i| {
+                                const offset: i64 = @intCast(i * 8);
+                                const field = try fb.emitFieldLocal(src_local, @intCast(i), offset, TypeRegistry.I64, ret.span);
+                                _ = try fb.emitStoreField(sret_ptr, @intCast(i), offset, field, ret.span);
+                            }
+                        }
+                    } else {
+                        const lowered2 = try self.lowerExprNode(ret.value);
+                        if (lowered2 != ir.null_node) {
+                            const ret_src_node = self.tree.getNode(ret.value);
+                            const ret_src_expr = if (ret_src_node) |n| n.asExpr() else null;
+                            const is_owned_expr = if (ret_src_expr) |e| (e == .struct_init or e == .new_expr or e == .call) else false;
+                            if (!is_owned_expr and !self.target.isWasm() and self.type_reg.couldBeARC(sret_type)) {
+                                _ = try self.emitCopyValue(fb, lowered2, sret_type, ret.span);
+                            }
+                            const tmp_local = try fb.addLocalWithSize("__ret_sret_src", sret_type, false, sret_size);
+                            _ = try fb.emitStoreLocal(tmp_local, lowered2, ret.span);
+                            for (0..num_words) |i| {
+                                const offset: i64 = @intCast(i * 8);
+                                const field = try fb.emitFieldLocal(tmp_local, @intCast(i), offset, TypeRegistry.I64, ret.span);
+                                _ = try fb.emitStoreField(sret_ptr, @intCast(i), offset, field, ret.span);
+                            }
                         }
                     }
                 }
@@ -3325,23 +3371,47 @@ pub const Lowerer = struct {
                         }
                     }
                 }
-                // Raw pointer store: forward cleanup for ident with scope_destroy.
-                // Swift: UnsafeMutablePointer.pointee = value still transfers ownership.
-                // Without this, the local's auto-deinit fires and corrupts the heap copy.
-                if (!self.target.isWasm()) {
-                    const assign_node = self.tree.getNode(assign.value);
-                    const assign_expr = if (assign_node) |n| n.asExpr() else null;
-                    if (assign_expr) |ae| {
-                        if (ae == .ident) {
-                            if (fb.lookupLocal(ae.ident.name)) |local_idx| {
-                                if (self.cleanup_stack.findCleanupForLocal(local_idx)) |handle| {
-                                    self.cleanup_stack.disable(handle);
+                // Swift Phase 8.5: T-indirect store → memcpy(dest, value_ptr, runtime_size)
+                // When the RHS is a T-indirect param, the scalar shadow has the first 8 bytes
+                // but for stores we need the full value. Load the pointer from __ptr_{name}.
+                const rhs_t_indirect: ?[]const u8 = blk: {
+                    const an = self.tree.getNode(assign.value) orelse break :blk null;
+                    const ae = an.asExpr() orelse break :blk null;
+                    if (ae == .ident) break :blk self.indirect_t_params.get(ae.ident.name);
+                    break :blk null;
+                };
+                if (rhs_t_indirect) |tp_name| {
+                    // Load the pointer from __ptr_{name} and memcpy from it
+                    const ptr_local_name = try std.fmt.allocPrint(self.allocator, "__ptr_{s}", .{blk2: {
+                        const an = self.tree.getNode(assign.value).?;
+                        const ae = an.asExpr().?;
+                        break :blk2 ae.ident.name;
+                    }});
+                    const ptr_local_idx = fb.lookupLocal(ptr_local_name) orelse unreachable;
+                    const src_ptr = try fb.emitLoadLocal(ptr_local_idx, TypeRegistry.I64, assign.span);
+                    const runtime_size = try self.emitRuntimeSizeOf(fb, tp_name, assign.span);
+                    var mc_args = [_]ir.NodeIndex{ ptr_node, src_ptr, runtime_size };
+                    _ = try fb.emitCall("memcpy", &mc_args, false, TypeRegistry.VOID, assign.span);
+                    debug.log(.lower, "Phase 8.5: T-indirect store via memcpy (type param '{s}')", .{tp_name});
+                } else {
+                    // Raw pointer store: forward cleanup for ident with scope_destroy.
+                    // Swift: UnsafeMutablePointer.pointee = value still transfers ownership.
+                    // Without this, the local's auto-deinit fires and corrupts the heap copy.
+                    if (!self.target.isWasm()) {
+                        const assign_node2 = self.tree.getNode(assign.value);
+                        const assign_expr2 = if (assign_node2) |n| n.asExpr() else null;
+                        if (assign_expr2) |ae| {
+                            if (ae == .ident) {
+                                if (fb.lookupLocal(ae.ident.name)) |local_idx| {
+                                    if (self.cleanup_stack.findCleanupForLocal(local_idx)) |handle| {
+                                        self.cleanup_stack.disable(handle);
+                                    }
                                 }
                             }
                         }
                     }
+                    _ = try fb.emitPtrStoreValue(ptr_node, store_value, assign.span);
                 }
-                _ = try fb.emitPtrStoreValue(ptr_node, store_value, assign.span);
             },
             else => {},
         }
@@ -9183,57 +9253,67 @@ pub const Lowerer = struct {
                     }
                     if (arg_node == ir.null_node) continue;
 
-                    // TODO(Phase 8.7): pass T-typed args indirectly when 8.5 (opaque body) is done.
-                    // Decompose large compound args (struct/union/tuple > 8 bytes)
-                    // into per-slot values. The callee expects N i64 params.
-                    // Same pattern as string/slice decomposition at other call sites.
-                    var is_large_compound = false;
-                    var is_opt_ptr_arg = false;
-                    if (cparam_types) |params| {
-                        if (arg_i < params.len) {
-                            const pt = self.type_reg.get(params[arg_i].type_idx);
-                            const ps = self.type_reg.sizeOf(params[arg_i].type_idx);
-                            is_opt_ptr_arg = pt == .optional and blk: {
-                                const ei = self.type_reg.get(pt.optional.elem);
-                                break :blk ei == .pointer and ei.pointer.managed;
-                            };
-                            const is_compound_opt = pt == .optional and !self.isPtrLikeOptional(params[arg_i].type_idx) and !is_opt_ptr_arg;
-                            is_large_compound = !self.target.isWasmGC() and (pt == .struct_type or pt == .union_type or pt == .tuple or is_compound_opt) and ps > 8;
-                        }
-                    }
-                    if (is_opt_ptr_arg) {
-                        // ?*T parameter: pass as (tag, payload).
-                        // The arg may be ?*T (already compound) or *T (needs wrapping).
-                        const arg_type_idx = fb.nodes.items[arg_node].type_idx;
-                        const arg_type_info = self.type_reg.get(arg_type_idx);
-                        if (arg_type_info == .pointer) {
-                            // *T → ?*T wrapping: tag=1, payload=pointer
-                            const tag = try fb.emitConstInt(1, TypeRegistry.I64, call.span);
-                            try gen_args.append(self.allocator, tag);
-                            try gen_args.append(self.allocator, arg_node);
-                        } else {
-                            // Already ?*T: store to temp, extract tag@0 and payload@8
-                            const arg_type = cparam_types.?[arg_i].type_idx;
-                            const opt_size = self.type_reg.sizeOf(arg_type);
-                            const tmp = try fb.addLocalWithSize("__opt_call_tmp", arg_type, false, opt_size);
-                            _ = try fb.emitStoreLocal(tmp, arg_node, call.span);
-                            const tag = try fb.emitFieldLocal(tmp, 0, 0, TypeRegistry.I64, call.span);
-                            const opt_info = self.type_reg.get(arg_type);
-                            const payload = try fb.emitFieldLocal(tmp, 1, 8, opt_info.optional.elem, call.span);
-                            try gen_args.append(self.allocator, tag);
-                            try gen_args.append(self.allocator, payload);
-                        }
-                    } else if (is_large_compound) {
-                        const param_type_idx = cparam_types.?[arg_i].type_idx;
-                        const param_size = self.type_reg.sizeOf(param_type_idx);
-                        const num_slots: u32 = @intCast((param_size + 7) / 8);
-                        for (0..num_slots) |slot| {
-                            const offset: i64 = @intCast(slot * 8);
-                            const field = try fb.emitFieldValue(arg_node, @intCast(slot), offset, TypeRegistry.I64, call.span);
-                            try gen_args.append(self.allocator, field);
-                        }
+                    // Swift Phase 8.7: T-typed args are passed indirectly (as pointer).
+                    // Store value to temp local, pass address. This ensures uniform
+                    // param layout regardless of T's concrete size.
+                    // Reference: Swift GenCall.cpp address-only convention.
+                    const is_t_indirect = self.isGenericParamIndirect(inst_info, arg_i);
+                    if (is_t_indirect) {
+                        // Store arg to temp local, pass address
+                        const arg_type_idx = if (cparam_types) |params| (if (arg_i < params.len) params[arg_i].type_idx else fb.nodes.items[arg_node].type_idx) else fb.nodes.items[arg_node].type_idx;
+                        const arg_size = self.type_reg.sizeOf(arg_type_idx);
+                        const tmp_name = try std.fmt.allocPrint(self.allocator, "__t_indirect_{d}", .{arg_i});
+                        const tmp = try fb.addLocalWithSize(tmp_name, arg_type_idx, false, arg_size);
+                        _ = try fb.emitStoreLocal(tmp, arg_node, call.span);
+                        const addr = try fb.emitAddrLocal(tmp, TypeRegistry.I64, call.span);
+                        try gen_args.append(self.allocator, addr);
+                        debug.log(.lower, "Phase 8.7: free-fn call arg {d} passed indirectly (size={d})", .{ arg_i, arg_size });
                     } else {
-                        try gen_args.append(self.allocator, arg_node);
+                        // Non-T args: decompose large compound args as before
+                        var is_large_compound = false;
+                        var is_opt_ptr_arg = false;
+                        if (cparam_types) |params| {
+                            if (arg_i < params.len) {
+                                const pt = self.type_reg.get(params[arg_i].type_idx);
+                                const ps = self.type_reg.sizeOf(params[arg_i].type_idx);
+                                is_opt_ptr_arg = pt == .optional and blk: {
+                                    const ei = self.type_reg.get(pt.optional.elem);
+                                    break :blk ei == .pointer and ei.pointer.managed;
+                                };
+                                const is_compound_opt = pt == .optional and !self.isPtrLikeOptional(params[arg_i].type_idx) and !is_opt_ptr_arg;
+                                is_large_compound = !self.target.isWasmGC() and (pt == .struct_type or pt == .union_type or pt == .tuple or is_compound_opt) and ps > 8;
+                            }
+                        }
+                        if (is_opt_ptr_arg) {
+                            const arg_type_idx2 = fb.nodes.items[arg_node].type_idx;
+                            const arg_type_info = self.type_reg.get(arg_type_idx2);
+                            if (arg_type_info == .pointer) {
+                                const tag = try fb.emitConstInt(1, TypeRegistry.I64, call.span);
+                                try gen_args.append(self.allocator, tag);
+                                try gen_args.append(self.allocator, arg_node);
+                            } else {
+                                const arg_type = cparam_types.?[arg_i].type_idx;
+                                const opt_size = self.type_reg.sizeOf(arg_type);
+                                const tmp = try fb.addLocalWithSize("__opt_call_tmp", arg_type, false, opt_size);
+                                _ = try fb.emitStoreLocal(tmp, arg_node, call.span);
+                                const tag = try fb.emitFieldLocal(tmp, 0, 0, TypeRegistry.I64, call.span);
+                                const opt_info = self.type_reg.get(arg_type);
+                                const payload = try fb.emitFieldLocal(tmp, 1, 8, opt_info.optional.elem, call.span);
+                                try gen_args.append(self.allocator, tag);
+                                try gen_args.append(self.allocator, payload);
+                            }
+                        } else if (is_large_compound) {
+                            const param_type_idx = cparam_types.?[arg_i].type_idx;
+                            const param_size = self.type_reg.sizeOf(param_type_idx);
+                            const num_slots: u32 = @intCast((param_size + 7) / 8);
+                            for (0..num_slots) |slot| {
+                                const offset: i64 = @intCast(slot * 8);
+                                const field = try fb.emitFieldValue(arg_node, @intCast(slot), offset, TypeRegistry.I64, call.span);
+                                try gen_args.append(self.allocator, field);
+                            }
+                        } else {
+                            try gen_args.append(self.allocator, arg_node);
+                        }
                     }
                 }
                 const ret_type = if (concrete_info == .func) concrete_info.func.return_type else TypeRegistry.VOID;
@@ -9700,7 +9780,10 @@ pub const Lowerer = struct {
 
         // Lower the function body with type substitution active
         self.type_substitution = sub_map;
-        defer self.type_substitution = null;
+        defer {
+            self.type_substitution = null;
+            self.indirect_t_params.clearRetainingCapacity();
+        }
 
         const return_type = self.resolveTypeNode(f.return_type);
 
@@ -9736,29 +9819,44 @@ pub const Lowerer = struct {
                 }
             }
 
-            // Regular params
+            // Regular params — Swift Phase 8.5+8.7: T-typed params are address-only.
+            // Pass as indirect pointer (i64, 8 bytes) regardless of T's concrete size.
+            // This ensures uniform param layout across all instantiations sharing this body.
+            // Reference: Swift GenCall.cpp:747-764 address-only convention.
+            self.indirect_t_params.clearRetainingCapacity();
             for (f.params) |param| {
                 var param_type = self.resolveTypeNode(param.type_expr);
-                const is_substituted = if (self.type_substitution) |sub| blk: {
+                // Detect T-typed params: check if param's type name is a type parameter.
+                // Also capture the type param name for metadata lookup.
+                const type_param_name: ?[]const u8 = if (self.type_substitution) |sub| blk: {
                     if (param.type_expr != ast.null_node) {
                         if (self.tree.getNode(param.type_expr)) |node| {
                             if (node.asExpr()) |expr_node| {
                                 if (expr_node == .ident) {
-                                    break :blk sub.contains(expr_node.ident.name);
+                                    if (sub.contains(expr_node.ident.name))
+                                        break :blk expr_node.ident.name;
                                 } else if (expr_node == .type_expr and expr_node.type_expr.kind == .named) {
-                                    break :blk sub.contains(expr_node.type_expr.kind.named);
+                                    if (sub.contains(expr_node.type_expr.kind.named))
+                                        break :blk expr_node.type_expr.kind.named;
                                 }
                             }
                         }
                     }
-                    break :blk false;
-                } else false;
-                if (!is_substituted) param_type = self.chk.safeWrapType(param_type) catch param_type;
-                // TODO(Phase 8.7): Make T-typed params indirect (@in convention).
-                // Requires Phase 8.5 (opaque body) first — the body can't load a fixed-size
-                // value from the pointer because the size depends on the concrete type.
-                // Swift: body operates on T entirely through pointers, never loads T to scalar.
-                _ = try fb.addParam(param.name, param_type, self.type_reg.sizeOf(param_type));
+                    break :blk null;
+                } else null;
+                if (type_param_name) |tp_name| {
+                    // Swift @in convention: T-typed param is always an indirect pointer (8 bytes).
+                    // Param is named __ptr_{name}; after all params, we load the i64 scalar
+                    // value from the pointer into a shadow local named {name} so the body
+                    // can use it for arithmetic/comparison. Stores/returns use the pointer.
+                    const ptr_name = try std.fmt.allocPrint(self.allocator, "__ptr_{s}", .{param.name});
+                    _ = try fb.addParam(ptr_name, TypeRegistry.I64, 8);
+                    try self.indirect_t_params.put(param.name, tp_name);
+                    debug.log(.lower, "Phase 8.7: param '{s}' → '__ptr_{s}' (T-indirect, type param '{s}')", .{ param.name, param.name, tp_name });
+                } else {
+                    param_type = self.chk.safeWrapType(param_type) catch param_type;
+                    _ = try fb.addParam(param.name, param_type, self.type_reg.sizeOf(param_type));
+                }
             }
 
             // Swift convention: metadata params AFTER user params.
@@ -9767,6 +9865,22 @@ pub const Lowerer = struct {
             for (param_names) |pn| {
                 const meta_name = try std.fmt.allocPrint(self.allocator, "__metadata_{s}", .{pn});
                 _ = try fb.addParam(meta_name, TypeRegistry.I64, 8);
+            }
+
+            // Phase 8.5: Create scalar shadow locals for T-indirect params.
+            // Load the first 8 bytes from each T-indirect pointer so the body can
+            // use the value for arithmetic/comparison. Stores/returns use the pointer.
+            for (f.params) |param| {
+                if (self.indirect_t_params.contains(param.name)) {
+                    const ptr_name = try std.fmt.allocPrint(self.allocator, "__ptr_{s}", .{param.name});
+                    if (fb.lookupLocal(ptr_name)) |ptr_local| {
+                        const ptr_val = try fb.emitLoadLocal(ptr_local, TypeRegistry.I64, f.span);
+                        const scalar_val = try fb.emitPtrLoadValue(ptr_val, TypeRegistry.I64, f.span);
+                        const scalar_local = try fb.addLocalWithSize(param.name, TypeRegistry.I64, false, 8);
+                        _ = try fb.emitStoreLocal(scalar_local, scalar_val, f.span);
+                        debug.log(.lower, "Phase 8.5: created scalar shadow '{s}' from '__ptr_{s}'", .{ param.name, param.name });
+                    }
+                }
             }
 
             if (f.body != null_node) {
@@ -9805,8 +9919,13 @@ pub const Lowerer = struct {
             .type_expr => |te| if (te.kind == .named) te.kind.named else return false,
             else => return false,
         };
-        // Check if the param type name is one of the generic's type parameters
+        // Check function's own type params first (free generic functions)
         for (f.type_params) |tp| {
+            if (std.mem.eql(u8, tp, param_type_name)) return true;
+        }
+        // Check inst_info.type_param_names (struct/impl-level type params)
+        // For methods inside `impl List(T)`, type params are on the struct, not the fn.
+        for (inst_info.type_param_names) |tp| {
             if (std.mem.eql(u8, tp, param_type_name)) return true;
         }
         return false;
@@ -9883,6 +10002,24 @@ pub const Lowerer = struct {
         const size_addr = try fb.emitBinary(.add, meta_val, size_offset, TypeRegistry.I64, span);
         const runtime_size = try fb.emitPtrLoadValue(size_addr, TypeRegistry.I64, span);
         debug.log(.lower, "emitLoadSizeFromMetadata: T='{s}' → runtime load from metadata[1]", .{param_name});
+        return runtime_size;
+    }
+
+    /// Load runtime size of T from __metadata_{type_param_name} local.
+    /// Used in shared generic bodies for T-indirect operations (memcpy, etc.).
+    /// Swift ref: GenOpaque.cpp emitLoadOfSize().
+    /// Cot TypeMetadata layout: [0]=vwt_ptr, [8]=size, [16]=stride, [24]=kind.
+    fn emitRuntimeSizeOf(self: *Lowerer, fb: *ir.FuncBuilder, type_param_name: []const u8, span: Span) !ir.NodeIndex {
+        const meta_local_name = try std.fmt.allocPrint(self.allocator, "__metadata_{s}", .{type_param_name});
+        const meta_local_idx = fb.lookupLocal(meta_local_name) orelse {
+            debug.log(.lower, "emitRuntimeSizeOf: no __metadata_{s} local, falling back to 8", .{type_param_name});
+            return try fb.emitConstInt(8, TypeRegistry.I64, span);
+        };
+        const meta_val = try fb.emitLoadLocal(meta_local_idx, TypeRegistry.I64, span);
+        const size_offset = try fb.emitConstInt(8, TypeRegistry.I64, span);
+        const size_addr = try fb.emitBinary(.add, meta_val, size_offset, TypeRegistry.I64, span);
+        const runtime_size = try fb.emitPtrLoadValue(size_addr, TypeRegistry.I64, span);
+        debug.log(.lower, "emitRuntimeSizeOf: T='{s}' → load from metadata[1]", .{type_param_name});
         return runtime_size;
     }
 
@@ -10230,9 +10367,32 @@ pub const Lowerer = struct {
                 }
             }
 
-            // Go pattern: decompose compound types (slice/string) into (ptr, len)
-            // at call sites. Reference: Go's OSPTR()/OLEN() in walk/builtin.go
-            if (param_is_compound) {
+            // Swift Phase 8.7: T-typed args passed indirectly for generic method calls.
+            // Check if this arg corresponds to a T-typed param in the generic definition.
+            const method_gi = self.chk.generics.generic_inst_by_name.get(method_info.func_name);
+            const is_method_t_indirect = if (method_gi) |gi| blk: {
+                // Save/restore tree for isGenericParamIndirect (needs generic's tree)
+                const st = self.tree;
+                self.tree = gi.tree;
+                defer self.tree = st;
+                break :blk self.isGenericParamIndirect(gi, arg_i);
+            } else false;
+
+            if (is_method_t_indirect) {
+                // Store arg to temp local, pass address (uniform 8-byte slot)
+                const arg_type_idx_m = if (param_types) |params| blk: {
+                    const pidx = arg_i + receiver_offset;
+                    break :blk if (pidx < params.len) params[pidx].type_idx else fb.nodes.items[arg_node].type_idx;
+                } else fb.nodes.items[arg_node].type_idx;
+                const arg_size_m = self.type_reg.sizeOf(arg_type_idx_m);
+                const tmp_name_m = try std.fmt.allocPrint(self.allocator, "__t_indirect_{d}", .{arg_i});
+                const tmp_m = try fb.addLocalWithSize(tmp_name_m, arg_type_idx_m, false, arg_size_m);
+                _ = try fb.emitStoreLocal(tmp_m, arg_node, call.span);
+                const addr_m = try fb.emitAddrLocal(tmp_m, TypeRegistry.I64, call.span);
+                try args.append(self.allocator, addr_m);
+                debug.log(.lower, "Phase 8.7: method call arg {d} passed indirectly (size={d})", .{ arg_i, arg_size_m });
+            } else if (param_is_compound) {
+                // Go pattern: decompose compound types (slice/string) into (ptr, len)
                 const ptr_val = try fb.emitSlicePtr(arg_node, TypeRegistry.I64, call.span);
                 const len_val = try fb.emitSliceLen(arg_node, call.span);
                 try args.append(self.allocator, ptr_val);
@@ -10255,8 +10415,8 @@ pub const Lowerer = struct {
                     }
                 }
                 if (is_opt_ptr_arg3) {
-                    const arg_type_idx = fb.nodes.items[arg_node].type_idx;
-                    const ati = self.type_reg.get(arg_type_idx);
+                    const arg_type_idx3 = fb.nodes.items[arg_node].type_idx;
+                    const ati = self.type_reg.get(arg_type_idx3);
                     if (ati == .pointer) {
                         const tag = try fb.emitConstInt(1, TypeRegistry.I64, call.span);
                         try args.append(self.allocator, tag);
@@ -10563,13 +10723,13 @@ pub const Lowerer = struct {
                 // Swift GenOpaque.cpp:1025 emitLoadOfSize(): in generic bodies,
                 // load size from metadata parameter at runtime instead of compile-time constant.
                 // metadata[1] (offset 0x08) = size field.
-                // Swift GenOpaque.cpp:1025 emitLoadOfSize(): load from metadata at runtime.
-                // Step 8.7 (indirect T params) complete. Test 8.3 separately.
-                // if (self.type_substitution) |sub| {
-                //     if (try self.emitLoadSizeFromMetadata(fb, bc.type_arg, sub, bc.span)) |runtime_size| {
-                //         return runtime_size;
-                //     }
-                // }
+                // Swift Phase 8.3: @sizeOf(T) in shared generic body → runtime load from metadata.
+                // GenOpaque.cpp:1025 emitLoadOfSize(): load from metadata at runtime.
+                if (self.type_substitution) |sub| {
+                    if (try self.emitLoadSizeFromMetadata(fb, bc.type_arg, sub, bc.span)) |runtime_size| {
+                        return runtime_size;
+                    }
+                }
                 return try fb.emitConstInt(@intCast(self.type_reg.sizeOf(type_idx)), TypeRegistry.I64, bc.span);
             },
             .enum_len => {
@@ -11262,6 +11422,17 @@ pub const Lowerer = struct {
                 const arg = try self.lowerExprNode(bc.args[0]);
                 // Wasm: no ARC runtime (bump allocator, no reference counting)
                 if (self.target.isWasm()) return arg;
+                // Phase 8.5: T-indirect param in shared generic body — noop.
+                // The store path uses memcpy which handles the raw copy.
+                // VWT-based retain dispatch will be added later.
+                if (self.indirect_t_params.count() > 0) {
+                    const arc_node = self.tree.getNode(bc.args[0]);
+                    const arc_expr = if (arc_node) |n| n.asExpr() else null;
+                    if (arc_expr) |ae| {
+                        if (ae == .ident and self.indirect_t_params.contains(ae.ident.name))
+                            return arg;
+                    }
+                }
                 const arg_type = self.inferExprType(bc.args[0]);
                 const arg_info = self.type_reg.get(arg_type);
                 // @arcRetain semantics: retain ARC-managed resources.
@@ -11288,6 +11459,15 @@ pub const Lowerer = struct {
             .arc_release => {
                 // Wasm: no ARC runtime (bump allocator, no reference counting)
                 if (self.target.isWasm()) return ir.null_node;
+                // Phase 8.5: T-indirect param in shared generic body — noop.
+                if (self.indirect_t_params.count() > 0) {
+                    const rel_node2 = self.tree.getNode(bc.args[0]);
+                    const rel_expr2 = if (rel_node2) |n| n.asExpr() else null;
+                    if (rel_expr2) |ae| {
+                        if (ae == .ident and self.indirect_t_params.contains(ae.ident.name))
+                            return ir.null_node;
+                    }
+                }
                 const arg = try self.lowerExprNode(bc.args[0]);
                 const arg_type = self.inferExprType(bc.args[0]);
                 const rel_info = self.type_reg.get(arg_type);
