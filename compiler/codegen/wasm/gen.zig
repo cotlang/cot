@@ -721,6 +721,17 @@ pub const GenState = struct {
                 _ = try self.builder.append(.f64_ge);
             },
 
+            // Float↔Int reinterpret — Go: these are register moves between R and F classes.
+            // Cot: explicit conversion between i64 and f64 on the Wasm stack.
+            .wasm_f64_reinterpret_i64 => {
+                try self.getValue64(v.args[0]); // pushes i64
+                _ = try self.builder.append(.f64_reinterpret_i64); // converts to f64
+            },
+            .wasm_i64_reinterpret_f64 => {
+                try self.getValue64(v.args[0]); // pushes f64 (from f64 local)
+                _ = try self.builder.append(.i64_reinterpret_f64); // converts to i64
+            },
+
             // Memory operations
             .wasm_i64_load => {
                 try self.getValue64(v.args[0]);
@@ -949,12 +960,10 @@ pub const GenState = struct {
 
             // Function calls
             .wasm_call => {
-                // Push arguments onto stack
+                // Push arguments onto stack.
+                // Float args stay as f64 (function signatures use native f64 for float params).
                 for (v.args) |arg| {
                     try self.getValue64(arg);
-                    if (isFloatType(arg.type_idx)) {
-                        _ = try self.builder.append(.i64_reinterpret_f64);
-                    }
                 }
                 // Emit call with function index from aux_int
                 // Pipeline debug: flag unresolved function calls (index 0 = fd_write = likely bug)
@@ -993,12 +1002,10 @@ pub const GenState = struct {
             },
 
             .wasm_lowered_static_call => {
-                // Push arguments onto stack
+                // Push arguments onto stack.
+                // Float args stay as f64 (function signatures use native f64 for float params).
                 for (v.args) |arg| {
                     try self.getValue64(arg);
-                    if (isFloatType(arg.type_idx)) {
-                        _ = try self.builder.append(.i64_reinterpret_f64);
-                    }
                 }
                 // Get function index from name
                 const fn_name: ?[]const u8 = switch (v.aux) {
@@ -1445,6 +1452,14 @@ pub const GenState = struct {
 
         // Generate value and store to local
         try self.ssaGenValueOnStack(v);
+
+        // Pipeline debug: log every setReg to catch double-set
+        if (self.value_to_local.get(v.id)) |li| {
+            debug.log(.codegen, "  ssaGenValue: v{d} op={s} type={d} → local.set {d} (float_local={s})", .{
+                v.id, @tagName(v.op), v.type_idx, li,
+                if (self.isFloatLocal(li)) "yes" else "no",
+            });
+        }
 
         // wasm_return_call is a terminator (opcode 0x12) — it doesn't leave
         // a value on the Wasm stack. Skip setReg to avoid popping from empty stack.
