@@ -3428,7 +3428,9 @@ pub const Lowerer = struct {
                     break :blk null;
                 };
                 if (rhs_t_indirect) |tp_name| {
-                    // Load the pointer from __ptr_{name} and memcpy from it
+                    // Swift VWT: T-indirect store via initializeWithCopy.
+                    // Copies bytes AND retains inner ARC refs. For trivial types (VWT=0),
+                    // falls back to memcpy. Reference: Swift GenOpaque.cpp.
                     const ptr_local_name = try std.fmt.allocPrint(self.allocator, "__ptr_{s}", .{blk2: {
                         const an = self.tree.getNode(assign.value).?;
                         const ae = an.asExpr().?;
@@ -3437,9 +3439,43 @@ pub const Lowerer = struct {
                     const ptr_local_idx = fb.lookupLocal(ptr_local_name) orelse unreachable;
                     const src_ptr = try fb.emitLoadLocal(ptr_local_idx, TypeRegistry.I64, assign.span);
                     const runtime_size = try self.emitRuntimeSizeOf(fb, tp_name, assign.span);
-                    var mc_args = [_]ir.NodeIndex{ ptr_node, src_ptr, runtime_size };
-                    _ = try fb.emitCall("memcpy", &mc_args, false, TypeRegistry.VOID, assign.span);
-                    debug.log(.lower, "Phase 8.5: T-indirect store via memcpy (type param '{s}')", .{tp_name});
+                    // On native with VWT: dispatch through initializeWithCopy for ARC correctness.
+                    // On wasm: plain memcpy (no ARC).
+                    const meta_local_name = try std.fmt.allocPrint(self.allocator, "__metadata_{s}", .{tp_name});
+                    const use_vwt = !self.target.isWasm() and fb.lookupLocal(meta_local_name) != null;
+                    if (use_vwt) {
+                        // Load metadata → VWT → initializeWithCopy fn ptr
+                        const meta_idx = fb.lookupLocal(meta_local_name).?;
+                        const meta_val = try fb.emitLoadLocal(meta_idx, TypeRegistry.I64, assign.span);
+                        const vwt_ptr = try fb.emitPtrLoadValue(meta_val, TypeRegistry.I64, assign.span);
+                        const zero_c = try fb.emitConstInt(0, TypeRegistry.I64, assign.span);
+                        const vwt_null = try fb.emitBinary(.eq, vwt_ptr, zero_c, TypeRegistry.BOOL, assign.span);
+                        const trivial_blk = try fb.newBlock("tstore.trivial");
+                        const vwt_blk = try fb.newBlock("tstore.vwt");
+                        const done_blk = try fb.newBlock("tstore.done");
+                        _ = try fb.emitBranch(vwt_null, trivial_blk, vwt_blk, assign.span);
+                        // VWT path: load initializeWithCopy at VWT[2] (offset 16)
+                        fb.setBlock(vwt_blk);
+                        const off_16 = try fb.emitConstInt(16, TypeRegistry.I64, assign.span);
+                        const iwc_addr = try fb.emitBinary(.add, vwt_ptr, off_16, TypeRegistry.I64, assign.span);
+                        const iwc_fn = try fb.emitPtrLoadValue(iwc_addr, TypeRegistry.I64, assign.span);
+                        // call_indirect initializeWithCopy(dest, src, metadata) → dest
+                        const meta_for_call = try fb.emitLoadLocal(meta_idx, TypeRegistry.I64, assign.span);
+                        var vwt_args = [_]ir.NodeIndex{ ptr_node, src_ptr, meta_for_call };
+                        _ = try fb.emitCallIndirect(iwc_fn, &vwt_args, TypeRegistry.I64, assign.span);
+                        _ = try fb.emitJump(done_blk, assign.span);
+                        // Trivial path: plain memcpy
+                        fb.setBlock(trivial_blk);
+                        var mc_args = [_]ir.NodeIndex{ ptr_node, src_ptr, runtime_size };
+                        _ = try fb.emitCall("memcpy", &mc_args, false, TypeRegistry.VOID, assign.span);
+                        _ = try fb.emitJump(done_blk, assign.span);
+                        fb.setBlock(done_blk);
+                        debug.log(.lower, "Phase 8.5: T-indirect store via VWT initializeWithCopy (type param '{s}')", .{tp_name});
+                    } else {
+                        var mc_args = [_]ir.NodeIndex{ ptr_node, src_ptr, runtime_size };
+                        _ = try fb.emitCall("memcpy", &mc_args, false, TypeRegistry.VOID, assign.span);
+                        debug.log(.lower, "Phase 8.5: T-indirect store via memcpy (type param '{s}')", .{tp_name});
+                    }
                 } else {
                     // Raw pointer store: forward cleanup for ident with scope_destroy.
                     // Swift: UnsafeMutablePointer.pointee = value still transfers ownership.
