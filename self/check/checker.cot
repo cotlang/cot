@@ -5212,6 +5212,29 @@ struct Checker {
         return false
     }
 
+    /// Get the type param name if a type expression is a substituted type parameter.
+    /// Returns "" if not substituted. Used by Phase 8.5 T-indirect param detection.
+    fn getSubstitutedTypeParamName(ptype_n: int) string {
+        if (!self.hasTypeSubstitution() or ptype_n == null_node) { return "" }
+        const ptype_tag = nodeTag(self.ast, ptype_n)
+        if (ptype_tag == "ident") {
+            var ptype_name = ""
+            switch (self.ast.getNode(ptype_n)) { Node.expr |pe2| => switch (pe2) { Expr.ident |pid| => { ptype_name = pid.name }, else => {} }, else => {} }
+            if (self.lookupTypeSub(ptype_name) >= 0) { return ptype_name }
+        }
+        if (ptype_tag == "type_expr") {
+            var te_kind = 0
+            var te_d1 = null_node
+            switch (self.ast.getNode(ptype_n)) { Node.expr |pe3| => switch (pe3) { Expr.type_expr |te| => { te_kind = te.kind; te_d1 = te.data1 }, else => {} }, else => {} }
+            if (te_kind == TYPE_NAMED and te_d1 != null_node and nodeTag(self.ast, te_d1) == "ident") {
+                var inner_name = ""
+                switch (self.ast.getNode(te_d1)) { Node.expr |pe4| => switch (pe4) { Expr.ident |iid| => { inner_name = iid.name }, else => {} }, else => {} }
+                if (self.lookupTypeSub(inner_name) >= 0) { return inner_name }
+            }
+        }
+        return ""
+    }
+
     // ---- Const evaluation ----
 
     /// Evaluate a constant expression. Split into sub-functions to avoid

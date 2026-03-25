@@ -104,6 +104,9 @@ struct Lowerer {
     bench_names: List(string),
     bench_display_names: List(string),
     lowered_generics: Map(string, int),
+    // Swift Phase 8.5: Track T-typed params passed indirectly in shared generic bodies.
+    // Maps param name → type param name (e.g., "value" → "T").
+    indirect_t_params: Map(string, string),
     global_error_table: Map(string, int),
     weak_locals: Map(int, int),
     comptime_value_vars: Map(string, ComptimeValue),
@@ -7799,7 +7802,10 @@ struct Lowerer {
                 }
             }
 
-            // Zig line 9419-9438: regular params
+            // Zig line 9419-9438: regular params — Phase 8.5+8.7 T-indirect.
+            // T-typed params become __ptr_{name} (I64 pointer, 8 bytes).
+            // Scalar shadow created after all params are added.
+            self.indirect_t_params = .{}
             for pi in 0..fn_d.params.len() {
                 const param_idx = fn_d.params.get(pi)
                 var pname = ""
@@ -7809,15 +7815,42 @@ struct Lowerer {
                     else => {},
                 }, else => {} }
                 var param_type = self.resolveTypeNode(ptype_expr)
-                const is_substituted = self.chk.isSubstitutedTypeParam(ptype_expr)
-                if (!is_substituted) { param_type = self.chk.safeWrapType(param_type) }
-                fb.addParam(pname, param_type, self.types.sizeOf(param_type))
+                const type_param_name = self.chk.getSubstitutedTypeParamName(ptype_expr)
+                if (@lenOf(type_param_name) > 0) {
+                    // Swift @in convention: T-typed param as indirect pointer (8 bytes)
+                    const ptr_name = "__ptr_" ++ pname
+                    fb.addParam(ptr_name, I64, 8)
+                    self.indirect_t_params.set(pname, type_param_name)
+                } else {
+                    param_type = self.chk.safeWrapType(param_type)
+                    fb.addParam(pname, param_type, self.types.sizeOf(param_type))
+                }
             }
 
             // Zig line 9440-9446: metadata params AFTER user params
             for mi in 0..param_names.len() {
                 const meta_name = "__metadata_" ++ param_names.get(mi)
                 fb.addParam(meta_name, I64, 8)
+            }
+
+            // Phase 8.5: Create scalar shadow locals for T-indirect params.
+            for si in 0..fn_d.params.len() {
+                const si_param_idx = fn_d.params.get(si)
+                var si_pname = ""
+                switch (self.tree.getNode(si_param_idx)) { Node.expr |sie| => switch (sie) {
+                    Expr.field_def |sfd| => { si_pname = sfd.name },
+                    else => {},
+                }, else => {} }
+                if (self.indirect_t_params.has(si_pname) != 0) {
+                    const shadow_ptr_name = "__ptr_" + si_pname
+                    const shadow_ptr_idx = fb.lookupLocal(shadow_ptr_name)
+                    if (shadow_ptr_idx >= 0) {
+                        const shadow_ptr = fb.emitLoadLocal(@intCast(i64, shadow_ptr_idx), I64, fn_d.span)
+                        const shadow_scalar = fb.emitPtrLoadValue(shadow_ptr, I64, fn_d.span)
+                        const shadow_local = fb.addLocalWithSize(si_pname, I64, false, 8)
+                        fb.emitStoreLocal(shadow_local, shadow_scalar, fn_d.span)
+                    }
+                }
             }
 
             // Zig line 9448-9460: lower body
@@ -7846,6 +7879,7 @@ struct Lowerer {
         self.chk.expr_types = saved_expr_types
         self.chk.ast = saved_chk_ast
         self.tree = saved_tree
+        self.indirect_t_params = .{}
     }
 
     /// Parse an integer from a substring of s[start..end].
@@ -7860,7 +7894,6 @@ struct Lowerer {
         return result
     }
 
-    // ========================================================================
     // AST query helpers
     // ========================================================================
 
