@@ -3808,6 +3808,10 @@ pub const Lowerer = struct {
         const elem_type: TypeIndex = switch (base_type) {
             .array => |a| a.elem,
             .slice => |s| s.elem,
+            .pointer => |p| blk: {
+                const pointee = self.type_reg.get(p.elem);
+                break :blk if (pointee == .array) pointee.array.elem else return;
+            },
             else => return,
         };
         const elem_size = self.type_reg.sizeOf(elem_type);
@@ -3850,6 +3854,13 @@ pub const Lowerer = struct {
                 }
                 if (local.is_param and self.type_reg.isArray(local.type_idx)) {
                     const ptr_val = try fb.emitLoadLocal(local_idx, local.type_idx, span);
+                    _ = try fb.emitStoreIndexValue(ptr_val, index_node, value_node, elem_size, span);
+                    return;
+                }
+                // *[N]T pointer-to-array: load pointer, store at indexed offset
+                const local_info = self.type_reg.get(local.type_idx);
+                if (local_info == .pointer and self.type_reg.get(local_info.pointer.elem) == .array) {
+                    const ptr_val = try fb.emitLoadLocal(local_idx, TypeRegistry.I64, span);
                     _ = try fb.emitStoreIndexValue(ptr_val, index_node, value_node, elem_size, span);
                     return;
                 }
