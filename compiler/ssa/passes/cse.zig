@@ -54,18 +54,21 @@ pub fn cse(f: *Func) !void {
 
     if (rewrites == 0) return;
 
-    // Apply rewrites
+    // Apply rewrites — use setArg to maintain use counts.
+    // Go reference: CSE records rewrites, then copyelim applies them via SetArg.
     for (f.blocks.items) |b| {
         for (b.values.items) |v| {
             for (v.args, 0..) |a, i| {
                 if (rewrite[a.id]) |replacement| {
-                    v.args[i] = replacement;
+                    v.setArg(i, replacement); // decrements old uses, increments replacement uses
                 }
             }
         }
         for (b.controls, 0..) |mc, i| {
             if (mc) |c| {
                 if (rewrite[c.id]) |replacement| {
+                    c.uses -= 1;
+                    replacement.uses += 1;
                     b.controls[i] = replacement;
                 }
             }

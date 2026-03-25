@@ -98,6 +98,9 @@ fn rewriteConstString(
 
     debug.log(.codegen, "  v{d}: const_string -> string_make(ptr={d}, len={d})", .{ v.id, offset, str_len });
 
+    // Check: does this const_string already have args (from a previous rewrite)?
+    debug.log(.codegen, "    v{d} BEFORE rewrite: op={s} args.len={d}", .{ v.id, @tagName(v.op), v.args.len });
+
     // Create ptr constant: const_64 with data section offset
     // Go: v0 := b.NewValue0(v.Pos, OpAddr, typ.BytePtr)
     const ptr_val = try f.newValue(.const_64, TypeRegistry.I64, block, v.pos);
@@ -113,9 +116,11 @@ fn rewriteConstString(
     // Transform const_string to string_make
     // Go: v.reset(OpStringMake)
     v.op = .string_make;
-    v.aux_int = 0; // Clear the string index
+    v.aux_int = 0;
     v.resetArgs();
     v.addArg2(ptr_val, len_val);
+
+    debug.log(.codegen, "    v{d} AFTER rewrite: args=[v{d}, v{d}] ptr_uses={d} len_uses={d}", .{ v.id, ptr_val.id, len_val.id, ptr_val.uses, len_val.uses });
 
     return true;
 }
