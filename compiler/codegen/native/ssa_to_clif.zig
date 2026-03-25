@@ -1587,13 +1587,15 @@ const SsaToClifTranslator = struct {
             else => "unknown",
         };
 
-        // Gather call arguments — skip the memory arg (last arg in memory chain).
+        // Gather call arguments — skip the memory arg (always last position).
         // Go: calls take (args..., mem) but codegen only emits the real args.
-        const mem_arg = v.memoryArg();
+        // IMPORTANT: skip by POSITION (last arg), not by value identity,
+        // because a call's result can be both data arg and memory state.
+        const has_mem = v.memoryArg() != null;
+        const data_args = if (has_mem and v.args.len > 0) v.args[0 .. v.args.len - 1] else v.args;
         var call_args = std.ArrayListUnmanaged(clif.Value){};
         defer call_args.deinit(self.allocator);
-        for (v.args) |arg| {
-            if (mem_arg != null and arg == mem_arg.?) continue;
+        for (data_args) |arg| {
             const clif_arg = self.getClif(arg);
             try call_args.append(self.allocator, clif_arg);
         }
@@ -1652,12 +1654,13 @@ const SsaToClifTranslator = struct {
             break :blk 2;
         } else 1;
 
-        const indirect_mem = v.memoryArg();
+        // Skip last arg (memory state) by position, not value identity
+        const indirect_has_mem = v.memoryArg() != null;
+        const indirect_end = if (indirect_has_mem and v.args.len > 0) v.args.len - 1 else v.args.len;
         var call_args = std.ArrayListUnmanaged(clif.Value){};
         defer call_args.deinit(self.allocator);
-        if (actual_args_start < v.args.len) {
-            for (v.args[actual_args_start..]) |arg| {
-                if (indirect_mem != null and arg == indirect_mem.?) continue;
+        if (actual_args_start < indirect_end) {
+            for (v.args[actual_args_start..indirect_end]) |arg| {
                 const clif_arg = self.getClif(arg);
                 try call_args.append(self.allocator, clif_arg);
             }

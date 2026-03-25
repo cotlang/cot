@@ -960,11 +960,9 @@ pub const GenState = struct {
 
             // Function calls
             .wasm_call => {
-                // Push arguments onto stack (skip memory arg).
-                // Float args stay as f64 (function signatures use native f64 for float params).
-                const wc_mem = v.memoryArg();
-                for (v.args) |arg| {
-                    if (wc_mem != null and arg == wc_mem.?) continue;
+                // Push arguments onto stack (skip last arg = memory state).
+                const wc_end = if (v.memoryArg() != null and v.args.len > 0) v.args.len - 1 else v.args.len;
+                for (v.args[0..wc_end]) |arg| {
                     try self.getValue64(arg);
                 }
                 // Emit call with function index from aux_int
@@ -981,10 +979,9 @@ pub const GenState = struct {
             // Same as wasm_call/wasm_lowered_static_call but emits return_call
             // The call implicitly returns, so no separate return is needed.
             .wasm_return_call => {
-                // Push arguments onto stack (skip memory arg)
-                const rc_mem = v.memoryArg();
-                for (v.args) |arg| {
-                    if (rc_mem != null and arg == rc_mem.?) continue;
+                // Push arguments onto stack (skip last arg = memory state)
+                const rc_end = if (v.memoryArg() != null and v.args.len > 0) v.args.len - 1 else v.args.len;
+                for (v.args[0..rc_end]) |arg| {
                     try self.getValue64(arg);
                 }
                 // Get function index from name (same as wasm_lowered_static_call)
@@ -1006,11 +1003,9 @@ pub const GenState = struct {
             },
 
             .wasm_lowered_static_call => {
-                // Push arguments onto stack (skip memory arg — Go memory threading).
-                // Float args stay as f64 (function signatures use native f64 for float params).
-                const sc_mem = v.memoryArg();
-                for (v.args) |arg| {
-                    if (sc_mem != null and arg == sc_mem.?) continue;
+                // Push arguments onto stack (skip last arg = memory state).
+                const sc_end = if (v.memoryArg() != null and v.args.len > 0) v.args.len - 1 else v.args.len;
+                for (v.args[0..sc_end]) |arg| {
                     try self.getValue64(arg);
                 }
                 // Get function index from name
@@ -1046,10 +1041,9 @@ pub const GenState = struct {
                     const p = try self.builder.append(.global_set);
                     p.to = prog_mod.constAddr(1); // CTXT = global 1
                 }
-                // Push function arguments (args[2..], skip memory arg)
-                const cc_mem = v.memoryArg();
-                for (args[2..]) |arg| {
-                    if (cc_mem != null and arg == cc_mem.?) continue;
+                // Push function arguments (args[2..end], skip last = memory state)
+                const cc_end = if (v.memoryArg() != null and args.len > 0) args.len - 1 else args.len;
+                for (args[2..cc_end]) |arg| {
                     try self.getValue64(arg);
                 }
                 // Push callee table index (args[0]) — must be i32 for call_indirect
@@ -1067,10 +1061,9 @@ pub const GenState = struct {
             // Args[0] = callee (table index), Args[1..] = function arguments
             .wasm_lowered_inter_call => {
                 const args = v.args;
-                // Push function arguments (skip arg[0]=callee and memory arg)
-                const ic_mem = v.memoryArg();
-                for (args[1..]) |arg| {
-                    if (ic_mem != null and arg == ic_mem.?) continue;
+                // Push function arguments (skip arg[0]=callee, skip last = memory state)
+                const ic_end = if (v.memoryArg() != null and args.len > 0) args.len - 1 else args.len;
+                for (args[1..ic_end]) |arg| {
                     try self.getValue64(arg);
                 }
                 // Push callee (table index) — must be i32 for call_indirect
