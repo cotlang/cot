@@ -691,27 +691,61 @@ pass (like Swift's `GenericSpecializer.cpp`), not required for correctness.
 
 ---
 
+#### Swift Audit Findings (2026-03-25)
+
+**Swift GenArchetype.cpp, ResilientTypeInfo.h, SILFunctionType.cpp audit:**
+
+In unspecialized generic bodies, T is **ALWAYS address-only** (`ResilientTypeInfo`,
+never `LoadableTypeInfo`). The body **NEVER** loads T to registers. ALL operations
+go through VWT witness function calls. This is non-negotiable — it's hardcoded in
+Swift's TypeInfo class hierarchy.
+
+| Operation | Swift implementation | Cot equivalent |
+|-----------|---------------------|----------------|
+| Param `value: T` | @in indirect (pointer) | `__indirect_value: *T` param |
+| Use `value` in body | Address-only, never scalar | Keep as pointer, deref through VWT |
+| `a + b` on T | PWT witness call | `call_indirect(pwt[add_idx], &a, &b)` |
+| `ptr.* = value` | VWT `assignWithCopy(dest, src, meta)` | VWT call, not fixed-width store |
+| `return value` | SRET + memcpy(sret, &value, meta.size) | Already have SRET for generic returns |
+| `@sizeOf(T)` | `emitLoadOfSize(meta)` → VWT indirection | `load(metadata + 8)` |
+| `var x: T` | Dynamic alloca(metadata.size) | Runtime-sized local allocation |
+
+**Key constraint:** The shared body's parameter layout must be IDENTICAL across all
+instantiations. This is why T params MUST be indirect (one pointer slot) — different
+T sizes (i64=8B, string=16B) use different numbers of value slots, causing metadata
+params to land at wrong offsets. Indirect params fix this.
+
+**Root cause of 8.3 regression (discovered during implementation):**
+`List(string).append(value: string)` compiles to 4 param slots (self + str_ptr +
+str_len + metadata). `List(i64).append(value: i64)` uses 3 slots (self + value +
+metadata). The shared body was compiled for string (4 slots), so when called with
+i64 (3 slots), `__metadata_T` was at slot 3 instead of slot 2 → read garbage.
+
 #### Implementation Order
 
-| Step | Depends on | Scope | Files |
-|------|-----------|-------|-------|
-| 8.1 Call sites pass metadata | — | Small | lower.zig (4 sites) |
-| 8.2 Trivial type metadata | — | Small | driver.zig, vwt_gen.zig |
-| 8.3 @sizeOf from metadata | 8.1, 8.2 | Medium | lower.zig (lowerBuiltinSizeOf) |
-| 8.4 Dynamic stack alloc | 8.3 | Medium | ir.zig, ssa_builder.zig, wasm_gen.zig, ssa_to_clif.zig |
-| 8.5 Opaque load/store | 8.3, 8.4 | Large | lower.zig (all ptr deref on T) |
-| 8.6 Opaque return | 8.5 | Small | lower.zig (return path) — mostly done |
-| 8.7 Indirect T params | 8.5 | Medium | lower.zig, checker.zig (calling convention) |
-| 8.8 PWT arithmetic | 8.7 | Large | lower.zig, checker.zig (trait bounds for ops) |
-| 8.9 VWT copy/destroy | 8.3 | Small | lower.zig — mostly done |
-| 8.10 Base-name sharing | ALL above | Trivial | lower.zig (remove gating, already structured) |
+| Step | Depends on | Scope | Files | Status |
+|------|-----------|-------|-------|--------|
+| 8.1 Call sites pass metadata | — | Small | lower.zig (4 sites) | **DONE** |
+| 8.2 Trivial type metadata | — | Small | driver.zig, vwt_gen.zig | **DONE** |
+| 8.5+8.7 Opaque T body + indirect params | 8.1, 8.2 | **LARGE** | lower.zig | **NEXT** |
+| 8.3 @sizeOf from metadata | 8.5+8.7 | Small | lower.zig | Ready (blocked) |
+| 8.4 Dynamic stack alloc | 8.3 | Medium | ir.zig, ssa_builder, codegen | Pending |
+| 8.6 Opaque return (SRET memcpy) | 8.5 | Small | lower.zig | Mostly done |
+| 8.8 PWT arithmetic | 8.5+8.7 | Large | lower.zig, checker.zig | Pending |
+| 8.9 VWT copy/destroy | 8.3 | Small | lower.zig | Mostly done |
+| 8.10 Base-name sharing | ALL above | Trivial | lower.zig | Already structured |
+| 9 Self-hosted port | ALL 8.x | Large | self/**/*.cot | Pending |
 
-**Critical path:** 8.1 → 8.2 → 8.3 → 8.5 → 8.10. Steps 8.4, 8.6, 8.7 are incremental.
-Step 8.8 (PWT arithmetic) is the largest and can be deferred — it only affects generic
-functions that do arithmetic on T directly (like `generic_add`), not stdlib container types
-like List/Map which only use `@sizeOf(T)` and pointer arithmetic.
+**Corrected critical path:** 8.1 → 8.2 → **8.5+8.7** → 8.3 → 8.10.
 
-**Estimated scope:** ~600 lines Zig compiler, ~300 lines selfcot port.
+Steps 8.5+8.7 are the **blocker** — the body must treat T as fully opaque (address-only).
+This is inseparable: indirect params (8.7) requires the body to not load T to scalars
+(8.5), and opaque body (8.5) requires params to be pointers (8.7).
+
+Step 8.8 (PWT arithmetic) can be deferred — stdlib containers (List, Map) only use
+`@sizeOf(T)` and pointer arithmetic on T, never `a + b` on T values directly.
+
+**Estimated scope:** ~800 lines Zig compiler, ~400 lines selfcot port.
 
 ---
 
