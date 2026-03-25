@@ -1025,14 +1025,56 @@ struct Lowerer {
 
             // Check SRET for non-EU compound returns
             if (sret_type != VOID) {
+                if (fb.lookupLocal("__sret")) |sret_local| {
+                    const sret_ptr = fb.emitLoadLocal(sret_local, I64, ret.span)
 
-                // Non-EU SRET: copy to __sret buffer
-                const val = self.lowerExprNode(ret.value)
-                if (val != null_node) {
-                    // Copy to caller's __sret buffer
-                    if (fb.lookupLocal("__sret")) |sret_local| {
-                        const sret_ptr = fb.emitLoadLocal(sret_local, I64, ret.span)
-                        fb.emitPtrStoreValue(sret_ptr, val, ret.span)
+                    // Phase 8.5: T-typed SRET return → memcpy with runtime size.
+                    // Check if return type came from a type parameter.
+                    var sret_tp_name = ""
+                    if (self.chk.hasTypeSubstitution()) {
+                        // Find type param that maps to sret_type
+                        for ki in 0..self.chk.type_sub_keys.len() {
+                            if (self.chk.type_sub_vals.get(ki) == sret_type) {
+                                sret_tp_name = self.chk.type_sub_keys.get(ki)
+                            }
+                        }
+                        // No fallback needed — type_sub_keys check above covers all cases
+                    }
+                    if (@lenOf(sret_tp_name) > 0) {
+                        // T-typed return: runtime memcpy
+                        const rt_size = self.emitRuntimeSizeOf(sret_tp_name, ret.span)
+                        // Check if return expression is a deref (ptr.*)
+                        var ret_is_deref = false
+                        switch (self.tree.getNode(ret.value)) { Node.expr |re| => switch (re) {
+                            Expr.deref |_| => { ret_is_deref = true },
+                            else => {},
+                        }, else => {} }
+                        if (ret_is_deref) {
+                            // Get source address from deref operand
+                            var deref_operand = null_node
+                            switch (self.tree.getNode(ret.value)) { Node.expr |re| => switch (re) {
+                                Expr.deref |dr| => { deref_operand = dr.operand },
+                                else => {},
+                            }, else => {} }
+                            const src_addr = self.lowerExprNode(deref_operand)
+                            var mc: List(int) = .{}
+                            mc.append(sret_ptr)
+                            mc.append(src_addr)
+                            mc.append(rt_size)
+                            fb.emitCall("memcpy", mc, false, VOID, ret.span)
+                        } else {
+                            // Scalar return
+                            const val = self.lowerExprNode(ret.value)
+                            if (val != null_node) {
+                                fb.emitPtrStoreValue(sret_ptr, val, ret.span)
+                            }
+                        }
+                    } else {
+                        // Non-T SRET: direct store
+                        const val = self.lowerExprNode(ret.value)
+                        if (val != null_node) {
+                            fb.emitPtrStoreValue(sret_ptr, val, ret.span)
+                        }
                     }
                 }
                 self.emitCleanups(0)
@@ -1201,9 +1243,26 @@ struct Lowerer {
                 Expr.deref |dr| => {
                     const ptr_val = self.lowerExprNode(dr.operand)
                     const val = self.lowerExprNode(a.value)
-                    if (ptr_val != null_node and val != null_node) {
-                        fb.emitPtrStoreValue(ptr_val, val, a.span)
+                    if (ptr_val == null_node or val == null_node) { return }
+                    // Phase 8.5: T-indirect store → memcpy with runtime size
+                    if (self.extractIdentName(a.value)) |rhs_name| {
+                        if (self.indirect_t_params.has(rhs_name) != 0) {
+                            const tp_name = self.indirect_t_params.get(rhs_name)
+                            const ptr_local_name = "__ptr_" + rhs_name
+                            const ptr_li = fb.lookupLocal(ptr_local_name)
+                            if (ptr_li >= 0) {
+                                const src = fb.emitLoadLocal(@intCast(i64, ptr_li), I64, a.span)
+                                const rt_size = self.emitRuntimeSizeOf(tp_name, a.span)
+                                var mc_args: List(int) = .{}
+                                mc_args.append(ptr_val)
+                                mc_args.append(src)
+                                mc_args.append(rt_size)
+                                fb.emitCall("memcpy", mc_args, false, VOID, a.span)
+                                return
+                            }
+                        }
                     }
+                    fb.emitPtrStoreValue(ptr_val, val, a.span)
                     return
                 },
                 else => {},
@@ -4468,6 +4527,20 @@ struct Lowerer {
         // Const emit builtins
         if (kind == BuiltinKind.size_of) {
             const type_arg = self.resolveTypeNode(bc.type_arg)
+            // Phase 8.3: @sizeOf(T) in shared generic body → runtime load from metadata
+            if (self.chk.hasTypeSubstitution()) {
+                const tp_name = self.chk.getSubstitutedTypeParamName(bc.type_arg)
+                if (@lenOf(tp_name) > 0) {
+                    const meta_name = "__metadata_" + tp_name
+                    const meta_local = fb.lookupLocal(meta_name)
+                    if (meta_local >= 0) {
+                        const meta_val = fb.emitLoadLocal(@intCast(i64, meta_local), I64, bc.span)
+                        const size_off = fb.emitConstInt(8, I64, bc.span)
+                        const size_addr = fb.emitBinary(BinaryOp.add, meta_val, size_off, I64, bc.span)
+                        return fb.emitPtrLoadValue(size_addr, I64, bc.span)
+                    }
+                }
+            }
             const size = self.types.sizeOf(type_arg)
             return fb.emitConstInt(size, I64, bc.span)
         }
@@ -8015,6 +8088,19 @@ struct Lowerer {
             if (last_seg == param_type_name) { return true }
         }
         return false
+    }
+
+    /// Load runtime size of T from __metadata_{type_param_name}[1].
+    /// Port of Zig emitRuntimeSizeOf. Returns size as IR node.
+    fn emitRuntimeSizeOf(tp_name: string, span: Span) int {
+        const fb = self.builder.func() orelse return null_node
+        const meta_name = "__metadata_" + tp_name
+        const meta_local = fb.lookupLocal(meta_name)
+        if (meta_local < 0) { return fb.emitConstInt(8, I64, span) }
+        const meta_val = fb.emitLoadLocal(@intCast(i64, meta_local), I64, span)
+        const off8 = fb.emitConstInt(8, I64, span)
+        const size_addr = fb.emitBinary(BinaryOp.add, meta_val, off8, I64, span)
+        return fb.emitPtrLoadValue(size_addr, I64, span)
     }
 
     // AST query helpers
