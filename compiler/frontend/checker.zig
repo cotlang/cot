@@ -179,7 +179,7 @@ pub const GenericImplInfo = struct {
     scope: ?*Scope = null, // defining file's scope (for cross-file generic resolution)
 };
 
-/// Parse type arguments from a monomorphized Map name like "Map(5;5)" → [K, V] TypeIndex values.
+/// Parse type arguments from a generic Map name like "Map(5;5)" → [K, V] TypeIndex values.
 /// Returns null if the name cannot be parsed.
 pub fn parseMapTypeArgs(name: []const u8) ?[2]TypeIndex {
     // Format: "Map(K;V)" where K and V are decimal TypeIndex integers
@@ -213,7 +213,7 @@ pub const Checker = struct {
     in_labeled_block: u32 = 0,
     labeled_block_result_type: TypeIndex = invalid_type,
     in_async_fn: bool = false,
-    // Generics support (Zig-style lazy monomorphization + Go checker flow)
+    // Generics support (Zig-style lazy generic instantiation + Go checker flow)
     // Shared across all checkers in multi-file mode (owned by driver)
     generics: *SharedGenericContext,
     // Per-checker: keyed by call-site NodeIndex (file-specific)
@@ -3246,7 +3246,7 @@ pub const Checker = struct {
                 .recv => {
                     // Type-check the channel expression
                     const ch_type = try self.checkExpr(case.channel);
-                    // Validate it's a pointer to a Channel struct (Channel(T) is monomorphized)
+                    // Validate it's a pointer to a Channel struct (Channel(T) is generic)
                     const ch_info = self.types.get(ch_type);
                     var elem_type: TypeIndex = TypeRegistry.I64; // fallback
                     if (ch_info == .pointer) {
@@ -3258,7 +3258,7 @@ pub const Checker = struct {
                                 self.err.errorWithCode(case.span.start, .e300, "select recv case requires a Channel type");
                             }
                             // Try to extract element type from tryRecv method return type
-                            // (monomorphized Channel(T) has tryRecv returning ?T)
+                            // (generic Channel(T) has tryRecv returning ?T)
                             _ = &elem_type;
                         }
                     }
@@ -3676,7 +3676,7 @@ pub const Checker = struct {
                     // Check if struct is a Map generic instance (name starts with "Map(")
                     // Go range.go:241-270: desugars `for k, v := range m` to mapIterStart/mapIterNext
                     if (std.mem.startsWith(u8, st.name, "Map(")) {
-                        // Parse type args from monomorphized name: "Map(K;V)" where K,V are TypeIndex ints
+                        // Parse type args from generic name: "Map(K;V)" where K,V are TypeIndex ints
                         if (parseMapTypeArgs(st.name)) |args| {
                             idx_type = args[0]; // K
                             elem_type = args[1]; // V
@@ -3960,7 +3960,7 @@ pub const Checker = struct {
 
     /// Instantiate all methods from generic impl blocks for a concrete struct type.
     /// Called from resolveGenericInstance after creating concrete struct "List(5)".
-    /// Go 1.18 pattern: methods on Stack[T] are monomorphized per concrete type.
+    /// Go 1.18 pattern: methods on Stack[T] are generic per concrete type.
     ///
     /// Two-pass approach (matches non-generic impl flow: collectDecl then checkDecl):
     ///   Pass 1: Register all method signatures in scope + method registry

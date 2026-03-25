@@ -4234,7 +4234,7 @@ pub const Lowerer = struct {
         const iter_info = self.type_reg.get(iter_type);
 
         // Map iteration has different structure — dispatch to dedicated handler
-        // After monomorphization, Map(K,V) is a struct_type with name "Map(...)".
+        // After generic instantiation, Map(K,V) is a struct_type with name "Map(...)".
         // Look up generic inst info to get K and V type args.
         if (iter_info == .map) {
             try self.lowerForMap(for_stmt, iter_type, iter_info.map);
@@ -4482,41 +4482,66 @@ pub const Lowerer = struct {
         if (iter_expr != .ident) return;
         const map_local = fb.lookupLocal(iter_expr.ident.name) orelse return;
 
-        // Read map fields into locals BEFORE the loop (same pattern as lowerFor for arrays/slices).
-        // We use emitFieldLocal to read from the struct, then store into simple i64 locals.
+        // Map(K,V) is a COW struct with a single field: buf: i64 (pointer to ARC buffer).
+        // Buffer layout: [count:8][capacity:8][states: cap*8][keys: cap*key_size][values: cap*val_size]
+        // Reference: stdlib/map.cot MAP_COUNT_OFFSET=0, MAP_CAP_OFFSET=8, MAP_STATES_OFFSET=16
+
+        // Loop index
         const idx_name = try std.fmt.allocPrint(self.allocator, "__map_idx_{d}", .{self.temp_counter});
         self.temp_counter += 1;
         const idx_local = try fb.addLocalWithSize(idx_name, TypeRegistry.I64, true, 8);
         const zero = try fb.emitConstInt(0, TypeRegistry.I64, for_stmt.span);
         _ = try fb.emitStoreLocal(idx_local, zero, for_stmt.span);
 
-        // Use m.count for total entries (optimization: early exit when found_count reaches count)
-        // But loop 0..capacity is correct for hash table iteration, checking states.
-        // Read capacity from the struct into a simple local
+        // Load buf pointer from Map struct (field 0, offset 0)
+        const buf_val = try fb.emitFieldLocal(map_local, 0, 0, TypeRegistry.I64, for_stmt.span);
+
+        // If buf == 0 (empty map), capacity = 0 → loop never executes.
+        // Read capacity from buf + 8, but only if buf != 0.
         const cap_name = try std.fmt.allocPrint(self.allocator, "__map_cap_{d}", .{self.temp_counter});
         self.temp_counter += 1;
-        const cap_local = try fb.addLocalWithSize(cap_name, TypeRegistry.I64, false, 8);
-        const cap_field = try fb.emitFieldLocal(map_local, 4, 32, TypeRegistry.I64, for_stmt.span);
+        const cap_local = try fb.addLocalWithSize(cap_name, TypeRegistry.I64, true, 8);
+        _ = try fb.emitStoreLocal(cap_local, zero, for_stmt.span); // default: 0
+        const buf_is_null = try fb.emitBinary(.eq, buf_val, zero, TypeRegistry.BOOL, for_stmt.span);
+        const buf_ok_block = try fb.newBlock("map.buf_ok");
+        const buf_loaded_block = try fb.newBlock("map.buf_loaded");
+        _ = try fb.emitBranch(buf_is_null, buf_loaded_block, buf_ok_block, for_stmt.span);
+        fb.setBlock(buf_ok_block);
+        const eight = try fb.emitConstInt(8, TypeRegistry.I64, for_stmt.span);
+        const cap_addr = try fb.emitBinary(.add, buf_val, eight, TypeRegistry.I64, for_stmt.span);
+        const cap_field = try fb.emitPtrLoadValue(cap_addr, TypeRegistry.I64, for_stmt.span);
         _ = try fb.emitStoreLocal(cap_local, cap_field, for_stmt.span);
 
-        // Read keys/values/states pointers into locals
-        const keys_name = try std.fmt.allocPrint(self.allocator, "__map_keys_{d}", .{self.temp_counter});
-        self.temp_counter += 1;
-        const keys_local = try fb.addLocalWithSize(keys_name, TypeRegistry.I64, false, 8);
-        const keys_field = try fb.emitFieldLocal(map_local, 0, 0, TypeRegistry.I64, for_stmt.span);
-        _ = try fb.emitStoreLocal(keys_local, keys_field, for_stmt.span);
-
-        const vals_name = try std.fmt.allocPrint(self.allocator, "__map_vals_{d}", .{self.temp_counter});
-        self.temp_counter += 1;
-        const vals_local = try fb.addLocalWithSize(vals_name, TypeRegistry.I64, false, 8);
-        const vals_field = try fb.emitFieldLocal(map_local, 1, 8, TypeRegistry.I64, for_stmt.span);
-        _ = try fb.emitStoreLocal(vals_local, vals_field, for_stmt.span);
-
+        // Declare locals outside branch (accessible in loop body)
         const states_name = try std.fmt.allocPrint(self.allocator, "__map_states_{d}", .{self.temp_counter});
         self.temp_counter += 1;
-        const states_local = try fb.addLocalWithSize(states_name, TypeRegistry.I64, false, 8);
-        const states_field = try fb.emitFieldLocal(map_local, 2, 16, TypeRegistry.I64, for_stmt.span);
-        _ = try fb.emitStoreLocal(states_local, states_field, for_stmt.span);
+        const states_local = try fb.addLocalWithSize(states_name, TypeRegistry.I64, true, 8);
+        const keys_name = try std.fmt.allocPrint(self.allocator, "__map_keys_{d}", .{self.temp_counter});
+        self.temp_counter += 1;
+        const keys_local = try fb.addLocalWithSize(keys_name, TypeRegistry.I64, true, 8);
+        const vals_name = try std.fmt.allocPrint(self.allocator, "__map_vals_{d}", .{self.temp_counter});
+        self.temp_counter += 1;
+        const vals_local = try fb.addLocalWithSize(vals_name, TypeRegistry.I64, true, 8);
+
+        // States base: buf + 16
+        const sixteen = try fb.emitConstInt(16, TypeRegistry.I64, for_stmt.span);
+        const states_base = try fb.emitBinary(.add, buf_val, sixteen, TypeRegistry.I64, for_stmt.span);
+        _ = try fb.emitStoreLocal(states_local, states_base, for_stmt.span);
+
+        // Keys base: buf + 16 + capacity * 8
+        const cap_for_keys = try fb.emitLoadLocal(cap_local, TypeRegistry.I64, for_stmt.span);
+        const states_size = try fb.emitBinary(.mul, cap_for_keys, eight, TypeRegistry.I64, for_stmt.span);
+        const keys_base = try fb.emitBinary(.add, states_base, states_size, TypeRegistry.I64, for_stmt.span);
+        _ = try fb.emitStoreLocal(keys_local, keys_base, for_stmt.span);
+
+        // Values base: keys_base + capacity * key_size
+        const key_size_val = try fb.emitConstInt(@intCast(key_size), TypeRegistry.I64, for_stmt.span);
+        const keys_total = try fb.emitBinary(.mul, cap_for_keys, key_size_val, TypeRegistry.I64, for_stmt.span);
+        const vals_base = try fb.emitBinary(.add, keys_base, keys_total, TypeRegistry.I64, for_stmt.span);
+        _ = try fb.emitStoreLocal(vals_local, vals_base, for_stmt.span);
+
+        _ = try fb.emitJump(buf_loaded_block, for_stmt.span);
+        fb.setBlock(buf_loaded_block);
 
         // Create loop blocks — same structure as lowerForRange
         const cond_block = try fb.newBlock("map.cond");
@@ -4546,8 +4571,8 @@ pub const Lowerer = struct {
         const cur_idx = try fb.emitLoadLocal(idx_local, TypeRegistry.I64, for_stmt.span);
 
         // Read state at current index: *(states + idx * 8)
-        const states_base = try fb.emitLoadLocal(states_local, TypeRegistry.I64, for_stmt.span);
-        const state_val = try fb.emitIndexValue(states_base, cur_idx, 8, TypeRegistry.I64, for_stmt.span);
+        const states_base2 = try fb.emitLoadLocal(states_local, TypeRegistry.I64, for_stmt.span);
+        const state_val = try fb.emitIndexValue(states_base2, cur_idx, 8, TypeRegistry.I64, for_stmt.span);
         const one = try fb.emitConstInt(1, TypeRegistry.I64, for_stmt.span);
         const is_occupied = try fb.emitBinary(.eq, state_val, one, TypeRegistry.BOOL, for_stmt.span);
 
@@ -4560,12 +4585,12 @@ pub const Lowerer = struct {
         const idx_load = try fb.emitLoadLocal(idx_local, TypeRegistry.I64, for_stmt.span);
 
         // Load key from keys[idx]
-        const keys_base = try fb.emitLoadLocal(keys_local, TypeRegistry.I64, for_stmt.span);
-        const key_val = try fb.emitIndexValue(keys_base, idx_load, @intCast(key_size), key_type, for_stmt.span);
+        const keys_base2 = try fb.emitLoadLocal(keys_local, TypeRegistry.I64, for_stmt.span);
+        const key_val = try fb.emitIndexValue(keys_base2, idx_load, @intCast(key_size), key_type, for_stmt.span);
 
         // Load value from values[idx]
-        const vals_base = try fb.emitLoadLocal(vals_local, TypeRegistry.I64, for_stmt.span);
-        const val_val = try fb.emitIndexValue(vals_base, idx_load, @intCast(val_size), val_type, for_stmt.span);
+        const vals_base2 = try fb.emitLoadLocal(vals_local, TypeRegistry.I64, for_stmt.span);
+        const val_val = try fb.emitIndexValue(vals_base2, idx_load, @intCast(val_size), val_type, for_stmt.span);
 
         // Bind value (binding = second name = value)
         const val_local = try fb.addLocalWithSize(for_stmt.binding, val_type, false, val_size);
@@ -4978,10 +5003,10 @@ pub const Lowerer = struct {
         // COW ensures mutations copy the buffer if shared, so elements
         // are safe — no per-element retain needed on copy.
         // Swift ref: _ContiguousArrayBuffer copy = swift_retain(storage).
-        // Also handles monomorphized generic List(T)/Map(K,V) which are .struct_type
+        // Also handles generic generic List(T)/Map(K,V) which are .struct_type
         // with names like "List(5)" — these have the same buf layout.
         const is_collection = (info == .list or info == .map) or
-            (info == .struct_type and types.TypeRegistry.isMonomorphizedCollection(info.struct_type.name));
+            (info == .struct_type and types.TypeRegistry.isGenericCollection(info.struct_type.name));
         if (is_collection) {
             const coll_size = self.type_reg.sizeOf(type_idx);
             const tmp = try fb.addLocalWithSize("__copy_coll", type_idx, false, coll_size);
@@ -5248,9 +5273,9 @@ pub const Lowerer = struct {
         // When buf is uniquely owned: destroy each element, then release buf.
         // When buf is shared: just release buf (other owners handle their elements).
         // Swift ref: ContiguousArrayBuffer.deinit → _fixLifetime + _deallocateUninitializedArray
-        // Also handles monomorphized generic List(T)/Map(K,V) (.struct_type named "List(...)" etc.)
+        // Also handles generic generic List(T)/Map(K,V) (.struct_type named "List(...)" etc.)
         const is_collection = (info == .list or info == .map) or
-            (info == .struct_type and types.TypeRegistry.isMonomorphizedCollection(info.struct_type.name));
+            (info == .struct_type and types.TypeRegistry.isGenericCollection(info.struct_type.name));
         if (is_collection) {
             const coll_size = self.type_reg.sizeOf(type_idx);
             const tmp = try fb.addLocalWithSize("__destroy_coll", type_idx, false, coll_size);
@@ -7345,7 +7370,7 @@ pub const Lowerer = struct {
                             _ = try fb.emitPtrStoreValue(field_addr, value_node, ne.span);
                             // Copy (retain) non-trivial +0 values (Swift store [init]: emitCopyValue).
                             // Matches lowerStructInitExpr pattern — all type categories, not just managed pointers.
-                            // Also retain monomorphized List(T)/Map(K,V) structs — their buf field is ARC-managed
+                            // Also retain generic List(T)/Map(K,V) structs — their buf field is ARC-managed
                             // even though isTrivial returns true (buf is declared as i64, not a managed pointer).
                             if (!self.target.isWasm() and !self.type_reg.isTrivial(struct_field.type_idx)) {
                                 const fi_node = self.tree.getNode(field_init.value);
@@ -9196,12 +9221,12 @@ pub const Lowerer = struct {
         // Generic function call: max(i64)(3, 5) — callee is a call expr (the inner call)
         if (callee_expr == .call) {
             const inner_call = callee_expr.call;
-            // When inside a monomorphized generic body (type_substitution active),
+            // When inside a generic generic body (type_substitution active),
             // re-resolve type args through substitution. The generic_instantiations map
             // is keyed by AST node index which is shared across instantiations, so the
             // last-checked instantiation overwrites earlier ones. We must construct the
             // correct GenericInstInfo for the current type substitution context.
-            // Go pattern: each monomorphized body has concrete types fully resolved.
+            // Go pattern: each generic body has concrete types fully resolved.
             const resolved_inst_info = blk: {
                 if (self.type_substitution) |sub| {
                     // Get the generic function name from the callee ident
@@ -11461,10 +11486,10 @@ pub const Lowerer = struct {
                 return try self.lowerExprNode(bc.args[0]);
             },
             // @arcRetain(val), @arcRelease(val) — conditional ARC builtins.
-            // Resolved at monomorphization: emit cot_retain/cot_release only when
+            // Resolved at generic instantiation: emit cot_retain/cot_release only when
             // the argument type is ARC-managed. No-op for non-ARC types (i64, etc).
             // Reference: Swift value witness tables — destroy/copy resolved per-type.
-            // In Cot, monomorphization makes the concrete type known at compile time.
+            // In Cot, generic instantiation makes the concrete type known at compile time.
             .arc_retain => {
                 const arg = try self.lowerExprNode(bc.args[0]);
                 // Wasm: no ARC runtime (bump allocator, no reference counting)
@@ -11484,7 +11509,7 @@ pub const Lowerer = struct {
                 const arg_info = self.type_reg.get(arg_type);
                 // @arcRetain semantics: retain ARC-managed resources.
                 // - Managed pointer (*T from new): retain(ptr) — bump refcount
-                // - Monomorphized collection (List(T)/Map(K,V)): retain(buf)
+                // - Generic collection (List(T)/Map(K,V)): retain(buf)
                 // - @safe pointer to value: load pointee, then retain its ARC resources
                 // - Struct/union containing ARC fields: NO-OP. The @arcRetain in list.cot
                 //   is for elements stored by memcpy — the buf pointers are already shared.
@@ -11494,8 +11519,8 @@ pub const Lowerer = struct {
                     // Managed pointer: retain the pointer directly
                     var args = [_]ir.NodeIndex{arg};
                     _ = try fb.emitCall("retain", &args, false, arg_type, bc.span);
-                } else if (arg_info == .struct_type and types.TypeRegistry.isMonomorphizedCollection(arg_info.struct_type.name)) {
-                    // Monomorphized collection value: retain the buf
+                } else if (arg_info == .struct_type and types.TypeRegistry.isGenericCollection(arg_info.struct_type.name)) {
+                    // Generic collection value: retain the buf
                     _ = try self.emitCopyValue(fb, arg, arg_type, bc.span);
                 }
                 // Struct/union values with nested ARC: no-op.
@@ -11521,7 +11546,7 @@ pub const Lowerer = struct {
                 if (rel_info == .pointer and rel_info.pointer.managed) {
                     var args = [_]ir.NodeIndex{arg};
                     _ = try fb.emitCall("release", &args, false, TypeRegistry.VOID, bc.span);
-                } else if (rel_info == .struct_type and types.TypeRegistry.isMonomorphizedCollection(rel_info.struct_type.name)) {
+                } else if (rel_info == .struct_type and types.TypeRegistry.isGenericCollection(rel_info.struct_type.name)) {
                     try self.emitDestroyValue(fb, arg, arg_type, bc.span);
                 }
                 return ir.null_node;
@@ -11957,7 +11982,7 @@ pub const Lowerer = struct {
                 return self.type_reg.makeExistential(trait_name, trait_def.method_names) catch TypeRegistry.VOID;
             },
             .generic_instance => |gi| {
-                // Look up the concrete monomorphized type by cache key
+                // Look up the concrete generic type by cache key
                 var buf = std.ArrayListUnmanaged(u8){};
                 defer buf.deinit(self.allocator);
                 const writer = buf.writer(self.allocator);

@@ -28,7 +28,7 @@ const Span = source.Span;
 const TypeCategory = enum {
     pod, // All basic types, raw pointers, enums — noop destroy, memcpy copy
     managed_ptr, // Managed pointer (*T from new) — retain/release
-    collection, // List, Map, monomorphized collections — retain/release buf
+    collection, // List, Map, generic collections — retain/release buf
     struct_with_arc, // Struct with at least one non-trivial field
     union_with_arc, // Union with at least one non-trivial variant payload
     optional_with_arc, // Optional wrapping a non-trivial type
@@ -200,7 +200,7 @@ pub const VWTGenerator = struct {
         if (info == .pointer and info.pointer.managed) return .managed_ptr;
 
         if (info == .list or info == .map) return .collection;
-        if (info == .struct_type and types.TypeRegistry.isMonomorphizedCollection(info.struct_type.name)) return .collection;
+        if (info == .struct_type and types.TypeRegistry.isGenericCollection(info.struct_type.name)) return .collection;
 
         if (info == .struct_type) return .struct_with_arc;
         if (info == .union_type) return .union_with_arc;
