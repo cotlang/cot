@@ -1826,7 +1826,16 @@ pub const Driver = struct {
             try rewritedec.rewrite(func_alloc, ssa_func);
             if (html_writer_native != null) html_writer_native.?.writePhase("rewritedec", "rewritedec", ssa_func);
 
-            try schedule.schedule(ssa_func);
+            schedule.schedule(ssa_func) catch |err| {
+                std.debug.print("SCHEDULE FAIL: func '{s}' err={s} blocks={d}\n", .{ ir_func.name, @errorName(err), ssa_func.blocks.items.len });
+                // Dump block info for debugging
+                for (ssa_func.blocks.items, 0..) |blk, bi| {
+                    std.debug.print("  block {d}: values={d} preds={d} succs={d} kind={s}\n", .{
+                        bi, blk.values.items.len, blk.preds.len, blk.succs.len, @tagName(blk.kind),
+                    });
+                }
+                return err;
+            };
             if (html_writer_native != null) html_writer_native.?.writePhase("schedule", "schedule", ssa_func);
 
             try layout.layout(ssa_func);
