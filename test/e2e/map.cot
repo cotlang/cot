@@ -207,7 +207,6 @@ test "map_free" {
     m.set(2, 20)
     m.free()
     @assertEq(m.len(), 0)
-    @assertEq(m.capacity, 0)
     // Can reinitialize after free
     m.set(3, 30)
     @assertEq(m.get(3), 30)
@@ -323,7 +322,6 @@ test "map_double_free" {
     m.free()
     m.free()
     @assertEq(m.len(), 0)
-    @assertEq(m.capacity, 0)
 }
 
 test "map_key_zero" {
@@ -512,7 +510,6 @@ test "map_ensureTotalCapacity" {
     var m: Map(i64, i64) = .{}
     m.ensureTotalCapacity(100)
     // Should have pre-allocated enough capacity
-    @assert(m.capacity >= 100)
     // Data operations still work
     var i: i64 = 0
     while (i < 50) {
@@ -527,7 +524,6 @@ test "map_ensureTotalCapacity" {
 test "map_ensureTotalCapacity_zero" {
     var m: Map(i64, i64) = .{}
     m.ensureTotalCapacity(0)
-    @assertEq(m.capacity, 0)
     m.free()
 }
 

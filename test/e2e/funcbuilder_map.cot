@@ -57,7 +57,7 @@ impl FuncBuilder {
     }
 
     fn addParam(self: *FuncBuilder, param_name: string, t: int, idx: int, sz: int) int {
-        const i = self.locals.count
+        const i = self.locals.len()
         var loc = Local {
             .name = param_name, .type_idx = t, .mutable = false,
             .is_param = true, .param_idx = idx, .size = sz,
@@ -69,7 +69,7 @@ impl FuncBuilder {
     }
 
     fn addLocalWithSize(self: *FuncBuilder, param_name: string, t: int, mutable: bool, sz: int) int {
-        const i = self.locals.count
+        const i = self.locals.len()
         var loc = Local {
             .name = param_name, .type_idx = t, .mutable = mutable,
             .is_param = false, .param_idx = 0, .size = sz,

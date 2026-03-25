@@ -292,7 +292,7 @@ test "arc: list multiple elements" {
     @assertEq(items.get(0).value, 10)
     @assertEq(items.get(1).value, 20)
     @assertEq(items.get(2).value, 30)
-    @assertEq(items.count, 3)
+    @assertEq(items.len(), 3)
     items.free()
 }
 

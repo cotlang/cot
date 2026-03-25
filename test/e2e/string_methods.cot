@@ -155,7 +155,7 @@ test "repeat" {
 test "split basic" {
     var parts: List(string) = .{}
     splitInto("a,b,c", ",", &parts)
-    @assertEq(parts.count, 3)
+    @assertEq(parts.len(), 3)
     @assertEq(parts.get(0), "a")
     @assertEq(parts.get(1), "b")
     @assertEq(parts.get(2), "c")
@@ -165,7 +165,7 @@ test "split basic" {
 test "split no separator found" {
     var parts: List(string) = .{}
     splitInto("hello", ",", &parts)
-    @assertEq(parts.count, 1)
+    @assertEq(parts.len(), 1)
     @assertEq(parts.get(0), "hello")
     parts.free()
 }
@@ -173,7 +173,7 @@ test "split no separator found" {
 test "split multi-char separator" {
     var parts: List(string) = .{}
     splitInto("a::b::c", "::", &parts)
-    @assertEq(parts.count, 3)
+    @assertEq(parts.len(), 3)
     @assertEq(parts.get(0), "a")
     @assertEq(parts.get(1), "b")
     @assertEq(parts.get(2), "c")
