@@ -266,7 +266,7 @@ const SsaToClifTranslator = struct {
         // insert block params and branch args when sealBlock resolves useVar calls.
         for (ssa_func.blocks.items) |ssa_block_ptr| {
             for (ssa_block_ptr.values.items) |v| {
-                if (v.op == .phi) {
+                if (v.op == .phi and v.type_idx != TypeRegistry.SSA_MEM) {
                     const clif_ty = self.ssaTypeToClifType(v.type_idx);
                     const phi_var = try self.builder.declareVar(clif_ty);
                     try self.phi_vars.put(self.allocator, v.id, phi_var);
@@ -1002,12 +1002,13 @@ const SsaToClifTranslator = struct {
                 }
             },
             .copy => {
+                // Memory copies (SSA_MEM type) are compile-time only — skip.
                 // Copy: use the same CLIF value as the source.
                 // Special case: if source is a string data offset (tracked by string_make),
                 // add the string data base address to produce an actual pointer.
                 // This is needed because rewritedec decomposes string_make into raw offset
                 // copies, losing the globalValue base address computation.
-                if (v.args.len > 0) {
+                if (v.args.len > 0 and v.type_idx != TypeRegistry.SSA_MEM) {
                     const src = self.getClif(v.args[0]);
                     if (self.string_data_symbol_idx != null and self.string_offset_ids.contains(v.args[0].id)) {
                         const sym_idx = self.string_data_symbol_idx.?;
@@ -1028,13 +1029,12 @@ const SsaToClifTranslator = struct {
                 }
             },
             .phi => {
-                // Phi values are resolved via defVar/useVar (Braun et al. 2013).
-                // Definitions happen in predecessor blocks (definePhiArgsForSuccessor).
-                // Here we useVar to get the resolved value, which may trigger
-                // automatic block param insertion by the FunctionBuilder.
-                if (self.phi_vars.get(v.id)) |phi_var| {
-                    const resolved = try self.builder.useVar(phi_var);
-                    try self.putValue(v.id, resolved);
+                // Go: memory-typed PHIs are compile-time only — no runtime representation.
+                if (v.type_idx != TypeRegistry.SSA_MEM) {
+                    if (self.phi_vars.get(v.id)) |phi_var| {
+                        const resolved = try self.builder.useVar(phi_var);
+                        try self.putValue(v.id, resolved);
+                    }
                 }
             },
             .cond_select => {
@@ -1545,7 +1545,7 @@ const SsaToClifTranslator = struct {
     fn definePhiArgsForSuccessor(self: *Self, from_block: *const ssa_block.Block, to_block: *const ssa_block.Block) !void {
         const pred_idx = self.findPredIndex(to_block, from_block) orelse return;
         for (to_block.values.items) |v| {
-            if (v.op == .phi) {
+            if (v.op == .phi and v.type_idx != TypeRegistry.SSA_MEM) {
                 if (self.phi_vars.get(v.id)) |phi_var| {
                     if (pred_idx < v.args.len) {
                         var arg_val = self.getClif(v.args[pred_idx]);
@@ -1587,16 +1587,19 @@ const SsaToClifTranslator = struct {
             else => "unknown",
         };
 
-        // Gather call arguments
+        // Gather call arguments — skip the memory arg (last arg in memory chain).
+        // Go: calls take (args..., mem) but codegen only emits the real args.
+        const mem_arg = v.memoryArg();
         var call_args = std.ArrayListUnmanaged(clif.Value){};
         defer call_args.deinit(self.allocator);
         for (v.args) |arg| {
+            if (mem_arg != null and arg == mem_arg.?) continue;
             const clif_arg = self.getClif(arg);
             try call_args.append(self.allocator, clif_arg);
         }
 
-        // Create/get function reference
-        const n_params = v.args.len;
+        // Create/get function reference (exclude memory arg from param count)
+        const n_params = call_args.items.len;
         const has_return = v.type_idx != TypeRegistry.VOID and v.type_idx != TypeRegistry.SSA_MEM;
         const n_returns: usize = if (has_return) 1 else 0;
         const func_ref = try self.getOrCreateFuncRef(func_name, n_params, n_returns);
@@ -1649,10 +1652,12 @@ const SsaToClifTranslator = struct {
             break :blk 2;
         } else 1;
 
+        const indirect_mem = v.memoryArg();
         var call_args = std.ArrayListUnmanaged(clif.Value){};
         defer call_args.deinit(self.allocator);
         if (actual_args_start < v.args.len) {
             for (v.args[actual_args_start..]) |arg| {
+                if (indirect_mem != null and arg == indirect_mem.?) continue;
                 const clif_arg = self.getClif(arg);
                 try call_args.append(self.allocator, clif_arg);
             }

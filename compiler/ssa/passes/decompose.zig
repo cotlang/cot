@@ -259,7 +259,8 @@ fn isSliceType(type_idx: TypeIndex, f: *Func) bool {
         type_idx != TypeRegistry.I64 and
         type_idx != TypeRegistry.I32 and
         type_idx != TypeRegistry.BOOL and
-        type_idx != TypeRegistry.VOID;
+        type_idx != TypeRegistry.VOID and
+        type_idx != TypeRegistry.SSA_MEM;
 }
 
 /// Copy a value's identity to another (Go's v.copyOf).

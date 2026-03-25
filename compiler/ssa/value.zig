@@ -224,9 +224,17 @@ pub const Value = struct {
     pub fn hasSideEffects(self: *const Value) bool { return self.op.info().has_side_effects; }
     pub fn readsMemory(self: *const Value) bool { return self.op.info().reads_memory; }
     pub fn writesMemory(self: *const Value) bool { return self.op.info().writes_memory; }
+    /// Returns the memory-state arg if present (always last arg).
+    /// Go reference: ssa/value.go:550-562 MemoryArg().
+    /// In Go, all memory producers have TypeMem. In Cot, stores/moves have SSA_MEM type,
+    /// but calls keep their return type (no tuple support). So we check both:
+    /// SSA_MEM type (stores, moves, init_mem) OR writesMemory flag (calls).
     pub fn memoryArg(self: *const Value) ?*Value {
-        if (!self.readsMemory() or self.args.len == 0) return null;
-        return self.args[self.args.len - 1];
+        if (self.args.len == 0) return null;
+        const last = self.args[self.args.len - 1];
+        if (last.type_idx == frontend_types.TypeRegistry.SSA_MEM) return last;
+        if (last.writesMemory()) return last;
+        return null;
     }
 
     /// Get the assigned home location (register or stack slot).

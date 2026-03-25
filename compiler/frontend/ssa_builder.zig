@@ -45,15 +45,28 @@ pub const SSABuilder = struct {
     node_values: std.AutoHashMap(ir.NodeIndex, *Value),
     loop_stack: std.ArrayListUnmanaged(LoopContext),
     cur_pos: Pos,
-    /// Go explicit memory threading: tracks the current memory state value.
-    /// Every store/call takes this as last arg and produces a new memory state.
-    /// Loads take this as last arg for ordering. Reference: Go ssa/compile.go.
-    current_mem: ?*Value = null,
     /// Maps IR local_idx → frame slot offset (in 8-byte units).
     /// Accounts for multi-word locals (structs, tuples) occupying multiple slots.
     local_slot_offsets: []u32,
 
     const LoopContext = struct { continue_block: *Block, break_block: *Block };
+
+    /// Go: memVar = ssaMarker("mem") — sentinel local index for memory state.
+    /// Memory is tracked as a regular variable in vars/defvars so that insertPhis
+    /// automatically creates memory Phi nodes at block join points.
+    /// Uses maxInt to avoid collision with real IR local indices.
+    pub const MEM_VAR: ir.LocalIdx = std.math.maxInt(ir.LocalIdx);
+
+    /// Go: s.mem() — get current memory state for this block.
+    /// If not defined in the current block, creates a FwdRef that insertPhis resolves.
+    fn mem(self: *SSABuilder) !*Value {
+        return self.variable(MEM_VAR, TypeRegistry.SSA_MEM);
+    }
+
+    /// Go: s.vars[memVar] = v — set current memory state.
+    fn setMem(self: *SSABuilder, v: *Value) void {
+        self.assign(MEM_VAR, v);
+    }
 
     pub fn init(allocator: Allocator, ir_func: *const ir.Func, ir_globals: []const ir.Global, type_registry: *TypeRegistry, target: Target) !SSABuilder {
         const func = try allocator.create(Func);
@@ -156,6 +169,12 @@ pub const SSABuilder = struct {
 
         var vars = std.AutoHashMap(ir.LocalIdx, *Value).init(allocator);
 
+        // Go: s.startmem = s.entryNewValue0(OpInitMem, TypeMem); s.vars[memVar] = s.startmem
+        // InitMem at entry block — initial memory state stored as MEM_VAR variable.
+        const init_mem = try func.newValue(.init_mem, TypeRegistry.SSA_MEM, entry, .{});
+        try entry.addValue(allocator, init_mem);
+        try vars.put(MEM_VAR, init_mem);
+
         // Initialize parameters - emit arg ops for each param
         var phys_reg_idx: i32 = 0;
         const is_wasm_gc = target.isWasmGC();
@@ -194,16 +213,18 @@ pub const SSABuilder = struct {
                 const addr = try func.newValue(.local_addr, TypeRegistry.VOID, entry, .{});
                 addr.aux_int = @intCast(slot_offsets[i]);
                 try entry.addValue(allocator, addr);
-                const tag_store = try func.newValue(.store, TypeRegistry.VOID, entry, .{});
-                tag_store.addArg2(addr, tag_val);
+                const tag_store = try func.newValue(.store, TypeRegistry.SSA_MEM, entry, .{});
+                tag_store.addArg3(addr, tag_val, vars.get(MEM_VAR).?);
                 try entry.addValue(allocator, tag_store);
+                try vars.put(MEM_VAR, tag_store);
                 const data_addr = try func.newValue(.off_ptr, TypeRegistry.VOID, entry, .{});
                 data_addr.aux_int = 8;
                 data_addr.addArg(addr);
                 try entry.addValue(allocator, data_addr);
-                const data_store = try func.newValue(.store, TypeRegistry.VOID, entry, .{});
-                data_store.addArg2(data_addr, data_val);
+                const data_store = try func.newValue(.store, TypeRegistry.SSA_MEM, entry, .{});
+                data_store.addArg3(data_addr, data_val, vars.get(MEM_VAR).?);
                 try entry.addValue(allocator, data_store);
+                try vars.put(MEM_VAR, data_store);
             } else if (is_string_or_slice) {
                 // String/slice: two registers (ptr, len)
                 const ptr_val = try func.newValue(.arg, TypeRegistry.I64, entry, .{});
@@ -229,16 +250,18 @@ pub const SSABuilder = struct {
                 const addr = try func.newValue(.local_addr, TypeRegistry.VOID, entry, .{});
                 addr.aux_int = @intCast(slot_offsets[i]);
                 try entry.addValue(allocator, addr);
-                const ptr_store = try func.newValue(.store, TypeRegistry.VOID, entry, .{});
-                ptr_store.addArg2(addr, ptr_val);
+                const ptr_store = try func.newValue(.store, TypeRegistry.SSA_MEM, entry, .{});
+                ptr_store.addArg3(addr, ptr_val, vars.get(MEM_VAR).?);
                 try entry.addValue(allocator, ptr_store);
+                try vars.put(MEM_VAR, ptr_store);
                 const len_addr = try func.newValue(.off_ptr, TypeRegistry.VOID, entry, .{});
                 len_addr.aux_int = 8;
                 len_addr.addArg(addr);
                 try entry.addValue(allocator, len_addr);
-                const len_store = try func.newValue(.store, TypeRegistry.VOID, entry, .{});
-                len_store.addArg2(len_addr, len_val);
+                const len_store = try func.newValue(.store, TypeRegistry.SSA_MEM, entry, .{});
+                len_store.addArg3(len_addr, len_val, vars.get(MEM_VAR).?);
                 try entry.addValue(allocator, len_store);
+                try vars.put(MEM_VAR, len_store);
             } else if (is_large_struct) {
                 // Large struct: N i64 registers (one per 8-byte chunk)
                 const num_slots: u32 = @intCast((type_size + 7) / 8);
@@ -253,17 +276,19 @@ pub const SSABuilder = struct {
                     phys_reg_idx += 1;
 
                     if (slot == 0) {
-                        const store = try func.newValue(.store, TypeRegistry.VOID, entry, .{});
-                        store.addArg2(base_addr, chunk_val);
+                        const store = try func.newValue(.store, TypeRegistry.SSA_MEM, entry, .{});
+                        store.addArg3(base_addr, chunk_val, vars.get(MEM_VAR).?);
                         try entry.addValue(allocator, store);
+                        try vars.put(MEM_VAR, store);
                     } else {
                         const off_addr = try func.newValue(.off_ptr, TypeRegistry.VOID, entry, .{});
                         off_addr.aux_int = @intCast(slot * 8);
                         off_addr.addArg(base_addr);
                         try entry.addValue(allocator, off_addr);
-                        const store = try func.newValue(.store, TypeRegistry.VOID, entry, .{});
-                        store.addArg2(off_addr, chunk_val);
+                        const store = try func.newValue(.store, TypeRegistry.SSA_MEM, entry, .{});
+                        store.addArg3(off_addr, chunk_val, vars.get(MEM_VAR).?);
                         try entry.addValue(allocator, store);
+                        try vars.put(MEM_VAR, store);
                     }
                 }
             } else {
@@ -285,9 +310,10 @@ pub const SSABuilder = struct {
                     const addr = try func.newValue(.local_addr, TypeRegistry.VOID, entry, .{});
                     addr.aux_int = @intCast(slot_offsets[i]);
                     try entry.addValue(allocator, addr);
-                    const store = try func.newValue(.store, TypeRegistry.VOID, entry, .{});
-                    store.addArg2(addr, arg_val);
+                    const store = try func.newValue(.store, TypeRegistry.SSA_MEM, entry, .{});
+                    store.addArg3(addr, arg_val, vars.get(MEM_VAR).?);
                     try entry.addValue(allocator, store);
+                    try vars.put(MEM_VAR, store);
                 }
             }
         }
@@ -366,24 +392,25 @@ pub const SSABuilder = struct {
         self.vars.put(local_idx, value) catch {};
     }
 
-    /// Go memory threading: create a store with memory arg, update current_mem.
-    /// Store takes (addr, value, mem) — type stays VOID (no runtime result).
-    /// The memory ordering is purely compile-time for the schedule pass.
-    fn emitMemStore(self: *SSABuilder, addr: *Value, value: *Value, cur: *Block) !*Value {
-        const store = try self.func.newValue(.store, TypeRegistry.VOID, cur, self.cur_pos);
+    /// Go: s.vars[memVar] = s.newValue3A(OpStore, TypeMem, ..., s.mem())
+    /// Store takes (addr, value, mem) and produces SSA_MEM (like Go's TypeMem).
+    fn emitMemStore(self: *SSABuilder, store_op: Op, addr: *Value, value: *Value, cur: *Block) !*Value {
+        const store = try self.func.newValue(store_op, TypeRegistry.SSA_MEM, cur, self.cur_pos);
         store.addArg2(addr, value);
-        if (self.current_mem) |mem| try store.addArgAlloc(mem, self.allocator);
+        const cur_mem = try self.mem();
+        try store.addArgAlloc(cur_mem, self.allocator);
         try cur.addValue(self.allocator, store);
-        self.current_mem = store;
+        self.setMem(store);
         return store;
     }
 
-    /// Go memory threading: create a load with memory arg for ordering.
+    /// Go: loads take (addr, s.mem()) for ordering.
     /// Load takes (addr, mem) — reads memory but doesn't produce new state.
-    fn emitMemLoad(self: *SSABuilder, op: Op, addr: *Value, type_idx: TypeIndex, cur: *Block) !*Value {
-        const load = try self.func.newValue(op, type_idx, cur, self.cur_pos);
+    fn emitMemLoad(self: *SSABuilder, load_op: Op, addr: *Value, type_idx: TypeIndex, cur: *Block) !*Value {
+        const load = try self.func.newValue(load_op, type_idx, cur, self.cur_pos);
         load.addArg(addr);
-        if (self.current_mem) |mem| try load.addArgAlloc(mem, self.allocator);
+        const cur_mem = try self.mem();
+        try load.addArgAlloc(cur_mem, self.allocator);
         try cur.addValue(self.allocator, load);
         return load;
     }
@@ -443,20 +470,22 @@ pub const SSABuilder = struct {
         }
 
         // Walk all IR blocks
+        // Go: init_mem is in vars[MEM_VAR] from init(). Each block starts fresh
+        // (startBlock clears vars), so memory state creates FwdRefs at block boundaries
+        // that insertPhis resolves into memory Phi nodes.
         for (self.ir_func.blocks, 0..) |ir_block, i| {
             const ssa_block_ptr = try self.getOrCreateBlock(@intCast(i));
             if (i != 0) self.startBlock(ssa_block_ptr);
-            // Go: InitMem at entry block — initial memory state for threading
-            if (i == 0) {
-                const init_mem = try self.func.newValue(.init_mem, TypeRegistry.SSA_MEM, ssa_block_ptr, self.cur_pos);
-                try ssa_block_ptr.addValue(self.allocator, init_mem);
-                self.current_mem = init_mem;
-            }
             for (ir_block.nodes) |node_idx| {
                 if (logical_operands.contains(node_idx)) continue;
                 _ = try self.convertNode(node_idx);
             }
         }
+
+        // Go: endBlock() saves final block's vars to defvars.
+        // Without this, the last block's memory state is missing from defvars
+        // and lookupVarOutgoing can't find it during phi insertion.
+        self.saveDefvars();
 
         try self.insertPhis();
         try self.verify();
@@ -739,27 +768,21 @@ pub const SSABuilder = struct {
         if (load_type == .slice) {
             // Slice: load ptr, len, cap separately, combine with slice_make
             // Go: SliceMake always has 3 args (ptr, len, cap)
-            const ptr_load = try self.func.newValue(.load, TypeRegistry.I64, cur, self.cur_pos);
-            ptr_load.addArg(addr_val);
-            try cur.addValue(self.allocator, ptr_load);
+            const ptr_load = try self.emitMemLoad(.load, addr_val, TypeRegistry.I64, cur);
 
             const len_addr = try self.func.newValue(.off_ptr, TypeRegistry.VOID, cur, self.cur_pos);
             len_addr.aux_int = 8;
             len_addr.addArg(addr_val);
             try cur.addValue(self.allocator, len_addr);
 
-            const len_load = try self.func.newValue(.load, TypeRegistry.I64, cur, self.cur_pos);
-            len_load.addArg(len_addr);
-            try cur.addValue(self.allocator, len_load);
+            const len_load = try self.emitMemLoad(.load, len_addr, TypeRegistry.I64, cur);
 
             const cap_addr = try self.func.newValue(.off_ptr, TypeRegistry.VOID, cur, self.cur_pos);
             cap_addr.aux_int = 16;
             cap_addr.addArg(addr_val);
             try cur.addValue(self.allocator, cap_addr);
 
-            const cap_load = try self.func.newValue(.load, TypeRegistry.I64, cur, self.cur_pos);
-            cap_load.addArg(cap_addr);
-            try cur.addValue(self.allocator, cap_load);
+            const cap_load = try self.emitMemLoad(.load, cap_addr, TypeRegistry.I64, cur);
 
             const slice_val = try self.func.newValue(.slice_make, type_idx, cur, self.cur_pos);
             slice_val.addArg(ptr_load);
@@ -774,17 +797,13 @@ pub const SSABuilder = struct {
             const elem_info = self.type_registry.get(load_type.optional.elem);
             if (elem_info == .pointer and elem_info.pointer.managed) {
                 // Load tag@0
-                const tag_load = try self.func.newValue(.load, TypeRegistry.I64, cur, self.cur_pos);
-                tag_load.addArg(addr_val);
-                try cur.addValue(self.allocator, tag_load);
+                const tag_load = try self.emitMemLoad(.load, addr_val, TypeRegistry.I64, cur);
                 // Load payload@8
                 const data_addr = try self.func.newValue(.off_ptr, TypeRegistry.VOID, cur, self.cur_pos);
                 data_addr.aux_int = 8;
                 data_addr.addArg(addr_val);
                 try cur.addValue(self.allocator, data_addr);
-                const data_load = try self.func.newValue(.load, TypeRegistry.I64, cur, self.cur_pos);
-                data_load.addArg(data_addr);
-                try cur.addValue(self.allocator, data_load);
+                const data_load = try self.emitMemLoad(.load, data_addr, TypeRegistry.I64, cur);
                 // Compose: opt_make(tag, payload)
                 const opt_val = try self.func.newValue(.opt_make, type_idx, cur, self.cur_pos);
                 opt_val.addArg(tag_load);
@@ -811,10 +830,7 @@ pub const SSABuilder = struct {
         const type_info = self.type_registry.get(type_idx);
         const is_narrow_int = type_info == .basic and type_info.basic.isInteger() and type_info.basic.size() < 8;
         const load_op: Op = if (is_narrow_int) self.getLoadOp(type_idx) else .load;
-        const load_val = try self.func.newValue(load_op, type_idx, cur, self.cur_pos);
-        load_val.addArg(addr_val);
-        try cur.addValue(self.allocator, load_val);
-        return load_val;
+        return self.emitMemLoad(load_op, addr_val, type_idx, cur);
     }
 
     fn convertStoreLocal(self: *SSABuilder, local_idx: ir.LocalIdx, value_idx: ir.NodeIndex, cur: *Block) !*Value {
@@ -835,7 +851,12 @@ pub const SSABuilder = struct {
             try mc.addArgAlloc(dst, self.allocator);
             try mc.addArgAlloc(value, self.allocator);
             try mc.addArgAlloc(size_val, self.allocator);
+            {
+                const cur_mem = try self.mem();
+                try mc.addArgAlloc(cur_mem, self.allocator);
+            }
             try cur.addValue(self.allocator, mc);
+            self.setMem(mc);
             self.assign(local_idx, value);
             return value;
         }
@@ -904,18 +925,14 @@ pub const SSABuilder = struct {
             }
 
             const addr_val = try self.emitLocalAddr(local_idx, TypeRegistry.VOID, cur);
-            const ptr_store = try self.func.newValue(.store, TypeRegistry.VOID, cur, self.cur_pos);
-            ptr_store.addArg2(addr_val, ptr_component);
-            try cur.addValue(self.allocator, ptr_store);
+            _ = try self.emitMemStore(.store, addr_val, ptr_component, cur);
 
             const len_addr = try self.func.newValue(.off_ptr, TypeRegistry.VOID, cur, self.cur_pos);
             len_addr.aux_int = 8;
             len_addr.addArg(addr_val);
             try cur.addValue(self.allocator, len_addr);
 
-            const len_store = try self.func.newValue(.store, TypeRegistry.VOID, cur, self.cur_pos);
-            len_store.addArg2(len_addr, len_component);
-            try cur.addValue(self.allocator, len_store);
+            _ = try self.emitMemStore(.store, len_addr, len_component, cur);
 
             // Store cap at offset 16 (Go slice layout) for slices with cap
             if (cap_component) |cap_val| {
@@ -924,9 +941,7 @@ pub const SSABuilder = struct {
                 cap_addr.addArg(addr_val);
                 try cur.addValue(self.allocator, cap_addr);
 
-                const cap_store = try self.func.newValue(.store, TypeRegistry.VOID, cur, self.cur_pos);
-                cap_store.addArg2(cap_addr, cap_val);
-                try cur.addValue(self.allocator, cap_store);
+                _ = try self.emitMemStore(.store, cap_addr, cap_val, cur);
             } else if (value.op == .slice_make) {
                 // cap defaults to len for slices without explicit cap
                 const cap_addr = try self.func.newValue(.off_ptr, TypeRegistry.VOID, cur, self.cur_pos);
@@ -934,9 +949,7 @@ pub const SSABuilder = struct {
                 cap_addr.addArg(addr_val);
                 try cur.addValue(self.allocator, cap_addr);
 
-                const cap_store = try self.func.newValue(.store, TypeRegistry.VOID, cur, self.cur_pos);
-                cap_store.addArg2(cap_addr, len_component);
-                try cur.addValue(self.allocator, cap_store);
+                _ = try self.emitMemStore(.store, cap_addr, len_component, cur);
             }
 
             self.assign(local_idx, value);
@@ -965,18 +978,14 @@ pub const SSABuilder = struct {
                 }
 
                 const addr_val = try self.emitLocalAddr(local_idx, TypeRegistry.VOID, cur);
-                const tag_store = try self.func.newValue(.store, TypeRegistry.VOID, cur, self.cur_pos);
-                tag_store.addArg2(addr_val, tag_component);
-                try cur.addValue(self.allocator, tag_store);
+                _ = try self.emitMemStore(.store, addr_val, tag_component, cur);
 
                 const data_addr = try self.func.newValue(.off_ptr, TypeRegistry.VOID, cur, self.cur_pos);
                 data_addr.aux_int = 8;
                 data_addr.addArg(addr_val);
                 try cur.addValue(self.allocator, data_addr);
 
-                const data_store = try self.func.newValue(.store, TypeRegistry.VOID, cur, self.cur_pos);
-                data_store.addArg2(data_addr, data_component);
-                try cur.addValue(self.allocator, data_store);
+                _ = try self.emitMemStore(.store, data_addr, data_component, cur);
 
                 self.assign(local_idx, value);
                 return value;
@@ -1019,20 +1028,23 @@ pub const SSABuilder = struct {
             // (op=load), which IS the address to copy from — use value directly too.
             // Both cases: use value as src_addr.
             const src_addr = value;
-            const move_val = try self.func.newValue(.move, TypeRegistry.VOID, cur, self.cur_pos);
+            const move_val = try self.func.newValue(.move, TypeRegistry.SSA_MEM, cur, self.cur_pos);
             move_val.addArg2(addr_val, src_addr);
+            {
+                const cur_mem = try self.mem();
+                try move_val.addArgAlloc(cur_mem, self.allocator);
+            }
             // Use value's type_size when available, fall back to local's size for
             // VOID-typed addresses (from convertFieldValue for struct fields).
             const move_size = if (type_size > 0) type_size else self.ir_func.locals[local_idx].size;
             move_val.aux_int = @intCast(move_size);
             try cur.addValue(self.allocator, move_val);
+            self.setMem(move_val);
             self.assign(local_idx, value);
             return value;
         }
 
-        const store_val = try self.func.newValue(.store, TypeRegistry.VOID, cur, self.cur_pos);
-        store_val.addArg2(addr_val, value);
-        try cur.addValue(self.allocator, store_val);
+        _ = try self.emitMemStore(.store, addr_val, value, cur);
         self.assign(local_idx, value);
         return value;
     }
@@ -1045,27 +1057,21 @@ pub const SSABuilder = struct {
         const load_type = self.type_registry.get(type_idx);
         if (load_type == .slice) {
             // Go: SliceMake always has 3 args (ptr, len, cap)
-            const ptr_load = try self.func.newValue(.load, TypeRegistry.I64, cur, self.cur_pos);
-            ptr_load.addArg(addr_val);
-            try cur.addValue(self.allocator, ptr_load);
+            const ptr_load = try self.emitMemLoad(.load, addr_val, TypeRegistry.I64, cur);
 
             const len_addr = try self.func.newValue(.off_ptr, TypeRegistry.VOID, cur, self.cur_pos);
             len_addr.aux_int = 8;
             len_addr.addArg(addr_val);
             try cur.addValue(self.allocator, len_addr);
 
-            const len_load = try self.func.newValue(.load, TypeRegistry.I64, cur, self.cur_pos);
-            len_load.addArg(len_addr);
-            try cur.addValue(self.allocator, len_load);
+            const len_load = try self.emitMemLoad(.load, len_addr, TypeRegistry.I64, cur);
 
             const cap_addr = try self.func.newValue(.off_ptr, TypeRegistry.VOID, cur, self.cur_pos);
             cap_addr.aux_int = 16;
             cap_addr.addArg(addr_val);
             try cur.addValue(self.allocator, cap_addr);
 
-            const cap_load = try self.func.newValue(.load, TypeRegistry.I64, cur, self.cur_pos);
-            cap_load.addArg(cap_addr);
-            try cur.addValue(self.allocator, cap_load);
+            const cap_load = try self.emitMemLoad(.load, cap_addr, TypeRegistry.I64, cur);
 
             const slice_val = try self.func.newValue(.slice_make, type_idx, cur, self.cur_pos);
             slice_val.addArg(ptr_load);
@@ -1080,10 +1086,7 @@ pub const SSABuilder = struct {
         const gtype_info = self.type_registry.get(type_idx);
         const g_is_narrow_int = gtype_info == .basic and gtype_info.basic.isInteger() and gtype_info.basic.size() < 8;
         const gload_op: Op = if (g_is_narrow_int) self.getLoadOp(type_idx) else .load;
-        const load_val = try self.func.newValue(gload_op, type_idx, cur, self.cur_pos);
-        load_val.addArg(addr_val);
-        try cur.addValue(self.allocator, load_val);
-        return load_val;
+        return self.emitMemLoad(gload_op, addr_val, type_idx, cur);
     }
 
     fn convertGlobalStore(self: *SSABuilder, name: []const u8, global_idx: ir.GlobalIdx, value_idx: ir.NodeIndex, cur: *Block) !*Value {
@@ -1114,18 +1117,14 @@ pub const SSABuilder = struct {
                 try cur.addValue(self.allocator, len_component);
             }
 
-            const ptr_store = try self.func.newValue(.store, TypeRegistry.VOID, cur, self.cur_pos);
-            ptr_store.addArg2(addr_val, ptr_component);
-            try cur.addValue(self.allocator, ptr_store);
+            _ = try self.emitMemStore(.store, addr_val, ptr_component, cur);
 
             const len_addr = try self.func.newValue(.off_ptr, TypeRegistry.VOID, cur, self.cur_pos);
             len_addr.aux_int = 8;
             len_addr.addArg(addr_val);
             try cur.addValue(self.allocator, len_addr);
 
-            const len_store = try self.func.newValue(.store, TypeRegistry.VOID, cur, self.cur_pos);
-            len_store.addArg2(len_addr, len_component);
-            try cur.addValue(self.allocator, len_store);
+            _ = try self.emitMemStore(.store, len_addr, len_component, cur);
 
             if (value.op == .slice_make and value.args.len >= 3) {
                 const cap_addr = try self.func.newValue(.off_ptr, TypeRegistry.VOID, cur, self.cur_pos);
@@ -1133,9 +1132,7 @@ pub const SSABuilder = struct {
                 cap_addr.addArg(addr_val);
                 try cur.addValue(self.allocator, cap_addr);
 
-                const cap_store = try self.func.newValue(.store, TypeRegistry.VOID, cur, self.cur_pos);
-                cap_store.addArg2(cap_addr, value.args[2]);
-                try cur.addValue(self.allocator, cap_store);
+                _ = try self.emitMemStore(.store, cap_addr, value.args[2], cur);
             }
 
             return value;
@@ -1172,21 +1169,24 @@ pub const SSABuilder = struct {
 
         if (is_large_struct) {
             const src_addr = value;
-            const move_val = try self.func.newValue(.move, TypeRegistry.VOID, cur, self.cur_pos);
+            const move_val = try self.func.newValue(.move, TypeRegistry.SSA_MEM, cur, self.cur_pos);
             move_val.addArg2(addr_val, src_addr);
+            {
+                const cur_mem = try self.mem();
+                try move_val.addArgAlloc(cur_mem, self.allocator);
+            }
             // Use value's type_size when available, fall back to global's size for
             // VOID-typed addresses (from convertFieldValue for struct fields).
             const g_idx: usize = @intCast(global_idx);
             const move_size = if (type_size > 0) type_size else if (g_idx < self.ir_globals.len) self.ir_globals[g_idx].size else 8;
             move_val.aux_int = @intCast(move_size);
             try cur.addValue(self.allocator, move_val);
+            self.setMem(move_val);
             return value;
         }
 
         // Scalar path — single 8-byte .store (types <= 8 bytes)
-        const store_val = try self.func.newValue(.store, TypeRegistry.VOID, cur, self.cur_pos);
-        store_val.addArg2(addr_val, value);
-        try cur.addValue(self.allocator, store_val);
+        _ = try self.emitMemStore(.store, addr_val, value, cur);
         return value;
     }
 
@@ -1281,7 +1281,6 @@ pub const SSABuilder = struct {
         const call_val = try self.func.newValue(.static_call, type_idx, cur, self.cur_pos);
         call_val.aux = .{ .string = func_name };
 
-
         for (args, 0..) |arg_idx, argi| {
             const arg_val = try self.convertNode(arg_idx) orelse {
                 std.debug.print("convertCall '{s}' in '{s}': arg[{d}] node={d} returned null\n", .{ func_name, self.func.name, argi, arg_idx });
@@ -1289,7 +1288,13 @@ pub const SSABuilder = struct {
             };
             try self.addCallArg(call_val, arg_val, cur);
         }
+        // Go: calls take mem as last arg and produce new memory state
+        {
+            const cur_mem = try self.mem();
+            try call_val.addArgAlloc(cur_mem, self.allocator);
+        }
         try cur.addValue(self.allocator, call_val);
+        self.setMem(call_val);
         return call_val;
     }
 
@@ -1339,9 +1344,7 @@ pub const SSABuilder = struct {
 
             for (0..num_slots) |slot| {
                 if (slot == 0) {
-                    const chunk_val = try self.func.newValue(.load, TypeRegistry.I64, cur, self.cur_pos);
-                    chunk_val.addArg(addr);
-                    try cur.addValue(self.allocator, chunk_val);
+                    const chunk_val = try self.emitMemLoad(.load, addr, TypeRegistry.I64, cur);
                     try call_val.addArgAlloc(chunk_val, self.allocator);
                 } else {
                     const off_addr = try self.func.newValue(.off_ptr, TypeRegistry.VOID, cur, self.cur_pos);
@@ -1349,9 +1352,7 @@ pub const SSABuilder = struct {
                     off_addr.addArg(addr);
                     try cur.addValue(self.allocator, off_addr);
 
-                    const chunk_val = try self.func.newValue(.load, TypeRegistry.I64, cur, self.cur_pos);
-                    chunk_val.addArg(off_addr);
-                    try cur.addValue(self.allocator, chunk_val);
+                    const chunk_val = try self.emitMemLoad(.load, off_addr, TypeRegistry.I64, cur);
                     try call_val.addArgAlloc(chunk_val, self.allocator);
                 }
             }
@@ -1394,7 +1395,12 @@ pub const SSABuilder = struct {
             const arg_val = try self.convertNode(arg_idx) orelse return error.MissingValue;
             try self.addCallArg(call_val, arg_val, cur);
         }
+        {
+            const cur_mem = try self.mem();
+            try call_val.addArgAlloc(cur_mem, self.allocator);
+        }
         try cur.addValue(self.allocator, call_val);
+        self.setMem(call_val);
         return call_val;
     }
 
@@ -1408,7 +1414,12 @@ pub const SSABuilder = struct {
             const arg_val = try self.convertNode(arg_idx) orelse return error.MissingValue;
             try self.addCallArg(call_val, arg_val, cur);
         }
+        {
+            const cur_mem = try self.mem();
+            try call_val.addArgAlloc(cur_mem, self.allocator);
+        }
         try cur.addValue(self.allocator, call_val);
+        self.setMem(call_val);
         return call_val;
     }
 
@@ -1426,18 +1437,14 @@ pub const SSABuilder = struct {
         if (field_type == .optional) {
             const elem_info = self.type_registry.get(field_type.optional.elem);
             if (elem_info == .pointer and elem_info.pointer.managed) {
-                const tag_load = try self.func.newValue(.load, TypeRegistry.I64, cur, self.cur_pos);
-                tag_load.addArg(off_val);
-                try cur.addValue(self.allocator, tag_load);
+                const tag_load = try self.emitMemLoad(.load, off_val, TypeRegistry.I64, cur);
 
                 const data_addr = try self.func.newValue(.off_ptr, TypeRegistry.VOID, cur, self.cur_pos);
                 data_addr.aux_int = 8;
                 data_addr.addArg(off_val);
                 try cur.addValue(self.allocator, data_addr);
 
-                const data_load = try self.func.newValue(.load, TypeRegistry.I64, cur, self.cur_pos);
-                data_load.addArg(data_addr);
-                try cur.addValue(self.allocator, data_load);
+                const data_load = try self.emitMemLoad(.load, data_addr, TypeRegistry.I64, cur);
 
                 const opt_val = try self.func.newValue(.opt_make, type_idx, cur, self.cur_pos);
                 opt_val.addArg(tag_load);
@@ -1459,18 +1466,14 @@ pub const SSABuilder = struct {
         // String/slice compound load: decompose into ptr@0, len@8, create string_make/slice_make
         const is_string_or_slice = type_idx == TypeRegistry.STRING or field_type == .slice;
         if (is_string_or_slice) {
-            const ptr_load = try self.func.newValue(.load, TypeRegistry.I64, cur, self.cur_pos);
-            ptr_load.addArg(off_val);
-            try cur.addValue(self.allocator, ptr_load);
+            const ptr_load = try self.emitMemLoad(.load, off_val, TypeRegistry.I64, cur);
 
             const len_addr = try self.func.newValue(.off_ptr, TypeRegistry.VOID, cur, self.cur_pos);
             len_addr.aux_int = 8;
             len_addr.addArg(off_val);
             try cur.addValue(self.allocator, len_addr);
 
-            const len_load = try self.func.newValue(.load, TypeRegistry.I64, cur, self.cur_pos);
-            len_load.addArg(len_addr);
-            try cur.addValue(self.allocator, len_load);
+            const len_load = try self.emitMemLoad(.load, len_addr, TypeRegistry.I64, cur);
 
             const make_op: Op = if (type_idx == TypeRegistry.STRING) .string_make else .slice_make;
             const make_val = try self.func.newValue(make_op, type_idx, cur, self.cur_pos);
@@ -1480,10 +1483,7 @@ pub const SSABuilder = struct {
         }
 
         const load_op = self.getLoadOp(type_idx);
-        const load_val = try self.func.newValue(load_op, type_idx, cur, self.cur_pos);
-        load_val.addArg(off_val);
-        try cur.addValue(self.allocator, load_val);
-        return load_val;
+        return self.emitMemLoad(load_op, off_val, type_idx, cur);
     }
 
     fn convertStoreLocalField(self: *SSABuilder, f: ir.StoreLocalField, cur: *Block) !*Value {
@@ -1514,19 +1514,14 @@ pub const SSABuilder = struct {
                 try cur.addValue(self.allocator, len_component);
             }
 
-            const ptr_store = try self.func.newValue(.store, TypeRegistry.VOID, cur, self.cur_pos);
-            ptr_store.addArg2(off_val, ptr_component);
-            try cur.addValue(self.allocator, ptr_store);
+            _ = try self.emitMemStore(.store, off_val, ptr_component, cur);
 
             const len_addr = try self.func.newValue(.off_ptr, TypeRegistry.VOID, cur, self.cur_pos);
             len_addr.aux_int = 8;
             len_addr.addArg(off_val);
             try cur.addValue(self.allocator, len_addr);
 
-            const len_store = try self.func.newValue(.store, TypeRegistry.VOID, cur, self.cur_pos);
-            len_store.addArg2(len_addr, len_component);
-            try cur.addValue(self.allocator, len_store);
-            return len_store;
+            return self.emitMemStore(.store, len_addr, len_component, cur);
         }
 
         // ?*T optional pointer store: decompose into tag@0, payload@8
@@ -1549,19 +1544,14 @@ pub const SSABuilder = struct {
                     try cur.addValue(self.allocator, data_component);
                 }
 
-                const tag_store = try self.func.newValue(.store, TypeRegistry.VOID, cur, self.cur_pos);
-                tag_store.addArg2(off_val, tag_component);
-                try cur.addValue(self.allocator, tag_store);
+                _ = try self.emitMemStore(.store, off_val, tag_component, cur);
 
                 const data_addr = try self.func.newValue(.off_ptr, TypeRegistry.VOID, cur, self.cur_pos);
                 data_addr.aux_int = 8;
                 data_addr.addArg(off_val);
                 try cur.addValue(self.allocator, data_addr);
 
-                const data_store = try self.func.newValue(.store, TypeRegistry.VOID, cur, self.cur_pos);
-                data_store.addArg2(data_addr, data_component);
-                try cur.addValue(self.allocator, data_store);
-                return data_store;
+                return self.emitMemStore(.store, data_addr, data_component, cur);
             }
         }
 
@@ -1589,21 +1579,23 @@ pub const SSABuilder = struct {
 
         if (is_large) {
             const src_addr = if (value.op == .load and value.args.len > 0) value.args[0] else value;
-            const move_val = try self.func.newValue(.move, TypeRegistry.VOID, cur, self.cur_pos);
+            const move_val = try self.func.newValue(.move, TypeRegistry.SSA_MEM, cur, self.cur_pos);
             move_val.addArg2(off_val, src_addr);
+            {
+                const cur_mem = try self.mem();
+                try move_val.addArgAlloc(cur_mem, self.allocator);
+            }
             // Use value's type_size when available, fall back to IR node's size for
             // VOID-typed addresses (from convertFieldValue for struct fields).
             const move_size = if (type_size > 0) type_size else self.type_registry.sizeOf(self.ir_func.nodes[f.value].type_idx);
             move_val.aux_int = @intCast(move_size);
             try cur.addValue(self.allocator, move_val);
+            self.setMem(move_val);
             return move_val;
         }
 
         const store_op = self.getStoreOp(value.type_idx);
-        const store_val = try self.func.newValue(store_op, TypeRegistry.VOID, cur, self.cur_pos);
-        store_val.addArg2(off_val, value);
-        try cur.addValue(self.allocator, store_val);
-        return store_val;
+        return self.emitMemStore(store_op, off_val, value, cur);
     }
 
     fn convertFieldValue(self: *SSABuilder, f: ir.FieldValue, type_idx: TypeIndex, cur: *Block) !*Value {
@@ -1619,10 +1611,7 @@ pub const SSABuilder = struct {
         // Large structs stay as addresses (accessed via SRET or further field ops).
         // Reference: cg_clif value_and_place.rs — CValue::ByVal for small structs.
         if (field_type == .struct_type and self.type_registry.sizeOf(type_idx) <= 8) {
-            const load = try self.func.newValue(.load, type_idx, cur, self.cur_pos);
-            load.addArg(off_val);
-            try cur.addValue(self.allocator, load);
-            return load;
+            return self.emitMemLoad(.load, off_val, type_idx, cur);
         }
         if (field_type == .struct_type or field_type == .array or field_type == .union_type) return off_val;
 
@@ -1630,18 +1619,14 @@ pub const SSABuilder = struct {
         if (field_type == .optional) {
             const elem_info = self.type_registry.get(field_type.optional.elem);
             if (elem_info == .pointer and elem_info.pointer.managed) {
-                const tag_load = try self.func.newValue(.load, TypeRegistry.I64, cur, self.cur_pos);
-                tag_load.addArg(off_val);
-                try cur.addValue(self.allocator, tag_load);
+                const tag_load = try self.emitMemLoad(.load, off_val, TypeRegistry.I64, cur);
 
                 const data_addr = try self.func.newValue(.off_ptr, TypeRegistry.VOID, cur, self.cur_pos);
                 data_addr.aux_int = 8;
                 data_addr.addArg(off_val);
                 try cur.addValue(self.allocator, data_addr);
 
-                const data_load = try self.func.newValue(.load, TypeRegistry.I64, cur, self.cur_pos);
-                data_load.addArg(data_addr);
-                try cur.addValue(self.allocator, data_load);
+                const data_load = try self.emitMemLoad(.load, data_addr, TypeRegistry.I64, cur);
 
                 const opt_val = try self.func.newValue(.opt_make, type_idx, cur, self.cur_pos);
                 opt_val.addArg(tag_load);
@@ -1663,18 +1648,14 @@ pub const SSABuilder = struct {
         // String/slice compound load: decompose into ptr@0, len@8, create string_make/slice_make
         const is_string_or_slice = type_idx == TypeRegistry.STRING or field_type == .slice;
         if (is_string_or_slice) {
-            const ptr_load = try self.func.newValue(.load, TypeRegistry.I64, cur, self.cur_pos);
-            ptr_load.addArg(off_val);
-            try cur.addValue(self.allocator, ptr_load);
+            const ptr_load = try self.emitMemLoad(.load, off_val, TypeRegistry.I64, cur);
 
             const len_addr = try self.func.newValue(.off_ptr, TypeRegistry.VOID, cur, self.cur_pos);
             len_addr.aux_int = 8;
             len_addr.addArg(off_val);
             try cur.addValue(self.allocator, len_addr);
 
-            const len_load = try self.func.newValue(.load, TypeRegistry.I64, cur, self.cur_pos);
-            len_load.addArg(len_addr);
-            try cur.addValue(self.allocator, len_load);
+            const len_load = try self.emitMemLoad(.load, len_addr, TypeRegistry.I64, cur);
 
             const make_op: Op = if (type_idx == TypeRegistry.STRING) .string_make else .slice_make;
             const make_val = try self.func.newValue(make_op, type_idx, cur, self.cur_pos);
@@ -1684,10 +1665,7 @@ pub const SSABuilder = struct {
         }
 
         const load_op = self.getLoadOp(type_idx);
-        const load_val = try self.func.newValue(load_op, type_idx, cur, self.cur_pos);
-        load_val.addArg(off_val);
-        try cur.addValue(self.allocator, load_val);
-        return load_val;
+        return self.emitMemLoad(load_op, off_val, type_idx, cur);
     }
 
     fn convertStoreField(self: *SSABuilder, f: ir.StoreField, cur: *Block) !*Value {
@@ -1718,19 +1696,14 @@ pub const SSABuilder = struct {
                 try cur.addValue(self.allocator, len_component);
             }
 
-            const ptr_store = try self.func.newValue(.store, TypeRegistry.VOID, cur, self.cur_pos);
-            ptr_store.addArg2(off_val, ptr_component);
-            try cur.addValue(self.allocator, ptr_store);
+            _ = try self.emitMemStore(.store, off_val, ptr_component, cur);
 
             const len_addr = try self.func.newValue(.off_ptr, TypeRegistry.VOID, cur, self.cur_pos);
             len_addr.aux_int = 8;
             len_addr.addArg(off_val);
             try cur.addValue(self.allocator, len_addr);
 
-            const len_store = try self.func.newValue(.store, TypeRegistry.VOID, cur, self.cur_pos);
-            len_store.addArg2(len_addr, len_component);
-            try cur.addValue(self.allocator, len_store);
-            return len_store;
+            return self.emitMemStore(.store, len_addr, len_component, cur);
         }
 
         // ?*T optional pointer store: decompose into tag@0, payload@8
@@ -1753,19 +1726,14 @@ pub const SSABuilder = struct {
                     try cur.addValue(self.allocator, data_component);
                 }
 
-                const tag_store = try self.func.newValue(.store, TypeRegistry.VOID, cur, self.cur_pos);
-                tag_store.addArg2(off_val, tag_component);
-                try cur.addValue(self.allocator, tag_store);
+                _ = try self.emitMemStore(.store, off_val, tag_component, cur);
 
                 const data_addr = try self.func.newValue(.off_ptr, TypeRegistry.VOID, cur, self.cur_pos);
                 data_addr.aux_int = 8;
                 data_addr.addArg(off_val);
                 try cur.addValue(self.allocator, data_addr);
 
-                const data_store = try self.func.newValue(.store, TypeRegistry.VOID, cur, self.cur_pos);
-                data_store.addArg2(data_addr, data_component);
-                try cur.addValue(self.allocator, data_store);
-                return data_store;
+                return self.emitMemStore(.store, data_addr, data_component, cur);
             }
         }
 
@@ -1797,21 +1765,23 @@ pub const SSABuilder = struct {
 
         if (is_large_struct) {
             const src_addr = if (value.op == .load and value.args.len > 0) value.args[0] else value;
-            const move_val = try self.func.newValue(.move, TypeRegistry.VOID, cur, self.cur_pos);
+            const move_val = try self.func.newValue(.move, TypeRegistry.SSA_MEM, cur, self.cur_pos);
             move_val.addArg2(off_val, src_addr);
+            {
+                const cur_mem = try self.mem();
+                try move_val.addArgAlloc(cur_mem, self.allocator);
+            }
             // Use value's type_size when available, fall back to IR node's size for
             // VOID-typed addresses (from convertFieldValue for struct fields).
             const move_size = if (type_size > 0) type_size else self.type_registry.sizeOf(self.ir_func.nodes[f.value].type_idx);
             move_val.aux_int = @intCast(move_size);
             try cur.addValue(self.allocator, move_val);
+            self.setMem(move_val);
             return move_val;
         }
 
         const store_op = self.getStoreOp(value.type_idx);
-        const store_val = try self.func.newValue(store_op, TypeRegistry.VOID, cur, self.cur_pos);
-        store_val.addArg2(off_val, value);
-        try cur.addValue(self.allocator, store_val);
-        return store_val;
+        return self.emitMemStore(store_op, off_val, value, cur);
     }
 
     fn convertIndexLocal(self: *SSABuilder, idx: ir.IndexLocal, type_idx: TypeIndex, cur: *Block) !*Value {
@@ -1844,18 +1814,14 @@ pub const SSABuilder = struct {
         const field_type = self.type_registry.get(type_idx);
         const is_string_or_slice = type_idx == TypeRegistry.STRING or field_type == .slice;
         if (is_string_or_slice) {
-            const ptr_load = try self.func.newValue(.load, TypeRegistry.I64, cur, self.cur_pos);
-            ptr_load.addArg(ptr);
-            try cur.addValue(self.allocator, ptr_load);
+            const ptr_load = try self.emitMemLoad(.load, ptr, TypeRegistry.I64, cur);
 
             const len_addr = try self.func.newValue(.off_ptr, TypeRegistry.VOID, cur, self.cur_pos);
             len_addr.aux_int = 8;
             len_addr.addArg(ptr);
             try cur.addValue(self.allocator, len_addr);
 
-            const len_load = try self.func.newValue(.load, TypeRegistry.I64, cur, self.cur_pos);
-            len_load.addArg(len_addr);
-            try cur.addValue(self.allocator, len_load);
+            const len_load = try self.emitMemLoad(.load, len_addr, TypeRegistry.I64, cur);
 
             const make_op: Op = if (type_idx == TypeRegistry.STRING) .string_make else .slice_make;
             const make_val = try self.func.newValue(make_op, type_idx, cur, self.cur_pos);
@@ -1867,10 +1833,7 @@ pub const SSABuilder = struct {
         // Choose the right load op based on type size
         // Go reference: wasm/ssa.go loadOp() function
         const load_op = self.getLoadOp(type_idx);
-        const load = try self.func.newValue(load_op, type_idx, cur, self.cur_pos);
-        load.addArg(ptr);
-        try cur.addValue(self.allocator, load);
-        return load;
+        return self.emitMemLoad(load_op, ptr, type_idx, cur);
     }
 
     /// Choose the correct load operation based on type size and signedness.
@@ -1976,26 +1939,18 @@ pub const SSABuilder = struct {
                 try cur.addValue(self.allocator, len_component);
             }
 
-            const ptr_store = try self.func.newValue(.store, TypeRegistry.VOID, cur, self.cur_pos);
-            ptr_store.addArg2(ptr, ptr_component);
-            try cur.addValue(self.allocator, ptr_store);
+            _ = try self.emitMemStore(.store, ptr, ptr_component, cur);
 
             const len_addr = try self.func.newValue(.off_ptr, TypeRegistry.VOID, cur, self.cur_pos);
             len_addr.aux_int = 8;
             len_addr.addArg(ptr);
             try cur.addValue(self.allocator, len_addr);
 
-            const len_store = try self.func.newValue(.store, TypeRegistry.VOID, cur, self.cur_pos);
-            len_store.addArg2(len_addr, len_component);
-            try cur.addValue(self.allocator, len_store);
-            return len_store;
+            return self.emitMemStore(.store, len_addr, len_component, cur);
         }
 
         const store_op = self.getStoreOp(value.type_idx);
-        const store = try self.func.newValue(store_op, TypeRegistry.VOID, cur, self.cur_pos);
-        store.addArg2(ptr, value);
-        try cur.addValue(self.allocator, store);
-        return store;
+        return self.emitMemStore(store_op, ptr, value, cur);
     }
 
     fn convertSliceLocal(self: *SSABuilder, s: ir.SliceLocal, type_idx: TypeIndex, cur: *Block) !*Value {
@@ -2062,20 +2017,14 @@ pub const SSABuilder = struct {
     fn convertPtrLoad(self: *SSABuilder, ptr_local: ir.LocalIdx, type_idx: TypeIndex, cur: *Block) !*Value {
         const ptr_val = try self.variable(ptr_local, type_idx);
         const load_op = self.getLoadOp(type_idx);
-        const load_val = try self.func.newValue(load_op, type_idx, cur, self.cur_pos);
-        load_val.addArg(ptr_val);
-        try cur.addValue(self.allocator, load_val);
-        return load_val;
+        return self.emitMemLoad(load_op, ptr_val, type_idx, cur);
     }
 
     fn convertPtrStore(self: *SSABuilder, p: ir.PtrStore, cur: *Block) !*Value {
         const ptr_val = try self.variable(p.ptr_local, TypeRegistry.VOID);
         const value = try self.convertNode(p.value) orelse return error.MissingValue;
         const store_op = self.getStoreOp(value.type_idx);
-        const store_val = try self.func.newValue(store_op, TypeRegistry.VOID, cur, self.cur_pos);
-        store_val.addArg2(ptr_val, value);
-        try cur.addValue(self.allocator, store_val);
-        return store_val;
+        return self.emitMemStore(store_op, ptr_val, value, cur);
     }
 
     /// Convert ptr.* load — dereference a pointer to get its value.
@@ -2088,9 +2037,7 @@ pub const SSABuilder = struct {
         const is_string_or_slice = type_idx == TypeRegistry.STRING or value_type == .slice;
         if (is_string_or_slice) {
             // Load ptr component from base address
-            const ptr_load = try self.func.newValue(.load, TypeRegistry.I64, cur, self.cur_pos);
-            ptr_load.addArg(ptr_val);
-            try cur.addValue(self.allocator, ptr_load);
+            const ptr_load = try self.emitMemLoad(.load, ptr_val, TypeRegistry.I64, cur);
 
             // Load len component from base + 8
             const len_addr = try self.func.newValue(.off_ptr, TypeRegistry.VOID, cur, self.cur_pos);
@@ -2098,9 +2045,7 @@ pub const SSABuilder = struct {
             len_addr.addArg(ptr_val);
             try cur.addValue(self.allocator, len_addr);
 
-            const len_load = try self.func.newValue(.load, TypeRegistry.I64, cur, self.cur_pos);
-            len_load.addArg(len_addr);
-            try cur.addValue(self.allocator, len_load);
+            const len_load = try self.emitMemLoad(.load, len_addr, TypeRegistry.I64, cur);
 
             // Create string_make/slice_make to bundle the components
             const make_op: Op = if (type_idx == TypeRegistry.STRING) .string_make else .slice_make;
@@ -2114,18 +2059,14 @@ pub const SSABuilder = struct {
         if (value_type == .optional) {
             const opt_elem_info = self.type_registry.get(value_type.optional.elem);
             if (opt_elem_info == .pointer and opt_elem_info.pointer.managed) {
-                const tag_load = try self.func.newValue(.load, TypeRegistry.I64, cur, self.cur_pos);
-                tag_load.addArg(ptr_val);
-                try cur.addValue(self.allocator, tag_load);
+                const tag_load = try self.emitMemLoad(.load, ptr_val, TypeRegistry.I64, cur);
 
                 const data_addr = try self.func.newValue(.off_ptr, TypeRegistry.VOID, cur, self.cur_pos);
                 data_addr.aux_int = 8;
                 data_addr.addArg(ptr_val);
                 try cur.addValue(self.allocator, data_addr);
 
-                const data_load = try self.func.newValue(.load, TypeRegistry.I64, cur, self.cur_pos);
-                data_load.addArg(data_addr);
-                try cur.addValue(self.allocator, data_load);
+                const data_load = try self.emitMemLoad(.load, data_addr, TypeRegistry.I64, cur);
 
                 const opt_val = try self.func.newValue(.opt_make, type_idx, cur, self.cur_pos);
                 opt_val.addArg(tag_load);
@@ -2159,10 +2100,7 @@ pub const SSABuilder = struct {
         }
 
         const load_op = self.getLoadOp(type_idx);
-        const load_val = try self.func.newValue(load_op, type_idx, cur, self.cur_pos);
-        load_val.addArg(ptr_val);
-        try cur.addValue(self.allocator, load_val);
-        return load_val;
+        return self.emitMemLoad(load_op, ptr_val, type_idx, cur);
     }
 
     /// Convert ptr.* = value store.
@@ -2202,9 +2140,7 @@ pub const SSABuilder = struct {
             }
 
             // Store ptr at base address
-            const ptr_store = try self.func.newValue(.store, TypeRegistry.VOID, cur, self.cur_pos);
-            ptr_store.addArg2(ptr_val, ptr_component);
-            try cur.addValue(self.allocator, ptr_store);
+            _ = try self.emitMemStore(.store, ptr_val, ptr_component, cur);
 
             // Store len at base + 8
             const len_addr = try self.func.newValue(.off_ptr, TypeRegistry.VOID, cur, self.cur_pos);
@@ -2212,9 +2148,7 @@ pub const SSABuilder = struct {
             len_addr.addArg(ptr_val);
             try cur.addValue(self.allocator, len_addr);
 
-            const len_store = try self.func.newValue(.store, TypeRegistry.VOID, cur, self.cur_pos);
-            len_store.addArg2(len_addr, len_component);
-            try cur.addValue(self.allocator, len_store);
+            const len_store = try self.emitMemStore(.store, len_addr, len_component, cur);
 
             // Store cap at base + 16 for slices
             if (value.op == .slice_make and value.args.len >= 3) {
@@ -2223,9 +2157,7 @@ pub const SSABuilder = struct {
                 cap_addr.addArg(ptr_val);
                 try cur.addValue(self.allocator, cap_addr);
 
-                const cap_store = try self.func.newValue(.store, TypeRegistry.VOID, cur, self.cur_pos);
-                cap_store.addArg2(cap_addr, value.args[2]);
-                try cur.addValue(self.allocator, cap_store);
+                _ = try self.emitMemStore(.store, cap_addr, value.args[2], cur);
             }
 
             return len_store;
@@ -2251,19 +2183,14 @@ pub const SSABuilder = struct {
                     try cur.addValue(self.allocator, data_component);
                 }
 
-                const tag_store = try self.func.newValue(.store, TypeRegistry.VOID, cur, self.cur_pos);
-                tag_store.addArg2(ptr_val, tag_component);
-                try cur.addValue(self.allocator, tag_store);
+                _ = try self.emitMemStore(.store, ptr_val, tag_component, cur);
 
                 const data_addr = try self.func.newValue(.off_ptr, TypeRegistry.VOID, cur, self.cur_pos);
                 data_addr.aux_int = 8;
                 data_addr.addArg(ptr_val);
                 try cur.addValue(self.allocator, data_addr);
 
-                const data_store = try self.func.newValue(.store, TypeRegistry.VOID, cur, self.cur_pos);
-                data_store.addArg2(data_addr, data_component);
-                try cur.addValue(self.allocator, data_store);
-                return data_store;
+                return self.emitMemStore(.store, data_addr, data_component, cur);
             }
         }
 
@@ -2294,13 +2221,18 @@ pub const SSABuilder = struct {
             // pointer itself for large structs (type rewritten but value is addr).
             // Same pattern as convertStoreLocal (line ~673).
             const src_addr = value;
-            const move_val = try self.func.newValue(.move, TypeRegistry.VOID, cur, self.cur_pos);
+            const move_val = try self.func.newValue(.move, TypeRegistry.SSA_MEM, cur, self.cur_pos);
             move_val.addArg2(ptr_val, src_addr);
+            {
+                const cur_mem = try self.mem();
+                try move_val.addArgAlloc(cur_mem, self.allocator);
+            }
             // Use value's type_size when available, fall back to IR node's size for
             // VOID-typed addresses (from convertFieldValue for struct fields).
             const move_size = if (type_size > 0) type_size else self.type_registry.sizeOf(self.ir_func.nodes[p.value].type_idx);
             move_val.aux_int = @intCast(move_size);
             try cur.addValue(self.allocator, move_val);
+            self.setMem(move_val);
             return move_val;
         }
 
@@ -2310,10 +2242,7 @@ pub const SSABuilder = struct {
         const ptr_type = self.type_registry.get(ptr_val.type_idx);
         const store_type = if (ptr_type == .pointer) ptr_type.pointer.elem else value.type_idx;
         const store_op = self.getStoreOp(store_type);
-        const store_val = try self.func.newValue(store_op, TypeRegistry.VOID, cur, self.cur_pos);
-        store_val.addArg2(ptr_val, value);
-        try cur.addValue(self.allocator, store_val);
-        return store_val;
+        return self.emitMemStore(store_op, ptr_val, value, cur);
     }
 
     fn convertPtrField(self: *SSABuilder, p: ir.PtrField, type_idx: TypeIndex, cur: *Block) !*Value {
@@ -2327,10 +2256,7 @@ pub const SSABuilder = struct {
         if (field_type == .struct_type or field_type == .array) return off_val;
 
         const load_op = self.getLoadOp(type_idx);
-        const load_val = try self.func.newValue(load_op, type_idx, cur, self.cur_pos);
-        load_val.addArg(off_val);
-        try cur.addValue(self.allocator, load_val);
-        return load_val;
+        return self.emitMemLoad(load_op, off_val, type_idx, cur);
     }
 
     fn convertPtrFieldStore(self: *SSABuilder, p: ir.PtrFieldStore, cur: *Block) !*Value {
@@ -2342,10 +2268,7 @@ pub const SSABuilder = struct {
         try cur.addValue(self.allocator, off_val);
 
         const store_op = self.getStoreOp(value.type_idx);
-        const store_val = try self.func.newValue(store_op, TypeRegistry.VOID, cur, self.cur_pos);
-        store_val.addArg2(off_val, value);
-        try cur.addValue(self.allocator, store_val);
-        return store_val;
+        return self.emitMemStore(store_op, off_val, value, cur);
     }
 
     fn convertSelect(self: *SSABuilder, s: ir.Select, type_idx: TypeIndex, cur: *Block) !*Value {
@@ -2461,10 +2384,7 @@ pub const SSABuilder = struct {
 
     fn convertUnionTag(self: *SSABuilder, u: ir.UnionTag, type_idx: TypeIndex, cur: *Block) !*Value {
         const union_val = try self.convertNode(u.value) orelse return error.MissingValue;
-        const val = try self.func.newValue(.load, type_idx, cur, self.cur_pos);
-        val.addArg(union_val);
-        try cur.addValue(self.allocator, val);
-        return val;
+        return self.emitMemLoad(.load, union_val, type_idx, cur);
     }
 
     fn convertUnionPayload(self: *SSABuilder, u: ir.UnionPayload, type_idx: TypeIndex, cur: *Block) !*Value {
@@ -2474,10 +2394,7 @@ pub const SSABuilder = struct {
         off_val.aux_int = 8; // Payload after tag
         try cur.addValue(self.allocator, off_val);
 
-        const load_val = try self.func.newValue(.load, type_idx, cur, self.cur_pos);
-        load_val.addArg(off_val);
-        try cur.addValue(self.allocator, load_val);
-        return load_val;
+        return self.emitMemLoad(.load, off_val, type_idx, cur);
     }
 
     fn convertLogicalOp(self: *SSABuilder, b: ir.Binary, result_type: TypeIndex) anyerror!*Value {
@@ -2583,7 +2500,7 @@ pub const SSABuilder = struct {
 
             if (need_phi) {
                 fwd.op = .phi;
-                for (args.items) |v| fwd.addArg(v);
+                for (args.items) |v| try fwd.addArgAlloc(v, self.allocator);
             } else if (witness) |w| {
                 fwd.op = .copy;
                 fwd.addArg(w);
@@ -2617,6 +2534,9 @@ pub const SSABuilder = struct {
         if (!inner_gop.found_existing) inner_gop.value_ptr.* = value;
     }
 
+    /// Go: phi.go lookupVarOutgoing — walk back through single-pred chain.
+    /// If we hit a multi-pred block, create FwdRef for further resolution.
+    /// If we hit a 0-pred block (entry or orphan), check entry block's defvars.
     fn lookupVarOutgoing(self: *SSABuilder, block: *Block, local_idx: ir.LocalIdx, type_idx: TypeIndex, fwd_refs: *std.ArrayListUnmanaged(*Value)) !*Value {
         var cur = block;
         while (true) {
@@ -2627,6 +2547,23 @@ pub const SSABuilder = struct {
             break;
         }
 
+        // Reached a block with 0 or 2+ predecessors without finding the variable.
+        // For 0-pred blocks (entry/orphan): check the entry block's defvars directly.
+        // Go: entry block always has memVar defined; 0-pred orphan blocks shouldn't exist.
+        if (cur.preds.len == 0) {
+            if (self.func.entry) |entry| {
+                if (self.defvars.get(entry.id)) |entry_defs| {
+                    if (entry_defs.get(local_idx)) |val| return val;
+                }
+            }
+            // Variable not found anywhere — use a zero/undef value to avoid crash
+            debug.log(.ssa, "WARNING: lookupVarOutgoing failed for local {d} in 0-pred block b{d}", .{ local_idx, cur.id });
+            const undef = try self.func.newValue(.const_int, type_idx, cur, self.cur_pos);
+            try cur.addValue(self.allocator, undef);
+            return undef;
+        }
+
+        // Multi-pred block: create FwdRef for phi insertion
         const new_fwd = try self.func.newValue(.fwd_ref, type_idx, cur, self.cur_pos);
         new_fwd.aux_int = @intCast(local_idx);
         try cur.addValue(self.allocator, new_fwd);
@@ -2647,7 +2584,12 @@ pub const SSABuilder = struct {
                     if (seen_non_phi) return error.PhiNotAtBlockStart;
                     if (v.argsLen() != block.preds.len) return error.PhiArgCountMismatch;
                 } else seen_non_phi = true;
-                if (v.op == .fwd_ref) return error.UnresolvedFwdRef;
+                if (v.op == .fwd_ref) {
+                    debug.log(.ssa, "UNRESOLVED FwdRef: v{d} local_idx={d} type={d} block=b{d} func={s}", .{
+                        v.id, v.aux_int, v.type_idx, block.id, self.func.name,
+                    });
+                    return error.UnresolvedFwdRef;
+                }
             }
             switch (block.kind) {
                 .ret => if (block.succs.len != 0) return error.RetBlockHasSuccessors,

@@ -10,26 +10,34 @@ const Func = @import("../func.zig").Func;
 const Block = @import("../block.zig").Block;
 const Value = @import("../value.zig").Value;
 const Op = @import("../op.zig").Op;
+const frontend_types = @import("../../frontend/types.zig");
 const debug = @import("../../pipeline_debug.zig");
 
-/// Priority scores - lower numbers scheduled earlier (Go's pattern).
+/// Priority scores - lower numbers scheduled earlier.
+/// Go reference: schedule.go:16-28 (ScorePhi through ScoreControl).
 pub const Score = enum(i8) {
     phi = 0, // Phis must be first
     arg = 1, // Arguments early (entry block)
-    read_tuple = 2, // select_n must follow call immediately
-    memory = 3, // Stores early (reduces register pressure)
-    default = 4, // Normal instructions
-    control = 5, // Branch/return last
+    init_mem = 2, // After args — Go: ScoreInitMem (debug info marker)
+    read_tuple = 3, // select_n must follow call immediately
+    nil_check = 4, // Nil checks before loads from same address
+    memory = 5, // Stores/calls early (reduces register pressure)
+    default = 6, // Normal instructions
+    control = 7, // Branch/return last
 };
 
 /// Get the scheduling score for a value.
+/// Go reference: schedule.go:137-212.
 fn getScore(v: *Value, is_control: bool) Score {
     if (is_control) return .control;
+    // Go: v.Type.IsMemory() → ScoreMemory (includes stores AND calls)
+    if (v.type_idx == frontend_types.TypeRegistry.SSA_MEM or v.writesMemory()) return .memory;
     return switch (v.op) {
         .phi => .phi,
         .arg => .arg,
+        .init_mem => .init_mem,
         .select_n => .read_tuple,
-        .store, .store_reg => .memory,
+        .nil_check => .nil_check,
         else => .default,
     };
 }
@@ -91,22 +99,37 @@ fn scheduleBlock(allocator: std.mem.Allocator, block: *Block, f: *Func) !void {
         }
     }
 
-    // Memory ordering: chain stores and calls linearly via last_mem.
-    // Memory ordering: linear chain using writesMemory()/readsMemory()/hasSideEffects()
-    // flags. Uses op info flags instead of hardcoded op names.
-    // TODO: Port Go's explicit memory threading (MEMORY_THREADING_SPEC.md) for
-    // precise ordering that avoids false dependencies between independent locals.
-    var last_mem: ?*Value = null;
+    // Go schedule.go:257-264 — build nextMem: maps memory input → next memory output.
+    // Go uses v.Type.IsMemory() which covers stores (TypeMem) and calls (tuple with TypeMem).
+    // Cot equivalent: stores/moves have type SSA_MEM, calls have writes_memory flag.
+    // We check both to cover all memory-producing ops.
+    var next_mem = try allocator.alloc(?*Value, f.vid.next_id);
+    defer allocator.free(next_mem);
+    @memset(next_mem, null);
+
+    for (values) |v| {
+        if (v.op == .phi or v.op == .init_mem) continue;
+        // Go: v.Type.IsMemory() — true for stores AND calls
+        const is_mem_producer = v.type_idx == frontend_types.TypeRegistry.SSA_MEM or v.writesMemory();
+        if (is_mem_producer) {
+            if (v.memoryArg()) |mem_arg| {
+                next_mem[mem_arg.id] = v;
+            }
+        }
+    }
+
+    // Go schedule.go:266-278 — add load→store edges.
+    // For every non-phi, non-memory-producing value that has a memory arg:
+    // the value must be scheduled before the next memory op in the chain.
     for (values) |v| {
         if (v.op == .phi) continue;
-        if (v.writesMemory()) {
-            if (last_mem) |lm| try edges.append(allocator, .{ .x = lm, .y = v });
-            last_mem = v;
-        } else if (v.readsMemory()) {
-            if (last_mem) |lm| try edges.append(allocator, .{ .x = lm, .y = v });
-        } else if (v.hasSideEffects()) {
-            if (last_mem) |lm| try edges.append(allocator, .{ .x = lm, .y = v });
-            last_mem = v;
+        const is_mem_producer = v.type_idx == frontend_types.TypeRegistry.SSA_MEM or v.writesMemory();
+        if (is_mem_producer) continue; // skip memory producers (Go: v.Type.IsMemory())
+        const mem_arg = v.memoryArg() orelse continue;
+        if (next_mem[mem_arg.id]) |next_store| {
+            if (next_store.block == block) {
+                try edges.append(allocator, .{ .x = v, .y = next_store });
+            }
         }
     }
 
@@ -115,6 +138,7 @@ fn scheduleBlock(allocator: std.mem.Allocator, block: *Block, f: *Func) !void {
     defer allocator.free(in_edges);
     for (in_edges) |*e| e.* = 0;
     for (edges.items) |e| in_edges[e.y.id] += 1;
+
 
     // Initialize ready set
     var ready = std.ArrayListUnmanaged(*Value){};
@@ -189,9 +213,11 @@ fn scheduleBlock(allocator: std.mem.Allocator, block: *Block, f: *Func) !void {
 const testing = std.testing;
 
 test "Score ordering" {
-    // Verify score order matches expected emission order
+    // Verify score order matches expected emission order (Go schedule.go:16-28)
     try testing.expect(@intFromEnum(Score.phi) < @intFromEnum(Score.arg));
-    try testing.expect(@intFromEnum(Score.arg) < @intFromEnum(Score.memory));
+    try testing.expect(@intFromEnum(Score.arg) < @intFromEnum(Score.init_mem));
+    try testing.expect(@intFromEnum(Score.init_mem) < @intFromEnum(Score.read_tuple));
+    try testing.expect(@intFromEnum(Score.read_tuple) < @intFromEnum(Score.memory));
     try testing.expect(@intFromEnum(Score.memory) < @intFromEnum(Score.default));
     try testing.expect(@intFromEnum(Score.default) < @intFromEnum(Score.control));
 }
@@ -210,7 +236,8 @@ test "getScore returns correct priorities" {
     try b.addValue(allocator, arg);
     const add = try f.newValue(.add, 0, b, .{});
     try b.addValue(allocator, add);
-    const store = try f.newValue(.store, 0, b, .{});
+    // Store with SSA_MEM type (Go: stores produce TypeMem)
+    const store = try f.newValue(.store, frontend_types.TypeRegistry.SSA_MEM, b, .{});
     try b.addValue(allocator, store);
 
     try testing.expectEqual(Score.phi, getScore(phi, false));

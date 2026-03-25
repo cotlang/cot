@@ -367,7 +367,7 @@ const op_info_table = blk: {
     }
     // Sign/zero-extending loads (from IR, before lower_wasm converts to wasm_* ops)
     for ([_]Op{ .load8s, .load16s, .load32s }) |op| {
-        table[@intFromEnum(op)] = .{ .name = @tagName(op), .arg_len = 1, .reads_memory = true };
+        table[@intFromEnum(op)] = .{ .name = @tagName(op), .arg_len = 2, .reads_memory = true };
     }
     // Float arithmetic (2 args)
     for ([_]Op{ .add32f, .sub32f, .mul32f, .div32f, .add64f, .sub64f, .mul64f, .div64f }) |op| {
@@ -415,9 +415,9 @@ const op_info_table = blk: {
     table[@intFromEnum(Op.opt_tag)] = .{ .name = "OptTag", .arg_len = 1 };
     table[@intFromEnum(Op.opt_data)] = .{ .name = "OptData", .arg_len = 1 };
 
-    // Calls
+    // Calls — memory barriers: take mem as last arg, produce new memory state (Go pattern)
     for ([_]Op{ .call, .tail_call, .static_call, .closure_call, .inter_call }) |op| {
-        table[@intFromEnum(op)] = .{ .name = @tagName(op), .arg_len = -1, .call = true, .has_side_effects = true, .aux_type = .call };
+        table[@intFromEnum(op)] = .{ .name = @tagName(op), .arg_len = -1, .call = true, .has_side_effects = true, .writes_memory = true, .reads_memory = true, .aux_type = .call };
     }
 
     // Safety checks
@@ -447,7 +447,7 @@ const op_info_table = blk: {
     table[@intFromEnum(Op.atomic_exchange64)] = .{ .name = "AtomicExchange64", .arg_len = 2, .reads_memory = true, .writes_memory = true, .has_side_effects = true };
 
     // Move
-    table[@intFromEnum(Op.move)] = .{ .name = "Move", .arg_len = 2, .aux_type = .int64, .writes_memory = true, .has_side_effects = true };
+    table[@intFromEnum(Op.move)] = .{ .name = "Move", .arg_len = 3, .aux_type = .int64, .writes_memory = true, .has_side_effects = true };
 
     // ARM64 ops (machine-specific, not generic)
     for ([_]Op{ .arm64_add, .arm64_adds, .arm64_sub, .arm64_subs, .arm64_mul, .arm64_sdiv, .arm64_udiv, .arm64_madd, .arm64_msub }) |op| {
