@@ -581,10 +581,11 @@ pub const Lowerer = struct {
             const ptr_type = self.type_reg.makePointer(TypeRegistry.U8) catch TypeRegistry.VOID;
             const err_void_type = self.type_reg.makeErrorUnion(TypeRegistry.VOID) catch TypeRegistry.VOID;
 
-            // Initialize globals before any test code runs
+            // Initialize globals and type metadata before any test code runs
             {
                 var init_args = [_]ir.NodeIndex{};
                 _ = try fb.emitCall("__cot_init_globals", &init_args, false, TypeRegistry.VOID, span);
+                _ = try fb.emitCall("__cot_init_metadata", &init_args, false, TypeRegistry.VOID, span);
             }
 
             // fail_count local — counts test failures, returned as exit code
@@ -751,10 +752,11 @@ pub const Lowerer = struct {
                 param_type = self.chk.safeWrapType(param_type) catch param_type;
                 _ = try fb.addParam(param.name, param_type, self.type_reg.sizeOf(param_type));
             }
-            // Initialize globals before user code in main()
+            // Initialize globals and type metadata before user code in main()
             if (std.mem.eql(u8, fn_decl.name, "main")) {
                 var no_init_args = [_]ir.NodeIndex{};
                 _ = try fb.emitCall("__cot_init_globals", &no_init_args, false, TypeRegistry.VOID, fn_decl.span);
+                _ = try fb.emitCall("__cot_init_metadata", &no_init_args, false, TypeRegistry.VOID, fn_decl.span);
             }
             if (fn_decl.body != null_node) {
                 _ = try self.lowerBlockNode(fn_decl.body);
@@ -2375,6 +2377,34 @@ pub const Lowerer = struct {
                 }
             }
 
+            // Existential coercion: concrete → any Trait.
+            // Must be checked BEFORE type-specific inits (struct_init, array, etc.)
+            // because the value expr (e.g. Dog{}) is a struct literal but the TARGET
+            // type is existential — we need erasure, not plain struct init.
+            // Swift GenExistential.cpp emitExistentialErasure at decl sites.
+            if (self.type_reg.get(type_idx) == .existential) {
+                var value_node = try self.lowerExprNode(var_stmt.value);
+                if (value_node == ir.null_node) return;
+                const val_type = self.inferExprType(var_stmt.value);
+                debug.log(.lower, "existential var init: '{s}' val_type={d} target_type={d}", .{ var_stmt.name, val_type, type_idx });
+                // If source is already existential (e.g. `var b = a` where a: any Trait),
+                // this is a COPY, not an erasure. Just store directly (40B memcpy via SSA).
+                // Erasure is only needed when coercing concrete → existential.
+                if (self.type_reg.get(val_type) != .existential) {
+                    value_node = try self.emitExistentialErasure(fb, value_node, val_type, type_idx, var_stmt.span);
+                } else {
+                    debug.log(.lower, "existential copy (not erasure): val already existential", .{});
+                }
+                _ = try fb.emitStoreLocal(local_idx, value_node, var_stmt.span);
+                // Register ARC cleanup for existential (contains VWT-managed value)
+                if (!self.target.isWasm()) {
+                    const loaded = try fb.emitLoadLocal(local_idx, type_idx, var_stmt.span);
+                    const cleanup = arc.Cleanup.initForLocal(.release, loaded, type_idx, local_idx);
+                    _ = try self.cleanup_stack.push(cleanup);
+                }
+                return;
+            }
+
             const is_array = self.type_reg.isArray(type_idx);
             const is_slice = self.type_reg.isSlice(type_idx);
             const is_struct_literal = if (value_expr) |e| e == .struct_init else false;
@@ -2455,15 +2485,7 @@ pub const Lowerer = struct {
                     // Use lowerExprManaged as the SINGLE expression evaluation.
                     // Previously lowerExprNode was called separately, then lowerExprManaged
                     // was called again — causing double evaluation of function calls.
-                    // Existential coercion: concrete → any Trait (before ARC path)
-                                if (self.type_reg.get(type_idx) == .existential) {
-                        var value_node = try self.lowerExprNode(var_stmt.value);
-                        if (value_node == ir.null_node) return;
-                        const val_type = self.inferExprType(var_stmt.value);
-                        value_node = try self.emitExistentialErasure(fb, value_node, val_type, type_idx, var_stmt.span);
-                        _ = try fb.emitStoreLocal(local_idx, value_node, var_stmt.span);
-                        return;
-                    }
+                    // NOTE: Existential coercion handled above (before type-specific inits).
                     if (!self.target.isWasm() and !var_stmt.is_weak and !var_stmt.is_unowned and self.type_reg.couldBeARC(type_idx)) {
                         // ARC path: use lowerExprManaged for ownership tracking
                         const managed = try self.lowerExprManaged(var_stmt.value);
@@ -2486,14 +2508,9 @@ pub const Lowerer = struct {
                         }
                     } else {
                         // Non-ARC path (trivial types, weak, unowned)
-                        var value_node = try self.lowerExprNode(var_stmt.value);
+                        // NOTE: Existential coercion handled above (before type-specific inits).
+                        const value_node = try self.lowerExprNode(var_stmt.value);
                         if (value_node == ir.null_node) return;
-                        // Existential coercion: concrete → any Trait
-                        const type_info_check = self.type_reg.get(type_idx);
-                        if (type_info_check == .existential) {
-                            const val_type = self.inferExprType(var_stmt.value);
-                            value_node = try self.emitExistentialErasure(fb, value_node, val_type, type_idx, var_stmt.span);
-                        }
                         _ = try fb.emitStoreLocal(local_idx, value_node, var_stmt.span);
 
                         if (!self.target.isWasm() and var_stmt.is_weak and self.type_reg.couldBeARC(type_idx)) {
@@ -4683,7 +4700,14 @@ pub const Lowerer = struct {
     fn emitExistentialErasure(self: *Lowerer, fb: *ir.FuncBuilder, value: ir.NodeIndex, concrete_type: TypeIndex, existential_type: TypeIndex, span: Span) !ir.NodeIndex {
         const exist_info = self.type_reg.get(existential_type);
         if (exist_info != .existential) return value;
+        // Guard: if source is already existential, this is a copy not an erasure.
+        // Copying existential-to-existential is just memcpy, no container construction needed.
+        if (self.type_reg.get(concrete_type) == .existential) {
+            debug.log(.lower, "existential erasure skipped: source already existential (idx={d})", .{concrete_type});
+            return value;
+        }
         const concrete_name = self.type_reg.typeName(concrete_type);
+        debug.log(.lower, "existential erasure: concrete='{s}' (idx={d}) → trait='{s}' (idx={d})", .{ concrete_name, concrete_type, exist_info.existential.trait_name, existential_type });
 
         // Allocate 40-byte container on stack
         const container = try fb.addLocalWithSize("__exist_container", existential_type, false, 40);
@@ -9212,11 +9236,24 @@ pub const Lowerer = struct {
                     }
                 }
                 const ret_type = if (concrete_info == .func) concrete_info.func.return_type else TypeRegistry.VOID;
-                // Shape stenciling: call sites always use the concrete name.
-                // Shape stenciling: concrete name → wrapper → stencil (with dict args if needed).
-                const call_target = inst_info.concrete_name;
-                // SRET for generic function calls — reuse shared SRET local
-                if (self.needsSret(ret_type)) {
+                // VWT base-name sharing: call sites use the BASE name (shared body).
+                // Swift pattern: generic functions emit one body under the base name,
+                // all instantiations call that shared body with metadata args appended.
+                // Reference: lowerMethodCall does the same at line ~10166.
+                const call_target = self.computeGenericBaseName(inst_info.concrete_name) catch inst_info.concrete_name;
+                // Swift convention: append metadata args after user args for generic calls.
+                // Forward enclosing __metadata_T when inside a shared body.
+                // Reference: GenProto.cpp:3947-4001 emitPolymorphicArguments()
+                try self.appendMetadataArgs(fb, inst_info, &gen_args, call.span);
+                // SRET for generic function calls — reuse shared SRET local.
+                // Swift ResultConvention: use indirect return if the callee has
+                // has_indirect_result (generic return type = type parameter), not just
+                // if the concrete return type is large. The shared body always uses SRET
+                // when the return type is a type parameter, so callers must match.
+                // Reference: GenCall.cpp:677-685 addIndirectResult()
+                const callee_indirect_result = inst_info.has_indirect_result;
+                debug.log(.lower, "generic free fn call: target='{s}' concrete='{s}' ret_type={d} needsSret={} indirect_result={}", .{ call_target, inst_info.concrete_name, ret_type, self.needsSret(ret_type), callee_indirect_result });
+                if (self.needsSret(ret_type) or callee_indirect_result) {
                     const ret_size = self.type_reg.sizeOf(ret_type);
                     const sret_local = try fb.getOrCreateSretLocal(ret_type, ret_size);
                     const sret_addr = try fb.emitAddrLocal(sret_local, TypeRegistry.I64, call.span);
@@ -9745,6 +9782,95 @@ pub const Lowerer = struct {
         try self.builder.endFunc();
     }
 
+    /// Append metadata arguments for a generic call.
+    /// Swift GenProto.cpp:3947-4001 emitPolymorphicArguments().
+    /// When inside a shared generic body (type_substitution active), forwards the
+    /// enclosing __metadata_T parameter instead of looking up fresh metadata globals.
+    /// This is critical: the shared body doesn't know the concrete type — metadata
+    /// must flow through the call chain from the original caller.
+    fn appendMetadataArgs(self: *Lowerer, fb: *ir.FuncBuilder, inst_info: checker.GenericInstInfo, args: *std.ArrayListUnmanaged(ir.NodeIndex), span: Span) !void {
+        if (self.type_substitution != null) {
+            // Inside a shared generic body: forward __metadata_{T} from enclosing scope.
+            // Each type parameter maps to a __metadata_{name} local in the current function.
+            for (inst_info.type_args, 0..) |_, i| {
+                // Try to find the type param name from the callee's generic definition
+                const param_name = if (i < inst_info.type_param_names.len)
+                    inst_info.type_param_names[i]
+                else blk: {
+                    // Fallback: get from the generic function's AST
+                    const fn_node = self.tree.getNode(inst_info.generic_node) orelse break :blk null;
+                    const fn_decl_node = fn_node.asDecl() orelse break :blk null;
+                    if (fn_decl_node != .fn_decl) break :blk null;
+                    const f = fn_decl_node.fn_decl;
+                    break :blk if (i < f.type_params.len) f.type_params[i] else null;
+                };
+                if (param_name) |pn| {
+                    const meta_local_name = try std.fmt.allocPrint(self.allocator, "__metadata_{s}", .{pn});
+                    if (fb.lookupLocal(meta_local_name)) |meta_local| {
+                        const meta_val = try fb.emitLoadLocal(meta_local, TypeRegistry.I64, span);
+                        try args.append(self.allocator, meta_val);
+                        debug.log(.lower, "metadata forward: __metadata_{s} from enclosing scope", .{pn});
+                        continue;
+                    }
+                }
+                // Fallback: use concrete metadata global
+                const meta = try self.emitTypeMetadataRef(fb, inst_info.type_args[i], span);
+                try args.append(self.allocator, meta);
+            }
+        } else {
+            // Not inside a generic body: pass concrete metadata globals.
+            for (inst_info.type_args) |type_arg| {
+                const meta = try self.emitTypeMetadataRef(fb, type_arg, span);
+                try args.append(self.allocator, meta);
+            }
+        }
+    }
+
+    /// In a generic body, load @sizeOf(T) from the metadata parameter at runtime.
+    /// Swift ref: GenOpaque.cpp:1025 emitLoadOfSize() → metadata → VWT → size.
+    /// Cot metadata layout: [0]=vwt_ptr, [1]=size, [2]=stride, [3]=kind.
+    /// Returns null if the type_arg is not a type parameter (use compile-time constant).
+    fn emitLoadSizeFromMetadata(self: *Lowerer, fb: *ir.FuncBuilder, type_arg_node: ast.NodeIndex, sub: std.StringHashMap(TypeIndex), span: Span) !?ir.NodeIndex {
+        // Check if the type arg is a type parameter name (e.g., "T")
+        const node = self.tree.getNode(type_arg_node) orelse return null;
+        const expr = node.asExpr() orelse return null;
+        const param_name = switch (expr) {
+            .ident => |id| id.name,
+            .type_expr => |te| if (te.kind == .named) te.kind.named else return null,
+            else => return null,
+        };
+        if (!sub.contains(param_name)) return null;
+
+        // Found a type parameter. Look up __metadata_{T} local.
+        const meta_local_name = try std.fmt.allocPrint(self.allocator, "__metadata_{s}", .{param_name});
+        const meta_local_idx = fb.lookupLocal(meta_local_name) orelse {
+            debug.log(.lower, "emitLoadSizeFromMetadata: no local '{s}' found, falling back to compile-time", .{meta_local_name});
+            return null;
+        };
+        const meta_val = try fb.emitLoadLocal(meta_local_idx, TypeRegistry.I64, span);
+        // metadata[1] = size (offset 0x08)
+        const size_offset = try fb.emitConstInt(8, TypeRegistry.I64, span);
+        const size_addr = try fb.emitBinary(.add, meta_val, size_offset, TypeRegistry.I64, span);
+        const runtime_size = try fb.emitPtrLoadValue(size_addr, TypeRegistry.I64, span);
+        debug.log(.lower, "emitLoadSizeFromMetadata: T='{s}' → runtime load from metadata[1]", .{param_name});
+        return runtime_size;
+    }
+
+    /// Emit a reference to the __type_metadata_{Type} global for a concrete type.
+    /// Swift ref: GenProto.cpp emitPolymorphicArguments() — callers pass type metadata
+    /// pointers as trailing arguments for every generic type parameter.
+    /// Returns the global address, or 0 if the metadata global hasn't been emitted yet.
+    fn emitTypeMetadataRef(self: *Lowerer, fb: *ir.FuncBuilder, type_idx: TypeIndex, span: Span) !ir.NodeIndex {
+        const type_name = self.type_reg.typeName(type_idx);
+        const meta_global = try std.fmt.allocPrint(self.allocator, "__type_metadata_{s}", .{type_name});
+        if (self.builder.lookupGlobal(meta_global)) |gi| {
+            debug.log(.lower, "emitTypeMetadataRef: type='{s}' → global '{s}' (idx={d})", .{ type_name, meta_global, gi.idx });
+            return try fb.emitAddrGlobal(gi.idx, meta_global, TypeRegistry.I64, span);
+        }
+        debug.log(.lower, "emitTypeMetadataRef: type='{s}' → no global found, passing 0", .{type_name});
+        return try fb.emitConstInt(0, TypeRegistry.I64, span);
+    }
+
     /// Compute the base generic name from a concrete name.
     /// "List(5)_append" → "List_append", "Map(5;6)_get" → "Map_get"
     fn computeGenericBaseName(self: *Lowerer, concrete_name: []const u8) ![]const u8 {
@@ -10154,14 +10280,13 @@ pub const Lowerer = struct {
             false;
         // Swift convention: append metadata args after user args for generic calls.
         // Reference: GenProto.cpp:3947-4001 emitPolymorphicArguments()
+        // KEY: When inside a shared generic body (type_substitution active), inner calls
+        // must FORWARD the enclosing function's __metadata_T parameter — NOT look up fresh
+        // metadata globals from the first instantiation's type args.
+        // Swift: metadata flows through the entire call chain via parameters.
         if (is_generic_call) {
             if (self.chk.generics.generic_inst_by_name.get(method_info.func_name)) |gi| {
-                for (gi.type_args) |type_arg| {
-                    // Pass 0 as metadata placeholder (will be real metadata when VWT dispatch is active)
-                    _ = type_arg;
-                    const meta = try fb.emitConstInt(0, TypeRegistry.I64, call.span);
-                    try args.append(self.allocator, meta);
-                }
+                try self.appendMetadataArgs(fb, gi, &args, call.span);
             }
         }
 
@@ -10405,6 +10530,19 @@ pub const Lowerer = struct {
         switch (bc.kind) {
             .size_of => {
                 const type_idx = self.resolveTypeNode(bc.type_arg);
+                // Swift GenOpaque.cpp:1025 emitLoadOfSize(): in generic bodies,
+                // load size from metadata parameter at runtime instead of compile-time constant.
+                // metadata[1] (offset 0x08) = size field.
+                // Swift GenOpaque.cpp:1025 emitLoadOfSize(): load from metadata at runtime.
+                // BLOCKED: Requires Step 8.7 (indirect T params) first — shared body's
+                // parameter layout varies by T's size (string=16B vs i64=8B), causing
+                // __metadata_T to land at wrong offset. T params must be passed by address
+                // (one pointer slot regardless of size) before metadata forwarding works.
+                // if (self.type_substitution) |sub| {
+                //     if (try self.emitLoadSizeFromMetadata(fb, bc.type_arg, sub, bc.span)) |runtime_size| {
+                //         return runtime_size;
+                //     }
+                // }
                 return try fb.emitConstInt(@intCast(self.type_reg.sizeOf(type_idx)), TypeRegistry.I64, bc.span);
             },
             .enum_len => {

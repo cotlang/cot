@@ -382,86 +382,336 @@ Port all of the above to `self/` files:
 
 ---
 
-### Phase 8: Connect Real Metadata to Generic Function Bodies
+### Phase 8: Opaque Generic Bodies — Full Swift IRGen Port
 
-**Current state:** Generic functions use base-name sharing (`List_append` = one body for all `T`).
-Metadata params are appended to the signature but call sites pass `0` placeholders. The body
-resolves `@sizeOf(T)` via compile-time type substitution from the first instantiation — this is
-correct ONLY because each instantiation still gets a full body with its own type_substitution.
+**Goal:** A shared generic function body must NEVER know the concrete type of `T`. Every
+operation on `T` values dispatches through metadata + VWT + protocol witness tables at runtime.
+This is the full Swift `GenOpaque.cpp` / `GenCall.cpp` / `GenProto.cpp` pattern.
 
-**Problem this phase solves:** When base-name sharing skips body emission for the 2nd+
-instantiation (`if (self.builder.hasFunc(base_name)) return`), `@sizeOf(T)` inside the shared
-body resolves to the first T. This means `List(int).get` and `List(Node).get` share a body
-where element size = first T's size. This is wrong when T varies in size.
+**Current state (BROKEN):** Base-name sharing emits ONE body for all `T`, but the body bakes
+in compile-time type substitution from the first instantiation. `@sizeOf(T)` resolves to a
+constant. `a + b` compiles to `i64.add` or `i32.add`. `ptr.*` loads a fixed number of bytes.
+Metadata params exist but call sites pass `0`. This means `generic_add(i32)` and
+`generic_add(i64)` share a body that does `i64.add` — producing garbage for i32 values.
 
-**The fix (per Swift GenOpaque.cpp:431-476):**
+**The fix:** Make T fully opaque in the shared body. Every operation on T dispatches through
+runtime metadata. This is 10 changes, in dependency order.
+
+**Swift reference map:**
+
+| Cot operation on T | Swift IRGen function | File |
+|---------------------|---------------------|------|
+| `@sizeOf(T)` | `emitLoadOfSize()` | GenOpaque.cpp:1025 |
+| `@alignOf(T)` | `emitLoadOfAlignmentMask()` | GenOpaque.cpp:1043 |
+| `var x: T` (stack alloc) | `emitDynamicAlloca()` | IRGenFunction.cpp |
+| `ptr.* = value` (store T) | `emitInitializeWithCopyCall()` | GenOpaque.cpp:1117 |
+| `ptr.*` (load T) | `emitInitializeWithCopyCall()` to local | GenOpaque.cpp:1117 |
+| `return x` (return T) | `addIndirectResult()` — always SRET | GenCall.cpp:677 |
+| `f(x)` (pass T arg) | indirect convention — pass by address | GenCall.cpp |
+| `var b = a` (copy T) | `emitInitializeWithCopyCall()` via VWT | GenOpaque.cpp:1117 |
+| `a + b` (arithmetic on T) | `emitWitnessMethodRef()` → PWT fn ptr | GenProto.cpp:3802 |
+| scope exit (destroy T) | `emitDestroyCall()` via VWT | GenOpaque.cpp |
+
+---
 
 #### Step 8.1: Call Sites Pass Real Metadata
 
-Replace `emitConstInt(0)` metadata placeholders with real `__type_metadata_{type}` global addresses:
+Replace `emitConstInt(0)` metadata placeholders with real `__type_metadata_{type}` global
+addresses at ALL generic call sites.
+
+**Swift ref:** `GenProto.cpp:3947-4001 emitPolymorphicArguments()` — callers pass type
+metadata pointers as trailing arguments for every generic type parameter.
 
 ```zig
-// Current (broken for shared bodies):
+// Current (broken):
 const meta = try fb.emitConstInt(0, TypeRegistry.I64, call.span);
 
 // Fixed:
 const type_name = self.type_reg.typeName(inst_info.type_args[i]);
-const meta_global = "__type_metadata_" ++ type_name;
+const meta_global = try std.fmt.allocPrint(self.allocator, "__type_metadata_{s}", .{type_name});
 const meta = if (self.builder.lookupGlobal(meta_global)) |gi|
     try fb.emitAddrGlobal(gi.idx, meta_global, TypeRegistry.I64, call.span)
 else
     try fb.emitConstInt(0, TypeRegistry.I64, call.span);
 ```
 
-**Locations:**
-- `lowerMethodCall` (lower.zig:9912-9921) — metadata appending for method calls
-- `lowerGenericFnInstanceVWT` (lower.zig:9440-9446) — metadata params in body (already correct — params exist)
-- Same in selfcot `self/build/lower.cot`
+**Locations (4 sites):**
+- `lowerCall` — free generic function calls (lower.zig, generic call path)
+- `lowerMethodCall` — generic method calls (lower.zig, method call path)
+- `lowerGenericFnInstanceVWT` — calls from within a generic body to other generics
+- Same 3 sites in selfcot `self/build/lower.cot`
 
-#### Step 8.2: Generic Bodies Load @sizeOf from Metadata
+---
 
-When `@sizeOf(T)` is encountered inside a generic function body and `T` is a type parameter
-(detected via `type_substitution`), emit code to load size from the metadata parameter
-instead of resolving at compile time:
+#### Step 8.2: VWT Metadata for ALL Types (Including Trivials)
+
+`emitVWTWitnesses` in `driver.zig` currently emits metadata only for non-trivial types (structs,
+unions). But `i64`, `i32`, `bool`, `f64` etc. also need metadata when used as type arguments —
+the shared body loads `@sizeOf(T)` from metadata at runtime.
+
+**Swift ref:** Every type has metadata. `swift/stdlib/public/core/BuiltinIntegers.swift` defines
+metadata for `Int`, `Int32`, etc.
+
+**Fix:** After emitting VWT for non-trivial types, also emit lightweight metadata for every
+trivial type that appears as a generic type argument:
 
 ```zig
-// In lowerBuiltinSizeOf, when T is a substituted type param:
-if (self.type_substitution != null) {
-    // Check if the type came from a type parameter
-    if (isTypeParamType(type_idx)) {
-        // Load size from metadata: metadata → vwt_ptr → size (offset 0x40)
-        const meta_local = fb.lookupLocal("__metadata_T");
-        const meta_val = fb.emitLoadLocal(meta_local);
-        const vwt_ptr = fb.emitPtrLoadValue(meta_val, I64);       // metadata[0] = vwt_ptr
-        const size_offset = fb.emitConstInt(0x40, I64);            // VWT slot 8 = size
-        const size_addr = fb.emitBinary(.add, vwt_ptr, size_offset);
-        return fb.emitPtrLoadValue(size_addr, I64);                // load size
+// In driver.zig, after emitVWTWitnesses:
+for (generic_type_args) |type_idx| {
+    if (type_reg.isTrivial(type_idx)) {
+        const name = type_reg.typeName(type_idx);
+        const meta_name = "__type_metadata_" ++ name;
+        if (builder.lookupGlobal(meta_name) != null) continue;
+        // Emit: global [vwt_ptr=0, size, stride, flags=trivial]
+        // VWT ptr is 0 for trivials — @sizeOf reads from metadata.size directly
+        emitTrivialTypeMetadata(builder, name, type_reg.sizeOf(type_idx));
     }
 }
 ```
 
-This is the Swift pattern from `GenOpaque.cpp:emitLoadOfSize()`: load VWT from metadata,
-read size field at offset `0x40` (slot 8 of the 88-byte VWT table).
+**TypeMetadata layout (24 bytes):**
+```
+Offset  Field       Value for trivial i64
+0x00    vwt_ptr     0 (no VWT — trivial types don't need witnesses)
+0x08    size        8
+0x10    stride      8
+```
 
-#### Step 8.3: Verify VWT Emission Includes All Generic Types
+---
 
-Ensure `emitVWTWitnesses` in `driver.zig` emits VWT metadata for EVERY concrete type that
-appears as a type argument to a generic function — not just struct/union types. Currently it
-iterates `type_reg.types` and emits for non-trivial types. Basic types (int, bool) are trivial
-and skipped, but they DO need VWT metadata (at minimum: size field) for `@sizeOf(T)` dispatch.
+#### Step 8.3: `@sizeOf(T)` Loads from Metadata at Runtime
 
-Fix: emit lightweight metadata (just size/stride, no witnesses) for trivial types too, OR
-have `@sizeOf` fall back to compile-time resolution when metadata is 0 (i.e., trivial type
-where all instantiations have the same size via type substitution).
+When `@sizeOf(T)` appears inside a generic body and `T` is a type parameter, emit a runtime
+load from the metadata parameter instead of compile-time resolution.
 
-#### Step 8.4: Enable True Base-Name Sharing
+**Swift ref:** `GenOpaque.cpp:1025 emitLoadOfSize()` → `emitLoadOfValueWitnessValueFromMetadata()`
 
-Once Steps 8.1-8.3 are complete, the body no longer depends on compile-time `@sizeOf(T)`.
-All type-dependent operations go through metadata. At this point, `hasFunc(base_name)` correctly
-skips redundant body emission — one body serves all instantiations with different metadata.
+```zig
+// In lowerBuiltinSizeOf:
+if (self.type_substitution) |sub| {
+    // Check if the type came from a type parameter
+    if (self.isTypeParamOrigin(type_idx, sub)) {
+        const param_name = self.getTypeParamName(type_idx, sub);
+        const meta_local_name = try std.fmt.allocPrint(self.allocator,
+            "__metadata_{s}", .{param_name});
+        const meta_local = fb.lookupLocal(meta_local_name) orelse
+            return try fb.emitConstInt(@intCast(self.type_reg.sizeOf(type_idx)),
+                TypeRegistry.I64, span);
+        const meta_val = try fb.emitLoadLocal(meta_local, TypeRegistry.I64, span);
+        // metadata.size is at offset 0x08 (past vwt_ptr)
+        const size_offset = try fb.emitConstInt(8, TypeRegistry.I64, span);
+        const size_addr = try fb.emitBinary(.add, meta_val, size_offset,
+            TypeRegistry.I64, span);
+        return try fb.emitPtrLoadValue(size_addr, TypeRegistry.I64, span);
+    }
+}
+```
 
-This completes the Swift VWT architecture: monomorphization is now OPTIONAL (specialization
-pass), not required for correctness.
+---
+
+#### Step 8.4: Opaque Stack Allocation of T
+
+When a local variable of type T is declared inside a generic body, allocate stack space using
+the runtime size from metadata instead of compile-time size.
+
+**Swift ref:** `IRGenFunction.cpp emitDynamicAlloca()` — `alloca` with runtime size value.
+
+In Cot's IR, `addLocalWithSize` takes a compile-time size. For opaque T, this must use the
+runtime-loaded size from Step 8.3:
+
+```zig
+// Current (broken):
+const local = try fb.addLocalWithSize("x", type_idx, false, self.type_reg.sizeOf(type_idx));
+
+// Fixed (when T is a type parameter):
+if (self.isTypeParamOrigin(type_idx, sub)) {
+    const runtime_size = try self.emitLoadSizeFromMetadata(fb, type_idx, sub, span);
+    const local = try fb.addDynamicLocal("x", type_idx, false, runtime_size);
+} else {
+    const local = try fb.addLocalWithSize("x", type_idx, false, self.type_reg.sizeOf(type_idx));
+}
+```
+
+This requires a new IR node `addDynamicLocal` that takes a runtime size value instead of a
+compile-time constant. The SSA builder must emit `alloca` with the dynamic size.
+
+For native codegen: Cranelift's `stack_slot` is fixed-size, so dynamic locals need
+`stack_addr` + dynamic offset management, or use `alloca`-style frame pointer bumping.
+
+For wasm codegen: Wasm locals are fixed-size. Dynamic locals must be heap-allocated or
+use a shadow stack region.
+
+**Simpler alternative:** Use a fixed maximum buffer size (e.g., 24 bytes = 3 words, matching
+Swift's `FixedBuffer`). If the type fits in the buffer, use it inline. If not, heap-allocate
+and store a pointer. This avoids dynamic alloca entirely.
+
+---
+
+#### Step 8.5: Opaque Load/Store of T Values
+
+When the body reads or writes a value of type T through a pointer (`ptr.*`, `ptr.* = val`),
+it must use runtime-sized memcpy instead of fixed-width load/store.
+
+**Swift ref:** `GenOpaque.cpp:1117 emitInitializeWithCopyCall()` — copies `metadata.size`
+bytes via VWT `initializeWithCopy` witness. For trivial types, this is just memcpy.
+
+```zig
+// Current (broken — bakes in i64-width load):
+const val = try fb.emitPtrLoadValue(ptr, type_idx, span);
+
+// Fixed (when T is a type parameter):
+if (self.isTypeParamOrigin(type_idx, sub)) {
+    // Allocate buffer for the value
+    const size = try self.emitLoadSizeFromMetadata(fb, type_idx, sub, span);
+    const buf = try fb.emitCall("alloca_dynamic", &.{size}, false, TypeRegistry.I64, span);
+    // memcpy(buf, ptr, size) — opaque copy
+    var args = [_]ir.NodeIndex{ buf, ptr, size };
+    _ = try fb.emitCall("memcpy", &args, false, TypeRegistry.VOID, span);
+    return buf;  // return address of copied value
+} else {
+    return try fb.emitPtrLoadValue(ptr, type_idx, span);
+}
+```
+
+**Key insight:** In the opaque body, values of type T are ALWAYS passed by address, never
+by value. `ptr.*` returns an ADDRESS to the value, not the value itself. This matches Swift's
+`Address` type throughout IRGen — generic values are never SSA scalars.
+
+---
+
+#### Step 8.6: Opaque Return (SRET for Generic Return Types)
+
+**Already partially done.** `has_indirect_result` forces SRET when the return type is a type
+parameter. The body writes the return value to the `__sret` pointer via memcpy of
+`metadata.size` bytes.
+
+**Swift ref:** `GenCall.cpp:677 addIndirectResult()` — generic returns are ALWAYS indirect.
+The caller allocates destination space and passes a pointer as the first argument.
+
+```zig
+// In the body's return path, when return type is T:
+if (self.isTypeParamOrigin(return_type, sub)) {
+    const sret_ptr = try fb.emitLoadLocal(fb.lookupLocal("__sret").?, TypeRegistry.I64, span);
+    const size = try self.emitLoadSizeFromMetadata(fb, return_type, sub, span);
+    const val_addr = ...; // address of the value to return
+    var args = [_]ir.NodeIndex{ sret_ptr, val_addr, size };
+    _ = try fb.emitCall("memcpy", &args, false, TypeRegistry.VOID, span);
+    _ = try fb.emitRet(null, span);
+}
+```
+
+---
+
+#### Step 8.7: Opaque Argument Passing (Indirect Convention for T Params)
+
+Function parameters of type T must be passed by address (pointer), not by value. The caller
+stores the value to a temp local and passes its address. The callee receives a pointer.
+
+**Swift ref:** `GenCall.cpp` — `@in_guaranteed` convention for non-trivial/opaque types.
+The SIL convention passes large/opaque values by reference.
+
+```
+// Caller: f(x) where x: T
+temp = alloca(sizeof(T))
+memcpy(temp, &x, sizeof(T))
+call f(temp, metadata)
+
+// Callee: fn f(x: T)
+// x is actually *T (pointer to the value)
+```
+
+**Already partially done** for existential types (`@in_guaranteed` in checker.zig). Extend
+to all generic type parameters in shared bodies.
+
+---
+
+#### Step 8.8: Arithmetic on T via Protocol Witness Tables
+
+When the shared body does `a + b` where `a, b: T`, the `+` must dispatch through a protocol
+witness table function pointer — NOT compile to a fixed-width add instruction.
+
+**Swift ref:** `GenProto.cpp:3802 emitWitnessTableRef()` + `emitWitnessMethodRef()`.
+In Swift, `a + b` on `T: Numeric` calls `Numeric.+` through the PWT:
+
+```
+pwt = witness_table_for(T, Numeric)   // passed as hidden arg
+add_fn = load(pwt + offset_of_add)    // load fn pointer from PWT
+result = call_indirect(add_fn, &a, &b, metadata)
+```
+
+**For Cot:** Cot doesn't yet require trait bounds on generic type params for arithmetic.
+`fn add(T)(a: T, b: T) T` works for any T without a bound. Two options:
+
+**Option A (Swift-faithful):** Require trait bounds for arithmetic. `fn add(T)(a: T, b: T) T
+where T: Addable` — PWT dispatch through `Addable.+`. This is the correct long-term path.
+
+**Option B (Pragmatic):** For primitive types (i64, i32, f64, etc.), the metadata can include
+a "kind" field that selects the correct operation width at runtime:
+```
+metadata.kind == INT64 → i64.add
+metadata.kind == INT32 → i32.add
+metadata.kind == FLOAT64 → f64.add
+```
+This avoids requiring trait bounds for basic arithmetic but doesn't scale to user types.
+
+**Recommendation:** Option A (trait bounds) is the Swift-correct path. It also makes generic
+code self-documenting: `fn add(T: Addable)(a: T, b: T) T` explicitly declares what operations
+the body needs.
+
+---
+
+#### Step 8.9: Opaque Copy/Destroy via VWT
+
+When copying or destroying a value of type T in a generic body, dispatch through VWT witnesses
+instead of compile-time ARC inline code.
+
+**Swift ref:** `GenOpaque.cpp:1117 emitInitializeWithCopyCall()`,
+`GenOpaque.cpp emitDestroyCall()`.
+
+**Already partially done** — `emitCopyValue` and `emitDestroyValue` have VWT dispatch blocks.
+Extend to recognize when the type is a generic type parameter and use the metadata parameter's
+VWT instead of the compile-time type's VWT.
+
+---
+
+#### Step 8.10: Enable True Base-Name Sharing
+
+Once Steps 8.1-8.9 are complete, the shared body is FULLY opaque with respect to T:
+- `@sizeOf(T)` → runtime load from metadata
+- Stack alloc of T → dynamic size from metadata
+- Load/store T → memcpy of metadata.size bytes
+- Return T → SRET + memcpy
+- Pass T → by address
+- Arithmetic on T → PWT dispatch
+- Copy/destroy T → VWT dispatch
+
+At this point, `hasFunc(base_name)` correctly skips redundant body emission — one body serves
+ALL instantiations with different metadata. Monomorphization becomes an OPTIONAL specialization
+pass (like Swift's `GenericSpecializer.cpp`), not required for correctness.
+
+---
+
+#### Implementation Order
+
+| Step | Depends on | Scope | Files |
+|------|-----------|-------|-------|
+| 8.1 Call sites pass metadata | — | Small | lower.zig (4 sites) |
+| 8.2 Trivial type metadata | — | Small | driver.zig, vwt_gen.zig |
+| 8.3 @sizeOf from metadata | 8.1, 8.2 | Medium | lower.zig (lowerBuiltinSizeOf) |
+| 8.4 Dynamic stack alloc | 8.3 | Medium | ir.zig, ssa_builder.zig, wasm_gen.zig, ssa_to_clif.zig |
+| 8.5 Opaque load/store | 8.3, 8.4 | Large | lower.zig (all ptr deref on T) |
+| 8.6 Opaque return | 8.5 | Small | lower.zig (return path) — mostly done |
+| 8.7 Indirect T params | 8.5 | Medium | lower.zig, checker.zig (calling convention) |
+| 8.8 PWT arithmetic | 8.7 | Large | lower.zig, checker.zig (trait bounds for ops) |
+| 8.9 VWT copy/destroy | 8.3 | Small | lower.zig — mostly done |
+| 8.10 Base-name sharing | ALL above | Trivial | lower.zig (remove gating, already structured) |
+
+**Critical path:** 8.1 → 8.2 → 8.3 → 8.5 → 8.10. Steps 8.4, 8.6, 8.7 are incremental.
+Step 8.8 (PWT arithmetic) is the largest and can be deferred — it only affects generic
+functions that do arithmetic on T directly (like `generic_add`), not stdlib container types
+like List/Map which only use `@sizeOf(T)` and pointer arithmetic.
+
+**Estimated scope:** ~600 lines Zig compiler, ~300 lines selfcot port.
 
 ---
 
@@ -484,12 +734,19 @@ pass), not required for correctness.
 | 6.1 Dynamic cast (`as?`) | lower.zig, checker.zig | ~40 | 4.1 |
 | 6.2 `is` check | lower.zig, checker.zig | ~15 | 6.1 |
 | 7 Self-hosted port | self/**/*.cot | ~200 | All above |
-| 8.1 Real metadata at call sites | lower.zig, self/build/lower.cot | ~40 | 2.2, 7 |
-| 8.2 @sizeOf loads from metadata | lower.zig, self/build/lower.cot | ~50 | 8.1 |
-| 8.3 VWT metadata for all types | driver.zig, vwt_gen.zig | ~30 | 8.1 |
-| 8.4 Enable true base-name sharing | lower.zig (verify) | ~10 | 8.1, 8.2, 8.3 |
+| 8.1 Call sites pass real metadata | lower.zig (4 call sites) | ~40 | 2.2 |
+| 8.2 Trivial type metadata emission | driver.zig, vwt_gen.zig | ~60 | — |
+| 8.3 @sizeOf(T) from metadata | lower.zig (lowerBuiltinSizeOf) | ~50 | 8.1, 8.2 |
+| 8.4 Dynamic stack alloc for T | ir.zig, ssa_builder, codegen | ~80 | 8.3 |
+| 8.5 Opaque load/store of T | lower.zig (ptr deref paths) | ~120 | 8.3, 8.4 |
+| 8.6 Opaque return (SRET memcpy) | lower.zig (return path) | ~30 | 8.5 |
+| 8.7 Indirect T params (by address) | lower.zig, checker.zig | ~60 | 8.5 |
+| 8.8 PWT arithmetic dispatch | lower.zig, checker.zig | ~150 | 8.7 |
+| 8.9 VWT copy/destroy for T params | lower.zig | ~30 | 8.3 |
+| 8.10 Enable true base-name sharing | lower.zig (already structured) | ~10 | ALL 8.x |
+| 9 Self-hosted port of Phase 8 | self/**/*.cot | ~300 | ALL 8.x |
 
-**Total: ~820 lines across ~8 files** (Zig compiler) + ~250 lines self-hosted port.
+**Total: ~1,250 lines across ~10 files** (Zig compiler) + ~400 lines self-hosted port.
 
 ---
 

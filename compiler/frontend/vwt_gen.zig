@@ -316,10 +316,14 @@ pub const VWTGenerator = struct {
     ///   [9]  stride                            (u64, 8B)
     ///   [10] flags:u32 + extraInhabitantCount:u32 (packed, 8B)
     ///
-    /// TypeMetadata layout (24 bytes):
-    ///   [0]  vwt pointer                       (ptr to VWT global, 8B)
-    ///   [1]  kind                              (TypeMetadataKind, 8B)
-    ///   [2]  type_idx                          (TypeIndex, 8B)
+    /// TypeMetadata layout (32 bytes):
+    ///   [0]  vwt pointer                       (ptr to VWT global, 8B) — 0 for trivial types
+    ///   [1]  size                              (u64, 8B) — @sizeOf(T)
+    ///   [2]  stride                            (u64, 8B)
+    ///   [3]  kind                              (TypeMetadataKind, 8B)
+    ///
+    /// Swift ref: Metadata.h — size/stride are directly in metadata for fast access.
+    /// @sizeOf(T) in generic bodies loads metadata[1] (offset 0x08).
     fn emitMetadataGlobals(self: *VWTGenerator, builder: *ir.Builder, entry: VWTEntry, type_name: []const u8, info: types.Type) !void {
         const vwt_global_name = try std.fmt.allocPrint(self.allocator, "__vwt_table_{s}", .{type_name});
         const metadata_global_name = try std.fmt.allocPrint(self.allocator, "__type_metadata_{s}", .{type_name});
@@ -328,8 +332,8 @@ pub const VWTGenerator = struct {
         // Global for VWT table: 11 i64 slots = 88 bytes
         try builder.addGlobal(ir.Global.initWithSize(vwt_global_name, TypeRegistry.I64, false, Span.zero, 88));
 
-        // Global for TypeMetadata: 3 i64 slots = 24 bytes
-        try builder.addGlobal(ir.Global.initWithSize(metadata_global_name, TypeRegistry.I64, false, Span.zero, 24));
+        // Global for TypeMetadata: 4 i64 slots = 32 bytes
+        try builder.addGlobal(ir.Global.initWithSize(metadata_global_name, TypeRegistry.I64, false, Span.zero, 32));
 
         // Emit init function that populates VWT with function addresses + data
         builder.startFunc(init_fn_name, TypeRegistry.VOID, TypeRegistry.VOID, Span.zero);
@@ -370,11 +374,21 @@ pub const VWTGenerator = struct {
         const packed_flags: i64 = @intCast(@as(u64, entry.flags.data) | (@as(u64, entry.extra_inhabitant_count) << 32));
         try self.storeDataSlot(fb, vwt_addr, 10, packed_flags);
 
-        // TypeMetadata: [0]=vwt_ptr, [1]=kind, [2]=type_idx
+        // TypeMetadata: [0]=vwt_ptr, [1]=size, [2]=stride, [3]=kind
         const meta_addr = try fb.emitAddrGlobal(meta_info.idx, metadata_global_name, TypeRegistry.I64, Span.zero);
-        // Store VWT pointer (address of VWT global)
+        // [0] Store VWT pointer (address of VWT global)
         _ = try fb.emitPtrStoreValue(meta_addr, vwt_addr, Span.zero);
-        // Store kind
+        // [1] Store size — direct in metadata for fast @sizeOf(T) access
+        const eight = try fb.emitConstInt(8, TypeRegistry.I64, Span.zero);
+        const meta_size_addr = try fb.emitBinary(.add, meta_addr, eight, TypeRegistry.I64, Span.zero);
+        const size_const = try fb.emitConstInt(@intCast(entry.size), TypeRegistry.I64, Span.zero);
+        _ = try fb.emitPtrStoreValue(meta_size_addr, size_const, Span.zero);
+        // [2] Store stride
+        const sixteen = try fb.emitConstInt(16, TypeRegistry.I64, Span.zero);
+        const meta_stride_addr = try fb.emitBinary(.add, meta_addr, sixteen, TypeRegistry.I64, Span.zero);
+        const stride_const = try fb.emitConstInt(@intCast(entry.stride), TypeRegistry.I64, Span.zero);
+        _ = try fb.emitPtrStoreValue(meta_stride_addr, stride_const, Span.zero);
+        // [3] Store kind
         const kind_val: i64 = switch (info) {
             .struct_type => 0x200,
             .enum_type => 0x201,
@@ -386,15 +400,10 @@ pub const VWTGenerator = struct {
             .union_type => 0x201,
             else => 0x200,
         };
-        const eight = try fb.emitConstInt(8, TypeRegistry.I64, Span.zero);
-        const meta_kind_addr = try fb.emitBinary(.add, meta_addr, eight, TypeRegistry.I64, Span.zero);
+        const twentyfour = try fb.emitConstInt(24, TypeRegistry.I64, Span.zero);
+        const meta_kind_addr = try fb.emitBinary(.add, meta_addr, twentyfour, TypeRegistry.I64, Span.zero);
         const kind_const = try fb.emitConstInt(kind_val, TypeRegistry.I64, Span.zero);
         _ = try fb.emitPtrStoreValue(meta_kind_addr, kind_const, Span.zero);
-        // Store type_idx
-        const sixteen = try fb.emitConstInt(16, TypeRegistry.I64, Span.zero);
-        const meta_tidx_addr = try fb.emitBinary(.add, meta_addr, sixteen, TypeRegistry.I64, Span.zero);
-        const tidx_const = try fb.emitConstInt(@intCast(entry.type_idx), TypeRegistry.I64, Span.zero);
-        _ = try fb.emitPtrStoreValue(meta_tidx_addr, tidx_const, Span.zero);
 
         _ = try fb.emitRet(null, Span.zero);
         try builder.endFunc();

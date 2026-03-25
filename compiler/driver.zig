@@ -371,6 +371,12 @@ pub const Driver = struct {
         lowerer.release_mode = self.release_mode;
         if (self.test_mode) lowerer.setTestMode(true);
         if (self.fail_fast) lowerer.setFailFast(true);
+        // Pre-allocate metadata globals for all generic type args BEFORE lowering.
+        // This ensures emitTypeMetadataRef can find the global during call site lowering.
+        // The globals are populated later by emitTrivialTypeMetadata / emitVWTWitnesses.
+        debug.log(.codegen, "generic_inst_by_name has {d} entries before prealloc (compileSource path)", .{generic_ctx.generic_inst_by_name.count()});
+        try self.preallocateTypeMetadataGlobals(&lowerer.builder, &type_reg, &generic_ctx);
+
         try lowerer.lowerToBuilder();
         // ARC Phase 4: Generate synthetic deinit functions for structs with ARC fields
         try lowerer.emitPendingAutoDeinits();
@@ -385,7 +391,9 @@ pub const Driver = struct {
         }
 
         try self.emitVWTWitnesses(&lowerer.builder, &type_reg);
+        try self.emitTrivialTypeMetadata(&lowerer.builder, &type_reg, &generic_ctx);
         try self.emitProtocolWitnessTables(&lowerer.builder, &generic_ctx);
+        try self.emitMetadataInitMaster(&lowerer.builder);
 
         var ir_result = try lowerer.builder.getIR();
         defer ir_result.deinit();
@@ -433,6 +441,125 @@ pub const Driver = struct {
             vwt_emitted += 1;
         }
         if (vwt_emitted > 0) std.debug.print("VWT: {d} types emitted, {d} unique witnesses, total funcs: {d}\n", .{ vwt_emitted, gen.emitted.count(), builder.funcs.items.len });
+    }
+
+    /// Emit lightweight TypeMetadata globals for trivial types (i64, i32, bool, f64, etc.)
+    /// used as generic type arguments. Non-trivial types already get metadata via emitVWTWitnesses.
+    /// Swift ref: every type has metadata — BuiltinIntegers.swift, Metadata.h.
+    /// Layout: [vwt_ptr=0, size, stride, kind=0x100 (trivial)]
+    fn emitTrivialTypeMetadata(self: *Driver, builder: *ir_mod.Builder, type_reg: *types_mod.TypeRegistry, generic_ctx: *checker_mod.SharedGenericContext) !void {
+        _ = self;
+        const Span = @import("frontend/source.zig").Span;
+        var count: usize = 0;
+
+        // Collect all type args from all generic instantiations
+        var it = generic_ctx.generic_inst_by_name.valueIterator();
+        while (it.next()) |inst_info| {
+            for (inst_info.type_args) |type_arg| {
+                const type_name = type_reg.typeName(type_arg);
+                const meta_name = try std.fmt.allocPrint(builder.allocator, "__type_metadata_{s}", .{type_name});
+
+                // Skip if a VWT init function already handles this type's metadata
+                const vwt_init_name = try std.fmt.allocPrint(builder.allocator, "__vwt_init_{s}", .{type_name});
+                if (builder.hasFunc(vwt_init_name)) continue;
+
+                // Skip if trivial init already emitted for this type (dedup)
+                const init_name_check = try std.fmt.allocPrint(builder.allocator, "__trivial_meta_init_{s}", .{type_name});
+                if (builder.hasFunc(init_name_check)) continue;
+
+                // Trivial type — emit lightweight metadata (no VWT witnesses needed)
+                const size = type_reg.sizeOf(type_arg);
+                const stride = size;
+                // Global already pre-allocated by preallocateTypeMetadataGlobals
+
+                // Emit init function
+                const init_name = try std.fmt.allocPrint(builder.allocator, "__trivial_meta_init_{s}", .{type_name});
+                builder.startFunc(init_name, types_mod.TypeRegistry.VOID, types_mod.TypeRegistry.VOID, Span.zero);
+                if (builder.func()) |fb| {
+                    const meta_info = builder.lookupGlobal(meta_name) orelse continue;
+                    const meta_addr = try fb.emitAddrGlobal(meta_info.idx, meta_name, types_mod.TypeRegistry.I64, Span.zero);
+
+                    // [0] vwt_ptr = 0 (no VWT for trivial types)
+                    const zero = try fb.emitConstInt(0, types_mod.TypeRegistry.I64, Span.zero);
+                    _ = try fb.emitPtrStoreValue(meta_addr, zero, Span.zero);
+
+                    // [1] size
+                    const eight = try fb.emitConstInt(8, types_mod.TypeRegistry.I64, Span.zero);
+                    const size_addr = try fb.emitBinary(.add, meta_addr, eight, types_mod.TypeRegistry.I64, Span.zero);
+                    const size_val = try fb.emitConstInt(@intCast(size), types_mod.TypeRegistry.I64, Span.zero);
+                    _ = try fb.emitPtrStoreValue(size_addr, size_val, Span.zero);
+
+                    // [2] stride
+                    const sixteen = try fb.emitConstInt(16, types_mod.TypeRegistry.I64, Span.zero);
+                    const stride_addr = try fb.emitBinary(.add, meta_addr, sixteen, types_mod.TypeRegistry.I64, Span.zero);
+                    const stride_val = try fb.emitConstInt(@intCast(stride), types_mod.TypeRegistry.I64, Span.zero);
+                    _ = try fb.emitPtrStoreValue(stride_addr, stride_val, Span.zero);
+
+                    // [3] kind = 0x100 (trivial)
+                    const twentyfour = try fb.emitConstInt(24, types_mod.TypeRegistry.I64, Span.zero);
+                    const kind_addr = try fb.emitBinary(.add, meta_addr, twentyfour, types_mod.TypeRegistry.I64, Span.zero);
+                    const kind_val = try fb.emitConstInt(0x100, types_mod.TypeRegistry.I64, Span.zero);
+                    _ = try fb.emitPtrStoreValue(kind_addr, kind_val, Span.zero);
+
+                    _ = try fb.emitRet(null, Span.zero);
+                }
+                try builder.endFunc();
+                count += 1;
+            }
+        }
+
+        // Register all trivial metadata init functions in __cot_init_globals
+        if (count > 0) {
+            debug.log(.codegen, "Trivial metadata: {d} types emitted", .{count});
+        }
+    }
+
+    /// Pre-allocate __type_metadata_{Type} globals for ALL types used as generic
+    /// type arguments. Called BEFORE lowering so emitTypeMetadataRef can find them.
+    /// The globals are empty (zeroed) — populated later by emitVWTWitnesses /
+    /// emitTrivialTypeMetadata init functions.
+    fn preallocateTypeMetadataGlobals(self: *Driver, builder: *ir_mod.Builder, type_reg: *types_mod.TypeRegistry, generic_ctx: *checker_mod.SharedGenericContext) !void {
+        _ = self;
+        const Span = @import("frontend/source.zig").Span;
+        var count: usize = 0;
+        var it = generic_ctx.generic_inst_by_name.valueIterator();
+        while (it.next()) |inst_info| {
+            for (inst_info.type_args) |type_arg| {
+                const type_name = type_reg.typeName(type_arg);
+                const meta_name = try std.fmt.allocPrint(builder.allocator, "__type_metadata_{s}", .{type_name});
+                if (builder.lookupGlobal(meta_name) != null) continue;
+                // 32 bytes = 4 i64 slots: [vwt_ptr, size, stride, kind]
+                try builder.addGlobal(ir_mod.Global.initWithSize(meta_name, types_mod.TypeRegistry.I64, false, Span.zero, 32));
+                debug.log(.codegen, "preallocate metadata: '{s}' size={d}", .{ meta_name, type_reg.sizeOf(type_arg) });
+                count += 1;
+            }
+        }
+        if (count > 0) debug.log(.codegen, "pre-allocated {d} type metadata globals", .{count});
+    }
+
+    /// Generate __cot_init_metadata master function that calls ALL VWT init,
+    /// trivial metadata init, and PWT init functions.
+    /// Called from main() / test runner before any user code runs.
+    /// Swift ref: metadata is static constants, but Cot uses init functions
+    /// because our Global struct doesn't yet support initial data values.
+    fn emitMetadataInitMaster(self: *Driver, builder: *ir_mod.Builder) !void {
+        _ = self;
+        const Span = @import("frontend/source.zig").Span;
+        builder.startFunc("__cot_init_metadata", types_mod.TypeRegistry.VOID, types_mod.TypeRegistry.VOID, Span.zero);
+        if (builder.func()) |fb| {
+            // Call every __vwt_init_*, __trivial_meta_init_*, and __pwt_init_* function
+            for (builder.funcs.items) |func| {
+                if (std.mem.startsWith(u8, func.name, "__vwt_init_") or
+                    std.mem.startsWith(u8, func.name, "__trivial_meta_init_") or
+                    std.mem.startsWith(u8, func.name, "__pwt_init_"))
+                {
+                    var no_args = [_]ir_mod.NodeIndex{};
+                    _ = try fb.emitCall(func.name, &no_args, false, types_mod.TypeRegistry.VOID, Span.zero);
+                }
+            }
+            _ = try fb.emitRet(null, Span.zero);
+        }
+        try builder.endFunc();
     }
 
     /// Emit Protocol Witness Tables for each `impl Trait for Type` conformance.
@@ -682,6 +809,10 @@ pub const Driver = struct {
             try file_texts_list.append(self.allocator, pf.source_text);
         }
 
+        // Pre-allocate metadata globals for all generic type args BEFORE lowering.
+        // This ensures emitTypeMetadataRef can find the global during call site lowering.
+        try self.preallocateTypeMetadataGlobals(&shared_builder, &type_reg, &generic_ctx);
+
         for (parsed_files.items, 0..) |*pf, i| {
             const func_count_before = shared_builder.funcs.items.len;
 
@@ -837,7 +968,9 @@ pub const Driver = struct {
         }
 
         try self.emitVWTWitnesses(&shared_builder, &type_reg);
+        try self.emitTrivialTypeMetadata(&shared_builder, &type_reg, &generic_ctx);
         try self.emitProtocolWitnessTables(&shared_builder, &generic_ctx);
+        try self.emitMetadataInitMaster(&shared_builder);
 
         var final_ir = try shared_builder.getIR();
         defer final_ir.deinit();

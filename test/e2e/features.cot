@@ -97,6 +97,10 @@ struct CounterM(T) { value: T, count: i64 }
 
 // List(T) imported from std/list
 
+// FlatList(T) — simple flat-layout list for testing generic free-function pattern.
+// Not using stdlib List(T) here because we need direct field access to test the pattern.
+struct FlatList(T) { items: i64, count: i64, capacity: i64 }
+
 // ============================================================================
 // Generic helper functions (free function pattern)
 // ============================================================================
@@ -128,8 +132,8 @@ fn CounterM_increment(T)(self: *CounterM(T)) void {
     self.count = self.count + 1
 }
 
-// List free functions
-fn List_ensureCapacity(T)(self: *List(T), needed: i64) void {
+// FlatList free functions (test generic free-function pattern)
+fn FlatList_ensureCapacity(T)(self: *FlatList(T), needed: i64) void {
     if (self.capacity >= needed) { return }
     var new_cap: i64 = 8
     if (self.capacity > 0) { new_cap = self.capacity * 2 }
@@ -142,24 +146,24 @@ fn List_ensureCapacity(T)(self: *List(T), needed: i64) void {
     self.capacity = new_cap
 }
 
-fn List_append(T)(self: *List(T), value: T) void {
-    List_ensureCapacity(T)(self, self.count + 1)
+fn FlatList_append(T)(self: *FlatList(T), value: T) void {
+    FlatList_ensureCapacity(T)(self, self.count + 1)
     var ptr = @intToPtr(*T, self.items + self.count * @sizeOf(T))
     ptr.* = value
     self.count = self.count + 1
 }
 
-fn List_get(T)(self: *List(T), index: i64) T {
+fn FlatList_get(T)(self: *FlatList(T), index: i64) T {
     var ptr = @intToPtr(*T, self.items + index * @sizeOf(T))
     return ptr.*
 }
 
-fn List_set(T)(self: *List(T), index: i64, value: T) void {
+fn FlatList_set(T)(self: *FlatList(T), index: i64, value: T) void {
     var ptr = @intToPtr(*T, self.items + index * @sizeOf(T))
     ptr.* = value
 }
 
-fn List_pop(T)(self: *List(T)) T {
+fn FlatList_pop(T)(self: *FlatList(T)) T {
     self.count = self.count - 1
     var ptr = @intToPtr(*T, self.items + self.count * @sizeOf(T))
     return ptr.*
@@ -641,87 +645,84 @@ test "generic_field_mutation" {
 }
 
 // ============================================================================
-// Tests: List(T) free function pattern
+// Tests: FlatList(T) free function pattern
 // ============================================================================
 
 test "list_basic" {
-    var list: List(i64) = undefined
+    var list: FlatList(i64) = undefined
     list.items = 0
     list.count = 0
     list.capacity = 0
-    List_append(i64)(&list, 10)
-    List_append(i64)(&list, 20)
-    List_append(i64)(&list, 30)
-    var a = List_get(i64)(&list, 0)
-    var b = List_get(i64)(&list, 1)
-    var c = List_get(i64)(&list, 2)
+    FlatList_append(i64)(&list, 10)
+    FlatList_append(i64)(&list, 20)
+    FlatList_append(i64)(&list, 30)
+    var a = FlatList_get(i64)(&list, 0)
+    var b = FlatList_get(i64)(&list, 1)
+    var c = FlatList_get(i64)(&list, 2)
     @assertEq(a + b + c, 60)
 }
 
 test "list_growth" {
-    var list: List(i64) = undefined
+    var list: FlatList(i64) = undefined
     list.items = 0
     list.count = 0
     list.capacity = 0
     var i: i64 = 0
     while (i < 20) {
-        List_append(i64)(&list, i)
+        FlatList_append(i64)(&list, i)
         i = i + 1
     }
-    var first = List_get(i64)(&list, 0)
-    var last = List_get(i64)(&list, 19)
+    var first = FlatList_get(i64)(&list, 0)
+    var last = FlatList_get(i64)(&list, 19)
     @assertEq(first + last + list.count, 39)
 }
 
 test "list_pop" {
-    var list: List(i64) = undefined
+    var list: FlatList(i64) = undefined
     list.items = 0
     list.count = 0
     list.capacity = 0
-    List_append(i64)(&list, 10)
-    List_append(i64)(&list, 20)
-    List_append(i64)(&list, 30)
-    var popped = List_pop(i64)(&list)
+    FlatList_append(i64)(&list, 10)
+    FlatList_append(i64)(&list, 20)
+    FlatList_append(i64)(&list, 30)
+    var popped = FlatList_pop(i64)(&list)
     @assertEq(popped + list.count, 32)
 }
 
 test "list_set" {
-    var list: List(i64) = undefined
+    var list: FlatList(i64) = undefined
     list.items = 0
     list.count = 0
     list.capacity = 0
-    List_append(i64)(&list, 10)
-    List_append(i64)(&list, 20)
-    List_append(i64)(&list, 30)
-    List_set(i64)(&list, 1, 50)
-    @assertEq(List_get(i64)(&list, 0) + List_get(i64)(&list, 1) + List_get(i64)(&list, 2), 90)
+    FlatList_append(i64)(&list, 10)
+    FlatList_append(i64)(&list, 20)
+    FlatList_append(i64)(&list, 30)
+    FlatList_set(i64)(&list, 1, 50)
+    @assertEq(FlatList_get(i64)(&list, 0) + FlatList_get(i64)(&list, 1) + FlatList_get(i64)(&list, 2), 90)
 }
 
 test "list_multi_type" {
-    var a: List(i64) = undefined
+    var a: FlatList(i64) = undefined
     a.items = 0
     a.count = 0
     a.capacity = 0
-    var b: List(i32) = undefined
+    var b: FlatList(i32) = undefined
     b.items = 0
     b.count = 0
     b.capacity = 0
-    List_append(i64)(&a, 100)
-    List_append(i32)(&b, 5)
-    var x = List_get(i64)(&a, 0)
-    var y: i64 = List_get(i32)(&b, 0)
+    FlatList_append(i64)(&a, 100)
+    FlatList_append(i32)(&b, 5)
+    var x = FlatList_get(i64)(&a, 0)
+    var y: i64 = FlatList_get(i32)(&b, 0)
     @assertEq(x + y, 105)
 }
 
 // ============================================================================
-// Tests: List(T) impl pattern (dot-call syntax)
+// Tests: List(T) impl pattern (dot-call syntax via stdlib)
 // ============================================================================
 
 test "list_impl_basic" {
-    var list: List(i64) = undefined
-    list.items = 0
-    list.count = 0
-    list.capacity = 0
+    var list: List(i64) = .{}
     list.append(10)
     list.append(20)
     list.append(30)
@@ -729,13 +730,11 @@ test "list_impl_basic" {
     var b = list.get(1)
     var c = list.get(2)
     @assertEq(a + b + c, 60)
+    list.free()
 }
 
 test "list_impl_growth" {
-    var list: List(i64) = undefined
-    list.items = 0
-    list.count = 0
-    list.capacity = 0
+    var list: List(i64) = .{}
     var i: i64 = 0
     while (i < 20) {
         list.append(i)
@@ -743,47 +742,40 @@ test "list_impl_growth" {
     }
     var first = list.get(0)
     var last = list.get(19)
-    @assertEq(first + last + list.count, 39)
+    @assertEq(first + last + list.len(), 39)
+    list.free()
 }
 
 test "list_impl_pop" {
-    var list: List(i64) = undefined
-    list.items = 0
-    list.count = 0
-    list.capacity = 0
+    var list: List(i64) = .{}
     list.append(10)
     list.append(20)
     list.append(30)
     var popped = list.pop()
-    @assertEq(popped + list.count, 32)
+    @assertEq(popped + list.len(), 32)
+    list.free()
 }
 
 test "list_impl_set" {
-    var list: List(i64) = undefined
-    list.items = 0
-    list.count = 0
-    list.capacity = 0
+    var list: List(i64) = .{}
     list.append(10)
     list.append(20)
     list.append(30)
     list.set(1, 50)
     @assertEq(list.get(0) + list.get(1) + list.get(2), 90)
+    list.free()
 }
 
 test "list_impl_multi_type" {
-    var a: List(i64) = undefined
-    a.items = 0
-    a.count = 0
-    a.capacity = 0
-    var b: List(i32) = undefined
-    b.items = 0
-    b.count = 0
-    b.capacity = 0
+    var a: List(i64) = .{}
+    var b: List(i32) = .{}
     a.append(100)
     b.append(5)
     var x = a.get(0)
     var y: i64 = b.get(0)
     @assertEq(x + y, 105)
+    a.free()
+    b.free()
 }
 
 // ============================================================================
@@ -1261,9 +1253,9 @@ test "list_free" {
     list.append(2)
     list.append(3)
     list.free()
-    @assertEq(list.count, 0)
-    @assertEq(list.capacity, 0)
-    @assertEq(list.items, 0)
+    @assertEq(list.len(), 0)
+    @assertEq(list.cap(), 0)
+    @assertEq(list.buf, 0)
 }
 
 test "list_clear" {
@@ -1598,8 +1590,8 @@ test "list_shrink_and_free" {
     @assertEq(list.get(2), 30)
     // Shrink to 0 frees everything
     list.shrinkAndFree(0)
-    @assertEq(list.count, 0)
-    @assertEq(list.capacity, 0)
+    @assertEq(list.len(), 0)
+    @assertEq(list.cap(), 0)
 }
 
 test "list_delete_range" {
