@@ -162,7 +162,8 @@ pub fn isRuntimeFunction(name: []const u8) bool {
         "__cot_install_signals",
         // Memory/print runtime (handled by mem_runtime, print_runtime, etc.)
         "alloc", "dealloc", "realloc", "alloc_raw", "dealloc_raw", "realloc_raw",
-        "memcpy", "memset_zero", "string_eq", "string_concat",
+        "memcpy", "memcmp", "memset_zero", "string_eq", "string_concat",
+        "retain", "release",  // ARC noops on Wasm (bump allocator, no refcounting)
         "growslice", "nextslicecap",
         "println", "eprintln", "print_int", "eprint_int", "int_to_string",
     };

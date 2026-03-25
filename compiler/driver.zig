@@ -6350,6 +6350,9 @@ pub const Driver = struct {
         try func_indices.put(self.allocator, mem_runtime.MEMSET_ZERO_NAME, mem_funcs.memset_zero_idx + import_count);
         try func_indices.put(self.allocator, mem_runtime.STRING_EQ_NAME, mem_funcs.string_eq_idx + import_count);
         try func_indices.put(self.allocator, mem_runtime.STRING_CONCAT_NAME, mem_funcs.string_concat_idx + import_count);
+        try func_indices.put(self.allocator, "memcmp", mem_funcs.memcmp_idx + import_count);
+        try func_indices.put(self.allocator, "retain", mem_funcs.retain_noop_idx + import_count);
+        try func_indices.put(self.allocator, "release", mem_funcs.release_noop_idx + import_count);
 
         // Add slice function names to index map (Go)
         try func_indices.put(self.allocator, slice_runtime.GROWSLICE_NAME, slice_funcs.growslice_idx + import_count);

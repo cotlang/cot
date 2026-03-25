@@ -932,13 +932,16 @@ pub const GenState = struct {
                 // Push arguments onto stack
                 for (v.args) |arg| {
                     try self.getValue64(arg);
-                    // Float args stored in f64 locals need reinterpret to i64 for Wasm call ABI
-                    // (all Cot runtime functions use i64 parameters, even for float values)
                     if (isFloatType(arg.type_idx)) {
                         _ = try self.builder.append(.i64_reinterpret_f64);
                     }
                 }
                 // Emit call with function index from aux_int
+                // Pipeline debug: flag unresolved function calls (index 0 = fd_write = likely bug)
+                if (v.aux_int == 0) {
+                    const func_name_str = if (v.aux.string.len > 0) v.aux.string else "<no_name>";
+                    debug.log(.codegen, "WARNING: call to func_idx=0 (fd_write fallback) — likely unresolved '{s}' (args={d})", .{ func_name_str, v.args.len });
+                }
                 const p = try self.builder.append(.call);
                 p.to = prog_mod.constAddr(v.aux_int);
             },
@@ -988,7 +991,11 @@ pub const GenState = struct {
                             break :blk @intCast(idx);
                         }
                     }
-                    break :blk v.aux_int; // Fallback to aux_int
+                    // Unresolved function: emit unreachable trap instead of silent fallback to fd_write.
+                    // This prevents type mismatches and silent corruption.
+                    debug.log(.codegen, "UNRESOLVED: static call '{s}' not in func_indices — emitting unreachable", .{name});
+                    _ = try self.builder.append(.@"unreachable");
+                    break :blk v.aux_int;
                 } else v.aux_int;
 
                 const p = try self.builder.append(.call);

@@ -1580,6 +1580,86 @@ fn generateLegacyIsUniqueFunction(module: *wasm.Module, retain_count_idx: u32) !
 }
 
 // =============================================================================
+// Phase 8.8: memcmp for T-typed equality dispatch
+// =============================================================================
+
+pub fn generateMemcmpBody(allocator: std.mem.Allocator) ![]const u8 {
+    var code = wasm.CodeBuilder.init(allocator);
+    defer code.deinit();
+    // memcmp(a: i64, b: i64, n: i64) → i64 (0=equal, nonzero=different)
+    // Params: a(0), b(1), n(2). Locals: a_i32(3), b_i32(4), n_i32(5), i(6)
+    _ = try code.declareLocals(&[_]wasm.ValType{ .i32, .i32, .i32, .i32 });
+    try code.emitLocalGet(0);
+    try code.emitI32WrapI64();
+    try code.emitLocalSet(3);
+    try code.emitLocalGet(1);
+    try code.emitI32WrapI64();
+    try code.emitLocalSet(4);
+    try code.emitLocalGet(2);
+    try code.emitI32WrapI64();
+    try code.emitLocalSet(5);
+    // if (n == 0) return 0
+    try code.emitLocalGet(5);
+    try code.emitI32Eqz();
+    try code.emitIf(BLOCK_VOID);
+    try code.emitI64Const(0);
+    try code.emitReturn();
+    try code.emitEnd();
+    // i = 0; loop { if (i >= n) break; if (a[i] != b[i]) return 1; i++ }
+    try code.emitI32Const(0);
+    try code.emitLocalSet(6);
+    try code.emitBlock(BLOCK_VOID); // outer block for break
+    try code.emitLoop(BLOCK_VOID);
+    // if (i >= n) break
+    try code.emitLocalGet(6);
+    try code.emitLocalGet(5);
+    try code.emitI32GeU();
+    try code.emitBrIf(1); // break outer
+    // a[i] vs b[i]
+    try code.emitLocalGet(3);
+    try code.emitLocalGet(6);
+    try code.emitI32Add();
+    try code.emitI64Load8U(0); // load byte as i64
+    try code.emitLocalGet(4);
+    try code.emitLocalGet(6);
+    try code.emitI32Add();
+    try code.emitI64Load8U(0); // load byte as i64
+    try code.emitI64Ne();
+    try code.emitIf(BLOCK_VOID);
+    try code.emitI64Const(1);
+    try code.emitReturn();
+    try code.emitEnd();
+    // i++
+    try code.emitLocalGet(6);
+    try code.emitI32Const(1);
+    try code.emitI32Add();
+    try code.emitLocalSet(6);
+    try code.emitBr(0); // continue loop
+    try code.emitEnd(); // end loop
+    try code.emitEnd(); // end block
+    // return 0 (equal)
+    try code.emitI64Const(0);
+    return try code.finish();
+}
+
+// ARC noop functions for Wasm (bump allocator, no refcounting)
+
+pub fn generateRetainNoopBody(allocator: std.mem.Allocator) ![]const u8 {
+    var code = wasm.CodeBuilder.init(allocator);
+    defer code.deinit();
+    // retain(ptr: i64) → i64: just return ptr
+    try code.emitLocalGet(0);
+    return try code.finish();
+}
+
+pub fn generateReleaseNoopBody(allocator: std.mem.Allocator) ![]const u8 {
+    var code = wasm.CodeBuilder.init(allocator);
+    defer code.deinit();
+    // release(ptr: i64) → void: noop
+    return try code.finish();
+}
+
+// =============================================================================
 // Tests
 // =============================================================================
 

@@ -36,6 +36,9 @@ pub const MemFunctions = struct {
     memset_zero_idx: u32,
     string_eq_idx: u32,
     string_concat_idx: u32,
+    memcmp_idx: u32,
+    retain_noop_idx: u32,
+    release_noop_idx: u32,
 };
 
 pub fn addToLinker(allocator: std.mem.Allocator, linker: *wasm_link.Linker, heap_ptr_global: u32) !MemFunctions {
@@ -152,6 +155,33 @@ pub fn addToLinker(allocator: std.mem.Allocator, linker: *wasm_link.Linker, heap
         .exported = false,
     });
 
+    // memcmp(a, b, n) → i64: byte comparison for Phase 8.8 T-typed equality
+    const memcmp_body = try @import("arc.zig").generateMemcmpBody(allocator);
+    const memcmp_idx = try linker.addFunc(.{
+        .name = "memcmp",
+        .type_idx = i64_3i64_type,
+        .code = memcmp_body,
+        .exported = false,
+    });
+
+    // retain(ptr) → i64: ARC noop on Wasm (bump allocator)
+    const retain_noop_body = try @import("arc.zig").generateRetainNoopBody(allocator);
+    const retain_noop_idx = try linker.addFunc(.{
+        .name = "retain",
+        .type_idx = i64_1i64_type,
+        .code = retain_noop_body,
+        .exported = false,
+    });
+
+    // release(ptr) → void: ARC noop on Wasm
+    const release_noop_body = try @import("arc.zig").generateReleaseNoopBody(allocator);
+    const release_noop_idx = try linker.addFunc(.{
+        .name = "release",
+        .type_idx = void_1i64_type,
+        .code = release_noop_body,
+        .exported = false,
+    });
+
     return MemFunctions{
         .alloc_idx = alloc_idx,
         .dealloc_idx = dealloc_idx,
@@ -163,6 +193,9 @@ pub fn addToLinker(allocator: std.mem.Allocator, linker: *wasm_link.Linker, heap
         .memset_zero_idx = memset_zero_idx,
         .string_eq_idx = string_eq_idx,
         .string_concat_idx = string_concat_idx,
+        .memcmp_idx = memcmp_idx,
+        .retain_noop_idx = retain_noop_idx,
+        .release_noop_idx = release_noop_idx,
     };
 }
 
