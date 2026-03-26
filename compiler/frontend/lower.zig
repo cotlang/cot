@@ -4670,12 +4670,6 @@ pub const Lowerer = struct {
         // String: no ARC (string data is not refcounted in Cot)
         if (type_idx == TypeRegistry.STRING) return value;
 
-        // Future: heap-allocated ARC object, retain directly.
-        if (info == .future) {
-            var args = [_]ir.NodeIndex{value};
-            return try fb.emitCall("retain", &args, false, type_idx, span);
-        }
-
         // List(T) and Map(K,V): Swift COW value types with refcounted buffer.
         // Copy = retain(buf). The buf field is at offset 0 in the struct.
         // COW ensures mutations copy the buffer if shared, so elements
@@ -4938,13 +4932,6 @@ pub const Lowerer = struct {
 
         // String: not refcounted
         if (type_idx == TypeRegistry.STRING) return;
-
-        // Future: heap-allocated ARC object, release directly.
-        if (info == .future) {
-            var args = [_]ir.NodeIndex{value};
-            _ = try fb.emitCall("release", &args, false, TypeRegistry.VOID, span);
-            return;
-        }
 
         // List(T) and Map(K,V): Swift COW value types with refcounted buffer.
         // Compiler handles element cleanup (Swift's value witness destroy pattern).
@@ -7334,11 +7321,6 @@ pub const Lowerer = struct {
         return try fb.emitLoadLocal(temp_idx, TypeRegistry.I64, span);
     }
 
-    /// Lower spawn { body } — detect captures, create body function, call sched_spawn.
-    /// Closely follows lowerClosureExpr but:
-    ///   - Body function has signature (env_ptr: i64) -> void
-    ///   - Captures loaded from env_ptr parameter (NOT CTXT global)
-    ///   - Parent emits sched_spawn(fn_ptr, env_ptr) instead of returning closure struct
     fn lowerClosureExpr(self: *Lowerer, ce: ast.ClosureExpr) Error!ir.NodeIndex {
         const fb = self.current_func orelse return ir.null_node;
 
@@ -10590,7 +10572,7 @@ pub const Lowerer = struct {
             .ptr_to_int => {
                 // For function types: emit raw funcAddr directly (not a closure struct).
                 // lowerExprNode on a function name creates a heap-allocated closure wrapper,
-                // but @ptrToInt needs the raw code address for use with thread_spawn etc.
+                // but @ptrToInt needs the raw code address for use with function pointers.
                 const arg_type = self.inferExprType(bc.args[0]);
                 const arg_info = self.type_reg.get(arg_type);
                 if (arg_info == .func) {

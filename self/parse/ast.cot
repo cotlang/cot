@@ -287,30 +287,6 @@ struct AwaitExpr {
     span: Span,
 }
 
-struct SpawnExpr {
-    body: int,
-    span: Span,
-}
-
-/// Go-style select over channel operations.
-const SELECT_RECV: int = 0
-const SELECT_SEND: int = 1
-
-struct SelectCase {
-    kind: int,
-    channel: int,
-    capture: string,
-    send_value: int,
-    body: int,
-    span: Span,
-}
-
-struct SelectExpr {
-    cases: List(int),      // indices to SelectCase nodes
-    default_body: int,
-    span: Span,
-}
-
 struct CatchExpr {
     operand: int,
     capture: string,
@@ -565,8 +541,6 @@ union Expr {
     type_expr: TypeExprNode,
     try_expr: TryExpr,
     await_expr: AwaitExpr,
-    spawn_expr: SpawnExpr,
-    select_expr: SelectExpr,
     catch_expr: CatchExpr,
     orelse_expr: OrElseExpr,
     error_literal: ErrorLiteralExpr,
@@ -616,18 +590,15 @@ union Node {
 struct Ast {
     nodes: List(Node),
     file_decls: List(int),
-    select_cases: List(SelectCase),
     filename: string,
     safe_mode: bool,
 
     static fn init(filename: string) Ast {
         var nodes: List(Node) = .{}
         var file_decls: List(int) = .{}
-        var select_cases: List(SelectCase) = .{}
         return Ast {
             nodes: nodes,
             file_decls: file_decls,
-            select_cases: select_cases,
             filename: filename,
             safe_mode: false,
         }
@@ -636,11 +607,9 @@ struct Ast {
     static fn initHeap(filename: string) *Ast {
         var nodes: List(Node) = .{}
         var file_decls: List(int) = .{}
-        var select_cases: List(SelectCase) = .{}
         return new Ast {
             nodes: nodes,
             file_decls: file_decls,
-            select_cases: select_cases,
             filename: filename,
             safe_mode: false,
         }
@@ -662,16 +631,6 @@ struct Ast {
 
     fn addStmt(s: Stmt) int {
         return self.addNode(Node.stmt(s))
-    }
-
-    fn addSelectCase(sc: SelectCase) int {
-        const idx = self.select_cases.len()
-        self.select_cases.append(sc)
-        return idx
-    }
-
-    fn getSelectCase(idx: int) SelectCase {
-        return self.select_cases.get(idx)
     }
 
     fn getNode(idx: int) Node {
@@ -796,8 +755,6 @@ fn exprSpan(e: Expr) Span {
         Expr.type_expr |v| => v.span,
         Expr.try_expr |v| => v.span,
         Expr.await_expr |v| => v.span,
-        Expr.spawn_expr |v| => v.span,
-        Expr.select_expr |v| => v.span,
         Expr.catch_expr |v| => v.span,
         Expr.orelse_expr |v| => v.span,
         Expr.error_literal |v| => v.span,
@@ -988,8 +945,6 @@ fn exprTagStr2(e: Expr) string {
     return switch (e) {
         Expr.try_expr |_| => "try_expr",
         Expr.await_expr |_| => "await_expr",
-        Expr.spawn_expr |_| => "spawn_expr",
-        Expr.select_expr |_| => "select_expr",
         Expr.catch_expr |_| => "catch_expr",
         Expr.orelse_expr |_| => "orelse_expr",
         Expr.error_literal |_| => "error_literal",

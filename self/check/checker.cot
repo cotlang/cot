@@ -287,8 +287,6 @@ struct Checker {
     current_switch_enum_type: int,            // for .variant shorthand
     // Lint
     lint_mode: bool,
-    // Async
-    in_async_fn: bool,
     // Comptime
     comptime_vars: Map(string, int),
     in_comptime: bool,
@@ -327,7 +325,6 @@ struct Checker {
             expected_type: invalid_type,
             current_switch_enum_type: invalid_type,
             lint_mode: false,
-            in_async_fn: false,
             comptime_vars: comptime_vars,
             in_comptime: false,
             body_check_depth: 0,
@@ -1689,8 +1686,6 @@ struct Checker {
         if (tag == "try_expr") { return self.checkTryExpr(idx) }
         if (tag == "catch_expr") { return self.checkCatchExpr(idx) }
         if (tag == "orelse_expr") { return self.checkOrElseExpr(idx) }
-        if (tag == "spawn_expr") { return self.checkSpawnExpr(idx) }
-        if (tag == "select_expr") { return self.checkSelectExpr(idx) }
         if (tag == "closure_expr") { return self.checkClosureExpr(idx) }
         if (tag == "error_literal") { return self.checkErrorLiteral(idx) }
         if (tag == "addr_of") { return self.checkAddrOf(idx) }
@@ -3784,17 +3779,9 @@ struct Checker {
         return invalid_type
     }
 
-    /// Check an await expression. Validates operand is Future(T), returns T.
-    /// Zig ref: checker.zig:2781-2792
+    /// Check an await expression — not yet implemented.
     fn checkAwaitExpr(idx: int) int {
-        var operand_n = null_node
-        switch (self.ast.getNode(idx)) { Node.expr |e| => switch (e) { Expr.await_expr |ae| => { operand_n = ae.operand }, else => {} }, else => {} }
-        const operand_type = self.checkExpr(operand_n)
-        const ot = self.types.get(operand_type)
-        if (ot.tag == TAG_FUTURE) {
-            return switch (ot) { Type.future |f| => f.result_type, else => invalid_type }
-        }
-        self.reportError(idx, ErrorCode.e300, "await requires Future type")
+        self.reportError(idx, ErrorCode.e300, "await not yet implemented")
         return invalid_type
     }
 
@@ -3927,63 +3914,6 @@ struct Checker {
         }
 
         return self.current_return_type
-    }
-
-    /// spawn { body } — fire-and-forget, returns void
-    /// Copied from checker.zig:3005-3009
-    fn checkSpawnExpr(idx: int) int {
-        var body_n = null_node
-        switch (self.ast.getNode(idx)) { Node.expr |e| => switch (e) { Expr.spawn_expr |se| => { body_n = se.body }, else => {} }, else => {} }
-        self.checkExpr(body_n)
-        return VOID
-    }
-
-    /// select { recv/send cases } — Go-style channel select, returns void
-    /// Copied from checker.zig:3011-3059
-    fn checkSelectExpr(idx: int) int {
-        var cases: List(int) = .{}
-        var default_body = null_node
-        switch (self.ast.getNode(idx)) { Node.expr |e| => switch (e) { Expr.select_expr |se| => { cases = se.cases; default_body = se.default_body }, else => {} }, else => {} }
-
-        var i = 0
-        while (i < cases.len()) {
-            const sc = self.ast.getSelectCase(cases.get(i))
-            if (sc.kind == SELECT_RECV) {
-                // Type-check channel expression
-                const ch_type = self.checkExpr(sc.channel)
-                var elem_type = I64  // fallback
-                if (self.types.isPointer(ch_type)) {
-                    const pointee = self.types.pointerElem(ch_type)
-                    const pt = self.types.get(pointee)
-                    if (pt.tag == TAG_STRUCT) {
-                        const sname = switch (pt) { Type.struct_type |st| => st.name, else => "" }
-                        if (sname.len >= 7 and substring(sname, 0, 7) == "Channel") {
-                            // Channel(T) — elem_type derived from tryRecv return type
-                        } else {
-                            self.reportError(idx, ErrorCode.e300, "select recv case requires a Channel type")
-                        }
-                    }
-                }
-                // Bind capture in case body scope
-                if (sc.capture.len > 0) {
-                    self.pushScope()
-                    self.defineSymbol(makeSymbol(sc.capture, elem_type, null_node, false))
-                    self.checkExpr(sc.body)
-                    self.popScope()
-                } else {
-                    self.checkExpr(sc.body)
-                }
-            } else {
-                // Send case: channel expr is full ch.send(value) call
-                self.checkExpr(sc.channel)
-                self.checkExpr(sc.body)
-            }
-            i += 1
-        }
-        if (default_body != null_node) {
-            self.checkExpr(default_body)
-        }
-        return VOID
     }
 
     fn checkOrElseExpr(idx: int) int {

@@ -187,8 +187,6 @@ struct SliceType { elem: int }
 struct ArrayType { elem: int, length: int }
 struct CotMapType { key: int, value: int }
 struct CotListType { elem: int }
-struct FutureType { result_type: int }
-
 struct ErrorVariant {
     name: string,
 }
@@ -315,8 +313,7 @@ const TAG_STRUCT: int = 10
 const TAG_ENUM: int = 11
 const TAG_UNION: int = 12
 const TAG_FUNC: int = 13
-const TAG_FUTURE: int = 14
-const TAG_DISTINCT: int = 15
+const TAG_DISTINCT: int = 14
 
 struct DistinctType {
     name: string,
@@ -338,7 +335,6 @@ union Type {
     enum_type: EnumType,
     union_type: UnionType,
     func: FuncType,
-    future: FutureType,
     distinct_type: DistinctType,
 }
 
@@ -601,7 +597,6 @@ struct TypeRegistry {
             Type.slice |_| => "slice",
             Type.array |_| => "array",
             Type.tuple |_| => "tuple",
-            Type.future |_| => "Future",
             Type.func |_| => "function",
             Type.distinct_type |d| => d.name,
             else => "unknown",
@@ -777,10 +772,6 @@ struct TypeRegistry {
         return self.add(Type.func(FuncType { param_count: count, params: @intCast(i64, ptr), return_type: return_type }))
     }
 
-    fn makeFuture(result_type: int) int {
-        return self.add(Type.future(FutureType { result_type: result_type }))
-    }
-
     // ---- Predicates ----
 
     fn isPointer(idx: int) bool {
@@ -860,7 +851,6 @@ struct TypeRegistry {
             Type.list_type |_| => 8,
             Type.func |_| => 8,
             Type.error_set |_| => 8,
-            Type.future |_| => 8,
             Type.optional |opt| => {
                 // Zig types.zig:350-354: tag (8) + payload aligned
                 const es = self.sizeOf(opt.elem)
@@ -921,7 +911,6 @@ struct TypeRegistry {
             Type.list_type |_| => 8,
             Type.union_type |_| => 8,
             Type.tuple |_| => 8,
-            Type.future |_| => 8,
             Type.array |a| => self.alignmentOf(a.elem),
             Type.struct_type |s| => s.alignment,
             Type.enum_type |e| => self.alignmentOf(e.backing_type),
@@ -997,7 +986,6 @@ struct TypeRegistry {
             Type.error_union |e| => self.isTrivial(e.elem),
             Type.map_type |_| => false,
             Type.list_type |_| => false,
-            Type.future |_| => false,
             Type.tuple |tup| => {
                 for i in 0..tup.elem_count {
                     const et = tup.getElemType(i)
@@ -1063,7 +1051,7 @@ struct TypeRegistry {
         // Tag-based dispatch with extractElem — NO nested union switch.
         if (ta.tag == TAG_BASIC) { return a == b }
         if (ta.tag == TAG_POINTER or ta.tag == TAG_OPTIONAL or ta.tag == TAG_ERROR_UNION or
-            ta.tag == TAG_SLICE or ta.tag == TAG_LIST or ta.tag == TAG_FUTURE) {
+            ta.tag == TAG_SLICE or ta.tag == TAG_LIST) {
             return self.equal(self.extractElem(a), self.extractElem(b))
         }
         if (ta.tag == TAG_ARRAY) {
@@ -1101,7 +1089,6 @@ struct TypeRegistry {
             Type.slice |s| => { return s.elem },
             Type.array |a| => { return a.elem },
             Type.list_type |l| => { return l.elem },
-            Type.future |f| => { return f.result_type },
             else => { return 0 },
         }
     }

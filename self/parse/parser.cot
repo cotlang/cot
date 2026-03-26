@@ -1383,21 +1383,6 @@ struct Parser {
         const tok = @enumFromInt(self.tok) as Token
         const start = self.tok_start
 
-        // Contextual keyword: spawn { ... }
-        if (tok == Token.ident and self.tok_text == "spawn" and self.peekToken() == Token.lbrace as int) {
-            self.advance()  // consume "spawn"
-            const body = self.parseBlockExpr()
-            if (body == null_node) {
-                return null_node
-            }
-            return self.ast.addExpr(Expr.spawn_expr(SpawnExpr { .body = body, .span = self.spanSE(start, self.tok_end) }))
-        }
-
-        // Contextual keyword: select { ... }
-        if (tok == Token.ident and self.tok_text == "select" and self.peekToken() == Token.lbrace as int) {
-            return self.parseSelectExpr(start)
-        }
-
         // Labeled block: label: { ... break :label value ... }
         if (tok == Token.ident and self.peekToken() == Token.colon as int) {
             const label = self.tok_text
@@ -1985,96 +1970,6 @@ struct Parser {
         }
         self.expect(Token.rbrace as int)
         return self.ast.addExpr(Expr.block_expr(BlockExpr { .stmts = stmts, .result_expr = result_expr, .label = label, .span = self.spanSE(start, self.tok_end) }))
-    }
-
-    /// Parse select expression (Go-style channel select).
-    /// Copied from parser.zig:1819-1890
-    fn parseSelectExpr(start: int) int {
-        self.advance()  // consume "select"
-        if (!self.expect(Token.lbrace as int)) {
-            return null_node
-        }
-
-        var cases: List(int) = .{}
-        var default_body = null_node
-
-        while (self.tok != Token.rbrace and self.tok != Token.eof) {
-            const case_start = self.tok_start
-
-            // default => { body }
-            if (self.tok == Token.ident and self.tok_text == "default") {
-                self.advance()
-                if (!self.expect(Token.fat_arrow as int)) {
-                    return null_node
-                }
-                default_body = self.parseExpr()
-                if (default_body == null_node) {
-                    return null_node
-                }
-                if (self.match(Token.comma as int)) {}
-                continue
-            }
-
-            // Peek ahead: if second token is "from", it's a recv case
-            // recv: <capture> from <channel> => { body }
-            if (self.tok == Token.ident and self.peekToken() == Token.ident as int) {
-                if (self.peek_text == "from") {
-                    const capture = self.tok_text
-                    self.advance()  // consume capture name
-                    self.advance()  // consume "from"
-                    const channel = self.parsePrimaryExpr()
-                    if (channel == null_node) {
-                        return null_node
-                    }
-                    if (!self.expect(Token.fat_arrow as int)) {
-                        return null_node
-                    }
-                    const body = self.parseExpr()
-                    if (body == null_node) {
-                        return null_node
-                    }
-                    const case_node = self.ast.addSelectCase(SelectCase {
-                        .kind = SELECT_RECV,
-                        .channel = channel,
-                        .capture = capture,
-                        .send_value = null_node,
-                        .body = body,
-                        .span = self.spanSE(case_start, self.tok_end),
-                    })
-                    cases.append(case_node)
-                    if (self.match(Token.comma as int)) {}
-                    continue
-                }
-            }
-
-            // Send case: <channel>.send(<value>) => { body }
-            const channel_expr = self.parsePrimaryExpr()
-            if (channel_expr == null_node) {
-                return null_node
-            }
-            if (!self.expect(Token.fat_arrow as int)) {
-                return null_node
-            }
-            const body = self.parseExpr()
-            if (body == null_node) {
-                return null_node
-            }
-            const case_node = self.ast.addSelectCase(SelectCase {
-                .kind = SELECT_SEND,
-                .channel = channel_expr,
-                .capture = "",
-                .send_value = null_node,
-                .body = body,
-                .span = self.spanSE(case_start, self.tok_end),
-            })
-            cases.append(case_node)
-            if (self.match(Token.comma as int)) {}
-        }
-
-        if (!self.expect(Token.rbrace as int)) {
-            return null_node
-        }
-        return self.ast.addExpr(Expr.select_expr(SelectExpr { .cases = cases, .default_body = default_body, .span = self.spanSE(start, self.tok_end) }))
     }
 
     /// @builtin(args) — dispatches per-builtin to parse type vs expr args.
