@@ -333,7 +333,8 @@ pub const Checker = struct {
             const node = self.tree.getNode(stmt_idx) orelse continue;
             if (node.asDecl()) |decl| {
                 switch (decl) {
-                    .struct_decl, .enum_decl, .union_decl, .type_alias, .error_set_decl, .trait_decl
+                    .struct_decl, .enum_decl, .union_decl, .type_alias, .error_set_decl, .trait_decl,
+                    .fn_decl,
                         => self.collectDecl(stmt_idx) catch {},
                     else => {},
                 }
@@ -344,7 +345,7 @@ pub const Checker = struct {
         for (stmts) |stmt_idx| {
             const node = self.tree.getNode(stmt_idx) orelse continue;
             if (node.asDecl()) |decl| {
-                if (decl == .struct_decl) self.checkDecl(stmt_idx) catch {};
+                if (decl == .struct_decl or decl == .fn_decl) self.checkDecl(stmt_idx) catch {};
             }
         }
         var seen_terminal = false;
@@ -446,7 +447,13 @@ pub const Checker = struct {
                     try self.defineInFileScope(Symbol.init(f.name, .type_name, invalid_type, idx, false));
                     return;
                 }
-                const func_type = try self.buildFuncType(f.params, f.return_type);
+                var func_type = try self.buildFuncType(f.params, f.return_type);
+                // async fn: wrap return type in Task(T)
+                if (f.is_async) {
+                    const inner_ret = self.types.get(func_type).func.return_type;
+                    const task_ret = try self.types.makeTask(inner_ret);
+                    func_type = try self.types.makeFunc(self.types.get(func_type).func.params, task_ret);
+                }
                 var sym = Symbol.initExtern(f.name, .function, func_type, idx, false, f.is_extern);
                 sym.is_export = f.is_export;
                 try self.defineInFileScope(sym);
@@ -810,8 +817,11 @@ pub const Checker = struct {
         });
         const sym = self.scope.lookup(lookup_name) orelse return;
         const return_type = if (self.types.get(sym.type_idx) == .func) self.types.get(sym.type_idx).func.return_type else TypeRegistry.VOID;
-        // For async functions, the registered return type is Future(T).
-        const body_return_type = return_type;
+        // For async functions, the registered return type is Task(T) — body returns T
+        const body_return_type = if (f.is_async and self.types.get(return_type) == .task)
+            self.types.get(return_type).task.result_type
+        else
+            return_type;
         var func_scope = Scope.init(self.allocator, self.scope);
         defer func_scope.deinit();
         for (f.params) |param| {
@@ -3208,9 +3218,13 @@ pub const Checker = struct {
     }
 
     fn checkAwaitExpr(self: *Checker, ae: ast.AwaitExpr) CheckError!TypeIndex {
-        // TODO: Swift-style async/await — not yet implemented
-        self.err.errorWithCode(ae.span.start, .e300, "await is not yet implemented (Swift concurrency port pending)");
-        return invalid_type;
+        const operand_type = try self.checkExpr(ae.operand);
+        const operand_info = self.types.get(operand_type);
+        if (operand_info != .task) {
+            self.err.errorWithCode(ae.span.start, .e300, "cannot await non-task type");
+            return invalid_type;
+        }
+        return operand_info.task.result_type;
     }
 
 

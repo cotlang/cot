@@ -73,6 +73,9 @@ pub const MapType = struct { key: TypeIndex, value: TypeIndex };
 pub const ListType = struct { elem: TypeIndex };
 pub const TupleType = struct { element_types: []const TypeIndex };
 pub const DistinctType = struct { name: []const u8, underlying: TypeIndex };
+/// Swift-style Task: ARC heap object wrapping an async function result.
+/// Reference: Swift Task.h (Job + AsyncTask), simplified for Cot Phase 1.
+pub const TaskType = struct { result_type: TypeIndex };
 /// Swift OpaqueExistentialContainer: 40 bytes = 3-word buffer + metadata ptr + witness table ptr.
 /// Holds any value conforming to a trait, with VWT-based lifecycle and indirect method dispatch.
 pub const ExistentialType = struct {
@@ -126,6 +129,7 @@ pub const Type = union(enum) {
     func: FuncType,
     distinct: DistinctType,
     existential: ExistentialType,
+    task: TaskType,
 
     pub fn underlying(self: Type) Type { return self; }
     pub fn isInvalid(self: Type) bool { return self == .basic and self.basic == .invalid; }
@@ -325,6 +329,7 @@ pub const TypeRegistry = struct {
             .func => "function",
             .distinct => |d| d.name,
             .existential => |e| e.trait_name,
+            .task => "Task",
         };
     }
 
@@ -452,6 +457,12 @@ pub const TypeRegistry = struct {
         return self.add(.{ .func = .{ .params = try self.allocator.dupe(FuncParam, params), .return_type = ret } });
     }
 
+    pub fn makeTask(self: *TypeRegistry, result_type: TypeIndex) !TypeIndex {
+        for (self.types.items, 0..) |t, i| {
+            if (t == .task and t.task.result_type == result_type) return @intCast(i);
+        }
+        return self.add(.{ .task = .{ .result_type = result_type } });
+    }
 
     pub fn isPointer(self: *const TypeRegistry, idx: TypeIndex) bool { return self.get(idx) == .pointer; }
     pub fn pointerElem(self: *const TypeRegistry, idx: TypeIndex) TypeIndex {
@@ -498,13 +509,14 @@ pub const TypeRegistry = struct {
             },
             .distinct => |d| self.sizeOf(d.underlying),
             .existential => 40, // 3-word buffer (24) + metadata ptr (8) + witness table ptr (8)
+            .task => 8, // pointer to heap-allocated TaskObject
         };
     }
 
     pub fn alignmentOf(self: *const TypeRegistry, idx: TypeIndex) u32 {
         return switch (self.get(idx)) {
             .basic => |k| if (k.size() == 0) 1 else k.size(),
-            .pointer, .func, .optional, .error_union, .error_set, .slice, .map, .list, .union_type, .tuple, .existential => 8,
+            .pointer, .func, .optional, .error_union, .error_set, .slice, .map, .list, .union_type, .tuple, .existential, .task => 8,
             .array => |a| self.alignmentOf(a.elem),
             .struct_type => |s| s.alignment,
             .enum_type => |e| self.alignmentOf(e.backing_type),
@@ -583,6 +595,8 @@ pub const TypeRegistry = struct {
             .distinct => |d| self.isTrivial(d.underlying),
             // Existentials are non-trivial (contain VWT-managed value)
             .existential => false,
+            // Tasks are non-trivial (ARC heap objects)
+            .task => false,
         };
     }
 
@@ -628,7 +642,7 @@ pub const TypeRegistry = struct {
         // Error union: check payload (Swift: non-trivial if success type is non-trivial)
         if (t == .error_union) return self.couldBeARC(t.error_union.elem);
         // Collections and futures are heap-allocated ARC objects
-        if (t == .list or t == .map) return true;
+        if (t == .list or t == .map or t == .task) return true;
         // Array/slice: check element type
         if (t == .array) return self.couldBeARC(t.array.elem);
         if (t == .slice) return self.couldBeARC(t.slice.elem);
@@ -728,6 +742,7 @@ pub const TypeRegistry = struct {
             .func => false,
             .distinct => |da| std.mem.eql(u8, da.name, tb.distinct.name),
             .existential => |ea| std.mem.eql(u8, ea.trait_name, tb.existential.trait_name),
+            .task => |task_a| self.equal(task_a.result_type, tb.task.result_type),
         };
     }
 

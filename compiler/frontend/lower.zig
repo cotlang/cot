@@ -714,6 +714,20 @@ pub const Lowerer = struct {
             fn_decl.name, fn_decl.params.len, fn_decl.is_async, fn_decl.is_export,
         });
 
+        // Save parent function context (supports nested fn declarations in blocks)
+        const saved_func = self.current_func;
+        const saved_cleanup = self.cleanup_stack;
+        defer {
+            self.current_func = saved_func;
+            self.cleanup_stack = saved_cleanup;
+        }
+
+        // Async functions: Phase 1 eager evaluation — body runs immediately,
+        // result wrapped in heap-allocated TaskObject. Phase 2 adds state machines.
+        if (fn_decl.is_async) {
+            try self.lowerAsyncFnEager(fn_decl);
+            return;
+        }
 
         const return_type = if (fn_decl.return_type != null_node) self.resolveTypeNode(fn_decl.return_type) else TypeRegistry.VOID;
         // SRET: callee receives hidden __sret pointer, returns void at Wasm level
@@ -769,6 +783,62 @@ pub const Lowerer = struct {
                     }
                 }
             }
+            self.current_func = null;
+        }
+        try self.builder.endFunc();
+    }
+
+    /// Phase 1 async: eager evaluation. The async function runs its body immediately
+    /// and wraps the result in a heap-allocated TaskObject (16 bytes: refcount + result).
+    /// The wrapper function has the same params as the original, returns i64 (task ptr).
+    /// Phase 2 will replace this with state machine splitting.
+    /// Swift reference: Task.swift — Task<Success> wraps a NativeObject.
+    fn lowerAsyncFnEager(self: *Lowerer, fn_decl: ast.FnDecl) !void {
+        const return_type = if (fn_decl.return_type != null_node) self.resolveTypeNode(fn_decl.return_type) else TypeRegistry.VOID;
+        const link_name = if (fn_decl.is_export or std.mem.eql(u8, fn_decl.name, "main"))
+            fn_decl.name
+        else
+            try self.qualifyName(fn_decl.name);
+
+        // The async wrapper returns a Task pointer (i64)
+        self.builder.startFunc(link_name, TypeRegistry.VOID, TypeRegistry.I64, fn_decl.span);
+        if (self.builder.func()) |fb| {
+            fb.is_export = fn_decl.is_export;
+            self.current_func = fb;
+            self.cleanup_stack.clear();
+            self.comptime_value_vars.clearRetainingCapacity();
+            self.weak_locals.clearRetainingCapacity();
+
+            // Add params (same as the original function)
+            for (fn_decl.params) |param| {
+                var param_type = self.resolveTypeNode(param.type_expr);
+                param_type = self.chk.safeWrapType(param_type) catch param_type;
+                const param_size = self.type_reg.sizeOf(param_type);
+                _ = try fb.addParam(param.name, param_type, param_size);
+            }
+
+            // Allocate TaskObject: 16 bytes (refcount=1 at offset 0, result at offset 8)
+            const sixteen = try fb.emitConstInt(16, TypeRegistry.I64, fn_decl.span);
+            var alloc_args = [_]ir.NodeIndex{sixteen};
+            const task_ptr = try fb.emitCall("alloc", &alloc_args, false, TypeRegistry.I64, fn_decl.span);
+
+            // Store refcount = 1 at offset 0
+            const one = try fb.emitConstInt(1, TypeRegistry.I64, fn_decl.span);
+            _ = try fb.emitPtrStoreValue(task_ptr, one, fn_decl.span);
+
+            // Store the task_ptr in a local so lowerReturn can access it
+            const task_local = try fb.addLocalWithSize("__async_task", TypeRegistry.I64, false, 8);
+            _ = try fb.emitStoreLocal(task_local, task_ptr, fn_decl.span);
+            fb.async_task_local = task_local;
+            fb.async_result_type = return_type;
+
+            // Lower the function body — executes eagerly.
+            // Return statements in the body will store result at task_ptr+8
+            // and return the task_ptr (handled by async path in lowerReturn).
+            if (fn_decl.body != null_node) {
+                _ = try self.lowerBlockNode(fn_decl.body);
+            }
+
             self.current_func = null;
         }
         try self.builder.endFunc();
@@ -1251,6 +1321,7 @@ pub const Lowerer = struct {
                     } else if (stmt_node.asDecl()) |decl| {
                         switch (decl) {
                             .struct_decl => |d| try self.lowerStructDecl(d),
+                            .fn_decl => |d| try self.lowerFnDecl(d),
                             else => {},
                         }
                     }
@@ -1283,6 +1354,21 @@ pub const Lowerer = struct {
 
     fn lowerReturn(self: *Lowerer, ret: ast.ReturnStmt) !void {
         const fb = self.current_func orelse return;
+
+        // Phase 1 async: store result at task_ptr+8, then return task_ptr
+        if (fb.async_task_local) |task_local| {
+            if (ret.value != null_node) {
+                const result = try self.lowerExprNode(ret.value);
+                const task_ptr = try fb.emitLoadLocal(task_local, TypeRegistry.I64, ret.span);
+                const result_addr = try fb.emitAddrOffset(task_ptr, 8, TypeRegistry.I64, ret.span);
+                _ = try fb.emitPtrStoreValue(result_addr, result, ret.span);
+            }
+            // Run cleanup stack before returning
+            try self.emitCleanups(0);
+            const task_ptr2 = try fb.emitLoadLocal(task_local, TypeRegistry.I64, ret.span);
+            _ = try fb.emitRet(task_ptr2, ret.span);
+            return;
+        }
 
         var value_node: ?ir.NodeIndex = null;
         // Track whether this return is an error path (for errdefer)
@@ -11867,10 +11953,26 @@ pub const Lowerer = struct {
     /// On Wasm: calls the poll function in a loop until READY, then reads result.
     /// On native: calls fiber_switch to suspend current fiber and resume target.
     fn lowerAwaitExpr(self: *Lowerer, ae: ast.AwaitExpr) Error!ir.NodeIndex {
-        // TODO: Swift-style async/await — not yet implemented
-        _ = ae;
-        _ = self;
-        return ir.null_node;
+        const fb = self.current_func orelse return ir.null_node;
+
+        // Lower the operand — this returns a Task pointer (i64)
+        const task_ptr = try self.lowerExprNode(ae.operand);
+
+        // Phase 1 (eager): result is already at task_ptr+8 (body ran synchronously)
+        // Load the result directly
+        const result_addr = try fb.emitAddrOffset(task_ptr, 8, TypeRegistry.I64, ae.span);
+        const result_type = self.inferExprType(ae.operand);
+        const inner_type = if (self.type_reg.get(result_type) == .task)
+            self.type_reg.get(result_type).task.result_type
+        else
+            TypeRegistry.I64;
+        const result = try fb.emitPtrLoadValue(result_addr, inner_type, ae.span);
+
+        // Free the task memory (Phase 1: simple dealloc, no ARC metadata)
+        var dealloc_args = [_]ir.NodeIndex{task_ptr};
+        _ = try fb.emitCall("dealloc", &dealloc_args, false, TypeRegistry.VOID, ae.span);
+
+        return result;
     }
 
     /// Lower catch expr — unwrap error union, use fallback on error.

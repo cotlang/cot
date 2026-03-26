@@ -1,0 +1,33 @@
+// Concurrency tests — Swift-style async/await (Phase 1: eager evaluation)
+
+test "basic async await returns value" {
+    async fn getValue() int {
+        return 42
+    }
+
+    let result = await getValue()
+    @assertEq(result, 42)
+}
+
+test "async fn with parameters" {
+    async fn add(a: int, b: int) int {
+        return a + b
+    }
+
+    let result = await add(10, 20)
+    @assertEq(result, 30)
+}
+
+test "async fn with computation" {
+    async fn factorial(n: int) int {
+        var result = 1
+        var i = 1
+        while (i <= n) {
+            result = result * i
+            i = i + 1
+        }
+        return result
+    }
+
+    @assertEq(await factorial(5), 120)
+}

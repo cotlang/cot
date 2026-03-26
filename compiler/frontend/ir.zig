@@ -255,6 +255,10 @@ pub const FuncBuilder = struct {
     /// without scanning function names (which false-positives on generic methods).
     is_destructor: bool = false,
     is_export: bool = false,
+    /// Phase 1 async: local storing the TaskObject pointer (for lowerReturn to store result)
+    async_task_local: ?LocalIdx = null,
+    /// Phase 1 async: the inner result type (T in Task(T))
+    async_result_type: ?TypeIndex = null,
     /// Shared SRET local: reused across function calls returning large structs.
     /// Avoids allocating a new __sret_tmp for every call. Grown to max needed size.
     shared_sret_local: ?LocalIdx = null,
@@ -621,6 +625,8 @@ pub const Builder = struct {
     /// Forward-declared function names (declared but body not yet emitted).
     /// Swift GenDecl.cpp: getAddrOfSILFunction(NotForDefinition).
     declared_names: std.StringHashMapUnmanaged(void) = .{},
+    /// Stack of saved function contexts for nested fn declarations in blocks.
+    saved_funcs: std.ArrayListUnmanaged(FuncBuilder) = .{},
 
     pub fn init(allocator: Allocator, type_reg: *TypeRegistry) Builder { return .{ .ir = IR.init(allocator, type_reg), .allocator = allocator }; }
 
@@ -630,10 +636,17 @@ pub const Builder = struct {
         self.structs.deinit(self.allocator);
         self.func_names.deinit(self.allocator);
         self.declared_names.deinit(self.allocator);
+        self.saved_funcs.deinit(self.allocator);
         if (self.current_func) |*fb| fb.deinit();
     }
 
-    pub fn startFunc(self: *Builder, name: []const u8, type_idx: TypeIndex, return_type: TypeIndex, span: Span) void { self.current_func = FuncBuilder.init(self.allocator, name, type_idx, return_type, span); }
+    pub fn startFunc(self: *Builder, name: []const u8, type_idx: TypeIndex, return_type: TypeIndex, span: Span) void {
+        // If there's a current function, push it onto the stack (nested fn decl)
+        if (self.current_func) |cf| {
+            self.saved_funcs.append(self.allocator, cf) catch {};
+        }
+        self.current_func = FuncBuilder.init(self.allocator, name, type_idx, return_type, span);
+    }
     pub fn func(self: *Builder) ?*FuncBuilder { return if (self.current_func) |*fb| fb else null; }
 
     pub fn endFunc(self: *Builder) !void {
@@ -641,7 +654,12 @@ pub const Builder = struct {
             const built = try fb.build();
             try self.func_names.put(self.allocator, built.name, {});
             try self.funcs.append(self.allocator, built);
-            self.current_func = null;
+            // Pop the saved function context (restore parent for nested fn decl)
+            if (self.saved_funcs.items.len > 0) {
+                self.current_func = self.saved_funcs.pop();
+            } else {
+                self.current_func = null;
+            }
         }
     }
 

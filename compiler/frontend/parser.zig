@@ -1927,7 +1927,9 @@ pub const Parser = struct {
                 _ = self.match(.semicolon);
                 return try self.tree.addStmt(.{ .defer_stmt = .{ .expr = e, .is_errdefer = is_errdefer, .span = Span.init(start, self.pos()) } });
             },
-            // Block-scoped type declarations (reuse top-level parse functions)
+            // Block-scoped declarations (reuse top-level parse functions)
+            .kw_fn => return self.parseFnDecl(false, false, false, false, false),
+            .kw_async => return self.parseAsyncFn(),
             .kw_struct => return self.parseStructDeclWithLayout(.auto),
             .kw_union => return self.parseUnionDecl(),
             .kw_packed => {
