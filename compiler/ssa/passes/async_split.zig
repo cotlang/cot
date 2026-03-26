@@ -45,6 +45,8 @@ const SuspendPoint = struct {
     call_value: *Value,
     /// SSA values that are live across this suspension point (must be spilled)
     live_values: std.ArrayListUnmanaged(*Value),
+    /// Local indices that are live across this suspension point
+    live_locals: std.ArrayListUnmanaged(u32),
     /// State number assigned to this suspension point
     state_number: i64,
     /// The block to resume into after this suspension
@@ -79,7 +81,10 @@ pub fn asyncSplit(f: *Func, type_registry: *const TypeRegistry) !void {
     // Step 1: Find all suspension points
     var suspend_points = std.ArrayListUnmanaged(SuspendPoint){};
     defer {
-        for (suspend_points.items) |*sp| sp.live_values.deinit(f.allocator);
+        for (suspend_points.items) |*sp| {
+            sp.live_values.deinit(f.allocator);
+            sp.live_locals.deinit(f.allocator);
+        }
         suspend_points.deinit(f.allocator);
     }
 
@@ -91,6 +96,7 @@ pub fn asyncSplit(f: *Func, type_registry: *const TypeRegistry) !void {
                     .block = b,
                     .call_value = v,
                     .live_values = .{},
+                    .live_locals = .{},
                     .state_number = state_num,
                     .resume_block = null,
                 });
@@ -103,16 +109,20 @@ pub fn asyncSplit(f: *Func, type_registry: *const TypeRegistry) !void {
 
     if (suspend_points.items.len == 0) return;
 
-    // Step 2: Compute liveness across suspension points
-    // For each suspend point, find values defined before it that are used after it.
+    // Step 2: Compute liveness across suspension points.
+    // Track both SSA values AND locals (stack slots) that are live across each point.
+    // The SSA uses local_addr + store + load for locals, so liveness propagates
+    // through memory, not just SSA value references.
     // Rust reference: coroutine.rs:709-811 locals_live_across_suspend_points
     for (suspend_points.items) |*sp| {
         try computeLiveValues(f, sp);
-        debug.log(.ssa, "  suspend point state={d}: {d} live values to spill", .{
-            sp.state_number, sp.live_values.items.len,
+        try computeLiveLocals(f, sp);
+        debug.log(.ssa, "  suspend point state={d}: {d} live values, {d} live locals to spill", .{
+            sp.state_number, sp.live_values.items.len, sp.live_locals.items.len,
         });
     }
 
+    // Step 3+: State struct layout, block splitting, dispatch insertion
     // TODO: Steps 3-7 (state struct layout, block splitting, dispatch insertion)
     // These require modifying the SSA graph, which is the most complex part.
     // For now, log the analysis results so we can verify correctness.
@@ -123,43 +133,41 @@ pub fn asyncSplit(f: *Func, type_registry: *const TypeRegistry) !void {
 }
 
 /// Compute which SSA values are live across a suspension point.
-/// A value is live across a suspend point if:
-/// 1. It is defined in a block that dominates the suspend point's block
-/// 2. It is used in a block that is reachable from the resume point
-/// Simplified for Phase 2: any value used after the suspend point in the
-/// same function that was defined before or at the suspend point.
+/// Rust reference: coroutine.rs:709-811 locals_live_across_suspend_points
+///
+/// A value V is live across suspend point S if:
+/// 1. V is defined BEFORE S (in an earlier position in the linear block order)
+/// 2. V is used AFTER S (in a later position)
+/// 3. V is NOT the suspend call itself (the call result is consumed by the await)
+///
+/// For multiple suspend points, a value defined between suspend N and suspend N+1
+/// that is used after suspend N+1 must also be spilled at suspend N+1.
 fn computeLiveValues(f: *const Func, sp: *SuspendPoint) !void {
-    // Build set of all values defined at or before the suspend point
-    var defined_before = std.AutoHashMapUnmanaged(*Value, void){};
-    defer defined_before.deinit(f.allocator);
+    // Build linear position map: value → position index (across all blocks)
+    var positions = std.AutoHashMapUnmanaged(*Value, u32){};
+    defer positions.deinit(f.allocator);
+    var pos: u32 = 0;
+    var suspend_pos: u32 = 0;
 
-    var found_suspend = false;
     for (f.blocks.items) |b| {
         for (b.values.items) |v| {
-            if (v == sp.call_value) {
-                found_suspend = true;
-                break;
-            }
-            try defined_before.put(f.allocator, v, {});
+            try positions.put(f.allocator, v, pos);
+            if (v == sp.call_value) suspend_pos = pos;
+            pos += 1;
         }
-        if (found_suspend) break;
     }
 
-    // Find values used after the suspend point
-    var after_suspend = false;
+    // Find all values defined BEFORE the suspend that are used AFTER it
     for (f.blocks.items) |b| {
         for (b.values.items) |v| {
-            if (v == sp.call_value) {
-                after_suspend = true;
-                continue;
-            }
-            if (!after_suspend) continue;
+            const v_pos = positions.get(v) orelse continue;
+            if (v_pos <= suspend_pos) continue; // Only check values after the suspend
 
-            // Check if any argument of v was defined before the suspend
+            // Check each argument: if defined before the suspend, it's live across
             for (v.args) |arg| {
-                if (defined_before.contains(arg)) {
-                    // This value is live across the suspension
-                    // Avoid duplicates
+                const arg_pos = positions.get(arg) orelse continue;
+                if (arg_pos < suspend_pos and arg != sp.call_value) {
+                    // arg is defined before suspend and used after → must spill
                     var already = false;
                     for (sp.live_values.items) |existing| {
                         if (existing == arg) { already = true; break; }
@@ -169,6 +177,69 @@ fn computeLiveValues(f: *const Func, sp: *SuspendPoint) !void {
                     }
                 }
             }
+        }
+    }
+}
+
+/// Compute which LOCALS (stack slots) are live across a suspension point.
+/// Rust reference: coroutine.rs:709-811 (MaybeStorageLive + MaybeLiveLocals)
+///
+/// A local is live across suspend point S if:
+/// 1. There is a store to local[N] at a position BEFORE S
+/// 2. There is a load from local[N] at a position AFTER S
+///
+/// This handles the SSA pattern: store x to local → suspend → load x from local.
+/// The SSA doesn't have direct value references across suspension points;
+/// instead it uses memory (local store/load) to persist values.
+fn computeLiveLocals(f: *const Func, sp: *SuspendPoint) !void {
+    // Build position map
+    var positions = std.AutoHashMapUnmanaged(*Value, u32){};
+    defer positions.deinit(f.allocator);
+    var pos: u32 = 0;
+    var suspend_pos: u32 = 0;
+
+    for (f.blocks.items) |b| {
+        for (b.values.items) |v| {
+            try positions.put(f.allocator, v, pos);
+            if (v == sp.call_value) suspend_pos = pos;
+            pos += 1;
+        }
+    }
+
+    // Track locals stored before suspend and loaded after
+    var stored_before = std.AutoHashMapUnmanaged(u32, void){};
+    defer stored_before.deinit(f.allocator);
+    var loaded_after = std.AutoHashMapUnmanaged(u32, void){};
+    defer loaded_after.deinit(f.allocator);
+
+    for (f.blocks.items) |b| {
+        for (b.values.items) |v| {
+            const v_pos = positions.get(v) orelse continue;
+
+            // Check for store operations (store to local)
+            if (v.op == .store and v_pos < suspend_pos) {
+                // store to local: the first arg is usually local_addr with aux_int = slot
+                if (v.args.len > 0 and v.args[0].op == .local_addr) {
+                    const slot = @as(u32, @intCast(v.args[0].aux_int));
+                    try stored_before.put(f.allocator, slot, {});
+                }
+            }
+
+            // Check for load operations (load from local)
+            if (v.op == .load and v_pos > suspend_pos) {
+                if (v.args.len > 0 and v.args[0].op == .local_addr) {
+                    const slot = @as(u32, @intCast(v.args[0].aux_int));
+                    try loaded_after.put(f.allocator, slot, {});
+                }
+            }
+        }
+    }
+
+    // Locals that are both stored before AND loaded after = live across suspend
+    var iter = stored_before.keyIterator();
+    while (iter.next()) |key| {
+        if (loaded_after.contains(key.*)) {
+            try sp.live_locals.append(f.allocator, key.*);
         }
     }
 }
