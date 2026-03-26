@@ -51,6 +51,9 @@ pub const Lowerer = struct {
     spawn_counter: u32 = 0,
     lowered_generics: std.StringHashMap(void),
     type_substitution: ?std.StringHashMap(TypeIndex) = null,
+    /// True when lowering the body of an @inlinable generic function.
+    /// Used to distinguish @inlinable from shared body when type_substitution is active.
+    is_inlinable_body: bool = false,
     /// Swift Phase 8.5: Track T-typed params that are passed indirectly (as pointers)
     /// in shared generic bodies. Maps param name → type param name (e.g., "value" → "T")
     /// so we can find the right __metadata_{T} local for runtime size lookups.
@@ -1830,7 +1833,10 @@ pub const Lowerer = struct {
                 // This handles `return ptr.*` where ptr points to a T-sized value.
                 // Detect: type_substitution active = shared generic body. Find the type
                 // param name that the return type maps to.
-                const sret_tp_name: ?[]const u8 = if (self.type_substitution) |sub| blk_tp: {
+                // Only use runtime-sized SRET for shared bodies (not @inlinable).
+                // @inlinable functions have concrete return types — use compile-time sized copy.
+                const sret_tp_name: ?[]const u8 = if (self.type_substitution != null and !self.is_inlinable_body) blk_tp: {
+                    const sub = self.type_substitution.?;
                     // Check if any type param maps to the current sret_type
                     var sub_it = sub.iterator();
                     while (sub_it.next()) |entry| {
@@ -9446,7 +9452,9 @@ pub const Lowerer = struct {
                 // the method must be dispatched at runtime — not devirtualized from the
                 // first instantiation. Otherwise Map(string,int) + Map(int,string)
                 // would both call string_hash via the same shared body.
-                if (self.type_substitution != null and std.mem.eql(u8, fa.field, "hash")) {
+                // Runtime hash dispatch only for shared bodies (not @inlinable).
+                // @inlinable functions use direct concrete hash calls (string_hash, i64_hash).
+                if (self.type_substitution != null and !self.is_inlinable_body and std.mem.eql(u8, fa.field, "hash")) {
                     if (self.type_substitution) |sub| {
                         var sub_it = sub.iterator();
                         while (sub_it.next()) |entry| {
@@ -10224,13 +10232,13 @@ pub const Lowerer = struct {
             self.chk.expr_types = saved_expr_types;
         }
 
-        // @inlinable: concrete types directly, no type_substitution during lowering.
-        // Shared body: type_substitution active for address-only handling.
-        if (!is_inlinable) {
-            self.type_substitution = sub_map;
-        }
+        // Type substitution active for BOTH @inlinable and shared bodies.
+        // resolveTypeNode needs it to resolve generic type params (K → string, V → int).
+        // Shared-body-only paths are guarded by !self.is_inlinable_body.
+        self.type_substitution = sub_map;
         defer {
             self.type_substitution = null;
+            self.is_inlinable_body = false;
             self.indirect_t_params.clearRetainingCapacity();
         }
 
@@ -10272,11 +10280,17 @@ pub const Lowerer = struct {
             self.indirect_t_params.clearRetainingCapacity();
             if (is_inlinable) {
                 // Swift @inlinable: concrete params directly, no indirection.
+                // type_substitution is active (set above) so resolveTypeNode
+                // can resolve generic type params (K → string, V → int).
                 for (f.params) |param| {
                     var param_type = self.resolveTypeNode(param.type_expr);
                     param_type = self.chk.safeWrapType(param_type) catch param_type;
                     _ = try fb.addParam(param.name, param_type, self.type_reg.sizeOf(param_type));
                 }
+                // type_substitution stays active for body lowering too
+                // (@sizeOf(K), type annotations, etc. need it).
+                // Shared-body-only paths are guarded by !self.is_inlinable_body.
+                self.is_inlinable_body = true;
                 // No metadata params, no scalar shadows.
             } else {
                 // Shared body: T-typed params are address-only (Swift Phase 8.5+8.7).
@@ -10487,7 +10501,9 @@ pub const Lowerer = struct {
     /// This is critical: the shared body doesn't know the concrete type — metadata
     /// must flow through the call chain from the original caller.
     fn appendMetadataArgs(self: *Lowerer, fb: *ir.FuncBuilder, inst_info: checker.GenericInstInfo, args: *std.ArrayListUnmanaged(ir.NodeIndex), span: Span) !void {
-        if (self.type_substitution != null) {
+        // Forward metadata only inside shared generic bodies (not @inlinable).
+        // @inlinable bodies have type_substitution set but no __metadata_ locals to forward.
+        if (self.type_substitution != null and !self.is_inlinable_body) {
             // Inside a shared generic body: forward __metadata_{T} from enclosing scope.
             // Each type parameter maps to a __metadata_{name} local in the current function.
             for (inst_info.type_args, 0..) |_, i| {
