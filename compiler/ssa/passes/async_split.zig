@@ -144,16 +144,30 @@ pub fn asyncSplit(f: *Func, type_registry: *const TypeRegistry) !void {
     });
 
     // Step 4-7: SSA graph transformation (block splitting, dispatch, spill/restore)
-    // Currently analysis-only — the transformation is implemented but gated behind
-    // the ENABLE_ASYNC_TRANSFORM flag until the full constructor + poll + executor
-    // infrastructure is wired up. Enabling prematurely would break eager evaluation.
-    const ENABLE_ASYNC_TRANSFORM = false;
-    if (!ENABLE_ASYNC_TRANSFORM) {
-        debug.log(.async_split, "=== AsyncSplit analysis complete for '{s}': {d} suspend points, {d}B frame (transform disabled) ===", .{
-            f.name, suspend_points.items.len, frame_size,
+    // Only transform functions with 2+ suspension points.
+    // Single-suspend functions work correctly with eager evaluation.
+    // The state machine is needed when a function has multiple awaits
+    // and needs to save/restore state between them.
+    // Rust: coroutine.rs only transforms functions with Yield terminators.
+    // Kotlin: all suspend functions get the transform.
+    // Transform disabled while SSA dominance fixup is in progress.
+    // The block splitting works but creates invalid SSA (values crossing
+    // block boundaries without phi nodes). Need to add:
+    // 1. Frame pointer arg value in each resume block
+    // 2. init_mem at resume block entry for memory state
+    // 3. Phi nodes for values that cross split boundaries
+    // Rust reference: coroutine.rs TransformVisitor rewrites all local
+    // references to coroutine struct fields, avoiding the dominance issue.
+    if (true or suspend_points.items.len < 2) {
+        debug.log(.async_split, "=== AsyncSplit skipped for '{s}': {d} suspend points (<=1, eager sufficient) ===", .{
+            f.name, suspend_points.items.len,
         });
         return;
     }
+
+    debug.log(.async_split, "=== AsyncSplit TRANSFORMING '{s}': {d} suspend points, {d}B frame ===", .{
+        f.name, suspend_points.items.len, frame_size,
+    });
 
     // Step 4: Split blocks at each suspension point
     // Rust reference: coroutine.rs:1085-1109 insert_switch + TransformVisitor
