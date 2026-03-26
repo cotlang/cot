@@ -11003,7 +11003,14 @@ pub const Lowerer = struct {
                 const st = self.tree;
                 self.tree = gi.tree;
                 defer self.tree = st;
-                break :blk self.isGenericParamIndirect(gi, arg_i);
+                // For method calls, arg_i counts user args (excluding receiver).
+                // If the function has explicit self as first param (non-@safe),
+                // offset by 1 to skip self when checking if the param is T-typed.
+                const gi_fn = self.tree.getNode(gi.generic_node);
+                const gi_decl = if (gi_fn) |n| n.asDecl() else null;
+                const has_explicit_self = if (gi_decl) |d| (d == .fn_decl and d.fn_decl.params.len > 0 and std.mem.eql(u8, d.fn_decl.params[0].name, "self")) else false;
+                const adjusted_idx = if (has_explicit_self) arg_i + 1 else arg_i;
+                break :blk self.isGenericParamIndirect(gi, adjusted_idx);
             } else false;
 
             if (is_method_t_indirect) {
