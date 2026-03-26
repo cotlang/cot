@@ -11982,12 +11982,11 @@ pub const Lowerer = struct {
     fn lowerAwaitExpr(self: *Lowerer, ae: ast.AwaitExpr) Error!ir.NodeIndex {
         const fb = self.current_func orelse return ir.null_node;
 
-        // Check if this is a cross-actor method call (no task allocation needed)
-        // Swift: hop_to_executor + call + hop_back. Phase 1 eager: hops are no-ops.
-        if (self.isCrossActorCall(ae.operand)) {
-            // Lower the method call directly — no task wrapping
-            // Phase 1: synchronous call (single-threaded, no executor hop needed)
-            // Phase 2+: emit hop_to_executor before/after the call
+        // Check if this is a cross-actor or global-actor call (no task allocation needed).
+        // Swift: hop_to_executor + call + hop_back (SILGenApply.cpp:6155).
+        // Phase 1: hops are no-ops (single-threaded).
+        // Phase 2+: emit swift_task_switch before/after the call.
+        if (self.isCrossActorCall(ae.operand) or self.isGlobalActorCall(ae.operand)) {
             return try self.lowerExprNode(ae.operand);
         }
 
@@ -12007,6 +12006,18 @@ pub const Lowerer = struct {
         _ = try fb.emitCall("release", &release_args, false, TypeRegistry.VOID, ae.span);
 
         return result;
+    }
+
+    /// Check if an expression is a call to a @globalActor-isolated function.
+    /// Used by lowerAwaitExpr to detect `await mainActorFn()`.
+    fn isGlobalActorCall(self: *Lowerer, operand_idx: NodeIndex) bool {
+        const node = self.tree.getNode(operand_idx) orelse return false;
+        const expr = node.asExpr() orelse return false;
+        if (expr != .call) return false;
+        const callee_node = self.tree.getNode(expr.call.callee) orelse return false;
+        const callee_expr = callee_node.asExpr() orelse return false;
+        if (callee_expr != .ident) return false;
+        return self.chk.global_actor_fns.contains(callee_expr.ident.name);
     }
 
     /// Check if an expression is a method call on an actor type (cross-actor call).

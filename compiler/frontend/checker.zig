@@ -234,10 +234,16 @@ pub const Checker = struct {
     /// Cross-actor calls (calling methods on a different actor) require `await`.
     current_actor_type: ?[]const u8 = null,
     /// Tracks cross-actor calls that require `await`. Keyed by source offset.
-    /// If a call is in this set after checkExpr returns, it wasn't inside `await` → error.
     cross_actor_calls: std.AutoHashMap(u32, void) = std.AutoHashMap(u32, void).init(std.heap.page_allocator),
+    /// Swift SE-0316: functions annotated with @globalActor (e.g. @MainActor).
+    /// Keyed by function name, value is the actor name.
+    global_actor_fns: std.StringHashMap([]const u8) = std.StringHashMap([]const u8).init(std.heap.page_allocator),
     /// True when currently inside an `await` expression (suppresses cross-actor errors).
     in_await: bool = false,
+    /// Swift SE-0316: current global actor context (e.g. "MainActor").
+    /// Non-null when inside a @MainActor function or @MainActor type member.
+    /// Cross-global-actor calls require await (TypeCheckConcurrency.cpp:3954).
+    current_global_actor: ?[]const u8 = null,
     /// Mutable comptime variable storage — active during comptime block evaluation.
     /// Zig Sema: ComptimeAlloc list holds mutable values, runtime_index prevents time travel.
     comptime_vars: ?std.StringHashMap(ComptimeValue) = null,
@@ -482,6 +488,10 @@ pub const Checker = struct {
                 try self.defineInFileScope(sym);
                 if (f.params.len > 0 and std.mem.eql(u8, f.params[0].name, "self"))
                     try self.registerMethod(f.name, f.params[0].type_expr, func_type);
+                // Track @globalActor functions (SE-0316)
+                if (f.global_actor) |actor| {
+                    self.global_actor_fns.put(f.name, actor) catch {};
+                }
             },
             .var_decl => |v| {
                 if (self.scope.isDefined(v.name)) { self.reportRedefined(v.span.start, v.name); return; }
@@ -879,13 +889,17 @@ pub const Checker = struct {
         }
         const old_scope = self.scope;
         const old_return = self.current_return_type;
+        const old_global_actor = self.current_global_actor;
         self.scope = &func_scope;
         self.current_return_type = body_return_type;
+        // Swift SE-0316: set global actor context for isolation checking
+        if (f.global_actor) |ga| self.current_global_actor = ga;
         if (f.body != null_node) try self.checkBlockExpr(f.body);
         // Lint: check for unused vars/params before scope exits
         if (self.lint_mode) self.checkScopeUnused(&func_scope);
         self.scope = old_scope;
         self.current_return_type = old_return;
+        self.current_global_actor = old_global_actor;
     }
 
     fn checkVarDecl(self: *Checker, v: ast.VarDecl, idx: NodeIndex) CheckError!void {
@@ -2048,6 +2062,21 @@ pub const Checker = struct {
             // Generic function instantiation: max(i64) where max is generic
             if (self.generics.generic_functions.get(name)) |gen_info| {
                 return try self.instantiateGenericFunc(c, gen_info, name);
+            }
+
+            // Swift SE-0316: global actor isolation check for direct function calls.
+            // If the called function is @MainActor and the caller is in a different
+            // (or no) global actor context, require await.
+            // Reference: TypeCheckConcurrency.cpp:3954 tryMarkImplicitlyAsync
+            if (self.global_actor_fns.get(name)) |callee_actor| {
+                const is_same_actor = if (self.current_global_actor) |cga|
+                    std.mem.eql(u8, cga, callee_actor)
+                else
+                    false;
+                if (!is_same_actor and !self.in_await) {
+                    self.err.errorWithCode(c.span.start, .e300,
+                        "call to global actor-isolated function requires 'await'");
+                }
             }
         };
 
@@ -3343,9 +3372,10 @@ pub const Checker = struct {
 
         const operand_type = try self.checkExpr(ae.operand);
 
-        // Check if the operand is a cross-actor call (doesn't return Task, just needs await)
-        if (self.isCrossActorCallExpr(ae.operand)) {
-            return operand_type; // Return the method's actual return type
+        // Check if the operand is a cross-actor or global-actor call
+        // (doesn't return Task, just needs await for isolation hop)
+        if (self.isCrossActorCallExpr(ae.operand) or self.isGlobalActorCallExpr(ae.operand)) {
+            return operand_type; // Return the function's actual return type
         }
 
         // Otherwise, must be an async function call returning Task(T)
@@ -3365,6 +3395,17 @@ pub const Checker = struct {
         const receiver_name = self.getCallReceiverActorName(expr.call.callee);
         if (receiver_name) |rn| return self.actor_types.contains(rn);
         return false;
+    }
+
+    /// Check if an expression is a call to a @globalActor-isolated function.
+    fn isGlobalActorCallExpr(self: *Checker, operand_idx: NodeIndex) bool {
+        const node = self.tree.getNode(operand_idx) orelse return false;
+        const expr = node.asExpr() orelse return false;
+        if (expr != .call) return false;
+        const callee_node = self.tree.getNode(expr.call.callee) orelse return false;
+        const callee_expr = callee_node.asExpr() orelse return false;
+        if (callee_expr != .ident) return false;
+        return self.global_actor_fns.contains(callee_expr.ident.name);
     }
 
     /// Get the actor type name from a method call callee (field_access on an actor instance).

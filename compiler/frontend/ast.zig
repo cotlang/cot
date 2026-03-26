@@ -62,6 +62,9 @@ pub const FnDecl = struct {
     /// Swift nonisolated: actor method accessible without await from outside.
     /// Must not access mutable actor state. Reference: SE-0313.
     is_nonisolated: bool = false,
+    /// Swift @globalActor: function isolated to a global actor (e.g. @MainActor).
+    /// Calling from outside the actor's context requires await. Reference: SE-0316.
+    global_actor: ?[]const u8 = null,
     doc_comment: []const u8 = "",
     span: Span,
 };

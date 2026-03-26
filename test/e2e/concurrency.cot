@@ -72,6 +72,21 @@ test "nonisolated actor method callable without await" {
     @assertEq(name, "world")
 }
 
+test "global actor MainActor isolation" {
+    @MainActor fn updateUI() int {
+        return 42
+    }
+
+    @MainActor fn helperUI() int {
+        // Same global actor — no await needed
+        return updateUI()
+    }
+
+    // From outside @MainActor, await is required
+    let result = await updateUI()
+    @assertEq(result, 42)
+}
+
 test "task cancellation flag" {
     async fn longTask() int {
         // Phase 1: runs immediately, cancellation checked cooperatively

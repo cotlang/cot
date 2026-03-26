@@ -34,6 +34,8 @@ pub const Parser = struct {
     current_impl_is_generic: bool = false,
     /// True when inside an actor body — forces self injection like @safe mode.
     current_impl_is_actor: bool = false,
+    /// Swift SE-0316: pending @globalActor attribute for the next fn declaration.
+    pending_global_actor: ?[]const u8 = null,
     /// Pending doc comment text (accumulated from consecutive /// lines)
     pending_doc_comment: []const u8 = "",
 
@@ -220,13 +222,27 @@ pub const Parser = struct {
                 break :blk self.parseFnDecl(false, false, true, false, false);
             },
             .at => blk: {
-                // @inlinable fn ... — Swift @inlinable: monomorphize generic function
                 const peek = self.peekToken();
+                // @inlinable fn ... — Swift @inlinable: monomorphize generic function
                 if (peek.tok == .ident and std.mem.eql(u8, peek.text, "inlinable")) {
                     self.advance(); // consume @
                     self.advance(); // consume inlinable
                     if (!self.check(.kw_fn)) { self.syntaxError("expected 'fn' after '@inlinable'"); break :blk null; }
                     break :blk self.parseFnDecl(false, false, false, false, true);
+                }
+                // @MainActor fn ... — Swift SE-0316: global actor isolation
+                if (peek.tok == .ident and (std.mem.eql(u8, peek.text, "MainActor") or std.mem.eql(u8, peek.text, "globalActor"))) {
+                    self.advance(); // consume @
+                    const actor_name = self.tok.text;
+                    self.advance(); // consume actor name
+                    if (!self.check(.kw_fn) and !self.check(.kw_async)) {
+                        self.syntaxError("expected 'fn' or 'async fn' after global actor attribute");
+                        break :blk null;
+                    }
+                    // Store actor name for parseFnDeclFull to pick up
+                    self.pending_global_actor = actor_name;
+                    defer self.pending_global_actor = null;
+                    break :blk self.parseFnDecl(false, false, false, false, false);
                 }
                 self.syntaxError("expected declaration");
                 break :blk null;
@@ -369,7 +385,7 @@ pub const Parser = struct {
             body = try self.parseBlock() orelse return null;
         }
 
-        return try self.tree.addDecl(.{ .fn_decl = .{ .name = name, .type_params = type_params, .type_param_bounds = type_param_bounds, .params = params, .return_type = return_type, .body = body, .is_extern = is_extern, .is_export = is_export, .is_async = is_async, .is_static = is_static, .is_inlinable = is_inlinable, .is_nonisolated = is_nonisolated, .doc_comment = doc_comment, .span = Span.init(start, self.pos()) } });
+        return try self.tree.addDecl(.{ .fn_decl = .{ .name = name, .type_params = type_params, .type_param_bounds = type_param_bounds, .params = params, .return_type = return_type, .body = body, .is_extern = is_extern, .is_export = is_export, .is_async = is_async, .is_static = is_static, .is_inlinable = is_inlinable, .is_nonisolated = is_nonisolated, .global_actor = self.pending_global_actor, .doc_comment = doc_comment, .span = Span.init(start, self.pos()) } });
     }
 
     fn parseFieldList(self: *Parser, end_tok: Token) ParseError![]const ast.Field {
@@ -2007,6 +2023,17 @@ pub const Parser = struct {
             // Block-scoped declarations (reuse top-level parse functions)
             .kw_fn => return self.parseFnDecl(false, false, false, false, false),
             .kw_async => return self.parseAsyncFn(),
+            .at => {
+                // Block-scoped @attribute fn ... (reuse top-level @ handler)
+                const peek = self.peekToken();
+                if (peek.tok == .ident and (std.mem.eql(u8, peek.text, "MainActor") or
+                    std.mem.eql(u8, peek.text, "inlinable") or
+                    std.mem.eql(u8, peek.text, "globalActor")))
+                {
+                    return try self.parseDecl();
+                }
+                return self.parseExprOrAssign(start);
+            },
             .kw_struct => return self.parseStructDeclWithLayout(.auto),
             .kw_actor => return self.parseActorDecl(),
             .kw_union => return self.parseUnionDecl(),
