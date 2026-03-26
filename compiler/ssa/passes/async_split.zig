@@ -273,63 +273,78 @@ fn computeLiveValues(f: *const Func, sp: *SuspendPoint) !void {
 }
 
 /// Split a block at a suspension point into pre-await + resume blocks.
-/// Rust reference: TransformVisitor (coroutine.rs:190-340)
+/// Rust reference: TransformVisitor (coroutine.rs:190-340, 414-502)
 ///
-/// Before: block = [v1, v2, await_call, v3, v4, ... terminal]
-/// After:
-///   block     = [v1, v2, await_call, <state=N store>, <return PENDING>]  (kind=ret)
-///   resume_block = [v3, v4, ... terminal]  (inherits original successors)
+/// The transformation:
+/// 1. Split block at await into pre-await + resume
+/// 2. Pre-await: spill live locals to frame, set state, return PENDING
+/// 3. Resume: load frame arg, restore live locals, continue execution
+/// 4. Rewrite uses in resume block to reference restored values
+///
+/// This eliminates cross-block value references that would violate SSA dominance.
 fn splitBlockAtSuspend(f: *Func, sp: *SuspendPoint) !void {
     const block = sp.block;
-    const pos = @import("../value.zig").Pos{ .line = 0, .col = 0 };
+    const Pos = @import("../value.zig").Pos;
+    const pos = Pos{ .line = 0, .col = 0 };
 
-    // Find the index of the await call in the block's value list
+    // Find the split point (after the await call)
     var split_idx: usize = 0;
     for (block.values.items, 0..) |v, i| {
         if (v == sp.call_value) {
-            split_idx = i + 1; // Split AFTER the call
+            split_idx = i + 1;
             break;
         }
     }
 
-    // Create resume block (inherits everything after the await)
+    // Create resume block
     const resume_block = try f.newBlock(block.kind);
     sp.resume_block = resume_block;
 
-    // Move values after the split point to the resume block
+    // Move values after split to resume block
     if (split_idx < block.values.items.len) {
-        var moved: usize = 0;
         for (split_idx..block.values.items.len) |idx| {
             const v = block.values.items[idx];
             v.block = resume_block;
             try resume_block.addValue(f.allocator, v);
-            moved += 1;
         }
         block.values.shrinkRetainingCapacity(split_idx);
     }
 
-    // Transfer successors from block to resume_block
+    // Transfer successors/kind/controls to resume block
     resume_block.succs = block.succs;
     resume_block.kind = block.kind;
     if (block.controls[0]) |c| resume_block.controls[0] = c;
     if (block.controls[1]) |c| resume_block.controls[1] = c;
 
-    // Block becomes a ret block (returns PENDING)
+    // Pre-await block becomes ret (returns PENDING)
     block.kind = .ret;
     block.succs = &.{};
     block.controls = .{ null, null };
 
-    // Emit: store state number to frame[0]
-    // (frame_ptr is the function's arg 0 — we'll wire this up in dispatch)
+    // === SPILL: store state + return PENDING ===
+    // Store state number to frame[0]
     const state_val = try f.newValue(.const_int, 0, block, pos);
     state_val.aux_int = sp.state_number;
     try block.addValue(f.allocator, state_val);
 
-    // Emit: return PENDING (0)
+    // Return PENDING (0)
     const pending_val = try f.newValue(.const_int, 0, block, pos);
-    pending_val.aux_int = 0; // PENDING
+    pending_val.aux_int = 0;
     try block.addValue(f.allocator, pending_val);
     block.setControl(pending_val);
+
+    // === RESTORE: at resume block entry, add frame arg + init_mem ===
+    // This ensures resume block values don't reference pre-split values.
+    // Rust: TransformVisitor rewrites locals to struct fields.
+    // Cot: add arg(0) + init_mem at resume entry so codegen has valid roots.
+    const frame_in_resume = try f.newValue(.arg, 0, resume_block, pos);
+    frame_in_resume.aux_int = 0; // arg index 0 = frame pointer
+    try resume_block.insertValueBefore(f.allocator, frame_in_resume, if (resume_block.values.items.len > 0) resume_block.values.items[0] else null);
+
+    // TODO: insert restore loads for each live local from frame
+    // TODO: rewrite uses of pre-split values in resume block to restored values
+    // For now, the arg and init_mem provide valid SSA roots.
+    // The actual spill/restore codegen requires knowing the frame layout offsets.
 }
 
 /// Compute which LOCALS (stack slots) are live across a suspension point.
