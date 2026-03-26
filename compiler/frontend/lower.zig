@@ -8721,11 +8721,16 @@ pub const Lowerer = struct {
                         const elem = self.type_reg.get(p.elem);
                         if (elem == .struct_type) break :blk elem.struct_type.name;
                         if (elem == .enum_type) break :blk elem.enum_type.name;
+                        if (elem == .list) break :blk @as(?[]const u8, "List");
+                        if (elem == .map) break :blk @as(?[]const u8, "Map");
                         break :blk null;
                     },
                     .basic => |bk| bk.name(),
                     // string is stored as slice(u8) — look up methods registered under "string"
                     .slice => if (base_type_idx == TypeRegistry.STRING) "string" else null,
+                    // Collection types: use built-in type names for method resolution
+                    .list => "List",
+                    .map => "Map",
                     else => null,
                 };
                 // Existential method dispatch: load fn_ptr from PWT, call indirectly.

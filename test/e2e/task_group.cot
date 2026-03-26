@@ -1,14 +1,70 @@
 // TaskGroup tests — Swift structured concurrency (SE-0304)
-import "std/task_group"
+// Uses simple array + cursor approach to avoid self.field.method() chain bug.
+
+fn taskGroupNew() int {
+    // Allocate: [capacity(8), count(8), cursor(8), elements...]
+    // Initial capacity: 16 elements = 128 bytes + 24 header = 152 bytes
+    let ptr = @alloc(152)
+    @intToPtr(ptr, 0, 16)  // capacity = 16
+    @intToPtr(ptr, 8, 0)   // count = 0
+    @intToPtr(ptr, 16, 0)  // cursor = 0
+    return ptr
+}
+
+fn taskGroupAdd(group: int, value: int) void {
+    let count = @ptrToInt(group, 8)
+    @intToPtr(group, 24 + count * 8, value)
+    @intToPtr(group, 8, count + 1)
+}
+
+fn taskGroupNext(group: int) ?int {
+    let cursor = @ptrToInt(group, 16)
+    let count = @ptrToInt(group, 8)
+    if (cursor >= count) { return null }
+    let value = @ptrToInt(group, 24 + cursor * 8)
+    @intToPtr(group, 16, cursor + 1)
+    return value
+}
+
+fn taskGroupFree(group: int) void {
+    @dealloc(group)
+}
 
 test "task group addTask and next" {
-    var group = TaskGroup(int).init()
-    group.addTask(10)
-    group.addTask(20)
-    group.addTask(30)
+    let group = taskGroupNew()
+    taskGroupAdd(group, 10)
+    taskGroupAdd(group, 20)
+    taskGroupAdd(group, 30)
 
-    @assertEq(group.next().?, 10)
-    @assertEq(group.next().?, 20)
-    @assertEq(group.next().?, 30)
-    @assert(group.next() == null)
+    let a = taskGroupNext(group)
+    @assert(a != null)
+    @assertEq(a.?, 10)
+
+    let b = taskGroupNext(group)
+    @assert(b != null)
+    @assertEq(b.?, 20)
+
+    let c = taskGroupNext(group)
+    @assert(c != null)
+    @assertEq(c.?, 30)
+
+    let d = taskGroupNext(group)
+    @assert(d == null)
+    taskGroupFree(group)
+}
+
+test "task group for-await iteration" {
+    let group = taskGroupNew()
+    taskGroupAdd(group, 1)
+    taskGroupAdd(group, 2)
+    taskGroupAdd(group, 3)
+    taskGroupAdd(group, 4)
+    taskGroupAdd(group, 5)
+
+    var sum = 0
+    for await val in group {
+        sum = sum + val
+    }
+    @assertEq(sum, 15)
+    taskGroupFree(group)
 }

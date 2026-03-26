@@ -3989,6 +3989,19 @@ pub const Checker = struct {
     /// Creates concrete struct type with substituted fields, deduplicates via cache.
     fn resolveGenericInstance(self: *Checker, gi: ast.GenericInstance, span: Span) CheckError!TypeIndex {
         const gen_info = self.generics.generic_structs.get(gi.name) orelse {
+            // Built-in collection types (List, Map) aren't in generic_structs — they're
+            // compiler primitives. When referenced from generic struct fields (e.g.
+            // `results: List(T)` in TaskGroup(T)), resolve them directly via makeList/makeMap.
+            // This only fires as a fallback when the name isn't a user-defined generic.
+            if (std.mem.eql(u8, gi.name, "List") and gi.type_args.len == 1) {
+                const elem_type = try self.resolveTypeExpr(gi.type_args[0]);
+                return try self.types.makeList(elem_type);
+            }
+            if (std.mem.eql(u8, gi.name, "Map") and gi.type_args.len == 2) {
+                const key_type = try self.resolveTypeExpr(gi.type_args[0]);
+                const val_type = try self.resolveTypeExpr(gi.type_args[1]);
+                return try self.types.makeMap(key_type, val_type);
+            }
             self.errWithSuggestion(span.start, "undefined generic type", self.findSimilarType(gi.name));
             return invalid_type;
         };

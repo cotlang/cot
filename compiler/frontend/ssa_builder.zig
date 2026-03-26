@@ -499,7 +499,15 @@ pub const SSABuilder = struct {
             if (i != 0) self.startBlock(ssa_block_ptr);
             for (ir_block.nodes) |node_idx| {
                 if (logical_operands.contains(node_idx)) continue;
-                _ = try self.convertNode(node_idx);
+                _ = self.convertNode(node_idx) catch |e| {
+                    const failing_node = self.ir_func.getNode(node_idx);
+                    debug.log(.ssa, "SSA error in func '{s}' block {d} node {d} tag={s} err={s}", .{
+                        self.ir_func.name, i, node_idx,
+                        @tagName(failing_node.data),
+                        @errorName(e),
+                    });
+                    return e;
+                };
             }
         }
 
@@ -2051,7 +2059,10 @@ pub const SSABuilder = struct {
     /// Convert ptr.* load — dereference a pointer to get its value.
     /// Go reference: ssagen/ssa.go ODEREF loads — compound types decompose to ptr@0, len@8.
     fn convertPtrLoadValue(self: *SSABuilder, ptr_idx: ir.NodeIndex, type_idx: TypeIndex, cur: *Block) !*Value {
-        const ptr_val = try self.convertNode(ptr_idx) orelse return error.MissingValue;
+        const ptr_val = try self.convertNode(ptr_idx) orelse {
+            debug.log(.ssa, "convertPtrLoadValue: ptr_idx={d} returned null (not in node_values)", .{ptr_idx});
+            return error.MissingValue;
+        };
 
         // String/slice compound load: load ptr@0 and len@8, create string_make/slice_make
         const value_type = self.type_registry.get(type_idx);
