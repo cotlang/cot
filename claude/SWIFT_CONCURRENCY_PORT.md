@@ -548,7 +548,10 @@ let results = await withTaskGroup(of: int) { group in
 
 1. **Child tasks cannot outlive the group.** `withTaskGroup` blocks until ALL children finish, even cancelled ones.
 2. **Cancelling the group** cancels all children. Children cooperatively check `Task.isCancelled`.
-3. **Error propagation**: `withThrowingTaskGroup` — if body throws, group cancels all children, then rethrows.
+3. **Error propagation (nuanced)**:
+   - An individual child error returned via `group.next()` does NOT auto-cancel siblings — the caller decides how to handle it
+   - But throwing OUT of the `withThrowingTaskGroup` body DOES cancel all children, wait for them all to complete, then rethrow
+   - This distinction matters: `next()` gives control, exiting the scope gives safety
 4. **Results are collected via `for await in`** or manual `group.next()` calls.
 
 ### async let (Structured Child Task)
@@ -1785,7 +1788,7 @@ The existing Go-style concurrency code is **half-built and non-functional**:
 | Lowerer (spawn/select/await) | Partially works | ~1,200 | Calls non-existent runtime functions |
 | Runtime (scheduler, threads) | **Missing entirely** | 0 | `sched_spawn`, `sched_select` declared but never implemented |
 | Stdlib (async.cot, channel.cot, thread.cot) | Partially written | ~615 | No test coverage, known channel ring buffer bug |
-| Tests | **Zero** | 0 | Not a single async test in 375 total tests |
+| Tests | **Deleted** | ~1,062 | 7 test files existed but were deleted as part of Go concurrency cleanup |
 | Selfcot (self/build/lower.cot) | Ported from Zig | ~850 | Same broken calls to missing runtime |
 
 **Verdict:** Clean deletion. Nothing works end-to-end. No user code depends on it. The only reusable piece is `detectCaptures()` in the lowerer (used by closures too).
@@ -1809,22 +1812,19 @@ The document's "cooperative thread pool" description is misleading. The actual S
 
 ---
 
-### D.3: Critical Design Recommendation — Hybrid Compilation Strategy
+### D.3: Compilation Strategy — State Machines Everywhere, Optimize Later
 
-The web research revealed a fundamental architectural choice the document underspecifies:
+The web research revealed two async lowering approaches:
 
 **Swift's approach:** Heap-allocated continuation frames (AsyncContext). Every `await` allocates. ~400-800 bytes per task creation. ~50-100ns overhead per async call.
 
 **Rust's approach:** Compile async functions to state machines with known size at compile time. Zero heap allocation. The `Future` IS the state machine.
 
-**Recommendation for Cot:** Use Rust's state-machine compilation for Wasm, Swift's continuation model for native.
+**Recommendation for Cot:** Use **state machines for both Wasm and native** initially. One lowering strategy, one code path, fewer bugs. This is critical for self-hosting — selfcot would need to implement both paths otherwise, doubling the surface area.
 
-| Target | Strategy | Why |
-|--------|----------|-----|
-| Wasm | State machine (Rust-style `poll()`) | No heap per call, fits single-threaded event loop, Cot already has partial state machine infra |
-| Native | AsyncContext continuation (Swift-style) | Simpler codegen, works naturally with thread pool, heap allocation is cheap on native |
+State machines work on native too (Rust proves this at scale). The performance difference vs heap-allocated continuations is negligible for most workloads, and state machines are actually *faster* (zero alloc per call).
 
-Cot already has the Wasm state machine partially built (the current `async_poll_names` infrastructure in lower.zig). The native path would use Swift's continuation-passing style through the cooperative executor.
+AsyncContext-style continuations can be added later as a **native-only optimization** if profiling shows the state machine approach has limitations (e.g., deeply recursive async call chains where the state machine struct becomes very large). But start simple — one path, one implementation, one thing to debug.
 
 ---
 
