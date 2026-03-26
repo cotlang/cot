@@ -24,6 +24,7 @@ const lower_wasm = @import("ssa/passes/lower_wasm.zig");
 const lower_native = @import("ssa/passes/lower_native.zig");
 const deadcode = @import("ssa/passes/deadcode.zig");
 const copyelim = @import("ssa/passes/copyelim.zig");
+const async_split = @import("ssa/passes/async_split.zig");
 const phielim = @import("ssa/passes/phielim.zig");
 const cse_pass = @import("ssa/passes/cse.zig");
 const ssa_to_clif = @import("codegen/native/ssa_to_clif.zig");
@@ -1514,7 +1515,10 @@ pub const Driver = struct {
                 }
             }
 
-            // Run SSA passes (native path — copyelim not in native SSA pipeline)
+            // Run SSA passes (native path)
+            // Async state machine splitting — must run FIRST.
+            try async_split.asyncSplit(ssa_func, type_reg);
+
             try rewritegeneric.rewrite(func_alloc, ssa_func, &string_offsets);
             if (html_writer_native != null) html_writer_native.?.writePhase("rewritegeneric", "rewritegeneric", ssa_func);
 
@@ -6303,6 +6307,15 @@ pub const Driver = struct {
             const ssa_debug = @import("ssa/debug.zig");
             var t: i128 = undefined;
             var elapsed: i128 = undefined;
+
+            // Async state machine splitting — must run FIRST, before other SSA passes.
+            // Transforms async functions with multiple await points into state machines.
+            // Rust reference: rustc_mir_transform/src/coroutine.rs (StateTransform)
+            t = debug.timestamp();
+            try async_split.asyncSplit(ssa_func, type_reg);
+            elapsed = debug.timestamp() - t;
+            debug.logTimed(.ssa, "  pass async_split", elapsed, .{});
+            if (html_writer != null) html_writer.?.writePhase("async_split", "async_split", ssa_func);
 
             t = debug.timestamp();
             try copyelim.copyelim(ssa_func);
