@@ -37,6 +37,12 @@ const STATE_RETURNED: i64 = 1;
 const STATE_POISONED: i64 = 2;
 const STATE_FIRST_SUSPEND: i64 = 3;
 
+/// A local that needs to be spilled to the state struct.
+const SpillSlot = struct {
+    local_slot: u32,     // SSA local index
+    frame_offset: i64,   // offset in the state struct
+};
+
 /// Information about a single suspension point (await operation).
 const SuspendPoint = struct {
     /// The block containing the await call
@@ -129,18 +135,27 @@ pub fn asyncSplit(f: *Func, type_registry: *const TypeRegistry) !void {
     const result_offset: i64 = 8;
     const spill_offset: i64 = 16;
 
-    // Compute total frame size and assign offsets to each spilled local
-    var max_spills: usize = 0;
+    // Compute frame layout: assign a unique offset to each spilled local
+    // Rust: coroutine.rs:969-1068 compute_layout — builds variant-based layout
+    // Cot simplified: each unique spilled local gets one slot in the frame
+    var local_to_offset = std.AutoHashMapUnmanaged(u32, i64){};
+    defer local_to_offset.deinit(f.allocator);
+    var next_offset: i64 = spill_offset;
+
     for (suspend_points.items) |sp| {
-        if (sp.live_locals.items.len > max_spills) max_spills = sp.live_locals.items.len;
+        for (sp.live_locals.items) |local_slot| {
+            if (!local_to_offset.contains(local_slot)) {
+                try local_to_offset.put(f.allocator, local_slot, next_offset);
+                next_offset += 8;
+            }
+        }
     }
-    const frame_size = 16 + max_spills * 8; // state + result + spills
-    _ = spill_offset;
+    const frame_size: usize = @intCast(next_offset);
     _ = state_offset;
     _ = result_offset;
 
     debug.log(.async_split, "  state struct: {d} bytes ({d} spill slots)", .{
-        frame_size, max_spills,
+        frame_size, local_to_offset.count(),
     });
 
     // Step 4-7: SSA graph transformation (block splitting, dispatch, spill/restore)
@@ -158,6 +173,10 @@ pub fn asyncSplit(f: *Func, type_registry: *const TypeRegistry) !void {
     // 3. Phi nodes for values that cross split boundaries
     // Rust reference: coroutine.rs TransformVisitor rewrites all local
     // references to coroutine struct fields, avoiding the dominance issue.
+    // Transform gated: spill/restore codegen emits stores/loads but doesn't
+    // rewrite value args in resume blocks. Need rewriteUsesAfterSuspend to
+    // replace pre-split value references with restored local loads.
+    // Rust reference: coroutine.rs TransformVisitor visit_place (line 414-418)
     if (true or suspend_points.items.len < 2) {
         debug.log(.async_split, "=== AsyncSplit skipped for '{s}': {d} suspend points (<=1, eager sufficient) ===", .{
             f.name, suspend_points.items.len,
@@ -176,7 +195,7 @@ pub fn asyncSplit(f: *Func, type_registry: *const TypeRegistry) !void {
     while (i_sp > 0) {
         i_sp -= 1;
         const sp = &suspend_points.items[i_sp];
-        try splitBlockAtSuspend(f, sp);
+        try splitBlockAtSuspend(f, sp, &local_to_offset);
         debug.log(.async_split, "  split block at state={d}, resume block created", .{sp.state_number});
     }
 
@@ -282,7 +301,7 @@ fn computeLiveValues(f: *const Func, sp: *SuspendPoint) !void {
 /// 4. Rewrite uses in resume block to reference restored values
 ///
 /// This eliminates cross-block value references that would violate SSA dominance.
-fn splitBlockAtSuspend(f: *Func, sp: *SuspendPoint) !void {
+fn splitBlockAtSuspend(f: *Func, sp: *SuspendPoint, local_to_offset: *const std.AutoHashMapUnmanaged(u32, i64)) !void {
     const block = sp.block;
     const Pos = @import("../value.zig").Pos;
     const pos = Pos{ .line = 0, .col = 0 };
@@ -333,18 +352,89 @@ fn splitBlockAtSuspend(f: *Func, sp: *SuspendPoint) !void {
     try block.addValue(f.allocator, pending_val);
     block.setControl(pending_val);
 
-    // === RESTORE: at resume block entry, add frame arg + init_mem ===
-    // This ensures resume block values don't reference pre-split values.
-    // Rust: TransformVisitor rewrites locals to struct fields.
-    // Cot: add arg(0) + init_mem at resume entry so codegen has valid roots.
-    const frame_in_resume = try f.newValue(.arg, 0, resume_block, pos);
-    frame_in_resume.aux_int = 0; // arg index 0 = frame pointer
-    try resume_block.insertValueBefore(f.allocator, frame_in_resume, if (resume_block.values.items.len > 0) resume_block.values.items[0] else null);
+    // === SPILL: store live locals to frame before returning PENDING ===
+    // Rust reference: coroutine.rs TransformVisitor — rewrite locals to struct fields.
+    // We need the frame pointer. In the pre-await block, arg(0) is the frame.
+    // Find or create it:
+    var frame_ptr_in_block: ?*Value = null;
+    for (block.values.items) |v| {
+        if (v.op == .arg and v.aux_int == 0) {
+            frame_ptr_in_block = v;
+            break;
+        }
+    }
+    if (frame_ptr_in_block == null) {
+        // Create frame arg reference at block start
+        const fp = try f.newValue(.arg, 0, block, pos);
+        fp.aux_int = 0;
+        if (block.values.items.len > 0) {
+            try block.insertValueBefore(f.allocator, fp, block.values.items[0]);
+        } else {
+            try block.addValue(f.allocator, fp);
+        }
+        frame_ptr_in_block = fp;
+    }
 
-    // TODO: insert restore loads for each live local from frame
-    // TODO: rewrite uses of pre-split values in resume block to restored values
-    // For now, the arg and init_mem provide valid SSA roots.
-    // The actual spill/restore codegen requires knowing the frame layout offsets.
+    // Spill each live local to frame[offset]
+    for (sp.live_locals.items) |local_slot| {
+        const offset = local_to_offset.get(local_slot) orelse continue;
+
+        // Load from local
+        const local_addr_spill = try f.newValue(.local_addr, 0, block, pos);
+        local_addr_spill.aux_int = @intCast(local_slot);
+        try block.insertValueBefore(f.allocator, local_addr_spill, block.values.items[block.values.items.len - 2]); // before state/pending
+
+        const local_load = try f.newValue(.load, 0, block, pos);
+        local_load.addArg(local_addr_spill);
+        try block.insertValueBefore(f.allocator, local_load, block.values.items[block.values.items.len - 2]);
+
+        // Store to frame[offset]
+        const frame_off = try f.newValue(.off_ptr, 0, block, pos);
+        frame_off.aux_int = offset;
+        frame_off.addArg(frame_ptr_in_block.?);
+        try block.insertValueBefore(f.allocator, frame_off, block.values.items[block.values.items.len - 2]);
+
+        const frame_store = try f.newValue(.store, 0, block, pos);
+        frame_store.addArg(frame_off);
+        frame_store.addArg(local_load);
+        try block.insertValueBefore(f.allocator, frame_store, block.values.items[block.values.items.len - 2]);
+    }
+
+    // === RESTORE: at resume block entry ===
+    // Add frame arg reference + restore live locals from frame
+    const frame_in_resume = try f.newValue(.arg, 0, resume_block, pos);
+    frame_in_resume.aux_int = 0;
+    const first_val = if (resume_block.values.items.len > 0) resume_block.values.items[0] else null;
+    if (first_val) |fv| {
+        try resume_block.insertValueBefore(f.allocator, frame_in_resume, fv);
+    } else {
+        try resume_block.addValue(f.allocator, frame_in_resume);
+    }
+
+    // Restore each live local from frame[offset]
+    for (sp.live_locals.items) |local_slot| {
+        const offset = local_to_offset.get(local_slot) orelse continue;
+
+        // Load from frame[offset]
+        const frame_off_r = try f.newValue(.off_ptr, 0, resume_block, pos);
+        frame_off_r.aux_int = offset;
+        frame_off_r.addArg(frame_in_resume);
+        try resume_block.insertValueBefore(f.allocator, frame_off_r, resume_block.values.items[1]); // after frame arg
+
+        const frame_load = try f.newValue(.load, 0, resume_block, pos);
+        frame_load.addArg(frame_off_r);
+        try resume_block.insertValueBefore(f.allocator, frame_load, resume_block.values.items[2]);
+
+        // Store to local
+        const local_addr_r = try f.newValue(.local_addr, 0, resume_block, pos);
+        local_addr_r.aux_int = @intCast(local_slot);
+        try resume_block.insertValueBefore(f.allocator, local_addr_r, resume_block.values.items[3]);
+
+        const local_store = try f.newValue(.store, 0, resume_block, pos);
+        local_store.addArg(local_addr_r);
+        local_store.addArg(frame_load);
+        try resume_block.insertValueBefore(f.allocator, local_store, resume_block.values.items[4]);
+    }
 }
 
 /// Compute which LOCALS (stack slots) are live across a suspension point.
