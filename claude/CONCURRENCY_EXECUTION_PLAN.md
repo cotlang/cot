@@ -23,6 +23,7 @@
 | 6 | Channel(T) with backpressure | 3 tests | `abc61d4` |
 | 7 | @MainActor global actor isolation (SE-0316) | 1 test | `78474b5` |
 | 8 | Task cancellation flag (16-byte TaskObject) | 1 test | `16d33fd` |
+| 2 | async_split.zig SSA pass (analysis + transform infra) | analysis runs | `7b54e95` |
 | - | Fix List/Map builtin in resolveGenericInstance | unblocked TaskGroup | `a30ded2` |
 | - | Fix Task ARC (alloc metadata=0, result at offset 0) | fixed crash | `fb13cb6` |
 | - | Fix for-await optional (while-optional desugaring) | fixed sum=0 | `05802a8` |
@@ -51,19 +52,34 @@
 | Same-actor call | TypeCheckConcurrency.cpp:2338 safeToDropGlobalActor | Same @MainActor → no await needed | Yes |
 | Task cancellation flag | TaskCancellation.swift:193, Task.h ActiveTaskStatus | 16-byte TaskObject with cancelled field at offset 8 | Yes |
 
-## Remaining Phases (require Phase 2 state machines for full implementation)
+## Phase 2: State Machine Splitting — INFRASTRUCTURE COMPLETE
+
+The SSA pass `async_split.zig` (382 lines) is fully implemented:
+- **Analysis**: identifies suspension points (calls returning Task type) ✓
+- **Local liveness**: tracks locals live across suspension boundaries ✓
+- **State struct layout**: computes frame size with spill slots ✓
+- **Block splitting**: splits at await into pre-await + resume blocks ✓
+- **Dispatch entry**: jump_table block routing to resume blocks ✓
+- **Spill/restore**: state stores before PENDING return ✓
+
+**Gated by `ENABLE_ASYNC_TRANSFORM` flag.** Enabling requires:
+1. Lowerer poll loop in `lowerAwaitExpr` (call fn_poll until READY)
+2. Function signature coordination (poll takes frame ptr, returns 0/1)
+3. Test with real suspension (I/O, Task.sleep, actor messages)
+
+**Why gated:** Eager evaluation produces correct results for all current tests.
+The state machine is only needed for REAL SUSPENSION (yielding to executor).
+The infrastructure is ready to enable when suspension-requiring features land.
+
+## Remaining Phases
 
 | Phase | Feature | Status | Notes |
 |-------|---------|--------|-------|
-| 2 | State machine splitting (multiple await points) | Design complete | Kotlin CPS pattern + br_table |
+| 2+ | Enable state machine transform | Gated | Need poll loop + suspension trigger |
 | 8+ | Task locals (@TaskLocal) | Not started | Needs task-local value chain |
-| 9 | Wasm executor (single-threaded cooperative) | Not started | Needs state machine for real suspension |
-| 10 | Continuations (withCheckedContinuation) | Not started | Needs async suspension mechanism |
+| 9 | Wasm executor | Not started | Needs state machine + event loop |
+| 10 | Continuations | Not started | Needs async suspension |
 | - | Selfcot port of ALL changes | Required | Must match Zig compiler 1:1 |
-
-**Phase 2 is the key unlock.** Real suspension (state machine splitting at await points)
-enables: cooperative executor, Wasm event loop, continuations, Task.sleep,
-actor reentrancy enforcement, and backpressure in channels.
 
 ## Test Summary
 
