@@ -54,7 +54,7 @@ Swift's concurrency model (introduced Swift 5.5, hardened through Swift 6) is a 
 |------|-------|------|-------------|
 | `stdlib/async.cot` | ~230 | Event loop (kqueue/epoll), async I/O wrappers | Executor-integrated I/O |
 | `stdlib/thread.cot` | ~250 | Thread, Mutex, Condition, RwLock, WaitGroup, Atomic(T) | Internal to executor; Atomic stays as stdlib |
-| `stdlib/channel.cot` | ~135 | Channel(T) SPSC ring buffer | AsyncStream (channel replacement) |
+| `stdlib/channel.cot` | ~135 | Channel(T) SPSC ring buffer | New Channel(T) with backpressure + AsyncStream for callback bridging |
 
 ### Tests (~1,060 lines)
 
@@ -63,7 +63,7 @@ Swift's concurrency model (introduced Swift 5.5, hardened through Swift 6) is a 
 | `test/e2e/async.cot` | 198 | Rewrite for new async model |
 | `test/e2e/threading.cot` | 382 | Delete (raw threading replaced by actors) |
 | `test/e2e/spawn.cot` | 104 | Rewrite as Task {} |
-| `test/e2e/select.cot` | 132 | Delete (replaced by AsyncStream) |
+| `test/e2e/select.cot` | 132 | Delete (replaced by Channel + `for await in`) |
 | `test/e2e/thread_basic.cot` | 28 | Delete |
 | `test/e2e/event_loop.cot` | 189 | Rewrite for executor model |
 | `test/e2e/browser_async.cot` | 29 | Rewrite |
@@ -73,7 +73,7 @@ Swift's concurrency model (introduced Swift 5.5, hardened through Swift 6) is a 
 | Token/Node | Action |
 |------------|--------|
 | `kw_spawn` | **Delete** — replaced by `Task {}` |
-| `kw_select` | **Delete** — replaced by `for await in` on AsyncStream |
+| `kw_select` | **Delete** — replaced by `for await in` on Channel/AsyncSequence |
 | `SpawnExpr` | **Delete** — replaced by TaskExpr |
 | `SelectExpr` | **Delete** |
 | `kw_async` | **Keep** — same keyword, new semantics |
@@ -405,27 +405,39 @@ Swift reference: `TypeCheckConcurrency.cpp` — this is 330KB of isolation check
 - Each expression has a **required isolation** based on what it accesses
 - If the expression's required isolation ≠ current context's isolation → insert `await` (async hop) or reject (if non-async context)
 
-### Actor Reentrancy
+### Actor Reentrancy — NON-REENTRANT BY DEFAULT
 
-Swift actors are **reentrant** by default. When an actor method hits an `await`, the actor can process other messages while waiting. This prevents deadlocks but means state can change across await points.
+**Cot diverges from Swift here.** Swift actors are reentrant by default (SE-0306) — when an actor method hits `await`, other messages can execute. This is the #1 developer complaint in Swift concurrency (see Appendix D.4).
+
+Cot actors are **non-reentrant by default**. When an actor method hits `await`, the actor does NOT process other messages — it suspends until the await completes, then resumes. This prevents state invalidation across suspension points.
 
 ```cot
 actor ImageCache {
-    var cache: Map(string, Image) = {}
+    var cache: Map(string, Image) = .{}
 
     fn getImage(url: string) async Image {
-        if let cached = cache.get(url) {
-            return cached
-        }
-        let image = await downloadImage(url)  // actor may process other work here!
-        // WARNING: cache may have changed while we were awaiting
+        if (cache.has(url)) { return cache.get(url) }
+        let image = await downloadImage(url)
+        // SAFE: no other work ran on this actor while we awaited
         cache.set(url, image)
         return image
     }
 }
 ```
 
-This is an important semantic to preserve 1:1. The Cot compiler should warn when mutable actor state is accessed after an `await` point (Swift does this with the `SWIFT_STRICT_CONCURRENCY=complete` flag).
+Opt into reentrancy with `@reentrant` when deliberate interleaving is needed:
+
+```cot
+actor WorkQueue {
+    @reentrant
+    fn process(item: Item) async Result {
+        // Other messages CAN execute during this await
+        return await heavyComputation(item)
+    }
+}
+```
+
+The deadlock risk from non-reentrancy is manageable: actor A awaiting actor B while B awaits A deadlocks. This is detectable at runtime (cycle in the wait graph) and can be reported with a clear error. Reentrancy bugs (stale state after await) are silent and insidious.
 
 ### Runtime Functions for Actors
 
@@ -607,58 +619,86 @@ while let line = await iter.next() {
 }
 ```
 
-### AsyncStream (channel replacement)
+### Channel (symmetric, with backpressure)
 
-`AsyncStream` replaces Go-style channels. It's a single-producer-to-single-consumer async sequence with buffering.
+`Channel(T)` is the primary concurrency communication primitive. Both endpoints can send and recv. Send suspends when the buffer is full. Recv suspends when the buffer is empty. ARC manages lifetime — both endpoints retain the channel, last to drop deallocates.
+
+This is Go's channel design with Cot's ARC lifetime management. Swift's `AsyncStream` lacks backpressure (see Appendix D.5), which makes it unsuitable as a general-purpose channel.
 
 ```cot
-let stream = AsyncStream(of: int) { continuation in
-    for i in 0..10 {
-        continuation.yield(i)
-        await Task.sleep(seconds: 1)
+let ch = Channel(int, capacity: 10)
+
+// Producer
+Task {
+    for i in 0..100 {
+        await ch.send(i)    // suspends if buffer full — backpressure
     }
-    continuation.finish()
+    ch.close()
 }
 
-for await value in stream {
-    print(value)
+// Consumer
+for await val in ch {
+    print(val)
 }
 ```
 
-### AsyncStream.Continuation
+Channel conforms to `AsyncSequence` — usable with `for await in` and all async sequence operators.
 
 ```cot
-struct Continuation(Element) {
-    fn yield(value: Element)            // Send value to consumer
-    fn finish()                         // Signal end of stream
-    fn finish(throwing: Error)          // Signal error
+struct Channel(T) {
+    // Creation
+    static fn init(capacity: int) Channel(T)   // buffered
+    static fn init() Channel(T)                 // unbuffered (rendezvous)
 
-    // Buffering policy
-    enum BufferingPolicy {
-        unbounded,                      // Buffer everything (default)
-        bufferingOldest(int),           // Keep oldest N, drop new
-        bufferingNewest(int),           // Keep newest N, drop old
+    // Async operations
+    async fn send(value: T)             // suspends if full, error if closed
+    async fn recv() ?T                  // suspends if empty, null if closed+drained
+
+    // Control
+    fn close()                          // signal no more sends; recv drains remaining
+    fn isClosed() bool
+}
+```
+
+### AsyncStream (callback bridge, no backpressure)
+
+`AsyncStream` bridges synchronous callback-based APIs into async/await. The producer side (`Continuation`) is synchronous — it can be called from delegate methods, NotificationCenter callbacks, etc. without requiring an async context.
+
+**Use AsyncStream when:** the producer is a sync callback you don't control.
+**Use Channel when:** both producer and consumer are async code you control.
+
+```cot
+// Wrapping a callback-based API:
+let events = AsyncStream(of: Event) { continuation in
+    notificationCenter.observe("didUpdate") { event in
+        continuation.yield(event)    // sync call — no await needed
+    }
+    continuation.onTermination = { _ in
+        notificationCenter.removeObserver("didUpdate")
+    }
+}
+
+for await event in events {
+    await handleEvent(event)
+}
+```
+
+```cot
+struct AsyncStream(Element) {
+    struct Continuation {
+        fn yield(value: Element) YieldResult  // sync — never suspends
+        fn finish()                            // signal end of stream
+
+        enum BufferingPolicy {
+            unbounded,                         // buffer everything (default)
+            bufferingOldest(int),             // keep oldest N, drop new
+            bufferingNewest(int),             // keep newest N, drop old
+        }
     }
 }
 ```
 
-The continuation is `Sendable` — it can be called from any concurrency context, making it the replacement for channels:
-
-```cot
-// Old (Go-style channel):
-let ch = Channel(int).init(capacity: 10)
-spawn { for i in 0..10 { ch.send(i) }; ch.close() }
-while let val = ch.recv() { print(val) }
-
-// New (Swift-style stream):
-let stream = AsyncStream(of: int) { cont in
-    Task {
-        for i in 0..10 { cont.yield(i) }
-        cont.finish()
-    }
-}
-for await val in stream { print(val) }
-```
+**AsyncStream has NO backpressure.** When the buffer fills, elements are silently dropped per the buffering policy. This is acceptable for the callback-bridging use case (you can't suspend a sync callback) but wrong for general producer/consumer patterns. Use `Channel` for those.
 
 ### Async Sequence Operators
 
@@ -1010,8 +1050,16 @@ async fn loadPage() Page {
 // ═══════════════════════════════════════════
 // ASYNC SEQUENCES & STREAMS
 // ═══════════════════════════════════════════
-// AsyncStream replaces channels:
-let numbers = AsyncStream(of: int) { cont in
+// Channel with backpressure (primary concurrency primitive):
+let numbers = Channel(int, capacity: 100)
+Task {
+    for i in 0..100 { await numbers.send(i) }
+    numbers.close()
+}
+for await n in numbers { print(n) }
+
+// AsyncStream for callback bridging (no backpressure):
+let events = AsyncStream(of: int) { cont in
     for i in 0..100 {
         cont.yield(i)
     }
@@ -1142,41 +1190,48 @@ The concurrency runtime plugs in naturally:
 ### Dependency Graph
 
 ```
+Phase 0: Delete Go concurrency (clean slate)
+    │
 Phase 1: Task Runtime ──────────────────────┐
     │                                        │
 Phase 2: async/await Rewrite ───────────────┤
     │                                        │
-Phase 3: Actors ─────────── Phase 4: Sendable
-    │                           │
-Phase 5: TaskGroup ─────────────┤
-    │                           │
-Phase 6: AsyncSequence ─────────┤
-    │                           │
-Phase 7: Global Actors          │
-    │                           │
-Phase 8: Cancellation + Locals  │
-    │                           │
-Phase 9: Wasm Target ───────────┘
-    │
-Phase 10: Continuations
+Phase 4: Sendable (BEFORE actors)           │
+    │                                        │
+Phase 3: Actors ────────────────────────────┤
+    │                           │            │
+Phase 5: TaskGroup ─────────────┤            │
+    │                           │            │
+Phase 6: Channel + AsyncSequence┤            │
+    │                           │            │
+Phase 7: Global Actors          │            │
+    │                           │            │
+Phase 8: Cancellation + Locals  │            │
+    │                           │            │
+Phase 9: Wasm Target ───────────┘            │
+    │                                        │
+Phase 10: Continuations ─────────────────────┘
 ```
+
+**Key ordering change:** Sendable (Phase 4) comes BEFORE Actors (Phase 3). Without Sendable checking, actors compile but aren't safe — non-Sendable types can cross isolation boundaries unchecked.
 
 ### Recommended Order
 
 | Phase | Effort | Depends On | Deliverable |
 |-------|--------|------------|-------------|
-| **1. Task Runtime** | 1 week | ARC (done) | Task create/destroy/enqueue, cooperative thread pool |
-| **2. async/await** | 1 week | Phase 1 | AsyncContext-based suspension, executor integration |
-| **3. Actors** | 2 weeks | Phase 2 | `actor` keyword, serial executor, isolation checking |
-| **4. Sendable** | 1 week | Phase 3 | Sendable trait, compile-time checking at boundaries |
-| **5. TaskGroup** | 1 week | Phase 2, 4 | `withTaskGroup`, `async let`, child task management |
-| **6. AsyncSequence** | 1 week | Phase 4, 5 | AsyncSequence trait, AsyncStream, `for await in` |
-| **7. Global Actors** | 3 days | Phase 3 | `@globalActor`, `@MainActor` |
-| **8. Cancellation** | 3 days | Phase 1 | Cancellation API, handlers, Task.checkCancellation |
-| **9. Wasm Target** | 1 week | Phase 2 | State machine executor, browser integration |
-| **10. Continuations** | 3 days | Phase 2 | withCheckedContinuation, callback bridge |
+| **0. Delete Go concurrency** | 1 day | None | ~5,000 lines removed, clean foundation |
+| **1. Task Runtime** | 2-3 days | ARC (done) | Task create/destroy/enqueue, cooperative executor |
+| **2. async/await** | 3-4 days | Phase 1 | Wasm state machine + native continuation passing |
+| **4. Sendable** | 2-3 days | None (checker pass) | Sendable trait, compile-time checking at boundaries |
+| **3. Actors** | 4-5 days | Phase 2, 4 | `actor` keyword, serial executor, isolation checking |
+| **5. TaskGroup** | 3-4 days | Phase 2, 4 | `withTaskGroup`, `async let`, child task management |
+| **6. Channel + AsyncSequence** | 2-3 days | Phase 4, 5 | Channel(T) with backpressure, AsyncStream for bridging, `for await in` |
+| **7. Global Actors** | 1-2 days | Phase 3 | `@globalActor`, `@MainActor` |
+| **8. Cancellation** | 1-2 days | Phase 1 | Cancellation API, handlers, Task.checkCancellation |
+| **9. Wasm Target** | 2-3 days | Phase 2 | Single-threaded event loop executor, browser integration |
+| **10. Continuations** | 1-2 days | Phase 2 | withCheckedContinuation, callback bridge |
 
-**Total estimated effort: ~10 weeks**
+**Total estimated effort: ~5-7 weeks** (see Appendix D.8 for rationale)
 
 ### Deletion Order
 
@@ -1204,7 +1259,7 @@ Phase 10: Continuations
 | `stdlib/public/Concurrency/MainActor.swift` | MainActor singleton | `stdlib/main_actor.cot` |
 | `stdlib/public/Concurrency/TaskGroup.swift` | TaskGroup API | `stdlib/task_group.cot` |
 | `stdlib/public/Concurrency/AsyncSequence.swift` | AsyncSequence protocol | `stdlib/async_sequence.cot` |
-| `stdlib/public/Concurrency/AsyncStream.swift` | AsyncStream (channel replacement) | `stdlib/async_stream.cot` |
+| `stdlib/public/Concurrency/AsyncStream.swift` | AsyncStream (callback bridge) | `stdlib/async_stream.cot` |
 | `stdlib/public/Concurrency/TaskCancellation.swift` | Cancellation API | `stdlib/task.cot` |
 | `stdlib/public/Concurrency/TaskLocal.swift` | Task-local values | `stdlib/task_local.cot` |
 | `stdlib/public/Concurrency/CheckedContinuation.swift` | Continuation bridge | `stdlib/continuation.cot` |
@@ -1224,7 +1279,7 @@ These are known pain points from Swift's concurrency rollout (2021-2026) that Co
 Swift shipped Sendable as a warning first, then made it an error in Swift 6. Cot should ship with Sendable as errors from day one (we have no legacy code to break).
 
 ### 2. Actor reentrancy confuses developers
-Developers assume actor methods are atomic. They're not — state can change across `await` points. Cot should consider a `@nonreentrant` attribute for methods that must not interleave (at the cost of potential deadlocks).
+Developers assume actor methods are atomic. They're not — state can change across `await` points. **Cot makes actors non-reentrant by default** with `@reentrant` opt-in (see Section 5 and Appendix D.4).
 
 ### 3. MainActor inference was too aggressive
 Swift 6 made UI-related code implicitly `@MainActor`, breaking tons of existing code. Cot should require explicit annotation.
@@ -1245,7 +1300,7 @@ Forgetting to call `resume` leaks the continuation and deadlocks the caller. `Ch
 | Aspect | Go (current Cot) | Swift (new Cot) |
 |--------|-------------------|-----------------|
 | Concurrency primitive | goroutine (lightweight thread) | Task (structured unit of work) |
-| Communication | channels (CSP model) | AsyncStream, actor methods |
+| Communication | channels (CSP model) | Channel (with backpressure), AsyncStream (bridging), actor methods |
 | Synchronisation | mutex, waitgroup | Actor isolation (compile-time) |
 | Data race prevention | Race detector (runtime) | Sendable checking (compile-time) |
 | Function coloring | No (all functions can suspend) | Yes (async functions explicit) |
