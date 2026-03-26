@@ -341,21 +341,6 @@ const TokenCollector = struct {
             },
             .try_expr => |t| self.walkNode(t.operand),
             .await_expr => |a| self.walkNode(a.operand),
-            .spawn_expr => |s| {
-                // Emit "spawn" keyword token (contextual keyword — scanner produces .ident)
-                self.emitName(s.span, "spawn", .keyword, 0);
-                self.walkNode(s.body);
-            },
-            .select_expr => |s| {
-                // Emit "select" keyword token (contextual keyword)
-                self.emitName(s.span, "select", .keyword, 0);
-                for (s.cases) |case| {
-                    self.walkNode(case.channel);
-                    if (case.send_value != null_node) self.walkNode(case.send_value);
-                    self.walkNode(case.body);
-                }
-                if (s.default_body != null_node) self.walkNode(s.default_body);
-            },
             .string_interp => |s| {
                 for (s.segments) |seg| switch (seg) {
                     .expr => |e| self.walkNode(e),

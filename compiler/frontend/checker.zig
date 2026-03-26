@@ -212,7 +212,6 @@ pub const Checker = struct {
     in_loop: bool = false,
     in_labeled_block: u32 = 0,
     labeled_block_result_type: TypeIndex = invalid_type,
-    in_async_fn: bool = false,
     // Generics support (Zig-style lazy generic instantiation + Go checker flow)
     // Shared across all checkers in multi-file mode (owned by driver)
     generics: *SharedGenericContext,
@@ -447,13 +446,7 @@ pub const Checker = struct {
                     try self.defineInFileScope(Symbol.init(f.name, .type_name, invalid_type, idx, false));
                     return;
                 }
-                var func_type = try self.buildFuncType(f.params, f.return_type);
-                // Async functions: wrap return type in Future(T)
-                if (f.is_async) {
-                    const inner_ret = self.types.get(func_type).func.return_type;
-                    const future_ret = try self.types.makeFuture(inner_ret);
-                    func_type = try self.types.makeFunc(self.types.get(func_type).func.params, future_ret);
-                }
+                const func_type = try self.buildFuncType(f.params, f.return_type);
                 var sym = Symbol.initExtern(f.name, .function, func_type, idx, false, f.is_extern);
                 sym.is_export = f.is_export;
                 try self.defineInFileScope(sym);
@@ -818,11 +811,7 @@ pub const Checker = struct {
         const sym = self.scope.lookup(lookup_name) orelse return;
         const return_type = if (self.types.get(sym.type_idx) == .func) self.types.get(sym.type_idx).func.return_type else TypeRegistry.VOID;
         // For async functions, the registered return type is Future(T).
-        // Inside the body, current_return_type should be T (the inner type).
-        const body_return_type = if (f.is_async and self.types.get(return_type) == .future)
-            self.types.get(return_type).future.result_type
-        else
-            return_type;
+        const body_return_type = return_type;
         var func_scope = Scope.init(self.allocator, self.scope);
         defer func_scope.deinit();
         for (f.params) |param| {
@@ -849,16 +838,13 @@ pub const Checker = struct {
         }
         const old_scope = self.scope;
         const old_return = self.current_return_type;
-        const old_in_async = self.in_async_fn;
         self.scope = &func_scope;
         self.current_return_type = body_return_type;
-        self.in_async_fn = f.is_async;
         if (f.body != null_node) try self.checkBlockExpr(f.body);
         // Lint: check for unused vars/params before scope exits
         if (self.lint_mode) self.checkScopeUnused(&func_scope);
         self.scope = old_scope;
         self.current_return_type = old_return;
-        self.in_async_fn = old_in_async;
     }
 
     fn checkVarDecl(self: *Checker, v: ast.VarDecl, idx: NodeIndex) CheckError!void {
@@ -1670,8 +1656,6 @@ pub const Checker = struct {
             .string_interp => |si| self.checkStringInterp(si),
             .try_expr => |te| self.checkTryExpr(te),
             .await_expr => |ae| self.checkAwaitExpr(ae),
-            .spawn_expr => |se| self.checkSpawnExpr(se),
-            .select_expr => |se| self.checkSelectExpr(se),
             .catch_expr => |ce| self.checkCatchExpr(ce),
             .orelse_expr => |oe| self.checkOrElseExpr(oe),
             .error_literal => |el| self.checkErrorLiteral(el),
@@ -3224,73 +3208,11 @@ pub const Checker = struct {
     }
 
     fn checkAwaitExpr(self: *Checker, ae: ast.AwaitExpr) CheckError!TypeIndex {
-        const operand_type = try self.checkExpr(ae.operand);
-        const operand_info = self.types.get(operand_type);
-        if (operand_info != .future) {
-            self.err.errorWithCode(ae.span.start, .e300, "cannot await non-future type");
-            return invalid_type;
-        }
-        // await is allowed both in async and sync contexts.
-        // In sync context, it blocks until the future completes (like block_on).
-        // No function coloring — any code can await a Future.
-        return operand_info.future.result_type;
+        // TODO: Swift-style async/await — not yet implemented
+        self.err.errorWithCode(ae.span.start, .e300, "await is not yet implemented (Swift concurrency port pending)");
+        return invalid_type;
     }
 
-    fn checkSpawnExpr(self: *Checker, se: ast.SpawnExpr) CheckError!TypeIndex {
-        // spawn { body } — dispatches body to thread pool, returns void (fire-and-forget)
-        _ = try self.checkExpr(se.body);
-        return TypeRegistry.VOID;
-    }
-
-    fn checkSelectExpr(self: *Checker, se: ast.SelectExpr) CheckError!TypeIndex {
-        // Go-style select: each case is a channel operation (recv or send).
-        // Result type: void (select is a statement-like expression).
-        for (se.cases) |case| {
-            switch (case.kind) {
-                .recv => {
-                    // Type-check the channel expression
-                    const ch_type = try self.checkExpr(case.channel);
-                    // Validate it's a pointer to a Channel struct (Channel(T) is generic)
-                    const ch_info = self.types.get(ch_type);
-                    var elem_type: TypeIndex = TypeRegistry.I64; // fallback
-                    if (ch_info == .pointer) {
-                        const pointee_info = self.types.get(ch_info.pointer.elem);
-                        if (pointee_info == .struct_type) {
-                            const name = pointee_info.struct_type.name;
-                            // Validate it's a Channel type
-                            if (name.len < 7 or !std.mem.eql(u8, name[0..7], "Channel")) {
-                                self.err.errorWithCode(case.span.start, .e300, "select recv case requires a Channel type");
-                            }
-                            // Try to extract element type from tryRecv method return type
-                            // (generic Channel(T) has tryRecv returning ?T)
-                            _ = &elem_type;
-                        }
-                    }
-                    // Bind capture variable in case body scope
-                    if (case.capture.len > 0) {
-                        var case_scope = Scope.init(self.allocator, self.scope);
-                        const old_scope = self.scope;
-                        self.scope = &case_scope;
-                        try self.scope.define(Symbol.init(case.capture, .variable, elem_type, null_node, false));
-                        _ = try self.checkExpr(case.body);
-                        self.scope = old_scope;
-                    } else {
-                        _ = try self.checkExpr(case.body);
-                    }
-                },
-                .send => {
-                    // Send case: the channel expr is the full ch.send(value) call
-                    // Type-check it as a regular expression (it's a method call)
-                    _ = try self.checkExpr(case.channel);
-                    _ = try self.checkExpr(case.body);
-                },
-            }
-        }
-        if (se.default_body != null_node) {
-            _ = try self.checkExpr(se.default_body);
-        }
-        return TypeRegistry.VOID;
-    }
 
     fn checkCatchExpr(self: *Checker, ce: ast.CatchExpr) CheckError!TypeIndex {
         const operand_type = try self.checkExpr(ce.operand);

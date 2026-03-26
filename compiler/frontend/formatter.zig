@@ -880,40 +880,6 @@ pub const Formatter = struct {
                 self.write("await ") catch {};
                 self.printNode(e.operand);
             },
-            .spawn_expr => |e| {
-                self.write("spawn ") catch {};
-                self.printNode(e.body);
-            },
-            .select_expr => |e| {
-                self.write("select ") catch {};
-                self.write("{\n") catch {};
-                self.indent += 1;
-                for (e.cases) |case| {
-                    self.newline() catch {};
-                    switch (case.kind) {
-                        .recv => {
-                            if (case.capture.len > 0) {
-                                self.write(case.capture) catch {};
-                                self.write(" from ") catch {};
-                            }
-                            self.printNode(case.channel);
-                        },
-                        .send => {
-                            self.printNode(case.channel);
-                        },
-                    }
-                    self.write(" => ") catch {};
-                    self.printNode(case.body);
-                }
-                if (e.default_body != null_node) {
-                    self.newline() catch {};
-                    self.write("default => ") catch {};
-                    self.printNode(e.default_body);
-                }
-                self.indent -= 1;
-                self.newline() catch {};
-                self.write("}") catch {};
-            },
             .catch_expr => |e| {
                 self.printNode(e.operand);
                 self.write(" catch ") catch {};

@@ -426,7 +426,6 @@ pub const Driver = struct {
                 .map => "map",
                 .optional => "optional",
                 .error_union => "error_union",
-                .future => "Future",
                 .slice => "slice",
                 .array => "array",
                 .tuple => "tuple",

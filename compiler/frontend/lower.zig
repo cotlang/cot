@@ -2370,17 +2370,6 @@ pub const Lowerer = struct {
             const value_node_ast = self.tree.getNode(var_stmt.value);
             const value_expr = if (value_node_ast) |n| n.asExpr() else null;
 
-            // Track async future → poll name mapping for `await <variable>`.
-            // When `const f = async_fn(args)`, store "f" → "async_fn_poll".
-            if (value_expr) |ve| {
-                if (ve == .call) {
-                    const poll_name = self.resolveAsyncPollName(var_stmt.value);
-                    if (poll_name) |pn| {
-                        self.async_poll_names.put(var_stmt.name, pn) catch {};
-                    }
-                }
-            }
-
             // Check for undefined literal or .{} zero init - zero memory
             const is_undefined = if (value_expr) |e| (e == .literal and e.literal.kind == .undefined_lit) else false;
             const is_zero_init = if (value_expr) |e| (e == .zero_init) else false;
@@ -5728,8 +5717,6 @@ pub const Lowerer = struct {
             .slice_expr => |se| return try self.lowerSliceExpr(se),
             .try_expr => |te| return try self.lowerTryExpr(te),
             .await_expr => |ae| return try self.lowerAwaitExpr(ae),
-            .spawn_expr => |se| return try self.lowerSpawnExpr(se),
-            .select_expr => |se| return try self.lowerSelectExpr(se),
             .catch_expr => |ce| return try self.lowerCatchExpr(ce),
             .orelse_expr => |oe| return try self.lowerOrElseExpr(oe),
             .error_literal => |el| return try self.lowerErrorLiteral(el),
@@ -8377,15 +8364,6 @@ pub const Lowerer = struct {
                 },
                 .try_expr => |te| try self.detectCaptures(te.operand, parent_fb, captures),
                 .await_expr => |ae| try self.detectCaptures(ae.operand, parent_fb, captures),
-                .spawn_expr => |se| try self.detectCaptures(se.body, parent_fb, captures),
-                .select_expr => |se| {
-                    for (se.cases) |case| {
-                        try self.detectCaptures(case.channel, parent_fb, captures);
-                        if (case.send_value != null_node) try self.detectCaptures(case.send_value, parent_fb, captures);
-                        try self.detectCaptures(case.body, parent_fb, captures);
-                    }
-                    if (se.default_body != null_node) try self.detectCaptures(se.default_body, parent_fb, captures);
-                },
                 .catch_expr => |ce| {
                     try self.detectCaptures(ce.operand, parent_fb, captures);
                     if (ce.fallback != null_node) try self.detectCaptures(ce.fallback, parent_fb, captures);
@@ -12734,106 +12712,10 @@ pub const Lowerer = struct {
     /// On Wasm: calls the poll function in a loop until READY, then reads result.
     /// On native: calls fiber_switch to suspend current fiber and resume target.
     fn lowerAwaitExpr(self: *Lowerer, ae: ast.AwaitExpr) Error!ir.NodeIndex {
-        const fb = self.current_func orelse return ir.null_node;
-
-        // Get the future type from the operand
-        const operand_type = self.inferExprType(ae.operand);
-        const operand_info = self.type_reg.get(operand_type);
-        if (operand_info != .future) {
-            return try self.lowerExprNode(ae.operand);
-        }
-        const result_type = operand_info.future.result_type;
-
-        // Lower the future operand (this gives us the state/fiber pointer)
-        const future_ptr = try self.lowerExprNode(ae.operand);
-
-        // Check if result is compound (error union, >8 bytes) — needs multi-word copy
-        const result_size = self.type_reg.sizeOf(result_type);
-        const is_compound_result = result_size > 8;
-
-        if (!self.target.isWasm()) {
-            // Native (Zig approach): eager evaluation — result is already in future[8].
-            // No poll loop needed. Just extract the result directly.
-            if (is_compound_result) {
-                // Compound result: copy all words from future[8..] into a local,
-                // return pointer to the local (matching lowerTryExpr expectation)
-                const num_words = (result_size + 7) / 8;
-                const result_local = try fb.addLocalWithSize("__await_result", result_type, false, result_size);
-                for (0..num_words) |w| {
-                    const src_offset: i64 = @intCast(8 + w * 8);
-                    const src_addr = try fb.emitAddrOffset(future_ptr, src_offset, TypeRegistry.I64, ae.span);
-                    const word = try fb.emitPtrLoadValue(src_addr, TypeRegistry.I64, ae.span);
-                    _ = try fb.emitStoreLocalField(result_local, @intCast(w), @intCast(w * 8), word, ae.span);
-                }
-                return try fb.emitAddrLocal(result_local, TypeRegistry.I64, ae.span);
-            }
-            const result_addr = try fb.emitAddrOffset(future_ptr, 8, TypeRegistry.I64, ae.span);
-            return try fb.emitPtrLoadValue(result_addr, result_type, ae.span);
-        }
-
-        // Wasm (Rust approach): poll-based state machine.
-        // Store future pointer to a local so it can be reloaded across blocks
-        // (Wasm br_table dispatch doesn't carry values across blocks)
-        const future_local = try fb.addLocalWithSize("__await_future", TypeRegistry.I64, false, 8);
-        _ = try fb.emitStoreLocal(future_local, future_ptr, ae.span);
-
-        const poll_name = self.resolveAsyncPollName(ae.operand) orelse "__async_poll";
-
-        const poll_loop = try fb.newBlock("await.poll");
-        const await_done = try fb.newBlock("await.done");
-        _ = try fb.emitJump(poll_loop, ae.span);
-
-        // Poll loop: reload future_ptr from local, call poll, check result
-        fb.setBlock(poll_loop);
-        const fp_poll = try fb.emitLoadLocal(future_local, TypeRegistry.I64, ae.span);
-        var poll_args = [_]ir.NodeIndex{fp_poll};
-        const poll_result = try fb.emitCall(poll_name, &poll_args, false, TypeRegistry.I64, ae.span);
-        const one = try fb.emitConstInt(1, TypeRegistry.I64, ae.span);
-        const is_ready = try fb.emitBinary(.eq, poll_result, one, TypeRegistry.BOOL, ae.span);
-        _ = try fb.emitBranch(is_ready, await_done, poll_loop, ae.span);
-
-        // Done: reload future_ptr, extract result from state[8..]
-        fb.setBlock(await_done);
-        const fp_done = try fb.emitLoadLocal(future_local, TypeRegistry.I64, ae.span);
-        if (is_compound_result) {
-            // Compound result: copy all words from state[8..] into a local,
-            // return pointer to the local (matching lowerTryExpr expectation)
-            const num_words = (result_size + 7) / 8;
-            const result_local = try fb.addLocalWithSize("__await_result", result_type, false, result_size);
-            for (0..num_words) |w| {
-                const src_offset: i64 = @intCast(8 + w * 8);
-                const src_addr = try fb.emitAddrOffset(fp_done, src_offset, TypeRegistry.I64, ae.span);
-                const word = try fb.emitPtrLoadValue(src_addr, TypeRegistry.I64, ae.span);
-                _ = try fb.emitStoreLocalField(result_local, @intCast(w), @intCast(w * 8), word, ae.span);
-            }
-            return try fb.emitAddrLocal(result_local, TypeRegistry.I64, ae.span);
-        }
-        const result_addr = try fb.emitAddrOffset(fp_done, 8, TypeRegistry.I64, ae.span);
-        return try fb.emitPtrLoadValue(result_addr, result_type, ae.span);
-    }
-
-    /// Resolve the poll function name from an await operand.
-    /// Handles two cases:
-    /// 1. Direct call: `await foo(args)` → `foo_poll`
-    /// 2. Variable: `await f` → look up f's poll name from async_poll_names map
-    fn resolveAsyncPollName(self: *Lowerer, operand_idx: NodeIndex) ?[]const u8 {
-        const node = self.tree.getNode(operand_idx) orelse return null;
-        const expr = node.asExpr() orelse return null;
-        // Case 1: direct call — `await foo(args)`
-        if (expr == .call) {
-            const callee_node = self.tree.getNode(expr.call.callee) orelse return null;
-            const callee_expr = callee_node.asExpr() orelse return null;
-            if (callee_expr == .ident) {
-                // Qualify the async function name, then append _poll suffix
-                const qualified = self.resolveCallName(callee_expr.ident.name) catch return null;
-                return std.fmt.allocPrint(self.allocator, "{s}_poll", .{qualified}) catch null;
-            }
-        }
-        // Case 2: ident — `await f` where f was assigned from an async call
-        if (expr == .ident) {
-            return self.async_poll_names.get(expr.ident.name);
-        }
-        return null;
+        // TODO: Swift-style async/await — not yet implemented
+        _ = ae;
+        _ = self;
+        return ir.null_node;
     }
 
     /// Lower catch expr — unwrap error union, use fallback on error.

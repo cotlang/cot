@@ -1251,16 +1251,6 @@ pub const Parser = struct {
         const start = self.pos();
         switch (self.tok.tok) {
             .ident => {
-                // Contextual keyword: spawn { ... }
-                if (std.mem.eql(u8, self.tok.text, "spawn") and self.peekToken().tok == .lbrace) {
-                    self.advance();
-                    const body = try self.parseBlockExpr() orelse return null;
-                    return try self.tree.addExpr(.{ .spawn_expr = .{ .body = body, .span = Span.init(start, self.pos()) } });
-                }
-                // Contextual keyword: select { ... }
-                if (std.mem.eql(u8, self.tok.text, "select") and self.peekToken().tok == .lbrace) {
-                    return try self.parseSelectExpr();
-                }
                 // Labeled block expression: label: { ... break :label value ... }
                 // Zig pattern: blk: { break :blk val; }
                 if (self.peekToken().tok == .colon) {

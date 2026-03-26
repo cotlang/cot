@@ -72,7 +72,6 @@ pub const ArrayType = struct { elem: TypeIndex, length: u64 };
 pub const MapType = struct { key: TypeIndex, value: TypeIndex };
 pub const ListType = struct { elem: TypeIndex };
 pub const TupleType = struct { element_types: []const TypeIndex };
-pub const FutureType = struct { result_type: TypeIndex };
 pub const DistinctType = struct { name: []const u8, underlying: TypeIndex };
 /// Swift OpaqueExistentialContainer: 40 bytes = 3-word buffer + metadata ptr + witness table ptr.
 /// Holds any value conforming to a trait, with VWT-based lifecycle and indirect method dispatch.
@@ -125,7 +124,6 @@ pub const Type = union(enum) {
     enum_type: EnumType,
     union_type: UnionType,
     func: FuncType,
-    future: FutureType,
     distinct: DistinctType,
     existential: ExistentialType,
 
@@ -324,7 +322,6 @@ pub const TypeRegistry = struct {
             .slice => "slice",
             .array => "array",
             .tuple => "tuple",
-            .future => "Future",
             .func => "function",
             .distinct => |d| d.name,
             .existential => |e| e.trait_name,
@@ -455,12 +452,6 @@ pub const TypeRegistry = struct {
         return self.add(.{ .func = .{ .params = try self.allocator.dupe(FuncParam, params), .return_type = ret } });
     }
 
-    pub fn makeFuture(self: *TypeRegistry, result_type: TypeIndex) !TypeIndex {
-        for (self.types.items, 0..) |t, i| {
-            if (t == .future and t.future.result_type == result_type) return @intCast(i);
-        }
-        return self.add(.{ .future = .{ .result_type = result_type } });
-    }
 
     pub fn isPointer(self: *const TypeRegistry, idx: TypeIndex) bool { return self.get(idx) == .pointer; }
     pub fn pointerElem(self: *const TypeRegistry, idx: TypeIndex) TypeIndex {
@@ -473,7 +464,7 @@ pub const TypeRegistry = struct {
         if (idx == UNTYPED_INT or idx == UNTYPED_FLOAT) return 8;
         return switch (self.get(idx)) {
             .basic => |k| k.size(),
-            .pointer, .map, .list, .func, .error_set, .future => 8,
+            .pointer, .map, .list, .func, .error_set => 8,
             .tuple => |tup| blk: {
                 var total: u32 = 0;
                 for (tup.element_types) |et| total += ((self.sizeOf(et) + 7) / 8) * 8;
@@ -513,7 +504,7 @@ pub const TypeRegistry = struct {
     pub fn alignmentOf(self: *const TypeRegistry, idx: TypeIndex) u32 {
         return switch (self.get(idx)) {
             .basic => |k| if (k.size() == 0) 1 else k.size(),
-            .pointer, .func, .optional, .error_union, .error_set, .slice, .map, .list, .union_type, .tuple, .future, .existential => 8,
+            .pointer, .func, .optional, .error_union, .error_set, .slice, .map, .list, .union_type, .tuple, .existential => 8,
             .array => |a| self.alignmentOf(a.elem),
             .struct_type => |s| s.alignment,
             .enum_type => |e| self.alignmentOf(e.backing_type),
@@ -573,7 +564,7 @@ pub const TypeRegistry = struct {
                 return true;
             },
             // Collections and futures are non-trivial (heap-allocated)
-            .map, .list, .future => false,
+            .map, .list => false,
             // Union types: trivial only if ALL variant payloads are trivial.
             // Swift TypeLowering.cpp: LoadableEnumTypeLowering for enums with
             // non-trivial payloads.
@@ -637,7 +628,7 @@ pub const TypeRegistry = struct {
         // Error union: check payload (Swift: non-trivial if success type is non-trivial)
         if (t == .error_union) return self.couldBeARC(t.error_union.elem);
         // Collections and futures are heap-allocated ARC objects
-        if (t == .list or t == .map or t == .future) return true;
+        if (t == .list or t == .map) return true;
         // Array/slice: check element type
         if (t == .array) return self.couldBeARC(t.array.elem);
         if (t == .slice) return self.couldBeARC(t.slice.elem);
@@ -735,7 +726,6 @@ pub const TypeRegistry = struct {
                 return true;
             },
             .func => false,
-            .future => |fa| self.equal(fa.result_type, tb.future.result_type),
             .distinct => |da| std.mem.eql(u8, da.name, tb.distinct.name),
             .existential => |ea| std.mem.eql(u8, ea.trait_name, tb.existential.trait_name),
         };
