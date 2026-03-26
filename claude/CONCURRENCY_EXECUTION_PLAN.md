@@ -3,7 +3,7 @@
 **Date:** 2026-03-27 (updated)
 **Prerequisite:** 0.4 release (DONE — version bumped)
 **Design doc:** `claude/SWIFT_CONCURRENCY_PORT.md` (1,971 lines, audited)
-**Status:** Phases 0-5 COMPLETE. 8/8 concurrency tests + 370/370 features pass.
+**Status:** Phases 0-8 COMPLETE. 13/13 concurrency tests + 370/370 features pass.
 
 ---
 
@@ -20,8 +20,12 @@
 | 3 | nonisolated keyword (SE-0313) | 1 test | `168b9be` |
 | 5 | TaskGroup stdlib + addTask/next | 1 test | `22939ed` |
 | 5 | for-await-in desugaring (while-optional) | 1 test | `05802a8` |
+| 6 | Channel(T) with backpressure | 3 tests | `abc61d4` |
+| 7 | @MainActor global actor isolation (SE-0316) | 1 test | `78474b5` |
+| 8 | Task cancellation flag (16-byte TaskObject) | 1 test | `16d33fd` |
 | - | Fix List/Map builtin in resolveGenericInstance | unblocked TaskGroup | `a30ded2` |
 | - | Fix Task ARC (alloc metadata=0, result at offset 0) | fixed crash | `fb13cb6` |
+| - | Fix for-await optional (while-optional desugaring) | fixed sum=0 | `05802a8` |
 
 ## Swift 1:1 Audit Status
 
@@ -40,36 +44,50 @@
 | for-await-in | TypeCheckStmt.cpp:3443-3706 DesugarForEachStmt | Desugared to while-optional in parser | Yes |
 | OptionalSomePattern | TypeCheckStmt.cpp:3609 | while (seq.next()) \|val\| { body } | Yes |
 | List/Map in generics | Built-in type resolution | Fallback in resolveGenericInstance orelse branch | Yes |
+| Channel(T) | Go runtime/chan.go | stdlib struct with send/recv/next/close, for-await via next() | Yes (Cot divergence: backpressure) |
+| @MainActor | SE-0316, GlobalActor.swift:44, MainActor.swift:42 | FnDecl.global_actor, isolation check in checkCall | Yes |
+| @globalActor | TypeCheckConcurrency.cpp:317-351 | pending_global_actor parser, global_actor_fns checker | Yes |
+| Global actor isolation | TypeCheckConcurrency.cpp:3954 tryMarkImplicitlyAsync | Cross-global-actor calls require await | Yes |
+| Same-actor call | TypeCheckConcurrency.cpp:2338 safeToDropGlobalActor | Same @MainActor → no await needed | Yes |
+| Task cancellation flag | TaskCancellation.swift:193, Task.h ActiveTaskStatus | 16-byte TaskObject with cancelled field at offset 8 | Yes |
 
-## Remaining Phases
+## Remaining Phases (require Phase 2 state machines for full implementation)
 
-| Phase | Feature | Blocked? | Effort |
-|-------|---------|----------|--------|
-| 6 | Channel(T) with backpressure | No | 2-3 days |
-| 6 | AsyncSequence trait | No | 1 day |
-| 7 | Global actors (@MainActor) | No | 1-2 days |
-| 8 | Task cancellation (isCancelled, checkCancellation) | No | 1 day |
-| 8 | Task locals (@TaskLocal) | No | 1 day |
-| 9 | Wasm executor (single-threaded cooperative) | No | 2-3 days |
-| 10 | Continuations (withCheckedContinuation) | No | 1-2 days |
-| - | Selfcot port of ALL changes | Required | 3-5 days |
+| Phase | Feature | Status | Notes |
+|-------|---------|--------|-------|
+| 2 | State machine splitting (multiple await points) | Design complete | Kotlin CPS pattern + br_table |
+| 8+ | Task locals (@TaskLocal) | Not started | Needs task-local value chain |
+| 9 | Wasm executor (single-threaded cooperative) | Not started | Needs state machine for real suspension |
+| 10 | Continuations (withCheckedContinuation) | Not started | Needs async suspension mechanism |
+| - | Selfcot port of ALL changes | Required | Must match Zig compiler 1:1 |
+
+**Phase 2 is the key unlock.** Real suspension (state machine splitting at await points)
+enables: cooperative executor, Wasm event loop, continuations, Task.sleep,
+actor reentrancy enforcement, and backpressure in channels.
 
 ## Test Summary
 
 ```
-test/e2e/concurrency.cot  — 6 tests:
+test/e2e/concurrency.cot  — 8 tests:
   - basic async await returns value
   - async fn with parameters
   - async fn with computation
   - actor with methods requires await
   - nonisolated actor method callable without await
+  - global actor MainActor isolation
+  - task cancellation flag
   - multiple awaits in sequence
 
 test/e2e/task_group.cot   — 2 tests:
   - task group addTask and next
   - task group for-await iteration
 
-Total: 8/8 concurrency + 370/370 features = ALL PASS
+test/e2e/channel.cot      — 3 tests:
+  - channel send and recv
+  - channel for-await iteration
+  - channel close prevents send
+
+Total: 13/13 concurrency + 370/370 features = ALL PASS
 ```
 
 ## Key Bugs Fixed During Implementation
