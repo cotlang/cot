@@ -4232,23 +4232,29 @@ pub const Lowerer = struct {
         else
             try self.resolveMethodName(seq_type_name, next_method.func_name, next_method.source_tree);
 
-        var next_args = [_]ir.NodeIndex{seq_reload};
-        const next_result = try fb.emitCall(
-            next_call_name,
-            &next_args, false, TypeRegistry.I64, for_stmt.span,
-        );
-        // Check if result is null (optional payload)
+        // Swift desugaring: `while let $element = $generator.next()` (TypeCheckStmt.cpp:3605-3620)
+        // next() returns ?T (optional, compound = tag@0 + payload@8, 16 bytes via SRET).
+        // Allocate SRET buffer, call next, check tag, extract payload.
+        const opt_local = try fb.addLocalWithSize("__for_await_opt", TypeRegistry.I64, false, 16);
+        const opt_ptr = try fb.emitAddrLocal(opt_local, TypeRegistry.I64, for_stmt.span);
+
+        // Call next(self_ptr, __sret) — SRET pattern for compound optional return
+        var next_args = [_]ir.NodeIndex{ opt_ptr, seq_reload };
+        _ = try fb.emitCall(next_call_name, &next_args, false, TypeRegistry.VOID, for_stmt.span);
+
+        // Swift OptionalSomePattern: check tag at offset 0 — 0 = null (loop end), 1 = some
+        const tag_val = try fb.emitFieldLocal(opt_local, 0, 0, TypeRegistry.I64, for_stmt.span);
         const zero = try fb.emitConstInt(0, TypeRegistry.I64, for_stmt.span);
-        const is_null = try fb.emitBinary(.eq, next_result, zero, TypeRegistry.BOOL, for_stmt.span);
+        const is_null = try fb.emitBinary(.eq, tag_val, zero, TypeRegistry.BOOL, for_stmt.span);
         _ = try fb.emitBranch(is_null, exit_block, body_block, for_stmt.span);
 
-        // Body: bind the value and execute
+        // Body: extract payload at offset 8, bind to loop variable
         fb.setBlock(body_block);
         const cleanup_depth = self.cleanup_stack.getScopeDepth();
         const scope_depth = fb.markScopeEntry();
-        // Store the result as the loop binding
+        const payload_val = try fb.emitFieldLocal(opt_local, 1, 8, TypeRegistry.I64, for_stmt.span);
         const binding_local = try fb.addLocalWithSize(for_stmt.binding, TypeRegistry.I64, false, 8);
-        _ = try fb.emitStoreLocal(binding_local, next_result, for_stmt.span);
+        _ = try fb.emitStoreLocal(binding_local, payload_val, for_stmt.span);
 
         try self.loop_stack.append(self.allocator, .{
             .cond_block = cond_block,
