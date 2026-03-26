@@ -177,6 +177,9 @@ pub fn asyncSplit(f: *Func, type_registry: *const TypeRegistry) !void {
     // rewrite value args in resume blocks. Need rewriteUsesAfterSuspend to
     // replace pre-split value references with restored local loads.
     // Rust reference: coroutine.rs TransformVisitor visit_place (line 414-418)
+    // Value rewriting handles memory state but not all SSA value references.
+    // CLIF codegen creates vregs that span blocks → EntryLivein error.
+    // Need aggressive value rewriting or CLIF-level handling.
     if (true or suspend_points.items.len < 2) {
         debug.log(.async_split, "=== AsyncSplit skipped for '{s}': {d} suspend points (<=1, eager sufficient) ===", .{
             f.name, suspend_points.items.len,
@@ -434,6 +437,51 @@ fn splitBlockAtSuspend(f: *Func, sp: *SuspendPoint, local_to_offset: *const std.
         local_store.addArg(local_addr_r);
         local_store.addArg(frame_load);
         try resume_block.insertValueBefore(f.allocator, local_store, resume_block.values.items[4]);
+    }
+
+    // === REWRITE: fix cross-block SSA references ===
+    // Values in the resume block may reference values from the pre-split block
+    // (especially memory state .copy values). These violate SSA dominance.
+    // Fix: create init_mem at resume entry, rewrite all memory args to chain from it.
+    // For non-memory values: if an arg is from the pre-split block and was stored to a local,
+    // it will be loaded from the local (which was restored from the frame).
+    // Rust reference: coroutine.rs TransformVisitor visit_place (line 414-418)
+    const init_mem_val = try f.newValue(.init_mem, 0, resume_block, pos);
+    // Insert after frame arg + restore loads
+    const insert_pos = @min(resume_block.values.items.len, 1 + sp.live_locals.items.len * 4);
+    if (insert_pos < resume_block.values.items.len) {
+        try resume_block.insertValueBefore(f.allocator, init_mem_val, resume_block.values.items[insert_pos]);
+    } else {
+        try resume_block.addValue(f.allocator, init_mem_val);
+    }
+
+    // Rewrite memory state args: any .copy or memory-typed value that references
+    // a value from the pre-split block should be rewritten to use init_mem_val.
+    // Build set of values in the resume block for quick lookup.
+    var resume_vals = std.AutoHashMapUnmanaged(*Value, void){};
+    defer resume_vals.deinit(f.allocator);
+    for (resume_block.values.items) |v| {
+        try resume_vals.put(f.allocator, v, {});
+    }
+
+    // Rewrite args that reference values NOT in the resume block
+    for (resume_block.values.items) |v| {
+        for (0..v.args.len) |arg_idx| {
+            const arg = v.args[arg_idx];
+            if (arg == init_mem_val) continue; // Don't rewrite self-ref
+            if (arg == frame_in_resume) continue; // Frame arg is valid
+            if (!resume_vals.contains(arg)) {
+                // This arg references a value outside the resume block.
+                // If it's a memory state (.copy, .init_mem, .store result),
+                // replace with our init_mem. Otherwise it's likely a const
+                // that should be re-emitted.
+                if (arg.op == .copy or arg.op == .init_mem or arg.op == .store or
+                    arg.type_idx == 0) // type 0 = void = memory state type
+                {
+                    v.setArg(@intCast(arg_idx), init_mem_val);
+                }
+            }
+        }
     }
 }
 
