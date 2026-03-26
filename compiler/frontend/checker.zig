@@ -227,6 +227,12 @@ pub const Checker = struct {
     lint_mode: bool = false,
     /// Zig Sema pattern: current switch subject enum type for .variant shorthand resolution
     current_switch_enum_type: TypeIndex = invalid_type,
+    /// Swift actor isolation: tracks which type names are actors.
+    /// Used by the isolation checker to determine when `await` is required.
+    actor_types: std.StringHashMap(void) = std.StringHashMap(void).init(std.heap.page_allocator),
+    /// Current actor context: non-null when inside an actor method body.
+    /// Cross-actor calls (calling methods on a different actor) require `await`.
+    current_actor_type: ?[]const u8 = null,
     /// Mutable comptime variable storage — active during comptime block evaluation.
     /// Zig Sema: ComptimeAlloc list holds mutable values, runtime_index prevents time travel.
     comptime_vars: ?std.StringHashMap(ComptimeValue) = null,
@@ -478,6 +484,8 @@ pub const Checker = struct {
             },
             .struct_decl => |s| {
                 if (self.scope.isDefined(s.name)) { self.reportRedefined(s.span.start, s.name); return; }
+                // Track actor types for isolation checking
+                if (s.is_actor) self.actor_types.put(s.name, {}) catch {};
                 // Generic structs: store definition, don't build concrete type yet
                 if (s.type_params.len > 0) {
                     try self.generics.generic_structs.put(s.name, .{ .type_params = s.type_params, .node_idx = idx, .tree = self.tree, .scope = self.scope });

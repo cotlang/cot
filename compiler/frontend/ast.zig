@@ -64,7 +64,7 @@ pub const FnDecl = struct {
 };
 pub const VarDecl = struct { name: []const u8, type_expr: NodeIndex, value: NodeIndex, is_const: bool, doc_comment: []const u8 = "", span: Span };
 pub const StructLayout = enum { auto, @"packed", @"extern" };
-pub const StructDecl = struct { name: []const u8, type_params: []const []const u8 = &.{}, fields: []const Field, layout: StructLayout = .auto, nested_decls: []const NodeIndex = &.{}, doc_comment: []const u8 = "", span: Span };
+pub const StructDecl = struct { name: []const u8, type_params: []const []const u8 = &.{}, fields: []const Field, layout: StructLayout = .auto, nested_decls: []const NodeIndex = &.{}, doc_comment: []const u8 = "", is_actor: bool = false, span: Span };
 pub const ImplBlock = struct { type_name: []const u8, type_params: []const []const u8 = &.{}, methods: []const NodeIndex, consts: []const NodeIndex = &.{}, doc_comment: []const u8 = "", span: Span };
 pub const TraitDecl = struct { name: []const u8, methods: []const NodeIndex, doc_comment: []const u8 = "", span: Span };
 pub const ImplTraitBlock = struct { trait_name: []const u8, target_type: []const u8, type_params: []const []const u8 = &.{}, methods: []const NodeIndex, doc_comment: []const u8 = "", span: Span };

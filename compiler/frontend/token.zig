@@ -36,6 +36,7 @@ pub const Token = enum(u8) {
     kw_true, kw_false, kw_null, kw_new, kw_undefined,
     kw_comptime,
     kw_async, kw_await,
+    kw_actor, kw_nonisolated,
     kw_inline,
     kw_unreachable,
     kw_packed,
@@ -201,6 +202,8 @@ const token_strings = blk: {
     s[@intFromEnum(Token.kw_comptime)] = "comptime";
     s[@intFromEnum(Token.kw_async)] = "async";
     s[@intFromEnum(Token.kw_await)] = "await";
+    s[@intFromEnum(Token.kw_actor)] = "actor";
+    s[@intFromEnum(Token.kw_nonisolated)] = "nonisolated";
     s[@intFromEnum(Token.kw_inline)] = "inline";
     s[@intFromEnum(Token.kw_unreachable)] = "unreachable";
     s[@intFromEnum(Token.kw_packed)] = "packed";
@@ -244,6 +247,7 @@ pub const keywords = std.StaticStringMap(Token).initComptime(.{
     .{ "true", .kw_true }, .{ "false", .kw_false }, .{ "null", .kw_null }, .{ "new", .kw_new },
     .{ "undefined", .kw_undefined }, .{ "comptime", .kw_comptime },
     .{ "async", .kw_async }, .{ "await", .kw_await },
+    .{ "actor", .kw_actor }, .{ "nonisolated", .kw_nonisolated },
     .{ "inline", .kw_inline },
     .{ "unreachable", .kw_unreachable },
     .{ "packed", .kw_packed },

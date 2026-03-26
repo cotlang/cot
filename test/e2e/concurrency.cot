@@ -32,6 +32,17 @@ test "async fn with computation" {
     @assertEq(await factorial(5), 120)
 }
 
+test "actor declaration and field access" {
+    actor Counter {
+        count: int,
+    }
+
+    var c = Counter { .count = 0 }
+    @assertEq(c.count, 0)
+    c.count = 42
+    @assertEq(c.count, 42)
+}
+
 test "multiple awaits in sequence" {
     async fn getX() int { return 10 }
     async fn getY() int { return 20 }

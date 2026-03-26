@@ -233,6 +233,7 @@ pub const Parser = struct {
             .kw_var => self.parseVarDecl(false),
             .kw_const => self.parseVarDecl(true),
             .kw_struct => self.parseStructDeclWithLayout(.auto),
+            .kw_actor => self.parseActorDecl(),
             .kw_trait => self.parseTraitDecl(),
             .kw_impl => self.parseImplBlock(),
             .kw_enum => { self.err.errorWithCode(self.pos(), .e203, "use 'const Name = enum { ... }' syntax (Zig style)"); return null; },
@@ -580,6 +581,64 @@ pub const Parser = struct {
             .layout = layout,
             .nested_decls = if (nested_decls.items.len > 0) try self.allocator.dupe(NodeIndex, nested_decls.items) else &.{},
             .doc_comment = doc_comment,
+            .span = Span.init(start, self.pos()),
+        } });
+    }
+
+    /// Parse `actor Name { fields... methods... }` — Swift SE-0306 actor declaration.
+    /// Actors are structs with compiler-enforced isolation. Parsed as struct_decl with is_actor=true.
+    fn parseActorDecl(self: *Parser) ParseError!?NodeIndex {
+        const doc_comment = self.consumeDocComment();
+        const start = self.pos();
+        self.advance(); // consume 'actor'
+        if (!self.check(.ident)) { self.err.errorWithCode(self.pos(), .e203, "expected actor name"); return null; }
+        const name = self.tok.text;
+        self.advance();
+
+        if (!self.expect(.lbrace)) return null;
+
+        const saved_impl_type = self.current_impl_type;
+        const saved_impl_is_generic = self.current_impl_is_generic;
+        self.current_impl_type = name;
+        self.current_impl_is_generic = false;
+        defer {
+            self.current_impl_type = saved_impl_type;
+            self.current_impl_is_generic = saved_impl_is_generic;
+        }
+
+        var nested_decls = std.ArrayListUnmanaged(NodeIndex){};
+        defer nested_decls.deinit(self.allocator);
+        // Parse nested declarations before fields
+        while (!self.check(.rbrace) and !self.check(.eof)) {
+            self.collectDocComment();
+            if (self.check(.kw_const) or self.check(.kw_enum) or self.check(.kw_type) or
+                self.check(.kw_fn) or self.check(.kw_static) or self.check(.kw_async) or self.check(.at) or
+                self.check(.kw_nonisolated) or
+                (self.check(.kw_struct) and self.peekToken().tok == .ident))
+            {
+                if (try self.parseDecl()) |nested_idx| try nested_decls.append(self.allocator, nested_idx);
+            } else break;
+        }
+        const fields = try self.parseFieldList(.rbrace);
+        // Parse nested declarations after fields (methods)
+        while (!self.check(.rbrace) and !self.check(.eof)) {
+            self.collectDocComment();
+            if (self.check(.kw_const) or self.check(.kw_enum) or self.check(.kw_type) or
+                self.check(.kw_fn) or self.check(.kw_static) or self.check(.kw_async) or self.check(.at) or
+                self.check(.kw_nonisolated) or
+                (self.check(.kw_struct) and self.peekToken().tok == .ident))
+            {
+                if (try self.parseDecl()) |nested_idx| try nested_decls.append(self.allocator, nested_idx);
+            } else break;
+        }
+
+        if (!self.expect(.rbrace)) return null;
+        return try self.tree.addDecl(.{ .struct_decl = .{
+            .name = name,
+            .fields = fields,
+            .nested_decls = if (nested_decls.items.len > 0) try self.allocator.dupe(NodeIndex, nested_decls.items) else &.{},
+            .doc_comment = doc_comment,
+            .is_actor = true,
             .span = Span.init(start, self.pos()),
         } });
     }
@@ -1931,6 +1990,7 @@ pub const Parser = struct {
             .kw_fn => return self.parseFnDecl(false, false, false, false, false),
             .kw_async => return self.parseAsyncFn(),
             .kw_struct => return self.parseStructDeclWithLayout(.auto),
+            .kw_actor => return self.parseActorDecl(),
             .kw_union => return self.parseUnionDecl(),
             .kw_packed => {
                 if (self.peekToken().tok == .kw_struct)
