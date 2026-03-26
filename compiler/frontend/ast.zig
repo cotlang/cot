@@ -461,6 +461,7 @@ pub const ForStmt = struct {
     body: NodeIndex,
     label: ?[]const u8 = null, // Optional label for labeled break/continue (Zig: `outer: for ...`)
     is_inline: bool = false, // inline for — unrolled at compile time
+    is_await: bool = false, // Swift for-await-in — iterates AsyncSequence via .next()
     span: Span,
 
     /// Check if this is a numeric range loop (for i in 0..10)

@@ -2196,7 +2196,34 @@ pub const Parser = struct {
 
     fn parseForStmt(self: *Parser, label: ?[]const u8, is_inline: bool) ParseError!?NodeIndex {
         const start = self.pos();
-        self.advance();
+        self.advance(); // consume 'for'
+
+        // Swift for-await-in: `for await x in sequence { body }`
+        // Desugars to: while (true) { let __next = seq.next(); if (__next == null) break; let x = __next.?; body }
+        // Reference: Swift AsyncSequence.swift, SE-0298
+        if (self.check(.kw_await)) {
+            self.advance(); // consume 'await'
+            if (!self.check(.ident)) { self.syntaxError("expected loop variable after 'await'"); return null; }
+            const binding = self.tok.text;
+            self.advance();
+            if (!self.expect(.kw_in)) { self.syntaxError("expected 'in' in for-await loop"); return null; }
+            const sequence = try self.parseExpr() orelse return null;
+            const body = try self.parseBlockExpr() orelse return null;
+
+            // Desugar to:
+            //   { var __seq = sequence; while (true) { let __next = __seq.next(); if (__next == null) { break } let binding = __next.?; body } }
+            // For simplicity, emit a for_await_stmt that the lowerer handles
+            return try self.tree.addStmt(.{ .for_stmt = .{
+                .binding = binding,
+                .iterable = sequence,
+                .body = body,
+                .label = label,
+                .is_inline = false,
+                .is_await = true,
+                .span = Span.init(start, self.pos()),
+            } });
+        }
+
         if (!self.check(.ident)) {
             self.err.errorWithCode(self.pos(), .e203, "expected loop variable");
             return null;

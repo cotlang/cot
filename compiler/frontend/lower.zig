@@ -3988,6 +3988,14 @@ pub const Lowerer = struct {
     fn lowerFor(self: *Lowerer, for_stmt: ast.ForStmt) !void {
         const fb = self.current_func orelse return;
 
+        // Swift for-await-in: `for await x in sequence { body }`
+        // Desugars to: while (true) { let __next = seq.next(); if (__next == null) break; let x = __next.?; body }
+        // Reference: Swift AsyncSequence.swift, SE-0298
+        if (for_stmt.is_await) {
+            try self.lowerForAwait(for_stmt);
+            return;
+        }
+
         // Inline for: unroll at compile time — Zig AstGen.zig:6863
         if (for_stmt.is_inline) {
             try self.lowerInlineFor(for_stmt);
@@ -4171,6 +4179,75 @@ pub const Lowerer = struct {
         _ = self.comptime_value_vars.remove(for_stmt.binding);
         _ = self.const_values.remove(for_stmt.binding);
         if (for_stmt.index_binding) |ib| _ = self.const_values.remove(ib);
+    }
+
+    /// Lower `for await x in sequence { body }` — Swift AsyncSequence iteration.
+    /// Desugars to: while (true) { let __next = seq.next(); if (__next == null) break; let x = __next.?; body }
+    /// Reference: Swift AsyncSequence.swift, SE-0298.
+    fn lowerForAwait(self: *Lowerer, for_stmt: ast.ForStmt) !void {
+        const fb = self.current_func orelse return;
+
+        // Lower the sequence expression (e.g., the TaskGroup)
+        const seq_ptr = try self.lowerExprNode(for_stmt.iterable);
+
+        // Store sequence in a local (needed for method calls across blocks)
+        const seq_local = try fb.addLocalWithSize("__for_await_seq", TypeRegistry.I64, false, 8);
+        _ = try fb.emitStoreLocal(seq_local, seq_ptr, for_stmt.span);
+
+        // Create loop blocks
+        const cond_block = try fb.newBlock("for_await.cond");
+        const body_block = try fb.newBlock("for_await.body");
+        const exit_block = try fb.newBlock("for_await.end");
+        _ = try fb.emitJump(cond_block, for_stmt.span);
+
+        // Condition: call seq.next(), check if null
+        fb.setBlock(cond_block);
+        const seq_reload = try fb.emitLoadLocal(seq_local, TypeRegistry.I64, for_stmt.span);
+        // Call next() method — this returns ?T (optional)
+        var next_args = [_]ir.NodeIndex{seq_reload};
+        const next_result = try fb.emitCall(
+            try self.qualifyMethodName(for_stmt.iterable, "next"),
+            &next_args, false, TypeRegistry.I64, for_stmt.span,
+        );
+        // Check if result is null (optional payload)
+        const zero = try fb.emitConstInt(0, TypeRegistry.I64, for_stmt.span);
+        const is_null = try fb.emitBinary(.eq, next_result, zero, TypeRegistry.BOOL, for_stmt.span);
+        _ = try fb.emitBranch(is_null, exit_block, body_block, for_stmt.span);
+
+        // Body: bind the value and execute
+        fb.setBlock(body_block);
+        const cleanup_depth = self.cleanup_stack.getScopeDepth();
+        const scope_depth = fb.markScopeEntry();
+        // Store the result as the loop binding
+        const binding_local = try fb.addLocalWithSize(for_stmt.binding, TypeRegistry.I64, false, 8);
+        _ = try fb.emitStoreLocal(binding_local, next_result, for_stmt.span);
+
+        try self.loop_stack.append(self.allocator, .{
+            .cond_block = cond_block,
+            .exit_block = exit_block,
+            .cleanup_depth = cleanup_depth,
+            .label = for_stmt.label,
+        });
+        if (!try self.lowerBlockNode(for_stmt.body)) _ = try fb.emitJump(cond_block, for_stmt.span);
+        _ = self.loop_stack.pop();
+        try self.emitCleanups(cleanup_depth);
+        fb.restoreScope(scope_depth);
+        fb.setBlock(exit_block);
+    }
+
+    /// Get the qualified method name for a method call on an expression's type.
+    fn qualifyMethodName(self: *Lowerer, expr_idx: NodeIndex, method: []const u8) ![]const u8 {
+        const expr_type = self.inferExprType(expr_idx);
+        const type_info = self.type_reg.get(expr_type);
+        const type_name = switch (type_info) {
+            .struct_type => |st| st.name,
+            .pointer => |ptr| switch (self.type_reg.get(ptr.elem)) {
+                .struct_type => |st| st.name,
+                else => "unknown",
+            },
+            else => "unknown",
+        };
+        return std.fmt.allocPrint(self.allocator, "{s}_{s}", .{ type_name, method });
     }
 
     fn lowerForRange(self: *Lowerer, for_stmt: ast.ForStmt) !void {

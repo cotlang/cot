@@ -1,0 +1,14 @@
+// TaskGroup tests — Swift structured concurrency (SE-0304)
+import "std/task_group"
+
+test "task group addTask and next" {
+    var group = TaskGroup(int).init()
+    group.addTask(10)
+    group.addTask(20)
+    group.addTask(30)
+
+    @assertEq(group.next().?, 10)
+    @assertEq(group.next().?, 20)
+    @assertEq(group.next().?, 30)
+    @assert(group.next() == null)
+}
