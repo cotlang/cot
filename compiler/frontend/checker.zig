@@ -549,8 +549,10 @@ pub const Checker = struct {
                             const synth_name = try std.fmt.allocPrint(self.allocator, "{s}_{s}", .{ s.name, f.name });
                             const func_type = try self.buildFuncType(f.params, f.return_type);
                             // Without @safe, a method with no self param is effectively static
-                            // even if the parser didn't mark it. In @safe mode, self gets injected.
-                            const effective_static = f.is_static or (!self.safe_mode and (f.params.len == 0 or !std.mem.eql(u8, f.params[0].name, "self")));
+                            // even if the parser didn't mark it. In @safe mode or actor mode, self gets injected.
+                            // Swift: actor methods always have implicit isolated self.
+                            const safe_or_actor = self.safe_mode or s.is_actor;
+                            const effective_static = f.is_static or (!safe_or_actor and (f.params.len == 0 or !std.mem.eql(u8, f.params[0].name, "self")));
                             var is_ptr = !effective_static;
                             if (!effective_static) {
                                 const func_info = self.types.get(func_type);
@@ -4267,6 +4269,9 @@ pub const Checker = struct {
         // Reference: swift/lib/IRGen/GenExistential.cpp:899-905
         const t_pre = self.types.get(type_idx);
         if (t_pre == .existential) return try self.types.makePointer(type_idx);
+        // Actors always pass self by pointer (regardless of @safe mode)
+        if (t_pre == .struct_type and self.actor_types.contains(t_pre.struct_type.name))
+            return try self.types.makePointer(type_idx);
         if (!self.safe_mode) return type_idx;
         const t = t_pre;
         // Structs and unions are passed by pointer in @safe mode (like TypeScript objects)

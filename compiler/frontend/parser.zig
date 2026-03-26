@@ -32,6 +32,8 @@ pub const Parser = struct {
     current_impl_type: ?[]const u8 = null,
     /// Whether current impl block is generic (skip implicit self for generics)
     current_impl_is_generic: bool = false,
+    /// True when inside an actor body — forces self injection like @safe mode.
+    current_impl_is_actor: bool = false,
     /// Pending doc comment text (accumulated from consecutive /// lines)
     pending_doc_comment: []const u8 = "",
 
@@ -301,7 +303,7 @@ pub const Parser = struct {
         // if the first param is not already named "self".
         // The checker's safeWrapType will upgrade struct types to *TypeName automatically;
         // enum types stay as value receivers (Zig pattern: self: Token, not self: *Token).
-        if (self.safe_mode and self.current_impl_type != null and !self.current_impl_is_generic and !is_static) {
+        if ((self.safe_mode or self.current_impl_is_actor) and self.current_impl_type != null and !self.current_impl_is_generic and !is_static) {
             const needs_self = params.len == 0 or !std.mem.eql(u8, params[0].name, "self");
             if (needs_self) {
                 const impl_type = self.current_impl_type.?;
@@ -599,11 +601,14 @@ pub const Parser = struct {
 
         const saved_impl_type = self.current_impl_type;
         const saved_impl_is_generic = self.current_impl_is_generic;
+        const saved_impl_is_actor = self.current_impl_is_actor;
         self.current_impl_type = name;
         self.current_impl_is_generic = false;
+        self.current_impl_is_actor = true; // Actor methods get implicit self
         defer {
             self.current_impl_type = saved_impl_type;
             self.current_impl_is_generic = saved_impl_is_generic;
+            self.current_impl_is_actor = saved_impl_is_actor;
         }
 
         var nested_decls = std.ArrayListUnmanaged(NodeIndex){};

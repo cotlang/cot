@@ -32,15 +32,24 @@ test "async fn with computation" {
     @assertEq(await factorial(5), 120)
 }
 
-test "actor declaration and field access" {
+test "actor with methods and implicit self" {
     actor Counter {
         count: int,
+
+        fn increment() void {
+            self.count = self.count + 1
+        }
+
+        fn getCount() int {
+            return self.count
+        }
     }
 
     var c = Counter { .count = 0 }
-    @assertEq(c.count, 0)
-    c.count = 42
-    @assertEq(c.count, 42)
+    c.increment()
+    c.increment()
+    c.increment()
+    @assertEq(c.getCount(), 3)
 }
 
 test "multiple awaits in sequence" {
