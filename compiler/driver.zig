@@ -31,8 +31,6 @@ const arc_native = @import("codegen/native/arc_native.zig");
 const io_native = @import("codegen/native/io_native.zig");
 const print_native = @import("codegen/native/print_native.zig");
 const test_native_rt = @import("codegen/native/test_native.zig");
-const thread_native = @import("codegen/native/thread_native.zig");
-const scheduler_native = @import("codegen/native/scheduler_native.zig");
 const signal_native = @import("codegen/native/signal_native.zig");
 const target_mod = @import("frontend/target.zig");
 const debug = @import("pipeline_debug.zig");
@@ -1359,17 +1357,6 @@ pub const Driver = struct {
             // Print runtime (print_native.generate order)
             "print_int",     "eprint_int",       "int_to_string",
             "print_float",   "eprint_float",     "float_to_string",
-            // Threading runtime (thread_native.generate order) — unconditional, must come before
-            // conditional test runtime to avoid index gaps when test_mode=false
-            "thread_spawn",  "thread_join",    "thread_detach",
-            "mutex_init",    "mutex_lock",     "mutex_unlock",
-            "mutex_trylock", "mutex_destroy",
-            "cond_init",     "cond_wait",      "cond_signal",
-            "cond_broadcast", "cond_destroy",
-            // Scheduler runtime (scheduler_native.generate order)
-            "sched_spawn",   "sched_shutdown", "sched_get_num_workers",
-            "sched_init",    "sched_worker_spawn", "sched_worker_loop",
-            "sched_join_workers", "sched_select",
             // Signal handler runtime (signal_native.generate order)
             "__cot_print_hex", "__cot_signal_handler", "__cot_install_signals", "__cot_print_backtrace", "__cot_print_source_loc",
             // Test runtime (test_native.generate order)
@@ -1392,18 +1379,6 @@ pub const Driver = struct {
             "c_stat",        "c_unlink",      "signal",
             "sigaction",     "sigaltstack",
             "backtrace",     "backtrace_symbols_fd",
-            // pthread symbols — external references resolved by linker (-lpthread/-lSystem)
-            "pthread_create", "pthread_join",  "pthread_detach",
-            "pthread_mutex_init", "pthread_mutex_lock", "pthread_mutex_unlock",
-            "pthread_mutex_trylock", "pthread_mutex_destroy",
-            "pthread_cond_init", "pthread_cond_wait", "pthread_cond_signal",
-            "pthread_cond_broadcast", "pthread_cond_destroy",
-            // sysconf — used by scheduler to query CPU count
-            "sysconf",
-            // atexit — used by scheduler to register sched_shutdown
-            "atexit",
-            // usleep — used by scheduler for worker idle polling
-            "usleep",
             // dladdr — used by signal handler for source map lookup
             "dladdr",
             // poll — used by poll_read to wait on non-blocking fd
@@ -1478,12 +1453,9 @@ pub const Driver = struct {
         const argv_symbol_idx: u32 = argc_symbol_idx + 1;
         const envp_symbol_idx: u32 = argv_symbol_idx + 1;
 
-        // Scheduler global symbol index — _cot_sched_ptr BSS data for scheduler singleton.
-        const sched_symbol_idx: u32 = envp_symbol_idx + 1;
-
         // PC→line table symbol indices — Go-style pctab/functab for crash source lines.
         // Pre-allocated here so signal_native can reference them in CLIF globalValue instructions.
-        const pctab_symbol_idx: u32 = sched_symbol_idx + 1;
+        const pctab_symbol_idx: u32 = envp_symbol_idx + 1;
         const functab_symbol_idx: u32 = pctab_symbol_idx + 1;
         const functab_count_symbol_idx: u32 = functab_symbol_idx + 1;
         const filetab_symbol_idx: u32 = functab_count_symbol_idx + 1;
@@ -1651,22 +1623,6 @@ pub const Driver = struct {
                 try func_names.append(self.allocator, rf.name);
             }
 
-            // Threading runtime: thread_spawn, thread_join, thread_detach, mutex_*, cond_*
-            // Must come before conditional test runtime to avoid index gaps
-            var thread_funcs = try thread_native.generate(self.allocator, isa, &ctrl_plane, &func_index_map);
-            defer thread_funcs.deinit(self.allocator);
-            for (thread_funcs.items) |rf| {
-                try compiled_funcs.append(self.allocator, rf.compiled);
-                try func_names.append(self.allocator, rf.name);
-            }
-
-            // Scheduler runtime: sched_spawn, sched_shutdown, sched_get_num_workers, internals
-            var sched_funcs = try scheduler_native.generate(self.allocator, isa, &ctrl_plane, &func_index_map, sched_symbol_idx);
-            defer sched_funcs.deinit(self.allocator);
-            for (sched_funcs.items) |rf| {
-                try compiled_funcs.append(self.allocator, rf.compiled);
-                try func_names.append(self.allocator, rf.name);
-            }
 
             // Signal handler runtime: __cot_signal_handler, __cot_install_signals, __cot_print_source_loc
             var signal_funcs = try signal_native.generate(self.allocator, isa, &ctrl_plane, &func_index_map, self.target.os, pctab_symbol_idx, functab_symbol_idx, functab_count_symbol_idx, filetab_symbol_idx, funcnames_symbol_idx);
@@ -1705,7 +1661,6 @@ pub const Driver = struct {
             argc_symbol_idx,
             argv_symbol_idx,
             envp_symbol_idx,
-            sched_symbol_idx,
             pctab_symbol_idx,
             functab_symbol_idx,
             functab_count_symbol_idx,
@@ -1734,7 +1689,6 @@ pub const Driver = struct {
         argc_symbol_idx: u32,
         argv_symbol_idx: u32,
         envp_symbol_idx: u32,
-        sched_symbol_idx: u32,
         pctab_symbol_idx: u32,
         functab_symbol_idx: u32,
         functab_count_symbol_idx: u32,
@@ -1855,17 +1809,7 @@ pub const Driver = struct {
             }
         }
 
-        // Pass 3b3: Add _cot_sched_ptr global (8 bytes, zero-init).
-        // Scheduler singleton pointer — lazy-initialized by sched_init().
-        {
-            const sched_sym_name = "_cot_sched_ptr";
-            const sched_data_id = try module.declareData(sched_sym_name, .Local, true);
-            const sched_data = &[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0 };
-            try module.defineData(sched_data_id, sched_data);
-            try module.declareExternalName(sched_symbol_idx, sched_sym_name);
-        }
-
-        // Pass 3b4: Pre-register pctab/functab external names so signal handler CLIF code
+        // Pass 3b3: Pre-register pctab/functab external names so signal handler CLIF code
         // can reference them via globalValue. The actual data is emitted in Phase 5.
         {
             try module.declareExternalName(pctab_symbol_idx, "_cot_pctab");
@@ -1911,9 +1855,7 @@ pub const Driver = struct {
                 if (idx == ctxt_symbol_idx) continue;
                 // Skip argc/argv/envp symbols (already registered in Pass 3b2)
                 if (idx == argc_symbol_idx or idx == argv_symbol_idx or idx == envp_symbol_idx) continue;
-                // Skip scheduler global symbol (already registered in Pass 3b3)
-                if (idx == sched_symbol_idx) continue;
-                // Skip source map symbols (already registered in Pass 3b4)
+                // Skip source map symbols (already registered in Pass 3b3)
                 if (idx == pctab_symbol_idx or idx == functab_symbol_idx or idx == functab_count_symbol_idx or idx == filetab_symbol_idx or idx == funcnames_symbol_idx) continue;
                 // Skip global variable symbols (already registered in Pass 3c)
                 if (globals.len > 0 and idx >= globals_base_idx and idx < globals_base_idx + @as(u32, @intCast(globals.len))) continue;
