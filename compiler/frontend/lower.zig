@@ -823,14 +823,16 @@ pub const Lowerer = struct {
                 _ = try fb.addParam(param.name, param_type, param_size);
             }
 
-            // Allocate TaskObject via alloc(metadata=0, size=8).
+            // Allocate TaskObject via alloc(metadata=0, size=16).
             // alloc() adds a 32-byte ARC header (magic, size, metadata, refcount=1).
-            // User data = 8 bytes for the result at offset 0 of returned pointer.
+            // User data layout (16 bytes):
+            //   offset 0: result     (i64) — the async function's return value
+            //   offset 8: cancelled  (i64) — cancellation flag (0=running, 1=cancelled)
             // metadata=0 means no destructor (release just frees).
-            // Swift reference: Task.h — AsyncTask is a HeapObject (has ARC refcount).
+            // Swift reference: Task.h — AsyncTask has IsCancelled in ActiveTaskStatus flags.
             const zero_metadata = try fb.emitConstInt(0, TypeRegistry.I64, fn_decl.span);
-            const eight = try fb.emitConstInt(8, TypeRegistry.I64, fn_decl.span);
-            var alloc_args = [_]ir.NodeIndex{ zero_metadata, eight };
+            const sixteen = try fb.emitConstInt(16, TypeRegistry.I64, fn_decl.span);
+            var alloc_args = [_]ir.NodeIndex{ zero_metadata, sixteen };
             const task_ptr = try fb.emitCall("alloc", &alloc_args, false, TypeRegistry.I64, fn_decl.span);
 
             // Store the task_ptr in a local so lowerReturn can access it

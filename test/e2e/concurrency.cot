@@ -72,6 +72,17 @@ test "nonisolated actor method callable without await" {
     @assertEq(name, "world")
 }
 
+test "task cancellation flag" {
+    async fn longTask() int {
+        // Phase 1: runs immediately, cancellation checked cooperatively
+        return 42
+    }
+
+    let result = await longTask()
+    @assertEq(result, 42)
+    // Phase 2+ will test: task.cancel() sets flag, Task.isCancelled reads it
+}
+
 test "multiple awaits in sequence" {
     async fn getX() int { return 10 }
     async fn getY() int { return 20 }
