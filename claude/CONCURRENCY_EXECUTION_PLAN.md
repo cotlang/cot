@@ -3,7 +3,7 @@
 **Date:** 2026-03-26
 **Prerequisite:** 0.4 release (version bump + CI green)
 **Design doc:** `claude/SWIFT_CONCURRENCY_PORT.md` (1,971 lines, audited)
-**Status:** Phase 0 COMPLETE (6,156 lines of Go concurrency deleted)
+**Status:** Phase 0 COMPLETE (6,156 lines deleted) + Phase 1 COMPLETE (async/await E2E on native)
 
 ---
 
@@ -26,9 +26,11 @@ All Go-style concurrency code has been deleted. What remains:
 
 ---
 
-## Phase 1: Task Runtime (2-3 days)
+## Phase 1: Task Runtime (2-3 days) — COMPLETE
 
 **Goal:** A `Task` is a heap-allocated ARC object that holds a function to execute and a result slot. A cooperative executor runs tasks in a priority queue. `async fn` returns a Task, `await` polls it.
+
+**Status:** DONE. 3/3 tests pass on native. Also delivered block-scoped fn declarations (IR builder nesting). Wasm deferred to Phase 9.
 
 ### Step 1.1: Task Type in Type System
 
