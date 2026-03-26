@@ -280,6 +280,8 @@ pub const GenState = struct {
             const pred_idx = edge.i; // our index in succ's preds list
             for (succ.values.items) |v| {
                 if (v.op != .phi) continue;
+                // Skip memory PHIs (stripped by lower_wasm, but guard defensively)
+                if (v.type_idx == TypeRegistry.SSA_MEM) continue;
                 if (pred_idx >= v.args.len) continue;
                 const arg = v.args[pred_idx];
                 // Get arg value on stack
@@ -1352,6 +1354,10 @@ pub const GenState = struct {
                 _ = try self.builder.append(.memory_fill);
             },
 
+            .wasm_unreachable => {
+                _ = try self.builder.append(.@"unreachable");
+            },
+
             else => {
                 debug.log(.codegen, "wasm/gen: unhandled op {s}", .{@tagName(v.op)});
             },
@@ -1453,6 +1459,12 @@ pub const GenState = struct {
         // Go: "case ssa.OpPhi: // nothing to do"
         if (v.op == .phi) return;
 
+        // Skip memory-state values (init_mem, memory PHIs, memory copies).
+        // Memory threading adds SSA_MEM-typed values for ordering but they
+        // produce no wasm stack values.
+        if (v.type_idx == TypeRegistry.SSA_MEM) return;
+        if (v.op == .init_mem) return;
+
         // Generate value and store to local
         try self.ssaGenValueOnStack(v);
 
@@ -1493,7 +1505,9 @@ pub const GenState = struct {
             if (v.uses > 0) {
                 try self.setReg(v); // stores ptr to v's main local
             }
-        } else if (v.uses > 0) {
+        } else if (v.uses > 0 and v.type_idx != TypeRegistry.VOID and v.type_idx != TypeRegistry.SSA_MEM) {
+            // Memory-state values (VOID/SSA_MEM) have uses from memory threading
+            // but don't produce wasm stack values — skip setReg for them.
             try self.setReg(v);
         } else if (v.op.info().call and v.type_idx != TypeRegistry.VOID and v.type_idx != TypeRegistry.SSA_MEM) {
             // Side-effect call with discarded non-void return: drop from Wasm stack.
@@ -1543,6 +1557,8 @@ pub const GenState = struct {
                 if (v.op == .arg) continue;
                 if (v.uses == 0 and !v.hasSideEffects()) continue;
                 if (isRematerializable(v)) continue;
+                // Memory-state values produce no wasm stack values — no local needed
+                if (v.type_idx == TypeRegistry.SSA_MEM or v.op == .init_mem) continue;
                 if (isCmp(v)) continue;
                 // Go: SliceMake/StringMake are conceptual — no Wasm local needed
                 // wasm_lowered_move is inline bulk copy — no value produced

@@ -70,8 +70,83 @@ pub fn lower(f: *Func) !void {
         }
     }
 
+    // Strip memory threading artifacts: memory args, memory PHIs, init_mem.
+    // Memory threading is an SSA ordering concept — wasm has no explicit memory state.
+    stripMemoryThreading(f);
+
     // Peephole: convert call+return patterns to return_call (Wasm 3.0 tail calls)
     optimizeTailCalls(f);
+}
+
+/// Remove memory threading artifacts from the wasm-lowered SSA.
+///
+/// Memory threading adds explicit memory state to the SSA for ordering:
+/// - init_mem: initial memory state
+/// - Stores/calls produce new memory state (SSA_MEM type)
+/// - Loads/calls take memory state as trailing arg
+/// - Memory PHIs at block join points
+///
+/// Wasm has implicit memory ordering, so all of this must be stripped.
+/// Algorithm:
+///   1. Collect all memory-state value IDs (init_mem, SSA_MEM phi/copy)
+///   2. Remove memory-only values from blocks
+///   3. Strip trailing args that reference memory-state values
+fn stripMemoryThreading(f: *Func) void {
+    debug.log(.codegen, "stripMemoryThreading: '{s}'", .{f.name});
+    // Pass 1: Identify all memory-state values by ID.
+    // A value is a memory-state value if:
+    //   - op == init_mem
+    //   - type_idx == SSA_MEM (stores, memory PHIs, memory copies)
+    // We use a simple bitset approach via the value's type_idx field.
+    // After this pass, any value with type SSA_MEM is a memory value.
+    // Note: stores already have SSA_MEM type from the SSA builder.
+
+    // Pass 2: Remove memory-only values from blocks.
+    for (f.blocks.items) |block| {
+        var keep: usize = 0;
+        for (block.values.items) |v| {
+            const is_mem_value = v.op == .init_mem or v.type_idx == TypeRegistry.SSA_MEM;
+            if (is_mem_value and (v.op == .init_mem or v.op == .phi or v.op == .copy or v.op == .fwd_ref)) {
+                // Pure memory-state values — remove entirely
+                continue;
+            }
+            block.values.items[keep] = v;
+            keep += 1;
+        }
+        block.values.shrinkRetainingCapacity(keep);
+    }
+
+    // Pass 3: Strip trailing memory args from remaining values.
+    // Strategy:
+    //   a) Fixed-arg ops (arg_len >= 0): if actual args > declared arg_len,
+    //      the extras are memory args added by threading. Trim to arg_len.
+    //   b) Variable-arg ops (arg_len < 0, i.e. calls): check if last arg
+    //      has SSA_MEM type or is a known memory-state value.
+    for (f.blocks.items) |block| {
+        for (block.values.items) |v| {
+            if (v.args.len == 0) continue;
+            const info = v.op.info();
+            // (a) Fixed-arg ops: trim to declared arg count
+            if (info.arg_len >= 0) {
+                const expected: usize = @intCast(info.arg_len);
+                if (v.args.len > expected) {
+                    debug.log(.codegen, "  strip args: v{d} {s} {d} → {d}", .{ v.id, @tagName(v.op), v.args.len, expected });
+                    v.args = v.args[0..expected];
+                }
+                continue;
+            }
+            // (b) Variable-arg ops (calls): check if last arg is a memory state.
+            // Memory args may have SSA_MEM type (from stores), or VOID type
+            // (from void call results used as memory state after copyelim).
+            const last = v.args[v.args.len - 1];
+            if (last.type_idx == TypeRegistry.SSA_MEM or last.op == .init_mem or
+                (last.type_idx == TypeRegistry.VOID and last.writesMemory()))
+            {
+                debug.log(.codegen, "  strip call: v{d} {s} {d} → {d}", .{ v.id, @tagName(v.op), v.args.len, v.args.len - 1 });
+                v.args = v.args[0 .. v.args.len - 1];
+            }
+        }
+    }
 }
 
 /// Lower a single value's op from generic to Wasm-specific.

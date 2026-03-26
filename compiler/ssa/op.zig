@@ -658,9 +658,9 @@ const op_info_table = blk: {
     table[@intFromEnum(Op.wasm_lowered_move)] = .{ .name = "WasmLoweredMove", .generic = false, .arg_len = 2, .writes_memory = true, .has_side_effects = true };
     table[@intFromEnum(Op.wasm_lowered_zero)] = .{ .name = "WasmLoweredZero", .generic = false, .aux_type = .int64, .writes_memory = true, .has_side_effects = true };
     table[@intFromEnum(Op.wasm_lowered_nil_check)] = .{ .name = "WasmLoweredNilCheck", .generic = false, .arg_len = 1, .nil_check = true, .has_side_effects = true };
-    table[@intFromEnum(Op.wasm_lowered_static_call)] = .{ .name = "WasmLoweredStaticCall", .generic = false, .arg_len = -1, .aux_type = .call, .call = true, .has_side_effects = true };
-    table[@intFromEnum(Op.wasm_lowered_closure_call)] = .{ .name = "WasmLoweredClosureCall", .generic = false, .arg_len = -1, .aux_type = .call, .call = true, .has_side_effects = true };
-    table[@intFromEnum(Op.wasm_lowered_inter_call)] = .{ .name = "WasmLoweredInterCall", .generic = false, .arg_len = -1, .aux_type = .call, .call = true, .has_side_effects = true };
+    table[@intFromEnum(Op.wasm_lowered_static_call)] = .{ .name = "WasmLoweredStaticCall", .generic = false, .arg_len = -1, .aux_type = .call, .call = true, .has_side_effects = true, .writes_memory = true, .reads_memory = true };
+    table[@intFromEnum(Op.wasm_lowered_closure_call)] = .{ .name = "WasmLoweredClosureCall", .generic = false, .arg_len = -1, .aux_type = .call, .call = true, .has_side_effects = true, .writes_memory = true, .reads_memory = true };
+    table[@intFromEnum(Op.wasm_lowered_inter_call)] = .{ .name = "WasmLoweredInterCall", .generic = false, .arg_len = -1, .aux_type = .call, .call = true, .has_side_effects = true, .writes_memory = true, .reads_memory = true };
 
     // WasmGC struct operations
     table[@intFromEnum(Op.wasm_gc_struct_new)] = .{ .name = "WasmGcStructNew", .generic = false, .arg_len = -1, .aux_type = .int64, .has_side_effects = true };

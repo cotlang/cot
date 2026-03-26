@@ -64,8 +64,29 @@ pub const SSABuilder = struct {
     }
 
     /// Go: s.vars[memVar] = v — set current memory state.
+    /// If v doesn't have SSA_MEM type (e.g., a call returning pointer), wrap it
+    /// in a copy<SSA_MEM> so that all memory args have consistent SSA_MEM type.
+    /// This enables the wasm stripping pass to identify memory args reliably.
     fn setMem(self: *SSABuilder, v: *Value) void {
-        self.assign(MEM_VAR, v);
+        if (v.type_idx != TypeRegistry.SSA_MEM) {
+            // Wrap non-SSA_MEM value in a copy with SSA_MEM type
+            const cur = self.cur_block orelse {
+                self.assign(MEM_VAR, v);
+                return;
+            };
+            const wrapper = self.func.newValue(.copy, TypeRegistry.SSA_MEM, cur, self.cur_pos) catch {
+                self.assign(MEM_VAR, v);
+                return;
+            };
+            wrapper.addArg(v);
+            cur.addValue(self.allocator, wrapper) catch {
+                self.assign(MEM_VAR, v);
+                return;
+            };
+            self.assign(MEM_VAR, wrapper);
+        } else {
+            self.assign(MEM_VAR, v);
+        }
     }
 
     pub fn init(allocator: Allocator, ir_func: *const ir.Func, ir_globals: []const ir.Global, type_registry: *TypeRegistry, target: Target) !SSABuilder {
