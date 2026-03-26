@@ -4198,16 +4198,21 @@ pub const Lowerer = struct {
             if (iter_expr == .ident) {
                 if (fb.lookupLocal(iter_expr.ident.name)) |local_idx| {
                     const ptr_type = self.type_reg.makePointer(seq_type) catch TypeRegistry.I64;
+                    debug.log(.lower, "for-await: taking addr of local '{s}' idx={d} ptr_type={d}", .{ iter_expr.ident.name, local_idx, ptr_type });
                     break :blk try fb.emitAddrLocal(local_idx, ptr_type, for_stmt.span);
                 }
+                debug.log(.lower, "for-await: local not found for '{s}'", .{iter_expr.ident.name});
             }
             break :blk try self.lowerExprNode(for_stmt.iterable);
         };
-        _ = seq_info;
-
-        // Store pointer in a local (needed for reloading across blocks)
-        const seq_local = try fb.addLocalWithSize("__for_await_seq", TypeRegistry.I64, false, 8);
-        _ = try fb.emitStoreLocal(seq_local, seq_ptr, for_stmt.span);
+        // Find the group local index for re-address-taking in the loop
+        const group_local_idx: ?ir.LocalIdx = blk_local: {
+            const iter_node = self.tree.getNode(for_stmt.iterable) orelse break :blk_local null;
+            const iter_expr = iter_node.asExpr() orelse break :blk_local null;
+            if (iter_expr == .ident) break :blk_local fb.lookupLocal(iter_expr.ident.name);
+            break :blk_local null;
+        };
+        _ = seq_ptr; // Used for side effects (ensure group is evaluated)
 
         // Create loop blocks
         const cond_block = try fb.newBlock("for_await.cond");
@@ -4215,15 +4220,18 @@ pub const Lowerer = struct {
         const exit_block = try fb.newBlock("for_await.end");
         _ = try fb.emitJump(cond_block, for_stmt.span);
 
-        // Condition: call seq.next(), check if null
+        // Condition: take fresh address of the group local in the loop block
+        // (SSA blocks don't carry values across — re-emit addr_local each iteration)
         fb.setBlock(cond_block);
-        const seq_reload = try fb.emitLoadLocal(seq_local, TypeRegistry.I64, for_stmt.span);
+        const seq_reload = if (group_local_idx) |lidx|
+            try fb.emitAddrLocal(lidx, TypeRegistry.I64, for_stmt.span)
+        else
+            seq_ptr; // fallback: use the original pointer
 
         // Resolve the next() method through the standard method resolution path.
         // This ensures generic methods are queued for lowering.
-        const seq_type = self.inferExprType(for_stmt.iterable);
-        const seq_info = self.type_reg.get(seq_type);
-        const seq_type_name: []const u8 = switch (seq_info) {
+        const seq_info2 = self.type_reg.get(seq_type);
+        const seq_type_name: []const u8 = switch (seq_info2) {
             .struct_type => |st| st.name,
             .pointer => |ptr| switch (self.type_reg.get(ptr.elem)) {
                 .struct_type => |st| st.name,
