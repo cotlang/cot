@@ -1,0 +1,52 @@
+// Channel tests — Go-style buffered channel with backpressure
+import "std/channel"
+
+test "channel send and recv" {
+    var ch = Channel(int).init(10)
+    ch.send(42)
+    ch.send(100)
+    ch.send(7)
+
+    let a = ch.recv()
+    @assert(a != null)
+    @assertEq(a.?, 42)
+
+    let b = ch.recv()
+    @assert(b != null)
+    @assertEq(b.?, 100)
+
+    let c = ch.recv()
+    @assert(c != null)
+    @assertEq(c.?, 7)
+
+    let d = ch.recv()
+    @assert(d == null)
+}
+
+test "channel for-await iteration" {
+    var ch = Channel(int).init(10)
+    ch.send(10)
+    ch.send(20)
+    ch.send(30)
+    ch.close()
+
+    var sum = 0
+    for await val in ch {
+        sum = sum + val
+    }
+    @assertEq(sum, 60)
+}
+
+test "channel close prevents send" {
+    var ch = Channel(int).init(10)
+    ch.send(1)
+    ch.close()
+    ch.send(2)
+
+    let a = ch.recv()
+    @assert(a != null)
+    @assertEq(a.?, 1)
+
+    let b = ch.recv()
+    @assert(b == null)
+}
