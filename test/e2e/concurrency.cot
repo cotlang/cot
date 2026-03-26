@@ -32,7 +32,7 @@ test "async fn with computation" {
     @assertEq(await factorial(5), 120)
 }
 
-test "actor with methods and implicit self" {
+test "actor with methods requires await" {
     actor Counter {
         count: int,
 
@@ -46,10 +46,10 @@ test "actor with methods and implicit self" {
     }
 
     var c = Counter { .count = 0 }
-    c.increment()
-    c.increment()
-    c.increment()
-    @assertEq(c.getCount(), 3)
+    await c.increment()
+    await c.increment()
+    await c.increment()
+    @assertEq(await c.getCount(), 3)
 }
 
 test "multiple awaits in sequence" {

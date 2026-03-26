@@ -11955,16 +11955,32 @@ pub const Lowerer = struct {
         return try fb.emitPtrLoadValue(payload_addr_ok, elem_type, te.span);
     }
 
-    /// Lower await expr — poll a future to completion and extract the result.
-    /// On Wasm: calls the poll function in a loop until READY, then reads result.
-    /// On native: calls fiber_switch to suspend current fiber and resume target.
+    /// Lower await expr — Swift hop_to_executor + call + hop_back pattern.
+    ///
+    /// Two cases:
+    /// 1. `await asyncFn()` — operand is a call to an async fn that returns Task(T).
+    ///    Lower: call async fn (returns task ptr), load result from task user data, release task.
+    /// 2. `await actor.method()` — operand is a cross-actor method call.
+    ///    The checker wrapped the return type in Task(T) to force await, but the actual
+    ///    compiled method returns T directly. Lower: hop to actor executor (Phase 1: no-op),
+    ///    call method normally, hop back (Phase 1: no-op). No task allocation needed.
+    ///    Swift reference: SILGenApply.cpp:6155-6240, swift_task_switch in Actor.cpp:2448.
     fn lowerAwaitExpr(self: *Lowerer, ae: ast.AwaitExpr) Error!ir.NodeIndex {
         const fb = self.current_func orelse return ir.null_node;
 
-        // Lower the operand — this returns a Task pointer (i64)
+        // Check if this is a cross-actor method call (no task allocation needed)
+        // Swift: hop_to_executor + call + hop_back. Phase 1 eager: hops are no-ops.
+        if (self.isCrossActorCall(ae.operand)) {
+            // Lower the method call directly — no task wrapping
+            // Phase 1: synchronous call (single-threaded, no executor hop needed)
+            // Phase 2+: emit hop_to_executor before/after the call
+            return try self.lowerExprNode(ae.operand);
+        }
+
+        // Async function call — operand returns a Task pointer (heap-allocated)
         const task_ptr = try self.lowerExprNode(ae.operand);
 
-        // Phase 1 (eager): result is at task_ptr+0 (user data, body ran synchronously)
+        // Load result from task user data (offset 0, past ARC header managed by alloc)
         const result_type = self.inferExprType(ae.operand);
         const inner_type = if (self.type_reg.get(result_type) == .task)
             self.type_reg.get(result_type).task.result_type
@@ -11977,6 +11993,29 @@ pub const Lowerer = struct {
         _ = try fb.emitCall("release", &release_args, false, TypeRegistry.VOID, ae.span);
 
         return result;
+    }
+
+    /// Check if an expression is a method call on an actor type (cross-actor call).
+    /// Used by lowerAwaitExpr to distinguish `await asyncFn()` from `await actor.method()`.
+    fn isCrossActorCall(self: *Lowerer, operand_idx: NodeIndex) bool {
+        const node = self.tree.getNode(operand_idx) orelse return false;
+        const expr = node.asExpr() orelse return false;
+        if (expr != .call) return false;
+        const callee_node = self.tree.getNode(expr.call.callee) orelse return false;
+        const callee_expr = callee_node.asExpr() orelse return false;
+        if (callee_expr != .field_access) return false;
+        // Check if the base type is an actor
+        const base_type = self.inferExprType(callee_expr.field_access.base);
+        const base_info = self.type_reg.get(base_type);
+        const struct_name = switch (base_info) {
+            .struct_type => |st| st.name,
+            .pointer => |ptr| switch (self.type_reg.get(ptr.elem)) {
+                .struct_type => |st| st.name,
+                else => return false,
+            },
+            else => return false,
+        };
+        return self.chk.actor_types.contains(struct_name);
     }
 
     /// Lower catch expr — unwrap error union, use fallback on error.

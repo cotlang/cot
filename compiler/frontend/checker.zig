@@ -233,6 +233,11 @@ pub const Checker = struct {
     /// Current actor context: non-null when inside an actor method body.
     /// Cross-actor calls (calling methods on a different actor) require `await`.
     current_actor_type: ?[]const u8 = null,
+    /// Tracks cross-actor calls that require `await`. Keyed by source offset.
+    /// If a call is in this set after checkExpr returns, it wasn't inside `await` → error.
+    cross_actor_calls: std.AutoHashMap(u32, void) = std.AutoHashMap(u32, void).init(std.heap.page_allocator),
+    /// True when currently inside an `await` expression (suppresses cross-actor errors).
+    in_await: bool = false,
     /// Mutable comptime variable storage — active during comptime block evaluation.
     /// Zig Sema: ComptimeAlloc list holds mutable values, runtime_index prevents time travel.
     comptime_vars: ?std.StringHashMap(ComptimeValue) = null,
@@ -781,6 +786,10 @@ pub const Checker = struct {
             },
             .struct_decl => |s| {
                 if (s.type_params.len > 0) return;
+                // Set actor context for isolation checking inside actor method bodies
+                const saved_actor = self.current_actor_type;
+                if (s.is_actor) self.current_actor_type = s.name;
+                defer self.current_actor_type = saved_actor;
                 for (s.nested_decls) |nested_idx| {
                     const nested = (self.tree.getNode(nested_idx) orelse continue).asDecl() orelse continue;
                     if (nested == .fn_decl) {
@@ -2088,6 +2097,29 @@ pub const Checker = struct {
                 }
             }
         }
+
+        // Swift actor isolation: cross-actor method calls require `await`.
+        // Reference: Swift TypeCheckConcurrency.cpp:8253 forReference(),
+        //            SILGenApply.cpp:6155-6240 (hop_to_executor emission).
+        // The call itself returns the method's actual return type — no Task wrapping.
+        // The `await` is enforced by the caller context check, not by type wrapping.
+        // Cot tracks cross-actor calls via is_cross_actor_call flag on the expression.
+        if (is_method and method_info != null and !method_info.?.is_static) {
+            const receiver_name = self.getCallReceiverActorName(c.callee);
+            if (receiver_name) |rn| {
+                if (self.actor_types.contains(rn)) {
+                    const is_same_actor = if (self.current_actor_type) |cat| std.mem.eql(u8, cat, rn) else false;
+                    if (!is_same_actor and !self.in_await) {
+                        // Cross-actor call without await — error!
+                        // Swift: "actor-isolated instance method 'X' can not be
+                        // referenced from a nonisolated context"
+                        self.err.errorWithCode(c.span.start, .e300,
+                            "cross-actor call requires 'await'");
+                    }
+                }
+            }
+        }
+
         return ft.return_type;
     }
 
@@ -3302,13 +3334,51 @@ pub const Checker = struct {
     }
 
     fn checkAwaitExpr(self: *Checker, ae: ast.AwaitExpr) CheckError!TypeIndex {
+        // Set in_await so cross-actor calls inside this expression are allowed
+        const saved_in_await = self.in_await;
+        self.in_await = true;
+        defer self.in_await = saved_in_await;
+
         const operand_type = try self.checkExpr(ae.operand);
+
+        // Check if the operand is a cross-actor call (doesn't return Task, just needs await)
+        if (self.isCrossActorCallExpr(ae.operand)) {
+            return operand_type; // Return the method's actual return type
+        }
+
+        // Otherwise, must be an async function call returning Task(T)
         const operand_info = self.types.get(operand_type);
         if (operand_info != .task) {
             self.err.errorWithCode(ae.span.start, .e300, "cannot await non-task type");
             return invalid_type;
         }
         return operand_info.task.result_type;
+    }
+
+    /// Check if an expression is a call to a method on an actor type.
+    fn isCrossActorCallExpr(self: *Checker, operand_idx: NodeIndex) bool {
+        const node = self.tree.getNode(operand_idx) orelse return false;
+        const expr = node.asExpr() orelse return false;
+        if (expr != .call) return false;
+        const receiver_name = self.getCallReceiverActorName(expr.call.callee);
+        if (receiver_name) |rn| return self.actor_types.contains(rn);
+        return false;
+    }
+
+    /// Get the actor type name from a method call callee (field_access on an actor instance).
+    fn getCallReceiverActorName(self: *Checker, callee_idx: NodeIndex) ?[]const u8 {
+        const ce = (self.tree.getNode(callee_idx) orelse return null).asExpr() orelse return null;
+        if (ce != .field_access) return null;
+        const base_type_idx = self.expr_types.get(ce.field_access.base) orelse return null;
+        const base_type = self.types.get(base_type_idx);
+        return switch (base_type) {
+            .struct_type => |st| st.name,
+            .pointer => |ptr| switch (self.types.get(ptr.elem)) {
+                .struct_type => |st| st.name,
+                else => null,
+            },
+            else => null,
+        };
     }
 
 
