@@ -31,3 +31,16 @@ test "async fn with computation" {
 
     @assertEq(await factorial(5), 120)
 }
+
+test "multiple awaits in sequence" {
+    async fn getX() int { return 10 }
+    async fn getY() int { return 20 }
+
+    async fn combined() int {
+        let x = await getX()
+        let y = await getY()
+        return x + y
+    }
+
+    @assertEq(await combined(), 30)
+}

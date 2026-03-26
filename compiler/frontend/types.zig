@@ -595,8 +595,10 @@ pub const TypeRegistry = struct {
             .distinct => |d| self.isTrivial(d.underlying),
             // Existentials are non-trivial (contain VWT-managed value)
             .existential => false,
-            // Tasks are non-trivial (ARC heap objects)
-            .task => false,
+            // Phase 1: Tasks are trivially copyable (just a pointer).
+            // Explicit dealloc in lowerAwaitExpr handles cleanup.
+            // Phase 2+ will use proper ARC with VWT witnesses.
+            .task => true,
         };
     }
 
@@ -642,7 +644,7 @@ pub const TypeRegistry = struct {
         // Error union: check payload (Swift: non-trivial if success type is non-trivial)
         if (t == .error_union) return self.couldBeARC(t.error_union.elem);
         // Collections and futures are heap-allocated ARC objects
-        if (t == .list or t == .map or t == .task) return true;
+        if (t == .list or t == .map) return true;
         // Array/slice: check element type
         if (t == .array) return self.couldBeARC(t.array.elem);
         if (t == .slice) return self.couldBeARC(t.slice.elem);

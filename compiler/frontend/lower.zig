@@ -11974,9 +11974,8 @@ pub const Lowerer = struct {
             TypeRegistry.I64;
         const result = try fb.emitPtrLoadValue(result_addr, inner_type, ae.span);
 
-        // Free the task memory (Phase 1: simple dealloc, no ARC metadata)
-        var dealloc_args = [_]ir.NodeIndex{task_ptr};
-        _ = try fb.emitCall("dealloc", &dealloc_args, false, TypeRegistry.VOID, ae.span);
+        // Phase 1: skip dealloc for now (leak the 16 bytes).
+        // TODO: proper ARC-based task lifecycle in Phase 2.
 
         return result;
     }
