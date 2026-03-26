@@ -4187,10 +4187,25 @@ pub const Lowerer = struct {
     fn lowerForAwait(self: *Lowerer, for_stmt: ast.ForStmt) !void {
         const fb = self.current_func orelse return;
 
-        // Lower the sequence expression (e.g., the TaskGroup)
-        const seq_ptr = try self.lowerExprNode(for_stmt.iterable);
+        // Get pointer to the sequence (methods need *Self, not Self).
+        // Swift: $generator is a mutable local — methods mutate via inout.
+        const seq_type = self.inferExprType(for_stmt.iterable);
+        const seq_info = self.type_reg.get(seq_type);
+        const seq_ptr = blk: {
+            // If iterable is an ident, take address of the local variable
+            const iter_node = self.tree.getNode(for_stmt.iterable) orelse break :blk try self.lowerExprNode(for_stmt.iterable);
+            const iter_expr = iter_node.asExpr() orelse break :blk try self.lowerExprNode(for_stmt.iterable);
+            if (iter_expr == .ident) {
+                if (fb.lookupLocal(iter_expr.ident.name)) |local_idx| {
+                    const ptr_type = self.type_reg.makePointer(seq_type) catch TypeRegistry.I64;
+                    break :blk try fb.emitAddrLocal(local_idx, ptr_type, for_stmt.span);
+                }
+            }
+            break :blk try self.lowerExprNode(for_stmt.iterable);
+        };
+        _ = seq_info;
 
-        // Store sequence in a local (needed for method calls across blocks)
+        // Store pointer in a local (needed for reloading across blocks)
         const seq_local = try fb.addLocalWithSize("__for_await_seq", TypeRegistry.I64, false, 8);
         _ = try fb.emitStoreLocal(seq_local, seq_ptr, for_stmt.span);
 
@@ -4233,26 +4248,32 @@ pub const Lowerer = struct {
             try self.resolveMethodName(seq_type_name, next_method.func_name, next_method.source_tree);
 
         // Swift desugaring: `while let $element = $generator.next()` (TypeCheckStmt.cpp:3605-3620)
-        // next() returns ?T (optional, compound = tag@0 + payload@8, 16 bytes via SRET).
-        // Allocate SRET buffer, call next, check tag, extract payload.
-        const opt_local = try fb.addLocalWithSize("__for_await_opt", TypeRegistry.I64, false, 16);
-        const opt_ptr = try fb.emitAddrLocal(opt_local, TypeRegistry.I64, for_stmt.span);
+        // next() returns ?T (optional, compound, via SRET). Use lowerMethodCall-compatible
+        // call emission with SRET buffer for compound optional returns.
+        //
+        // Allocate shared SRET local for the ?T optional result (16 bytes: tag + payload).
+        // Pass SRET pointer as hidden first arg, self as second arg.
+        // The callee writes the result to the SRET buffer and returns void.
+        const opt_ret_type = try self.type_reg.makeOptional(TypeRegistry.I64); // ?int
+        const opt_size = self.type_reg.sizeOf(opt_ret_type);
+        const sret_local = try fb.addLocalWithSize("__for_await_sret", opt_ret_type, false, @intCast(opt_size));
+        const sret_ptr = try fb.emitAddrLocal(sret_local, TypeRegistry.I64, for_stmt.span);
 
-        // Call next(self_ptr, __sret) — SRET pattern for compound optional return
-        var next_args = [_]ir.NodeIndex{ opt_ptr, seq_reload };
+        // Call: next(__sret, self_ptr) — matches SRET calling convention
+        var next_args = [_]ir.NodeIndex{ sret_ptr, seq_reload };
         _ = try fb.emitCall(next_call_name, &next_args, false, TypeRegistry.VOID, for_stmt.span);
 
-        // Swift OptionalSomePattern: check tag at offset 0 — 0 = null (loop end), 1 = some
-        const tag_val = try fb.emitFieldLocal(opt_local, 0, 0, TypeRegistry.I64, for_stmt.span);
+        // Swift OptionalSomePattern: check tag at SRET local field 0
+        const tag_val = try fb.emitFieldLocal(sret_local, 0, 0, TypeRegistry.I64, for_stmt.span);
         const zero = try fb.emitConstInt(0, TypeRegistry.I64, for_stmt.span);
         const is_null = try fb.emitBinary(.eq, tag_val, zero, TypeRegistry.BOOL, for_stmt.span);
         _ = try fb.emitBranch(is_null, exit_block, body_block, for_stmt.span);
 
-        // Body: extract payload at offset 8, bind to loop variable
+        // Body: extract payload from SRET local field 1 (offset 8)
         fb.setBlock(body_block);
         const cleanup_depth = self.cleanup_stack.getScopeDepth();
         const scope_depth = fb.markScopeEntry();
-        const payload_val = try fb.emitFieldLocal(opt_local, 1, 8, TypeRegistry.I64, for_stmt.span);
+        const payload_val = try fb.emitFieldLocal(sret_local, 1, 8, TypeRegistry.I64, for_stmt.span);
         const binding_local = try fb.addLocalWithSize(for_stmt.binding, TypeRegistry.I64, false, 8);
         _ = try fb.emitStoreLocal(binding_local, payload_val, for_stmt.span);
 
