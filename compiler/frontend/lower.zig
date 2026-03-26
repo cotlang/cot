@@ -3988,13 +3988,9 @@ pub const Lowerer = struct {
     fn lowerFor(self: *Lowerer, for_stmt: ast.ForStmt) !void {
         const fb = self.current_func orelse return;
 
-        // Swift for-await-in: `for await x in sequence { body }`
-        // Desugars to: while (true) { let __next = seq.next(); if (__next == null) break; let x = __next.?; body }
-        // Reference: Swift AsyncSequence.swift, SE-0298
-        if (for_stmt.is_await) {
-            try self.lowerForAwait(for_stmt);
-            return;
-        }
+        // Note: for-await-in is desugared to while-let in the parser
+        // (Swift TypeCheckStmt.cpp:3443 DesugarForEachStmt pattern).
+        // The lowerer never sees is_await=true.
 
         // Inline for: unroll at compile time — Zig AstGen.zig:6863
         if (for_stmt.is_inline) {
@@ -4184,135 +4180,6 @@ pub const Lowerer = struct {
     /// Lower `for await x in sequence { body }` — Swift AsyncSequence iteration.
     /// Desugars to: while (true) { let __next = seq.next(); if (__next == null) break; let x = __next.?; body }
     /// Reference: Swift AsyncSequence.swift, SE-0298.
-    fn lowerForAwait(self: *Lowerer, for_stmt: ast.ForStmt) !void {
-        const fb = self.current_func orelse return;
-
-        // Get pointer to the sequence (methods need *Self, not Self).
-        // Swift: $generator is a mutable local — methods mutate via inout.
-        const seq_type = self.inferExprType(for_stmt.iterable);
-        const seq_info = self.type_reg.get(seq_type);
-        const seq_ptr = blk: {
-            // If iterable is an ident, take address of the local variable
-            const iter_node = self.tree.getNode(for_stmt.iterable) orelse break :blk try self.lowerExprNode(for_stmt.iterable);
-            const iter_expr = iter_node.asExpr() orelse break :blk try self.lowerExprNode(for_stmt.iterable);
-            if (iter_expr == .ident) {
-                if (fb.lookupLocal(iter_expr.ident.name)) |local_idx| {
-                    const ptr_type = self.type_reg.makePointer(seq_type) catch TypeRegistry.I64;
-                    debug.log(.lower, "for-await: taking addr of local '{s}' idx={d} ptr_type={d}", .{ iter_expr.ident.name, local_idx, ptr_type });
-                    break :blk try fb.emitAddrLocal(local_idx, ptr_type, for_stmt.span);
-                }
-                debug.log(.lower, "for-await: local not found for '{s}'", .{iter_expr.ident.name});
-            }
-            break :blk try self.lowerExprNode(for_stmt.iterable);
-        };
-        // Find the group local index for re-address-taking in the loop
-        const group_local_idx: ?ir.LocalIdx = blk_local: {
-            const iter_node = self.tree.getNode(for_stmt.iterable) orelse break :blk_local null;
-            const iter_expr = iter_node.asExpr() orelse break :blk_local null;
-            if (iter_expr == .ident) break :blk_local fb.lookupLocal(iter_expr.ident.name);
-            break :blk_local null;
-        };
-        _ = seq_ptr; // Used for side effects (ensure group is evaluated)
-
-        // Create loop blocks
-        const cond_block = try fb.newBlock("for_await.cond");
-        const body_block = try fb.newBlock("for_await.body");
-        const exit_block = try fb.newBlock("for_await.end");
-        _ = try fb.emitJump(cond_block, for_stmt.span);
-
-        // Condition: take fresh address of the group local in the loop block
-        // (SSA blocks don't carry values across — re-emit addr_local each iteration)
-        fb.setBlock(cond_block);
-        const seq_reload = if (group_local_idx) |lidx|
-            try fb.emitAddrLocal(lidx, TypeRegistry.I64, for_stmt.span)
-        else
-            seq_ptr; // fallback: use the original pointer
-
-        // Resolve the next() method through the standard method resolution path.
-        // This ensures generic methods are queued for lowering.
-        const seq_info2 = self.type_reg.get(seq_type);
-        const seq_type_name: []const u8 = switch (seq_info2) {
-            .struct_type => |st| st.name,
-            .pointer => |ptr| switch (self.type_reg.get(ptr.elem)) {
-                .struct_type => |st| st.name,
-                else => "unknown",
-            },
-            else => "unknown",
-        };
-        const next_method = self.type_reg.lookupMethod(seq_type_name, "next") orelse {
-            debug.log(.lower, "for-await: no 'next' method on type '{s}'", .{seq_type_name});
-            return;
-        };
-        // Ensure generic method is queued for lowering
-        if (self.chk.generics.generic_inst_by_name.get(next_method.func_name)) |inst_info| {
-            try self.ensureGenericFnQueued(inst_info);
-        }
-        // Use the generic base name (strips type args: TaskGroup(5)_next → TaskGroup_next).
-        // This matches how lowerMethodCall resolves generic method names.
-        const is_generic = self.chk.generics.generic_inst_by_name.contains(next_method.func_name);
-        const next_call_name = if (is_generic)
-            self.computeGenericBaseName(next_method.func_name) catch next_method.func_name
-        else
-            try self.resolveMethodName(seq_type_name, next_method.func_name, next_method.source_tree);
-
-        // Swift desugaring: `while let $element = $generator.next()` (TypeCheckStmt.cpp:3605-3620)
-        // next() returns ?T (optional, compound, via SRET). Use lowerMethodCall-compatible
-        // call emission with SRET buffer for compound optional returns.
-        //
-        // Allocate shared SRET local for the ?T optional result (16 bytes: tag + payload).
-        // Pass SRET pointer as hidden first arg, self as second arg.
-        // The callee writes the result to the SRET buffer and returns void.
-        const opt_ret_type = try self.type_reg.makeOptional(TypeRegistry.I64); // ?int
-        const opt_size = self.type_reg.sizeOf(opt_ret_type);
-        const sret_local = try fb.addLocalWithSize("__for_await_sret", opt_ret_type, false, @intCast(opt_size));
-        const sret_ptr = try fb.emitAddrLocal(sret_local, TypeRegistry.I64, for_stmt.span);
-
-        // Call: next(__sret, self_ptr) — matches SRET calling convention
-        var next_args = [_]ir.NodeIndex{ sret_ptr, seq_reload };
-        _ = try fb.emitCall(next_call_name, &next_args, false, TypeRegistry.VOID, for_stmt.span);
-
-        // Swift OptionalSomePattern: check tag at SRET local field 0
-        const tag_val = try fb.emitFieldLocal(sret_local, 0, 0, TypeRegistry.I64, for_stmt.span);
-        const zero = try fb.emitConstInt(0, TypeRegistry.I64, for_stmt.span);
-        const is_null = try fb.emitBinary(.eq, tag_val, zero, TypeRegistry.BOOL, for_stmt.span);
-        _ = try fb.emitBranch(is_null, exit_block, body_block, for_stmt.span);
-
-        // Body: extract payload from SRET local field 1 (offset 8)
-        fb.setBlock(body_block);
-        const cleanup_depth = self.cleanup_stack.getScopeDepth();
-        const scope_depth = fb.markScopeEntry();
-        const payload_val = try fb.emitFieldLocal(sret_local, 1, 8, TypeRegistry.I64, for_stmt.span);
-        const binding_local = try fb.addLocalWithSize(for_stmt.binding, TypeRegistry.I64, false, 8);
-        _ = try fb.emitStoreLocal(binding_local, payload_val, for_stmt.span);
-
-        try self.loop_stack.append(self.allocator, .{
-            .cond_block = cond_block,
-            .exit_block = exit_block,
-            .cleanup_depth = cleanup_depth,
-            .label = for_stmt.label,
-        });
-        if (!try self.lowerBlockNode(for_stmt.body)) _ = try fb.emitJump(cond_block, for_stmt.span);
-        _ = self.loop_stack.pop();
-        try self.emitCleanups(cleanup_depth);
-        fb.restoreScope(scope_depth);
-        fb.setBlock(exit_block);
-    }
-
-    /// Get the qualified method name for a method call on an expression's type.
-    fn qualifyMethodName(self: *Lowerer, expr_idx: NodeIndex, method: []const u8) ![]const u8 {
-        const expr_type = self.inferExprType(expr_idx);
-        const type_info = self.type_reg.get(expr_type);
-        const type_name = switch (type_info) {
-            .struct_type => |st| st.name,
-            .pointer => |ptr| switch (self.type_reg.get(ptr.elem)) {
-                .struct_type => |st| st.name,
-                else => "unknown",
-            },
-            else => "unknown",
-        };
-        return std.fmt.allocPrint(self.allocator, "{s}_{s}", .{ type_name, method });
-    }
-
     fn lowerForRange(self: *Lowerer, for_stmt: ast.ForStmt) !void {
         const fb = self.current_func orelse return;
 
