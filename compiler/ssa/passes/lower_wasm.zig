@@ -480,10 +480,8 @@ fn lowerValue(v: *Value) bool {
 /// the return, the return value becomes a local_get (not a call), so the pattern
 /// won't match. Only cleanup-free `return f(args)` patterns are converted.
 fn optimizeTailCalls(f: *Func) void {
-    // Disabled: return_call (Wasm 3.0 tail call) causes SIGILL in the native
-    // pipeline for functions with many parameters. The wasm_to_clif translator
-    // handles return_call as call+return, but the block kind change from .ret
-    // to .exit disrupts native code generation for complex call signatures.
+    // Disabled: return_call (Wasm 3.0 tail call) optimization disabled pending
+    // further testing with complex call signatures.
     // TODO: re-enable once the native return_call translation is fixed.
     _ = f;
 }

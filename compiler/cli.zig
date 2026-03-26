@@ -27,7 +27,6 @@ pub const BuildOptions = struct {
     release: bool = false,
     debug: bool = false,
     lib: bool = false,
-    direct_native: bool = false,
     ssa: ?[]const u8 = null,
 };
 
@@ -38,7 +37,6 @@ pub const RunOptions = struct {
     watch: bool = false,
     release: bool = false,
     debug: bool = false,
-    direct_native: bool = false,
 };
 
 pub const CheckOptions = struct {
@@ -177,8 +175,6 @@ fn parseBuild(args: *std.process.ArgIterator) ?Command {
             opts.debug = true;
         } else if (std.mem.eql(u8, arg, "--lib")) {
             opts.lib = true;
-        } else if (std.mem.eql(u8, arg, "--direct-native")) {
-            opts.direct_native = true;
         } else if (std.mem.startsWith(u8, arg, "--ssa=")) {
             opts.ssa = arg[6..];
         } else if (std.mem.eql(u8, arg, "--ssa")) {
@@ -221,8 +217,6 @@ fn parseRun(allocator: std.mem.Allocator, args: *std.process.ArgIterator) ?Comma
             opts.release = true;
         } else if (std.mem.eql(u8, arg, "--debug") or std.mem.eql(u8, arg, "-g")) {
             opts.debug = true;
-        } else if (std.mem.eql(u8, arg, "--direct-native")) {
-            opts.direct_native = true;
         } else if (!std.mem.startsWith(u8, arg, "-")) {
             opts.input_file = arg;
             has_input = true;
