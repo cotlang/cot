@@ -2198,13 +2198,11 @@ pub const Parser = struct {
         const start = self.pos();
         self.advance(); // consume 'for'
 
-        // Swift for-await-in: `for await x in sequence { body }`
-        // Desugars to: while (true) { let __next = seq.next(); if (__next == null) break; let x = __next.?; body }
-        // Reference: Swift AsyncSequence.swift, SE-0298
         // Swift for-await-in desugaring (TypeCheckStmt.cpp:3443-3706 DesugarForEachStmt).
         // `for await val in seq { body }` desugars to:
-        //   { while (true) { let __next = seq.next(); if (__next == null) { break } let val = __next.?; body } }
-        // All AST nodes synthesized here — lowerer never sees for-await.
+        //   while (seq.next()) |val| { body }
+        // Uses Cot's existing while-optional with capture pattern.
+        // Swift reference: buildWhileCond() lines 3605-3620, OptionalSomePattern line 3609.
         if (self.check(.kw_await)) {
             self.advance(); // consume 'await'
             if (!self.check(.ident)) { self.syntaxError("expected loop variable after 'await'"); return null; }
@@ -2214,8 +2212,7 @@ pub const Parser = struct {
             const sequence = try self.parseExpr() orelse return null;
             const body = try self.parseBlockExpr() orelse return null;
 
-            // Synthesize: let __next = seq.next()
-            const next_ident = try self.tree.addExpr(.{ .ident = .{ .name = "next", .span = Span.init(start, start) } });
+            // Synthesize: seq.next() — the while condition
             const seq_next_call = try self.tree.addExpr(.{ .call = .{
                 .callee = try self.tree.addExpr(.{ .field_access = .{
                     .base = sequence,
@@ -2225,61 +2222,12 @@ pub const Parser = struct {
                 .args = &.{},
                 .span = Span.init(start, start),
             } });
-            _ = next_ident;
-            const next_var = try self.tree.addStmt(.{ .var_stmt = .{
-                .name = "__for_await_next",
-                .type_expr = null_node,
-                .value = seq_next_call,
-                .is_const = true,
-                .span = Span.init(start, start),
-            } });
 
-            // Synthesize: if (__next == null) { break }
-            const next_ref = try self.tree.addExpr(.{ .ident = .{ .name = "__for_await_next", .span = Span.init(start, start) } });
-            const null_lit = try self.tree.addExpr(.{ .literal = .{ .kind = .null_lit, .value = "null", .span = Span.init(start, start) } });
-            const is_null = try self.tree.addExpr(.{ .binary = .{
-                .op = .eql,
-                .left = next_ref,
-                .right = null_lit,
-                .span = Span.init(start, start),
-            } });
-            const break_stmt = try self.tree.addStmt(.{ .break_stmt = .{ .span = Span.init(start, start) } });
-            const break_block = try self.tree.addStmt(.{ .block_stmt = .{
-                .stmts = try self.allocator.dupe(NodeIndex, &[_]NodeIndex{break_stmt}),
-                .span = Span.init(start, start),
-            } });
-            const if_null_break = try self.tree.addStmt(.{ .if_stmt = .{
-                .condition = is_null,
-                .then_branch = break_block,
-                .else_branch = null_node,
-                .span = Span.init(start, start),
-            } });
-
-            // Synthesize: let val = __next.?  (force unwrap — .question unary op)
-            const next_ref2 = try self.tree.addExpr(.{ .ident = .{ .name = "__for_await_next", .span = Span.init(start, start) } });
-            const unwrap = try self.tree.addExpr(.{ .unary = .{
-                .op = .question,
-                .operand = next_ref2,
-                .span = Span.init(start, start),
-            } });
-            const binding_var = try self.tree.addStmt(.{ .var_stmt = .{
-                .name = binding,
-                .type_expr = null_node,
-                .value = unwrap,
-                .is_const = true,
-                .span = Span.init(start, start),
-            } });
-
-            // Synthesize: while (true) { __next decl; if-null-break; binding decl; body }
-            const true_lit = try self.tree.addExpr(.{ .literal = .{ .kind = .true_lit, .value = "true", .span = Span.init(start, start) } });
-            const while_body_stmts = try self.allocator.dupe(NodeIndex, &[_]NodeIndex{ next_var, if_null_break, binding_var, body });
-            const while_body = try self.tree.addStmt(.{ .block_stmt = .{
-                .stmts = while_body_stmts,
-                .span = Span.init(start, self.pos()),
-            } });
+            // Desugar to: while (seq.next()) |val| { body }
             return try self.tree.addStmt(.{ .while_stmt = .{
-                .condition = true_lit,
-                .body = while_body,
+                .condition = seq_next_call,
+                .body = body,
+                .capture = binding,
                 .label = label,
                 .span = Span.init(start, self.pos()),
             } });
