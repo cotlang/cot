@@ -448,9 +448,21 @@ pub const Checker = struct {
                     return;
                 }
                 var func_type = try self.buildFuncType(f.params, f.return_type);
-                // async fn: wrap return type in Task(T)
+                // async fn: wrap return type in Task(T), check Sendable
                 if (f.is_async) {
                     const inner_ret = self.types.get(func_type).func.return_type;
+                    // Sendable check: return type must be safe to transfer across concurrency boundary
+                    if (inner_ret != TypeRegistry.VOID and !self.isSendable(inner_ret)) {
+                        self.err.errorWithCode(f.span.start, .e300,
+                            "async function return type is not Sendable");
+                    }
+                    // Sendable check: parameters cross from caller to async context
+                    for (self.types.get(func_type).func.params) |param| {
+                        if (!self.isSendable(param.type_idx)) {
+                            self.err.errorWithCode(f.span.start, .e300,
+                                "async function parameter is not Sendable");
+                        }
+                    }
                     const task_ret = try self.types.makeTask(inner_ret);
                     func_type = try self.types.makeFunc(self.types.get(func_type).func.params, task_ret);
                 }
@@ -3195,6 +3207,68 @@ pub const Checker = struct {
             if (seg == .expr) _ = try self.checkExpr(seg.expr);
         }
         return TypeRegistry.STRING;
+    }
+
+    /// Swift Sendable checking: determine if a type is safe to transfer across
+    /// concurrency boundaries (actor isolation, Task captures).
+    /// Reference: Swift TypeCheckConcurrency.cpp:7488 deriveImplicitSendableConformance.
+    ///
+    /// Rules:
+    /// - Primitives (int, i32, i64, f64, bool, string): always Sendable
+    /// - Structs: Sendable if ALL fields are Sendable (value semantics)
+    /// - Enums: always Sendable (simple value types)
+    /// - Unions: Sendable if ALL variant payloads are Sendable
+    /// - Optional(?T): Sendable if T is Sendable
+    /// - Error union(E!T): Sendable if T is Sendable
+    /// - List(T): Sendable if T is Sendable (COW — safe to share)
+    /// - Map(K,V): Sendable if K and V are Sendable (COW)
+    /// - Task(T): always Sendable (ARC heap object, safe reference)
+    /// - Actors: always Sendable (they ARE the isolation boundary) — Phase 3
+    /// - Distinct types: Sendable if underlying is Sendable
+    /// - Raw pointers: NOT Sendable (unsafe aliasing)
+    /// - Function types/closures: NOT Sendable (may capture mutable state)
+    /// - Slices: NOT Sendable (borrowed reference, not owned)
+    pub fn isSendable(self: *Checker, ty: TypeIndex) bool {
+        const info = self.types.get(ty);
+        return switch (info) {
+            .basic => true,
+            .struct_type => |s| {
+                for (s.fields) |f| {
+                    if (!self.isSendable(f.type_idx)) return false;
+                }
+                return true;
+            },
+            .enum_type => true,
+            .union_type => |u| {
+                for (u.variants) |v| {
+                    if (v.payload_type != types.invalid_type and !self.isSendable(v.payload_type)) return false;
+                }
+                return true;
+            },
+            .optional => |o| self.isSendable(o.elem),
+            .error_union => |eu| self.isSendable(eu.elem),
+            .list => |l| self.isSendable(l.elem),
+            .map => |m| self.isSendable(m.key) and self.isSendable(m.value),
+            .task => true,
+            .tuple => |t| {
+                for (t.element_types) |et| {
+                    if (!self.isSendable(et)) return false;
+                }
+                return true;
+            },
+            .distinct => |d| self.isSendable(d.underlying),
+            .existential => false, // TODO: Sendable if trait requires Sendable conformance
+            .pointer => false,
+            .func => false,
+            .slice => false,
+            .array => |a| self.isSendable(a.elem),
+            .error_set => true,
+        };
+    }
+
+    /// Format a type name for Sendable error messages.
+    fn sendableTypeName(self: *Checker, ty: TypeIndex) []const u8 {
+        return self.types.get(ty).name();
     }
 
     fn checkAddrOf(self: *Checker, ao: ast.AddrOf) CheckError!TypeIndex {

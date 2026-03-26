@@ -714,18 +714,20 @@ pub const Lowerer = struct {
             fn_decl.name, fn_decl.params.len, fn_decl.is_async, fn_decl.is_export,
         });
 
-        // Save parent function context (supports nested fn declarations in blocks)
-        const saved_func = self.current_func;
+        // Save parent state (supports nested fn declarations in blocks).
+        // The IR builder handles its own FuncBuilder stack (startFunc/endFunc).
+        // We save cleanup_stack and re-derive current_func from the builder after.
         const saved_cleanup = self.cleanup_stack;
-        defer {
-            self.current_func = saved_func;
-            self.cleanup_stack = saved_cleanup;
-        }
+        const saved_loop_stack_len = self.loop_stack.items.len;
 
         // Async functions: Phase 1 eager evaluation — body runs immediately,
         // result wrapped in heap-allocated TaskObject. Phase 2 adds state machines.
         if (fn_decl.is_async) {
             try self.lowerAsyncFnEager(fn_decl);
+            // Restore parent state (same as end of lowerFnDecl)
+            self.current_func = self.builder.func();
+            self.cleanup_stack = saved_cleanup;
+            self.loop_stack.shrinkRetainingCapacity(saved_loop_stack_len);
             return;
         }
 
@@ -786,6 +788,10 @@ pub const Lowerer = struct {
             self.current_func = null;
         }
         try self.builder.endFunc();
+        // Restore parent state after nested fn decl (builder already restored its FuncBuilder)
+        self.current_func = self.builder.func();
+        self.cleanup_stack = saved_cleanup;
+        self.loop_stack.shrinkRetainingCapacity(saved_loop_stack_len);
     }
 
     /// Phase 1 async: eager evaluation. The async function runs its body immediately
