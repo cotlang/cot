@@ -2502,7 +2502,23 @@ pub const SSABuilder = struct {
 
         while (fwd_refs.pop()) |fwd| {
             const block = fwd.block orelse continue;
-            if (block == self.func.entry or block.preds.len == 0) continue;
+            if (block == self.func.entry) continue;
+            // 0-pred blocks (orphan/dead code after @trap): resolve from entry block's
+            // defvars instead of skipping. Without this, FwdRefs for memory state in
+            // dead code remain unresolved and cause compilation failures.
+            if (block.preds.len == 0) {
+                const local_idx_orphan: ir.LocalIdx = @intCast(fwd.aux_int);
+                if (self.func.entry) |entry| {
+                    if (self.defvars.get(entry.id)) |entry_defs| {
+                        if (entry_defs.get(local_idx_orphan)) |val| {
+                            fwd.op = .copy;
+                            fwd.addArg(val);
+                            continue;
+                        }
+                    }
+                }
+                continue;
+            }
 
             const local_idx: ir.LocalIdx = @intCast(fwd.aux_int);
             args.clearRetainingCapacity();

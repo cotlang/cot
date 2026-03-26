@@ -528,8 +528,11 @@ pub const Checker = struct {
                         .fn_decl => |f| {
                             const synth_name = try std.fmt.allocPrint(self.allocator, "{s}_{s}", .{ s.name, f.name });
                             const func_type = try self.buildFuncType(f.params, f.return_type);
-                            var is_ptr = !f.is_static;
-                            if (!f.is_static) {
+                            // Without @safe, a method with no self param is effectively static
+                            // even if the parser didn't mark it. In @safe mode, self gets injected.
+                            const effective_static = f.is_static or (!self.safe_mode and (f.params.len == 0 or !std.mem.eql(u8, f.params[0].name, "self")));
+                            var is_ptr = !effective_static;
+                            if (!effective_static) {
                                 const func_info = self.types.get(func_type);
                                 if (func_info == .func and func_info.func.params.len > 0) {
                                     const first_param_type = self.types.get(func_info.func.params[0].type_idx);
@@ -537,7 +540,7 @@ pub const Checker = struct {
                                 }
                             }
                             try self.defineInFileScope(Symbol.initExtern(synth_name, .function, func_type, nested_idx, false, false));
-                            try self.types.registerMethod(s.name, types.MethodInfo{ .name = f.name, .func_name = synth_name, .func_type = func_type, .receiver_is_ptr = is_ptr, .is_static = f.is_static, .source_tree = self.tree });
+                            try self.types.registerMethod(s.name, types.MethodInfo{ .name = f.name, .func_name = synth_name, .func_type = func_type, .receiver_is_ptr = is_ptr, .is_static = effective_static, .source_tree = self.tree });
                         },
                         else => {},
                     }
@@ -560,8 +563,9 @@ pub const Checker = struct {
                         .fn_decl => |f| {
                             const synth_name = try std.fmt.allocPrint(self.allocator, "{s}_{s}", .{ e.name, f.name });
                             const func_type = try self.buildFuncType(f.params, f.return_type);
-                            var is_ptr = !f.is_static;
-                            if (!f.is_static) {
+                            const effective_static_e = f.is_static or (!self.safe_mode and (f.params.len == 0 or !std.mem.eql(u8, f.params[0].name, "self")));
+                            var is_ptr = !effective_static_e;
+                            if (!effective_static_e) {
                                 const func_info = self.types.get(func_type);
                                 if (func_info == .func and func_info.func.params.len > 0) {
                                     const first_param_type = self.types.get(func_info.func.params[0].type_idx);
@@ -569,7 +573,7 @@ pub const Checker = struct {
                                 }
                             }
                             try self.defineInFileScope(Symbol.initExtern(synth_name, .function, func_type, nested_idx, false, false));
-                            try self.types.registerMethod(e.name, types.MethodInfo{ .name = f.name, .func_name = synth_name, .func_type = func_type, .receiver_is_ptr = is_ptr, .is_static = f.is_static, .source_tree = self.tree });
+                            try self.types.registerMethod(e.name, types.MethodInfo{ .name = f.name, .func_name = synth_name, .func_type = func_type, .receiver_is_ptr = is_ptr, .is_static = effective_static_e, .source_tree = self.tree });
                         },
                         .var_decl => |v| {
                             const qualified = try std.fmt.allocPrint(self.allocator, "{s}_{s}", .{ e.name, v.name });
@@ -631,9 +635,9 @@ pub const Checker = struct {
                         const f = method_decl.fn_decl;
                         const synth_name = try std.fmt.allocPrint(self.allocator, "{s}_{s}", .{ impl_b.type_name, f.name });
                         const func_type = try self.buildFuncType(f.params, f.return_type);
-                        // Detect receiver_is_ptr from resolved func type (accounts for @safe auto-wrapping)
-                        var is_ptr = !f.is_static;
-                        if (!f.is_static) {
+                        const effective_static_i = f.is_static or (!self.safe_mode and (f.params.len == 0 or !std.mem.eql(u8, f.params[0].name, "self")));
+                        var is_ptr = !effective_static_i;
+                        if (!effective_static_i) {
                             const func_info = self.types.get(func_type);
                             if (func_info == .func and func_info.func.params.len > 0) {
                                 const first_param_type = self.types.get(func_info.func.params[0].type_idx);
@@ -641,7 +645,7 @@ pub const Checker = struct {
                             }
                         }
                         try self.defineInFileScope(Symbol.initExtern(synth_name, .function, func_type, method_idx, false, false));
-                        try self.types.registerMethod(impl_b.type_name, types.MethodInfo{ .name = f.name, .func_name = synth_name, .func_type = func_type, .receiver_is_ptr = is_ptr, .is_static = f.is_static, .source_tree = self.tree });
+                        try self.types.registerMethod(impl_b.type_name, types.MethodInfo{ .name = f.name, .func_name = synth_name, .func_type = func_type, .receiver_is_ptr = is_ptr, .is_static = effective_static_i, .source_tree = self.tree });
                     }
                 }
             },
@@ -4034,12 +4038,13 @@ pub const Checker = struct {
                 if (!self.global_scope.isDefined(synth_name)) {
                     try self.global_scope.define(Symbol.init(synth_name, .function, func_type, method_idx, false));
                 }
+                const effective_static_g = f.is_static or (!self.safe_mode and (f.params.len == 0 or !std.mem.eql(u8, f.params[0].name, "self")));
                 try self.types.registerMethod(concrete_name, types.MethodInfo{
                     .name = f.name,
                     .func_name = synth_name,
                     .func_type = func_type,
-                    .receiver_is_ptr = !f.is_static,
-                    .is_static = f.is_static,
+                    .receiver_is_ptr = !effective_static_g,
+                    .is_static = effective_static_g,
                     .source_tree = self.tree,
                 });
 
