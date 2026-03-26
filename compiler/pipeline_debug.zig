@@ -20,6 +20,7 @@ pub const Phase = enum {
     copyelim,
     phielim,
     schedule,
+    async_split,
     regalloc,
     codegen,
     strings,
@@ -35,6 +36,7 @@ pub const DebugPhases = struct {
     copyelim: bool = false,
     phielim: bool = false,
     schedule: bool = false,
+    async_split: bool = false,
     regalloc: bool = false,
     codegen: bool = false,
     strings: bool = false,
@@ -60,6 +62,7 @@ pub const DebugPhases = struct {
             if (std.mem.eql(u8, trimmed, "copyelim")) result.copyelim = true;
             if (std.mem.eql(u8, trimmed, "phielim")) result.phielim = true;
             if (std.mem.eql(u8, trimmed, "schedule")) result.schedule = true;
+            if (std.mem.eql(u8, trimmed, "async_split")) result.async_split = true;
             if (std.mem.eql(u8, trimmed, "regalloc")) result.regalloc = true;
             if (std.mem.eql(u8, trimmed, "codegen")) result.codegen = true;
             if (std.mem.eql(u8, trimmed, "strings")) result.strings = true;
@@ -79,6 +82,7 @@ pub const DebugPhases = struct {
             .copyelim => self.copyelim,
             .phielim => self.phielim,
             .schedule => self.schedule,
+            .async_split => self.async_split,
             .regalloc => self.regalloc,
             .codegen => self.codegen,
             .strings => self.strings,

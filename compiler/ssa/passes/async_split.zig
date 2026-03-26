@@ -76,7 +76,7 @@ fn isAwaitCall(v: *const Value, type_registry: *const TypeRegistry) bool {
 pub fn asyncSplit(f: *Func, type_registry: *const TypeRegistry) !void {
     if (!needsSplitting(f, type_registry)) return;
 
-    debug.log(.ssa, "=== AsyncSplit pass for '{s}' ===", .{f.name});
+    debug.log(.async_split, "=== AsyncSplit pass for '{s}' ===", .{f.name});
 
     // Step 1: Find all suspension points
     var suspend_points = std.ArrayListUnmanaged(SuspendPoint){};
@@ -105,7 +105,7 @@ pub fn asyncSplit(f: *Func, type_registry: *const TypeRegistry) !void {
         }
     }
 
-    debug.log(.ssa, "  found {d} suspension points", .{suspend_points.items.len});
+    debug.log(.async_split, "  found {d} suspension points", .{suspend_points.items.len});
 
     if (suspend_points.items.len == 0) return;
 
@@ -117,7 +117,7 @@ pub fn asyncSplit(f: *Func, type_registry: *const TypeRegistry) !void {
     for (suspend_points.items) |*sp| {
         try computeLiveValues(f, sp);
         try computeLiveLocals(f, sp);
-        debug.log(.ssa, "  suspend point state={d}: {d} live values, {d} live locals to spill", .{
+        debug.log(.async_split, "  suspend point state={d}: {d} live values, {d} live locals to spill", .{
             sp.state_number, sp.live_values.items.len, sp.live_locals.items.len,
         });
     }
@@ -139,7 +139,7 @@ pub fn asyncSplit(f: *Func, type_registry: *const TypeRegistry) !void {
     _ = state_offset;
     _ = result_offset;
 
-    debug.log(.ssa, "  state struct: {d} bytes ({d} spill slots)", .{
+    debug.log(.async_split, "  state struct: {d} bytes ({d} spill slots)", .{
         frame_size, max_spills,
     });
 
@@ -149,7 +149,7 @@ pub fn asyncSplit(f: *Func, type_registry: *const TypeRegistry) !void {
     // infrastructure is wired up. Enabling prematurely would break eager evaluation.
     const ENABLE_ASYNC_TRANSFORM = false;
     if (!ENABLE_ASYNC_TRANSFORM) {
-        debug.log(.ssa, "=== AsyncSplit analysis complete for '{s}': {d} suspend points, {d}B frame (transform disabled) ===", .{
+        debug.log(.async_split, "=== AsyncSplit analysis complete for '{s}': {d} suspend points, {d}B frame (transform disabled) ===", .{
             f.name, suspend_points.items.len, frame_size,
         });
         return;
@@ -163,7 +163,7 @@ pub fn asyncSplit(f: *Func, type_registry: *const TypeRegistry) !void {
         i_sp -= 1;
         const sp = &suspend_points.items[i_sp];
         try splitBlockAtSuspend(f, sp);
-        debug.log(.ssa, "  split block at state={d}, resume block created", .{sp.state_number});
+        debug.log(.async_split, "  split block at state={d}, resume block created", .{sp.state_number});
     }
 
     // Step 5: Create dispatch entry block with jump_table
@@ -204,7 +204,7 @@ pub fn asyncSplit(f: *Func, type_registry: *const TypeRegistry) !void {
     f.entry = dispatch;
     f.invalidateCFG();
 
-    debug.log(.ssa, "=== AsyncSplit complete for '{s}': {d} suspend points, {d}B frame, dispatch entry created ===", .{
+    debug.log(.async_split, "=== AsyncSplit complete for '{s}': {d} suspend points, {d}B frame, dispatch entry created ===", .{
         f.name, suspend_points.items.len, frame_size,
     });
 }
