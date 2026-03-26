@@ -59,6 +59,9 @@ pub const FnDecl = struct {
     /// Each concrete instantiation gets its own function body with concrete types.
     /// No shared body, no type_substitution, no metadata params.
     is_inlinable: bool = false,
+    /// Swift nonisolated: actor method accessible without await from outside.
+    /// Must not access mutable actor state. Reference: SE-0313.
+    is_nonisolated: bool = false,
     doc_comment: []const u8 = "",
     span: Span,
 };

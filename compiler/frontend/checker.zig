@@ -567,7 +567,7 @@ pub const Checker = struct {
                                 }
                             }
                             try self.defineInFileScope(Symbol.initExtern(synth_name, .function, func_type, nested_idx, false, false));
-                            try self.types.registerMethod(s.name, types.MethodInfo{ .name = f.name, .func_name = synth_name, .func_type = func_type, .receiver_is_ptr = is_ptr, .is_static = effective_static, .source_tree = self.tree });
+                            try self.types.registerMethod(s.name, types.MethodInfo{ .name = f.name, .func_name = synth_name, .func_type = func_type, .receiver_is_ptr = is_ptr, .is_static = effective_static, .is_nonisolated = f.is_nonisolated, .source_tree = self.tree });
                         },
                         else => {},
                     }
@@ -2105,11 +2105,13 @@ pub const Checker = struct {
         // The `await` is enforced by the caller context check, not by type wrapping.
         // Cot tracks cross-actor calls via is_cross_actor_call flag on the expression.
         if (is_method and method_info != null and !method_info.?.is_static) {
+            const mi_check = method_info.?;
             const receiver_name = self.getCallReceiverActorName(c.callee);
             if (receiver_name) |rn| {
                 if (self.actor_types.contains(rn)) {
                     const is_same_actor = if (self.current_actor_type) |cat| std.mem.eql(u8, cat, rn) else false;
-                    if (!is_same_actor and !self.in_await) {
+                    // nonisolated methods can be called without await (Swift SE-0313)
+                    if (!is_same_actor and !self.in_await and !mi_check.is_nonisolated) {
                         // Cross-actor call without await — error!
                         // Swift: "actor-isolated instance method 'X' can not be
                         // referenced from a nonisolated context"

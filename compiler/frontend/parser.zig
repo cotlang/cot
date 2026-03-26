@@ -232,6 +232,7 @@ pub const Parser = struct {
                 break :blk null;
             },
             .kw_async => self.parseAsyncFn(),
+            .kw_nonisolated => self.parseNonisolatedFn(),
             .kw_var => self.parseVarDecl(false),
             .kw_const => self.parseVarDecl(true),
             .kw_struct => self.parseStructDeclWithLayout(.auto),
@@ -266,7 +267,19 @@ pub const Parser = struct {
         return self.parseFnDecl(false, true, false, false, false);
     }
 
+    /// Parse `nonisolated fn name(...) { ... }` — Swift SE-0313.
+    /// Actor method accessible without await from outside the actor.
+    fn parseNonisolatedFn(self: *Parser) ParseError!?NodeIndex {
+        self.advance(); // consume 'nonisolated'
+        if (!self.check(.kw_fn)) { self.syntaxError("expected 'fn' after 'nonisolated'"); return null; }
+        return self.parseFnDeclFull(false, false, false, false, false, true);
+    }
+
     fn parseFnDecl(self: *Parser, is_extern: bool, is_async: bool, is_static: bool, is_export: bool, is_inlinable: bool) ParseError!?NodeIndex {
+        return self.parseFnDeclFull(is_extern, is_async, is_static, is_export, is_inlinable, false);
+    }
+
+    fn parseFnDeclFull(self: *Parser, is_extern: bool, is_async: bool, is_static: bool, is_export: bool, is_inlinable: bool, is_nonisolated: bool) ParseError!?NodeIndex {
         const doc_comment = self.consumeDocComment();
         const start = self.pos();
         self.advance();
@@ -356,7 +369,7 @@ pub const Parser = struct {
             body = try self.parseBlock() orelse return null;
         }
 
-        return try self.tree.addDecl(.{ .fn_decl = .{ .name = name, .type_params = type_params, .type_param_bounds = type_param_bounds, .params = params, .return_type = return_type, .body = body, .is_extern = is_extern, .is_export = is_export, .is_async = is_async, .is_static = is_static, .is_inlinable = is_inlinable, .doc_comment = doc_comment, .span = Span.init(start, self.pos()) } });
+        return try self.tree.addDecl(.{ .fn_decl = .{ .name = name, .type_params = type_params, .type_param_bounds = type_param_bounds, .params = params, .return_type = return_type, .body = body, .is_extern = is_extern, .is_export = is_export, .is_async = is_async, .is_static = is_static, .is_inlinable = is_inlinable, .is_nonisolated = is_nonisolated, .doc_comment = doc_comment, .span = Span.init(start, self.pos()) } });
     }
 
     fn parseFieldList(self: *Parser, end_tok: Token) ParseError![]const ast.Field {

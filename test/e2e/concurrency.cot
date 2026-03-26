@@ -52,6 +52,26 @@ test "actor with methods requires await" {
     @assertEq(await c.getCount(), 3)
 }
 
+test "nonisolated actor method callable without await" {
+    actor Greeter {
+        nonisolated fn hello() string {
+            return "hello"
+        }
+
+        fn getName() string {
+            return self.name
+        }
+
+        name: string,
+    }
+
+    var g = Greeter { .name = "world" }
+    let greeting = g.hello()
+    @assertEq(greeting, "hello")
+    let name = await g.getName()
+    @assertEq(name, "world")
+}
+
 test "multiple awaits in sequence" {
     async fn getX() int { return 10 }
     async fn getY() int { return 20 }

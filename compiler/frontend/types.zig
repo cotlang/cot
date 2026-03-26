@@ -141,6 +141,8 @@ pub const MethodInfo = struct {
     func_type: TypeIndex,
     receiver_is_ptr: bool,
     is_static: bool = false,
+    /// Swift SE-0313: nonisolated actor method — accessible without await.
+    is_nonisolated: bool = false,
     /// Go LinkFuncName: pointer to the AST that defined this method.
     /// Used by resolveMethodName to find the defining module for cross-module calls.
     /// Stored as anyopaque to avoid circular import with ast.zig.
