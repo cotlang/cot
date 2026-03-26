@@ -3747,6 +3747,46 @@ pub const Checker = struct {
         if (fs.is_inline) {
             return self.checkInlineFor(fs);
         }
+
+        // Swift for-await-in: `for await x in sequence { body }`
+        // The sequence must have a next() method returning ?T.
+        // Element type is T (the unwrapped optional payload).
+        // Reference: Swift AsyncSequence.swift, SE-0298.
+        if (fs.is_await) {
+            const iter_type = try self.checkExpr(fs.iterable);
+            // Look up next() method on the iterable type
+            const iter_info = self.types.get(iter_type);
+            const type_name: ?[]const u8 = switch (iter_info) {
+                .struct_type => |st| st.name,
+                .pointer => |ptr| switch (self.types.get(ptr.elem)) {
+                    .struct_type => |st| st.name,
+                    else => null,
+                },
+                else => null,
+            };
+            var elem_type: TypeIndex = TypeRegistry.I64;
+            if (type_name) |tn| {
+                if (self.lookupMethod(tn, "next")) |method| {
+                    const method_info = self.types.get(method.func_type);
+                    if (method_info == .func) {
+                        const ret = self.types.get(method_info.func.return_type);
+                        if (ret == .optional) elem_type = ret.optional.elem;
+                    }
+                }
+            }
+            var loop_scope = Scope.init(self.allocator, self.scope);
+            defer loop_scope.deinit();
+            try loop_scope.define(Symbol.init(fs.binding, .variable, elem_type, null_node, false));
+            const old_scope = self.scope;
+            const old_in_loop = self.in_loop;
+            self.scope = &loop_scope;
+            self.in_loop = true;
+            try self.checkBlockExpr(fs.body);
+            self.scope = old_scope;
+            self.in_loop = old_in_loop;
+            return;
+        }
+
         var elem_type: TypeIndex = invalid_type;
         var idx_type: TypeIndex = TypeRegistry.I64;
         if (fs.isRange()) {

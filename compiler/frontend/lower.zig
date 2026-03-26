@@ -4203,10 +4203,38 @@ pub const Lowerer = struct {
         // Condition: call seq.next(), check if null
         fb.setBlock(cond_block);
         const seq_reload = try fb.emitLoadLocal(seq_local, TypeRegistry.I64, for_stmt.span);
-        // Call next() method — this returns ?T (optional)
+
+        // Resolve the next() method through the standard method resolution path.
+        // This ensures generic methods are queued for lowering.
+        const seq_type = self.inferExprType(for_stmt.iterable);
+        const seq_info = self.type_reg.get(seq_type);
+        const seq_type_name: []const u8 = switch (seq_info) {
+            .struct_type => |st| st.name,
+            .pointer => |ptr| switch (self.type_reg.get(ptr.elem)) {
+                .struct_type => |st| st.name,
+                else => "unknown",
+            },
+            else => "unknown",
+        };
+        const next_method = self.type_reg.lookupMethod(seq_type_name, "next") orelse {
+            debug.log(.lower, "for-await: no 'next' method on type '{s}'", .{seq_type_name});
+            return;
+        };
+        // Ensure generic method is queued for lowering
+        if (self.chk.generics.generic_inst_by_name.get(next_method.func_name)) |inst_info| {
+            try self.ensureGenericFnQueued(inst_info);
+        }
+        // Use the generic base name (strips type args: TaskGroup(5)_next → TaskGroup_next).
+        // This matches how lowerMethodCall resolves generic method names.
+        const is_generic = self.chk.generics.generic_inst_by_name.contains(next_method.func_name);
+        const next_call_name = if (is_generic)
+            self.computeGenericBaseName(next_method.func_name) catch next_method.func_name
+        else
+            try self.resolveMethodName(seq_type_name, next_method.func_name, next_method.source_tree);
+
         var next_args = [_]ir.NodeIndex{seq_reload};
         const next_result = try fb.emitCall(
-            try self.qualifyMethodName(for_stmt.iterable, "next"),
+            next_call_name,
             &next_args, false, TypeRegistry.I64, for_stmt.span,
         );
         // Check if result is null (optional payload)

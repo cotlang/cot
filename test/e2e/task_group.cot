@@ -22,3 +22,18 @@ test "task group addTask and next" {
     let d = group.next()
     @assert(d == null)
 }
+
+test "task group for-await iteration" {
+    var group = TaskGroup(int).init()
+    group.addTask(1)
+    group.addTask(2)
+    group.addTask(3)
+    group.addTask(4)
+    group.addTask(5)
+
+    var sum = 0
+    for await val in group {
+        sum = sum + val
+    }
+    @assertEq(sum, 15)
+}
