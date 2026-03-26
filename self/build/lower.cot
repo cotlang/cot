@@ -3661,7 +3661,19 @@ struct Lowerer {
                 // Save/restore tree for isGenericParamIndirect
                 const saved_tree_m = self.tree
                 self.tree = mgi.getAst()
-                const is_m_t_indirect = self.isGenericParamIndirect(mgi, i)
+                // For methods with explicit self as first param (non-@safe),
+                // offset arg index by 1: arg_i counts user args excluding receiver,
+                // but f.params includes explicit self.
+                var has_explicit_self_m = false
+                switch (self.tree.getNode(mgi.generic_node)) { Node.decl |d| => switch (d) { Decl.fn_decl |gf| => {
+                    if (gf.params.len() > 0) {
+                        switch (self.tree.getNode(gf.params.get(0))) { Node.expr |e| => switch (e) { Expr.field_def |fd| => {
+                            if (fd.name == "self") { has_explicit_self_m = true }
+                        }, else => {} }, else => {} }
+                    }
+                }, else => {} }, else => {} }
+                const adjusted_i = if (has_explicit_self_m) { i + 1 } else { i }
+                const is_m_t_indirect = self.isGenericParamIndirect(mgi, adjusted_i)
                 self.tree = saved_tree_m
                 if (is_m_t_indirect) {
                     // Forward T-indirect ptr if available

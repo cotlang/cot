@@ -810,25 +810,27 @@ struct Checker {
                 const synth_name = "${type_name}_${method_name}"
                 const func_type = self.buildFuncType(method_idx)
 
-                // Detect static (no params or first param not named "self")
-                var is_static = true
+                // Detect static: parser's is_static flag, OR without @safe a method
+                // with no "self" first param is effectively static.
+                var has_self_param = false
                 if (f.params.len() > 0) {
                     const first_param = f.params.get(0)
                     const fp_node = self.ast.getNode(first_param)
                     switch (fp_node) { Node.expr |e| => switch (e) { Expr.field_def |fd| => {
                         if (fd.name == "self") {
-                            is_static = false
+                            has_self_param = true
                         }
                     }, else => {} }, else => {} }
                 }
+                const effective_static = f.is_static or (!self.safe_mode and !has_self_param)
 
                 self.defineSymbol(makeFuncSymbol(synth_name, func_type, method_idx))
                 self.types.registerMethod(type_name, MethodInfo {
                     name: method_name,
                     func_name: synth_name,
                     func_type: func_type,
-                    receiver_is_ptr: !is_static,
-                    is_static: is_static,
+                    receiver_is_ptr: !effective_static,
+                    is_static: effective_static,
                     source_tree: 0,
                 })
             }, else => {} }, else => {} }
@@ -4656,18 +4658,20 @@ struct Checker {
             const synth_name = "${concrete_name}_${method_name}"
             const func_type = self.buildFuncType(nested_idx)
 
-            // Detect static (no params or first param not named "self")
-            var is_static = true
+            // Detect static: parser's is_static, OR without @safe no "self" param
+            var has_self_param_n = false
+            var f_is_static_n = false
             var f_params: List(int) = .{}
-            switch (self.ast.getNode(nested_idx)) { Node.decl |d| => switch (d) { Decl.fn_decl |f| => { f_params = f.params }, else => {} }, else => {} }
+            switch (self.ast.getNode(nested_idx)) { Node.decl |d| => switch (d) { Decl.fn_decl |f| => { f_params = f.params; f_is_static_n = f.is_static }, else => {} }, else => {} }
             if (f_params.len() > 0) {
                 const first_param = f_params.get(0)
                 if (nodeTag(self.ast, first_param) == "field_def") {
                     var fp_name = ""
                     switch (self.ast.getNode(first_param)) { Node.expr |e| => switch (e) { Expr.field_def |fd| => { fp_name = fd.name }, else => {} }, else => {} }
-                    if (fp_name == "self") { is_static = false }
+                    if (fp_name == "self") { has_self_param_n = true }
                 }
             }
+            const effective_static_n = f_is_static_n or (!self.safe_mode and !has_self_param_n)
 
             // Define in global scope
             const old_scope = self.scope
@@ -4681,8 +4685,8 @@ struct Checker {
                 name: method_name,
                 func_name: synth_name,
                 func_type: func_type,
-                receiver_is_ptr: !is_static,
-                is_static: is_static,
+                receiver_is_ptr: !effective_static_n,
+                is_static: effective_static_n,
                 source_tree: 0,
             })
 
@@ -4769,13 +4773,26 @@ struct Checker {
                 }
                 self.scope = old_scope
 
+                // Detect static: parser's is_static, OR without @safe no "self" param
+                var has_self_gi = false
+                var f_is_static_gi = false
+                switch (self.ast.getNode(method_idx)) { Node.decl |d| => switch (d) { Decl.fn_decl |mf| => {
+                    f_is_static_gi = mf.is_static
+                    if (mf.params.len() > 0) {
+                        switch (self.ast.getNode(mf.params.get(0))) { Node.expr |e| => switch (e) { Expr.field_def |fd| => {
+                            if (fd.name == "self") { has_self_gi = true }
+                        }, else => {} }, else => {} }
+                    }
+                }, else => {} }, else => {} }
+                const effective_static_gi = f_is_static_gi or (!self.safe_mode and !has_self_gi)
+
                 // Register method
                 self.types.registerMethod(concrete_name, MethodInfo {
                     name: method_name,
                     func_name: synth_name,
                     func_type: func_type,
-                    receiver_is_ptr: true,
-                    is_static: false,
+                    receiver_is_ptr: !effective_static_gi,
+                    is_static: effective_static_gi,
                     source_tree: 0,
                 })
 

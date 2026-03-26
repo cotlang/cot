@@ -212,7 +212,10 @@ pub const Driver = struct {
         if (self.isProjectSafe(path)) {
             for (parsed_files.items) |*pf| {
                 if (pf.tree.file) |*file| {
-                    file.safe_mode = true;
+                    // Don't override stdlib files — they control their own safe mode
+                    if (!std.mem.containsAtLeast(u8, file.filename, 1, "stdlib/")) {
+                        file.safe_mode = true;
+                    }
                 }
             }
         }
@@ -281,7 +284,10 @@ pub const Driver = struct {
         if (self.isProjectSafe(path)) {
             for (parsed_files.items) |*pf| {
                 if (pf.tree.file) |*file| {
-                    file.safe_mode = true;
+                    // Don't override stdlib files — they control their own safe mode
+                    if (!std.mem.containsAtLeast(u8, file.filename, 1, "stdlib/")) {
+                        file.safe_mode = true;
+                    }
                 }
             }
         }
@@ -684,7 +690,10 @@ pub const Driver = struct {
         if (self.isProjectSafe(path)) {
             for (parsed_files.items) |*pf| {
                 if (pf.tree.file) |*file| {
-                    file.safe_mode = true;
+                    // Don't override stdlib files — they control their own safe mode
+                    if (!std.mem.containsAtLeast(u8, file.filename, 1, "stdlib/")) {
+                        file.safe_mode = true;
+                    }
                 }
             }
         }
