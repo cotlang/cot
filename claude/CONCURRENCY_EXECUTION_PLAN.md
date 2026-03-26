@@ -3,7 +3,35 @@
 **Date:** 2026-03-26
 **Prerequisite:** 0.4 release (version bump + CI green)
 **Design doc:** `claude/SWIFT_CONCURRENCY_PORT.md` (1,971 lines, audited)
-**Status:** Phase 0 COMPLETE (6,156 lines deleted) + Phase 1 COMPLETE (async/await E2E on native)
+**Status:** Phase 0-4 COMPLETE, Phase 3 IN PROGRESS
+
+## Completed Phases
+
+| Phase | What | Tests | Commit |
+|-------|------|-------|--------|
+| 0 | Delete 6,156 lines Go concurrency | 370/370 preserved | 5 commits |
+| 1 | Task type, async/await, ARC lifecycle, block-scoped fn | 4/6 | `8b3837e` |
+| 4 | Sendable isSendable() checker, async fn boundary checks | rejects fn params | `a7cca55` |
+| 1+ | Fix Task ARC (alloc metadata arg, result at offset 0) | 4/6 | `fb13cb6` |
+| 3 | Actor keyword, parser, implicit self injection | 5/6 | `cbd57aa` |
+| 3 | Cross-actor isolation (await required, hop_to_executor pattern) | 5/6 | `ad8f39c` |
+| 3 | nonisolated keyword (SE-0313) | 6/6 | `168b9be` |
+
+## Swift 1:1 Audit Status
+
+| Feature | Swift Reference | Cot Status | Faithful? |
+|---------|----------------|------------|-----------|
+| async fn | Task.swift | Returns Task(T), ARC heap object | Yes |
+| await | GenFunc.cpp suspension | Loads result, releases task | Yes |
+| Task ARC lifecycle | HeapObject.cpp | alloc(metadata=0, size=8) + release | Yes |
+| Sendable | TypeCheckConcurrency.cpp:7488 | isSendable() recursive check | Yes |
+| actor keyword | SE-0306 | Parsed as struct with is_actor=true | Yes |
+| Actor implicit self | Actor protocol | Self injection via parser + checker | Yes |
+| Actor pointer self | AnyObject conformance | safeWrapType for actor types | Yes |
+| Cross-actor await | TypeCheckConcurrency.cpp:8253 | Error without await, skip for nonisolated | Yes |
+| hop_to_executor | SILGenApply.cpp:6155, Actor.cpp:2448 | Phase 1: no-op (single-threaded) | Correct for Phase 1 |
+| nonisolated | SE-0313 | FnDecl flag, MethodInfo flag, checker skip | Yes |
+| Non-reentrant default | Cot divergence (documented) | Not yet enforced at runtime | Design only |
 
 ---
 
