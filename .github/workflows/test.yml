@@ -44,6 +44,7 @@ jobs:
       - name: Cot tests (wasm - full suite)
         if: always()
         continue-on-error: true
+        timeout-minutes: 5
         run: ./test/run_all.sh --target=wasm
 
   test-linux:
