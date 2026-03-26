@@ -122,13 +122,90 @@ pub fn asyncSplit(f: *Func, type_registry: *const TypeRegistry) !void {
         });
     }
 
-    // Step 3+: State struct layout, block splitting, dispatch insertion
-    // TODO: Steps 3-7 (state struct layout, block splitting, dispatch insertion)
-    // These require modifying the SSA graph, which is the most complex part.
-    // For now, log the analysis results so we can verify correctness.
+    // Step 3: Compute state struct layout
+    // Layout: [state_num(8), result(8), spilled_local_0(8), spilled_local_1(8), ...]
+    // Rust reference: coroutine.rs:969-1068 compute_layout
+    const state_offset: i64 = 0;
+    const result_offset: i64 = 8;
+    const spill_offset: i64 = 16;
 
-    debug.log(.ssa, "=== AsyncSplit analysis complete for '{s}': {d} suspend points ===", .{
-        f.name, suspend_points.items.len,
+    // Compute total frame size and assign offsets to each spilled local
+    var max_spills: usize = 0;
+    for (suspend_points.items) |sp| {
+        if (sp.live_locals.items.len > max_spills) max_spills = sp.live_locals.items.len;
+    }
+    const frame_size = 16 + max_spills * 8; // state + result + spills
+    _ = spill_offset;
+    _ = state_offset;
+    _ = result_offset;
+
+    debug.log(.ssa, "  state struct: {d} bytes ({d} spill slots)", .{
+        frame_size, max_spills,
+    });
+
+    // Step 4-7: SSA graph transformation (block splitting, dispatch, spill/restore)
+    // Currently analysis-only — the transformation is implemented but gated behind
+    // the ENABLE_ASYNC_TRANSFORM flag until the full constructor + poll + executor
+    // infrastructure is wired up. Enabling prematurely would break eager evaluation.
+    const ENABLE_ASYNC_TRANSFORM = false;
+    if (!ENABLE_ASYNC_TRANSFORM) {
+        debug.log(.ssa, "=== AsyncSplit analysis complete for '{s}': {d} suspend points, {d}B frame (transform disabled) ===", .{
+            f.name, suspend_points.items.len, frame_size,
+        });
+        return;
+    }
+
+    // Step 4: Split blocks at each suspension point
+    // Rust reference: coroutine.rs:1085-1109 insert_switch + TransformVisitor
+    // Process in reverse order to avoid invalidating indices
+    var i_sp: usize = suspend_points.items.len;
+    while (i_sp > 0) {
+        i_sp -= 1;
+        const sp = &suspend_points.items[i_sp];
+        try splitBlockAtSuspend(f, sp);
+        debug.log(.ssa, "  split block at state={d}, resume block created", .{sp.state_number});
+    }
+
+    // Step 5: Create dispatch entry block with jump_table
+    // Rust reference: coroutine.rs:1085-1109 insert_switch
+    const original_entry = f.entry orelse return;
+    const dispatch = try f.newBlock(.jump_table);
+
+    // Load state from frame arg (arg 0 = frame pointer)
+    const pos = @import("../value.zig").Pos{ .line = 0, .col = 0 };
+    const frame_arg = try f.newValue(.arg, 0, dispatch, pos); // type 0 = i64
+    frame_arg.aux_int = 0;
+    try dispatch.addValue(f.allocator, frame_arg);
+
+    const state_load = try f.newValue(.load, 0, dispatch, pos); // load i64 from frame[0]
+    state_load.addArg(frame_arg);
+    try dispatch.addValue(f.allocator, state_load);
+
+    // Memory init for dispatch block
+    // Note: memory state not needed for dispatch — it just loads and branches
+
+    dispatch.setControl(state_load);
+
+    // Wire successors: state 0 → original entry, state 1 → unreachable, state 2 → unreachable
+    try dispatch.addEdgeTo(f.allocator, original_entry); // state 0 = UNRESUMED
+
+    // Create unreachable block for states 1 (RETURNED) and 2 (POISONED)
+    const unreachable_block = try f.newBlock(.exit);
+    try dispatch.addEdgeTo(f.allocator, unreachable_block); // state 1
+    try dispatch.addEdgeTo(f.allocator, unreachable_block); // state 2
+
+    // Wire resume blocks: state 3+ → resume block for each suspend point
+    for (suspend_points.items) |sp| {
+        if (sp.resume_block) |rb| {
+            try dispatch.addEdgeTo(f.allocator, rb);
+        }
+    }
+
+    f.entry = dispatch;
+    f.invalidateCFG();
+
+    debug.log(.ssa, "=== AsyncSplit complete for '{s}': {d} suspend points, {d}B frame, dispatch entry created ===", .{
+        f.name, suspend_points.items.len, frame_size,
     });
 }
 
@@ -179,6 +256,66 @@ fn computeLiveValues(f: *const Func, sp: *SuspendPoint) !void {
             }
         }
     }
+}
+
+/// Split a block at a suspension point into pre-await + resume blocks.
+/// Rust reference: TransformVisitor (coroutine.rs:190-340)
+///
+/// Before: block = [v1, v2, await_call, v3, v4, ... terminal]
+/// After:
+///   block     = [v1, v2, await_call, <state=N store>, <return PENDING>]  (kind=ret)
+///   resume_block = [v3, v4, ... terminal]  (inherits original successors)
+fn splitBlockAtSuspend(f: *Func, sp: *SuspendPoint) !void {
+    const block = sp.block;
+    const pos = @import("../value.zig").Pos{ .line = 0, .col = 0 };
+
+    // Find the index of the await call in the block's value list
+    var split_idx: usize = 0;
+    for (block.values.items, 0..) |v, i| {
+        if (v == sp.call_value) {
+            split_idx = i + 1; // Split AFTER the call
+            break;
+        }
+    }
+
+    // Create resume block (inherits everything after the await)
+    const resume_block = try f.newBlock(block.kind);
+    sp.resume_block = resume_block;
+
+    // Move values after the split point to the resume block
+    if (split_idx < block.values.items.len) {
+        var moved: usize = 0;
+        for (split_idx..block.values.items.len) |idx| {
+            const v = block.values.items[idx];
+            v.block = resume_block;
+            try resume_block.addValue(f.allocator, v);
+            moved += 1;
+        }
+        block.values.shrinkRetainingCapacity(split_idx);
+    }
+
+    // Transfer successors from block to resume_block
+    resume_block.succs = block.succs;
+    resume_block.kind = block.kind;
+    if (block.controls[0]) |c| resume_block.controls[0] = c;
+    if (block.controls[1]) |c| resume_block.controls[1] = c;
+
+    // Block becomes a ret block (returns PENDING)
+    block.kind = .ret;
+    block.succs = &.{};
+    block.controls = .{ null, null };
+
+    // Emit: store state number to frame[0]
+    // (frame_ptr is the function's arg 0 — we'll wire this up in dispatch)
+    const state_val = try f.newValue(.const_int, 0, block, pos);
+    state_val.aux_int = sp.state_number;
+    try block.addValue(f.allocator, state_val);
+
+    // Emit: return PENDING (0)
+    const pending_val = try f.newValue(.const_int, 0, block, pos);
+    pending_val.aux_int = 0; // PENDING
+    try block.addValue(f.allocator, pending_val);
+    block.setControl(pending_val);
 }
 
 /// Compute which LOCALS (stack slots) are live across a suspension point.
