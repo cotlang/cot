@@ -823,14 +823,15 @@ pub const Lowerer = struct {
                 _ = try fb.addParam(param.name, param_type, param_size);
             }
 
-            // Allocate TaskObject: 16 bytes (refcount=1 at offset 0, result at offset 8)
-            const sixteen = try fb.emitConstInt(16, TypeRegistry.I64, fn_decl.span);
-            var alloc_args = [_]ir.NodeIndex{sixteen};
+            // Allocate TaskObject via alloc(metadata=0, size=8).
+            // alloc() adds a 32-byte ARC header (magic, size, metadata, refcount=1).
+            // User data = 8 bytes for the result at offset 0 of returned pointer.
+            // metadata=0 means no destructor (release just frees).
+            // Swift reference: Task.h — AsyncTask is a HeapObject (has ARC refcount).
+            const zero_metadata = try fb.emitConstInt(0, TypeRegistry.I64, fn_decl.span);
+            const eight = try fb.emitConstInt(8, TypeRegistry.I64, fn_decl.span);
+            var alloc_args = [_]ir.NodeIndex{ zero_metadata, eight };
             const task_ptr = try fb.emitCall("alloc", &alloc_args, false, TypeRegistry.I64, fn_decl.span);
-
-            // Store refcount = 1 at offset 0
-            const one = try fb.emitConstInt(1, TypeRegistry.I64, fn_decl.span);
-            _ = try fb.emitPtrStoreValue(task_ptr, one, fn_decl.span);
 
             // Store the task_ptr in a local so lowerReturn can access it
             const task_local = try fb.addLocalWithSize("__async_task", TypeRegistry.I64, false, 8);
@@ -1361,13 +1362,12 @@ pub const Lowerer = struct {
     fn lowerReturn(self: *Lowerer, ret: ast.ReturnStmt) !void {
         const fb = self.current_func orelse return;
 
-        // Phase 1 async: store result at task_ptr+8, then return task_ptr
+        // Phase 1 async: store result at task_ptr+0 (user data), then return task_ptr
         if (fb.async_task_local) |task_local| {
             if (ret.value != null_node) {
                 const result = try self.lowerExprNode(ret.value);
                 const task_ptr = try fb.emitLoadLocal(task_local, TypeRegistry.I64, ret.span);
-                const result_addr = try fb.emitAddrOffset(task_ptr, 8, TypeRegistry.I64, ret.span);
-                _ = try fb.emitPtrStoreValue(result_addr, result, ret.span);
+                _ = try fb.emitPtrStoreValue(task_ptr, result, ret.span);
             }
             // Run cleanup stack before returning
             try self.emitCleanups(0);
@@ -11964,18 +11964,17 @@ pub const Lowerer = struct {
         // Lower the operand — this returns a Task pointer (i64)
         const task_ptr = try self.lowerExprNode(ae.operand);
 
-        // Phase 1 (eager): result is already at task_ptr+8 (body ran synchronously)
-        // Load the result directly
-        const result_addr = try fb.emitAddrOffset(task_ptr, 8, TypeRegistry.I64, ae.span);
+        // Phase 1 (eager): result is at task_ptr+0 (user data, body ran synchronously)
         const result_type = self.inferExprType(ae.operand);
         const inner_type = if (self.type_reg.get(result_type) == .task)
             self.type_reg.get(result_type).task.result_type
         else
             TypeRegistry.I64;
-        const result = try fb.emitPtrLoadValue(result_addr, inner_type, ae.span);
+        const result = try fb.emitPtrLoadValue(task_ptr, inner_type, ae.span);
 
-        // Phase 1: skip dealloc for now (leak the 16 bytes).
-        // TODO: proper ARC-based task lifecycle in Phase 2.
+        // Release the task (ARC decrement — alloc sets refcount=1, release frees at 0)
+        var release_args = [_]ir.NodeIndex{task_ptr};
+        _ = try fb.emitCall("release", &release_args, false, TypeRegistry.VOID, ae.span);
 
         return result;
     }
