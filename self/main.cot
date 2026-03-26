@@ -55,7 +55,8 @@ fn main() void {
     }
 
     if (cmd == "version" or cmd == "--version") {
-        println("cot 0.3.7 (self-hosted)")
+        const ver = trim(@embedFile("../VERSION"))
+        println("cot ${ver} (self-hosted)")
         return
     }
 
