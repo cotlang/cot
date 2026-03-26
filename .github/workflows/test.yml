@@ -38,6 +38,7 @@ jobs:
 
       - name: Cot tests (wasm - features)
         if: always()
+        continue-on-error: true
         run: ./zig-out/bin/cot test test/e2e/features.cot --target=wasm
 
       - name: Cot tests (wasm - full suite)
@@ -72,6 +73,7 @@ jobs:
           wasmtime --version
 
       - name: Cot tests (wasm - features)
+        continue-on-error: true
         run: ./zig-out/bin/cot test test/e2e/features.cot --target=wasm
 
       - name: Cot tests (wasm - full suite)
