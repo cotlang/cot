@@ -1,0 +1,115 @@
+// AsyncStream tests — Swift SE-0314 faithful port.
+// Tests builder pattern, yield, buffering policies, finish, for-await.
+
+import "std/async_stream"
+import "std/sys"
+
+test "async stream builder yields values" {
+    var stream = AsyncStream_init(int)(POLICY_UNBOUNDED, 0, fn(cont: *AsyncStreamContinuation(int)) void {
+        cont.yield(10)
+        cont.yield(20)
+        cont.yield(30)
+    })
+
+    @assertEq(stream.next().?, 10)
+    @assertEq(stream.next().?, 20)
+    @assertEq(stream.next().?, 30)
+    @assert(stream.next() == null)
+}
+
+test "async stream yield result enqueued" {
+    var stream = AsyncStream_init(int)(POLICY_UNBOUNDED, 0, fn(cont: *AsyncStreamContinuation(int)) void {
+        const r = cont.yield(42)
+        @assertEq(r.kind, YIELD_ENQUEUED)
+    })
+    @assertEq(stream.next().?, 42)
+}
+
+test "async stream finish terminates" {
+    var stream = AsyncStream_init(int)(POLICY_UNBOUNDED, 0, fn(cont: *AsyncStreamContinuation(int)) void {
+        cont.yield(1)
+        cont.finish()
+        const r = cont.yield(2)
+        @assertEq(r.kind, YIELD_TERMINATED)
+    })
+
+    @assertEq(stream.next().?, 1)
+    @assert(stream.next() == null)
+}
+
+test "async stream for-await iteration" {
+    var stream = AsyncStream_init(int)(POLICY_UNBOUNDED, 0, fn(cont: *AsyncStreamContinuation(int)) void {
+        cont.yield(1)
+        cont.yield(2)
+        cont.yield(3)
+        cont.yield(4)
+        cont.yield(5)
+    })
+
+    var sum = 0
+    for await val in stream {
+        sum = sum + val
+    }
+    @assertEq(sum, 15)
+}
+
+test "async stream bufferingOldest drops new" {
+    // bufferingOldest(3): keep first 3, drop anything after
+    var stream = AsyncStream_init(int)(POLICY_OLDEST, 3, fn(cont: *AsyncStreamContinuation(int)) void {
+        @assertEq(cont.yield(1).kind, YIELD_ENQUEUED)
+        @assertEq(cont.yield(2).kind, YIELD_ENQUEUED)
+        @assertEq(cont.yield(3).kind, YIELD_ENQUEUED)
+        @assertEq(cont.yield(4).kind, YIELD_DROPPED)
+        @assertEq(cont.yield(5).kind, YIELD_DROPPED)
+    })
+
+    @assertEq(stream.next().?, 1)
+    @assertEq(stream.next().?, 2)
+    @assertEq(stream.next().?, 3)
+    @assert(stream.next() == null)
+}
+
+test "async stream bufferingNewest drops old" {
+    // bufferingNewest(3): keep last 3, drop oldest when full
+    var stream = AsyncStream_init(int)(POLICY_NEWEST, 3, fn(cont: *AsyncStreamContinuation(int)) void {
+        cont.yield(1)
+        cont.yield(2)
+        cont.yield(3)
+        cont.yield(4)
+        cont.yield(5)
+    })
+
+    // Should have [3, 4, 5] (1 and 2 dropped as oldest)
+    @assertEq(stream.next().?, 3)
+    @assertEq(stream.next().?, 4)
+    @assertEq(stream.next().?, 5)
+    @assert(stream.next() == null)
+}
+
+test "async stream makeStream factory" {
+    var cont: AsyncStreamContinuation(int) = undefined
+    var stream = AsyncStream_makeStream(int)(POLICY_UNBOUNDED, 0, &cont)
+    cont.yield(42)
+    cont.yield(99)
+    @assertEq(stream.next().?, 42)
+    @assertEq(stream.next().?, 99)
+}
+
+test "async stream empty" {
+    var stream = AsyncStream_init(int)(POLICY_UNBOUNDED, 0, fn(cont: *AsyncStreamContinuation(int)) void {
+        // yield nothing
+    })
+    @assert(stream.next() == null)
+}
+
+test "async stream bufferingOldest remaining count" {
+    var stream = AsyncStream_init(int)(POLICY_OLDEST, 5, fn(cont: *AsyncStreamContinuation(int)) void {
+        const r1 = cont.yield(1)
+        @assertEq(r1.remaining, 4)
+        const r2 = cont.yield(2)
+        @assertEq(r2.remaining, 3)
+        const r3 = cont.yield(3)
+        @assertEq(r3.remaining, 2)
+    })
+    let _ = stream.next()
+}
