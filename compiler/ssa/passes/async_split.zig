@@ -132,10 +132,12 @@ pub fn asyncSplit(f: *Func, type_registry: *const TypeRegistry) !void {
     // Layout: [state_num(8), result(8), spilled_local_0(8), spilled_local_1(8), ...]
     // Rust reference: coroutine.rs:969-1068 compute_layout
     // Frame layout: result at offset 0 (compatible with TaskObject — lowerAwaitExpr
-    // loads from task[0]), state at offset 8, spills start at offset 16.
+    // loads from task[0]), state at offset 8, call_result (task ptr from await) at
+    // offset 16, spills start at offset 24.
     const result_offset: i64 = 0;
     const state_offset: i64 = 8;
-    const spill_offset: i64 = 16;
+    const call_result_offset: i64 = 16;
+    const spill_offset: i64 = 24;
 
     // Compute frame layout: assign a unique offset to each spilled local
     // Rust: coroutine.rs:969-1068 compute_layout — builds variant-based layout
@@ -191,6 +193,11 @@ pub fn asyncSplit(f: *Func, type_registry: *const TypeRegistry) !void {
     // (if/else chain reading frame[state_offset]) has a bug where the state
     // check always fails, causing infinite loops. Native path skips async_split
     // entirely (uses eager evaluation). Re-enable after fixing Wasm dispatch.
+    // Gate: state machine works for individual files but produces truncated Wasm
+    // when the full concurrency.cot test file is compiled (139 functions).
+    // The constructor/poll split + state machine transform work correctly for
+    // isolated tests. The issue is in the Wasm linker when many functions are
+    // present. TODO: investigate section size calculation in link.zig.
     if (true or suspend_points.items.len < 2) {
         debug.log(.async_split, "=== AsyncSplit skipped for '{s}': {d} suspend points (<=1, eager sufficient) ===", .{
             f.name, suspend_points.items.len,
@@ -209,7 +216,7 @@ pub fn asyncSplit(f: *Func, type_registry: *const TypeRegistry) !void {
     while (i_sp > 0) {
         i_sp -= 1;
         const sp = &suspend_points.items[i_sp];
-        try splitBlockAtSuspend(f, sp, &local_to_offset, state_offset);
+        try splitBlockAtSuspend(f, sp, &local_to_offset, state_offset, call_result_offset);
         debug.log(.async_split, "  split block at state={d}, resume block created", .{sp.state_number});
     }
 
@@ -339,7 +346,7 @@ fn computeLiveValues(f: *const Func, sp: *SuspendPoint) !void {
 /// 4. Rewrite uses in resume block to reference restored values
 ///
 /// This eliminates cross-block value references that would violate SSA dominance.
-fn splitBlockAtSuspend(f: *Func, sp: *SuspendPoint, local_to_offset: *const std.AutoHashMapUnmanaged(u32, i64), state_offset: i64) !void {
+fn splitBlockAtSuspend(f: *Func, sp: *SuspendPoint, local_to_offset: *const std.AutoHashMapUnmanaged(u32, i64), state_offset: i64, call_result_offset: i64) !void {
     const block = sp.block;
     const Pos = @import("../value.zig").Pos;
     const pos = Pos{ .line = 0, .col = 0 };
@@ -380,10 +387,9 @@ fn splitBlockAtSuspend(f: *Func, sp: *SuspendPoint, local_to_offset: *const std.
 
     // === SPILL: store state + await result + live locals to frame, return void ===
 
-    // The await call result (task pointer) is stored to frame[result_offset]
+    // The await call result (task pointer) is stored to frame[call_result_offset]
     // so the resume block can load it to extract the task's return value.
     // Rust: the callee future is stored as a field in the caller's coroutine struct.
-    const call_result_offset: i64 = 8; // frame[8] = task pointer from await call
 
     // Get frame pointer (arg 0) in this block
     var frame_ptr_in_block: ?*Value = null;
