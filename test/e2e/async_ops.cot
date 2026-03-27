@@ -1,0 +1,181 @@
+// AsyncSequence operator tests — Swift AsyncSequence default implementations
+// Swift reference: AsyncSequence.swift, AsyncMapSequence.swift, etc.
+//
+// Terminal operators consume a stream and produce results.
+
+import "std/async_ops"
+
+// Helper: create a stream with values 1..n
+fn makeStream(n: int) AsyncStream(int) {
+    return AsyncStream_init(int)(POLICY_UNBOUNDED, 0,
+        fn(cont: *AsyncStreamContinuation(int)) void {
+            var i = 1
+            while (i <= n) {
+                cont.yield(i)
+                i = i + 1
+            }
+            cont.finish()
+        }
+    )
+}
+
+// --- reduce ---
+
+test "asyncReduce sum" {
+    var s = makeStream(5)
+    var sum = asyncReduce(&s, 0, fn(acc: int, x: int) int { return acc + x })
+    @assertEq(sum, 15)
+}
+
+test "asyncReduce product" {
+    var s = makeStream(4)
+    var product = asyncReduce(&s, 1, fn(acc: int, x: int) int { return acc * x })
+    @assertEq(product, 24)
+}
+
+test "asyncReduce empty stream" {
+    var s = makeStream(0)
+    var sum = asyncReduce(&s, 42, fn(acc: int, x: int) int { return acc + x })
+    @assertEq(sum, 42)
+}
+
+// --- contains ---
+
+test "asyncContains found" {
+    var s = makeStream(5)
+    var found = asyncContains(&s, fn(x: int) bool { return x == 3 })
+    @assert(found)
+}
+
+test "asyncContains not found" {
+    var s = makeStream(5)
+    var found = asyncContains(&s, fn(x: int) bool { return x == 99 })
+    @assert(!found)
+}
+
+// --- allSatisfy ---
+
+test "asyncAllSatisfy true" {
+    var s = makeStream(5)
+    var all = asyncAllSatisfy(&s, fn(x: int) bool { return x > 0 })
+    @assert(all)
+}
+
+test "asyncAllSatisfy false" {
+    var s = makeStream(5)
+    var all = asyncAllSatisfy(&s, fn(x: int) bool { return x < 3 })
+    @assert(!all)
+}
+
+// --- first ---
+
+test "asyncFirst found" {
+    var s = makeStream(5)
+    var first = asyncFirst(&s, fn(x: int) bool { return x > 3 })
+    @assertEq(first orelse -1, 4)
+}
+
+test "asyncFirst not found" {
+    var s = makeStream(5)
+    var first = asyncFirst(&s, fn(x: int) bool { return x > 99 })
+    @assert(first == null)
+}
+
+// --- min / max ---
+
+test "asyncMin" {
+    var s = makeStream(5)
+    var m = asyncMin(&s, fn(a: int, b: int) bool { return a < b })
+    @assertEq(m orelse -1, 1)
+}
+
+test "asyncMax" {
+    var s = makeStream(5)
+    var m = asyncMax(&s, fn(a: int, b: int) bool { return a < b })
+    @assertEq(m orelse -1, 5)
+}
+
+test "asyncMin empty" {
+    var s = makeStream(0)
+    var m = asyncMin(&s, fn(a: int, b: int) bool { return a < b })
+    @assert(m == null)
+}
+
+// --- map ---
+
+test "asyncMap double" {
+    var s = makeStream(3)
+    var doubled = asyncMap(&s, fn(x: int) int { return x * 2 })
+    @assertEq(doubled.len(), 3)
+    @assertEq(doubled.get(0), 2)
+    @assertEq(doubled.get(1), 4)
+    @assertEq(doubled.get(2), 6)
+}
+
+// --- filter ---
+
+test "asyncFilter evens" {
+    var s = makeStream(6)
+    var evens = asyncFilter(&s, fn(x: int) bool { return x % 2 == 0 })
+    @assertEq(evens.len(), 3)
+    @assertEq(evens.get(0), 2)
+    @assertEq(evens.get(1), 4)
+    @assertEq(evens.get(2), 6)
+}
+
+// --- collect ---
+
+test "asyncCollect" {
+    var s = makeStream(4)
+    var all = asyncCollect(int)(&s)
+    @assertEq(all.len(), 4)
+    @assertEq(all.get(0), 1)
+    @assertEq(all.get(3), 4)
+}
+
+// --- count ---
+
+test "asyncCount" {
+    var s = makeStream(7)
+    var n = asyncCount(int)(&s)
+    @assertEq(n, 7)
+}
+
+// --- dropFirst ---
+
+test "asyncDropFirst" {
+    var s = makeStream(5)
+    var rest = asyncDropFirst(&s, 2)
+    @assertEq(rest.len(), 3)
+    @assertEq(rest.get(0), 3)
+    @assertEq(rest.get(1), 4)
+    @assertEq(rest.get(2), 5)
+}
+
+test "asyncDropFirst more than available" {
+    var s = makeStream(2)
+    var rest = asyncDropFirst(&s, 5)
+    @assertEq(rest.len(), 0)
+}
+
+// --- prefix ---
+
+test "asyncPrefix" {
+    var s = makeStream(5)
+    var first3 = asyncPrefix(&s, 3)
+    @assertEq(first3.len(), 3)
+    @assertEq(first3.get(0), 1)
+    @assertEq(first3.get(1), 2)
+    @assertEq(first3.get(2), 3)
+}
+
+test "asyncPrefix more than available" {
+    var s = makeStream(2)
+    var all = asyncPrefix(&s, 5)
+    @assertEq(all.len(), 2)
+}
+
+// --- compactMap ---
+// NOTE: asyncCompactMap with fn(int) -> ?int closure crashes on native (SIGSEGV).
+// Pre-existing compiler bug: closures returning optionals through function pointers.
+// Skipped for now — will work once the compiler fixes optional closure returns.
