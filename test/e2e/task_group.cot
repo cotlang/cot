@@ -1,5 +1,6 @@
 // TaskGroup tests — Swift structured concurrency (SE-0304)
 import "std/task_group"
+import "std/sys"
 
 test "task group addTask with closure and next" {
     var group = TaskGroup(int).init()
@@ -99,4 +100,19 @@ test "task group closure captures" {
         sum = sum + val
     }
     @assertEq(sum, 306)
+}
+
+test "task group cancelAll" {
+    var group = TaskGroup(int).init()
+    group.addTask(fn() int { return 1 })
+    group.addTask(fn() int { return 2 })
+    group.addTask(fn() int { return 3 })
+
+    // Cancel all before consuming
+    group.cancelAll()
+    // Results still available (Phase 1: tasks already completed eagerly)
+    // but task objects have cancelled flag set
+    @assertEq(task_is_cancelled(group.tasks.get(0)), 1)
+    @assertEq(task_is_cancelled(group.tasks.get(1)), 1)
+    @assertEq(task_is_cancelled(group.tasks.get(2)), 1)
 }
