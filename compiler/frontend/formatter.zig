@@ -206,6 +206,12 @@ pub const Formatter = struct {
             .error_set_decl => |d| self.printErrorSet(d),
             .test_decl => |d| self.printTestDecl(d),
             .bench_decl => |d| self.printBenchDecl(d),
+            .unchecked_sendable => |d| {
+                self.writeIndent();
+                self.write("impl @unchecked Sendable for ") catch {};
+                self.write(d.type_name) catch {};
+                self.write(" {}\n") catch {};
+            },
             .bad_decl => {},
         }
     }

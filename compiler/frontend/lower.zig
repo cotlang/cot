@@ -701,7 +701,7 @@ pub const Lowerer = struct {
                     }
                 }
             },
-            .trait_decl, .union_decl, .type_alias, .import_decl, .error_set_decl, .bad_decl => {},
+            .trait_decl, .union_decl, .type_alias, .import_decl, .error_set_decl, .unchecked_sendable, .bad_decl => {},
         }
     }
 

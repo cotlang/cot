@@ -230,6 +230,9 @@ pub const Checker = struct {
     /// Swift actor isolation: tracks which type names are actors.
     /// Used by the isolation checker to determine when `await` is required.
     actor_types: std.StringHashMap(void) = std.StringHashMap(void).init(std.heap.page_allocator),
+    /// Types with `impl @unchecked Sendable for Type` — bypass recursive Sendable check.
+    /// Swift reference: TypeCheckConcurrency.cpp:7488 — @unchecked Sendable conformance.
+    unchecked_sendable_types: std.StringHashMap(void) = std.StringHashMap(void).init(std.heap.page_allocator),
     /// Current actor context: non-null when inside an actor method body.
     /// Cross-actor calls (calling methods on a different actor) require `await`.
     current_actor_type: ?[]const u8 = null,
@@ -819,6 +822,9 @@ pub const Checker = struct {
                         try self.checkFnDeclWithName(f, nested_idx, synth_name);
                     }
                 }
+            },
+            .unchecked_sendable => |us| {
+                try self.unchecked_sendable_types.put(us.type_name, {});
             },
             .test_decl => |t| try self.checkTestDecl(t),
             .bench_decl => |b| try self.checkBenchDecl(b),
@@ -3383,6 +3389,8 @@ pub const Checker = struct {
         return switch (info) {
             .basic => true,
             .struct_type => |s| {
+                // @unchecked Sendable: bypass recursive check
+                if (self.unchecked_sendable_types.contains(s.name)) return true;
                 for (s.fields) |f| {
                     if (!self.isSendable(f.type_idx)) return false;
                 }

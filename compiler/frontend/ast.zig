@@ -33,6 +33,7 @@ pub const Decl = union(enum) {
     trait_decl: TraitDecl,
     impl_trait: ImplTraitBlock,
     error_set_decl: ErrorSetDecl,
+    unchecked_sendable: UncheckedSendable,
     test_decl: TestDecl,
     bench_decl: BenchDecl,
     bad_decl: BadDecl,
@@ -81,6 +82,8 @@ pub const UnionDecl = struct { name: []const u8, variants: []const UnionVariant,
 pub const TypeAlias = struct { name: []const u8, target: NodeIndex, is_distinct: bool = false, doc_comment: []const u8 = "", span: Span };
 pub const ImportDecl = struct { path: []const u8, span: Span };
 pub const ErrorSetDecl = struct { name: []const u8, variants: []const []const u8, doc_comment: []const u8 = "", span: Span };
+/// impl @unchecked Sendable for Type { } — escape hatch for Sendable checking.
+pub const UncheckedSendable = struct { type_name: []const u8, span: Span };
 pub const BadDecl = struct { span: Span };
 
 pub const Field = struct { name: []const u8, type_expr: NodeIndex, default_value: NodeIndex, doc_comment: []const u8 = "", span: Span };

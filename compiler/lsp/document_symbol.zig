@@ -234,6 +234,7 @@ fn declToSymbol(allocator: std.mem.Allocator, tree: *const Ast, content: []const
                 .children = &.{},
             };
         },
+        .unchecked_sendable => return null,
         .bad_decl => return null,
     }
 }

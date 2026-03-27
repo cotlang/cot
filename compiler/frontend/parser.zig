@@ -680,7 +680,34 @@ pub const Parser = struct {
     fn parseImplBlock(self: *Parser) ParseError!?NodeIndex {
         const doc_comment = self.consumeDocComment();
         const start = self.pos();
-        self.advance();
+        self.advance(); // consume 'impl'
+
+        // impl @unchecked Sendable for Type — escape hatch (SE-0302)
+        // Registers type as unconditionally Sendable.
+        if (self.check(.at)) {
+            const peek = self.peekToken();
+            if (peek.tok == .ident and std.mem.eql(u8, peek.text, "unchecked")) {
+                self.advance(); // consume @
+                self.advance(); // consume unchecked
+                if (!self.check(.ident) or !std.mem.eql(u8, self.tok.text, "Sendable")) {
+                    self.syntaxError("expected 'Sendable' after @unchecked");
+                    return null;
+                }
+                self.advance(); // consume Sendable
+                if (!self.expect(.kw_for)) return null;
+                if (!self.check(.ident)) { self.syntaxError("expected type name after 'for'"); return null; }
+                const target_type = self.tok.text;
+                self.advance();
+                if (!self.expect(.lbrace)) return null;
+                if (!self.expect(.rbrace)) return null;
+                // Store in AST as a special unchecked_sendable decl
+                return try self.tree.addDecl(.{ .unchecked_sendable = .{
+                    .type_name = target_type,
+                    .span = Span.init(start, self.pos()),
+                } });
+            }
+        }
+
         if (!self.check(.ident)) { self.err.errorWithCode(self.pos(), .e203, "expected type name after 'impl'"); return null; }
         const type_name = self.tok.text;
         self.advance();

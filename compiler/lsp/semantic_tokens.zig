@@ -228,6 +228,7 @@ const TokenCollector = struct {
             .bench_decl => |b| {
                 self.walkNode(b.body);
             },
+            .unchecked_sendable => {},
             .bad_decl => {},
         }
     }
