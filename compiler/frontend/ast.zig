@@ -413,7 +413,7 @@ pub const OrElseExpr = struct {
 };
 pub const OrElseFallback = enum { expr, return_void, return_val, break_val, continue_val };
 pub const ErrorLiteral = struct { error_name: []const u8, span: Span };
-pub const ClosureExpr = struct { params: []const Field, return_type: NodeIndex, body: NodeIndex, span: Span };
+pub const ClosureExpr = struct { params: []const Field, return_type: NodeIndex, body: NodeIndex, is_sendable: bool = false, span: Span };
 pub const TupleLiteral = struct { elements: []const NodeIndex, span: Span };
 pub const ComptimeBlock = struct { body: NodeIndex, span: Span };
 pub const ZeroInit = struct { span: Span };

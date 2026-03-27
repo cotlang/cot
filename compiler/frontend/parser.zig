@@ -1594,7 +1594,37 @@ pub const Parser = struct {
                 self.advance();
                 return try self.tree.addExpr(.{ .field_access = .{ .base = null_node, .field = n, .span = Span.init(start, self.pos()) } });
             },
-            .at => return self.parseBuiltinCall(start),
+            .at => {
+                // Check for @Sendable fn(...) — closure with Sendable annotation (SE-0302)
+                const peek = self.peekToken();
+                if (peek.tok == .ident and std.mem.eql(u8, peek.text, "Sendable")) {
+                    self.advance(); // consume @
+                    self.advance(); // consume Sendable
+                    if (self.check(.kw_fn)) {
+                        // Parse closure with is_sendable = true
+                        self.advance(); // consume fn
+                        if (!self.expect(.lparen)) return null;
+                        const params = try self.parseFieldList(.rparen);
+                        if (!self.expect(.rparen)) return null;
+                        var return_type: NodeIndex = null_node;
+                        if (!self.check(.lbrace) and !self.check(.eof))
+                            return_type = try self.parseType() orelse null_node;
+                        const body = try self.parseBlock() orelse return null;
+                        return try self.tree.addExpr(.{ .closure_expr = .{
+                            .params = params,
+                            .return_type = return_type,
+                            .body = body,
+                            .is_sendable = true,
+                            .span = Span.init(start, self.pos()),
+                        } });
+                    }
+                    // Not followed by fn — rewind and parse as builtin
+                    // Can't easily rewind here, so just error
+                    self.err.errorWithCode(self.pos(), .e201, "@Sendable must be followed by 'fn'");
+                    return null;
+                }
+                return self.parseBuiltinCall(start);
+            },
             else => {
                 if (self.tok.tok.isTypeKeyword()) {
                     const n = self.tok.tok.string();

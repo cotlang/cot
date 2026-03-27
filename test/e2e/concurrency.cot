@@ -215,3 +215,23 @@ test "async fn with loop" {
 
     @assertEq(await sumTo(10), 55)
 }
+
+// === @Sendable closure tests (SE-0302) ===
+
+test "sendable closure with Sendable capture" {
+    const x = 42
+    const f = @Sendable fn() i64 { return x }
+    @assertEq(f(), 42)
+}
+
+test "sendable closure no captures" {
+    const f = @Sendable fn(a: i64) i64 { return a * 2 }
+    @assertEq(f(5), 10)
+}
+
+test "sendable closure captures multiple Sendable values" {
+    const a = 10
+    const b = 20
+    const f = @Sendable fn() i64 { return a + b }
+    @assertEq(f(), 30)
+}

@@ -2024,7 +2024,84 @@ pub const Checker = struct {
         if (ce.body != null_node) try self.checkBlockExpr(ce.body);
         self.scope = old_scope;
         self.current_return_type = old_return;
+
+        // @Sendable closures: verify all captured variables are Sendable.
+        // Swift reference: TypeCheckConcurrency.cpp:2971-3098 checkLocalCaptures
+        // A captured variable is any identifier in the body that resolves to the
+        // PARENT scope (not the closure's own scope or params).
+        if (ce.is_sendable and ce.body != null_node) {
+            try self.checkSendableCaptures(ce.body, &func_scope, ce.span);
+        }
+
         return func_type;
+    }
+
+    /// Check that all variables captured by a @Sendable closure are Sendable.
+    /// Swift reference: TypeCheckConcurrency.cpp:2971-3098 checkLocalCaptures.
+    /// Walks the closure body AST, finds identifiers that resolve to the enclosing
+    /// scope (not the closure's own params), and verifies each is Sendable.
+    fn checkSendableCaptures(self: *Checker, body: NodeIndex, closure_scope: *Scope, span: Span) CheckError!void {
+        const node = self.tree.getNode(body) orelse return;
+
+        // Check expressions for captured identifiers
+        if (node.asExpr()) |expr| {
+            switch (expr) {
+                .ident => |id| {
+                    // If this ident resolves in the closure's own scope (params), skip.
+                    // If it resolves in the PARENT scope, it's a capture.
+                    if (closure_scope.lookupLocal(id.name) != null) return; // param, not capture
+                    if (self.scope.lookup(id.name)) |sym| {
+                        if (sym.kind == .parameter or sym.kind == .variable or sym.kind == .constant) {
+                            if (!self.isSendable(sym.type_idx)) {
+                                self.err.errorWithCode(span.start, .e300,
+                                    "capture of non-Sendable type in @Sendable closure");
+                            }
+                        }
+                    }
+                },
+                .call => |c| {
+                    try self.checkSendableCaptures(c.callee, closure_scope, span);
+                    for (c.args) |arg| try self.checkSendableCaptures(arg, closure_scope, span);
+                },
+                .binary => |b| {
+                    try self.checkSendableCaptures(b.left, closure_scope, span);
+                    try self.checkSendableCaptures(b.right, closure_scope, span);
+                },
+                .unary => |u| try self.checkSendableCaptures(u.operand, closure_scope, span),
+                .field_access => |f| try self.checkSendableCaptures(f.base, closure_scope, span),
+                .index => |i| {
+                    try self.checkSendableCaptures(i.base, closure_scope, span);
+                    try self.checkSendableCaptures(i.idx, closure_scope, span);
+                },
+                .block_expr => |b| {
+                    for (b.stmts) |s| try self.checkSendableCaptures(s, closure_scope, span);
+                    if (b.expr != null_node) try self.checkSendableCaptures(b.expr, closure_scope, span);
+                },
+                else => {},
+            }
+        }
+
+        // Check statements
+        if (node.asStmt()) |stmt| {
+            switch (stmt) {
+                .return_stmt => |r| {
+                    if (r.value != null_node) try self.checkSendableCaptures(r.value, closure_scope, span);
+                },
+                .var_stmt => |v| {
+                    if (v.value != null_node) try self.checkSendableCaptures(v.value, closure_scope, span);
+                },
+                .expr_stmt => |e| try self.checkSendableCaptures(e.expr, closure_scope, span),
+                .if_stmt => |i| {
+                    try self.checkSendableCaptures(i.condition, closure_scope, span);
+                    if (i.then_branch != null_node) try self.checkSendableCaptures(i.then_branch, closure_scope, span);
+                    if (i.else_branch != null_node) try self.checkSendableCaptures(i.else_branch, closure_scope, span);
+                },
+                .block_stmt => |b| {
+                    for (b.stmts) |s| try self.checkSendableCaptures(s, closure_scope, span);
+                },
+                else => {},
+            }
+        }
     }
 
     fn checkCall(self: *Checker, c: ast.Call) CheckError!TypeIndex {
