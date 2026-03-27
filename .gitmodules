@@ -42,3 +42,6 @@
 	url = https://github.com/JetBrains/kotlin.git
 	shallow = true
 	ignore = dirty
+[submodule "references/roc"]
+	path = references/roc
+	url = https://github.com/roc-lang/roc.git

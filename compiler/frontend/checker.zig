@@ -3574,6 +3574,7 @@ pub const Checker = struct {
         }
         const elem_type = operand_info.error_union.elem;
         // Catch capture: catch |err| { ... } — bind err to error set type
+        var fallback_type: TypeIndex = TypeRegistry.VOID;
         if (ce.capture.len > 0) {
             const err_type = if (operand_info.error_union.error_set != types.invalid_type) operand_info.error_union.error_set else TypeRegistry.I64;
             const capture_type = if (ce.capture_is_ptr)
@@ -3585,10 +3586,16 @@ pub const Checker = struct {
             const old_scope = self.scope;
             self.scope = &capture_scope;
             try capture_scope.define(Symbol.init(ce.capture, .variable, capture_type, ast.null_node, false));
-            _ = try self.checkExpr(ce.fallback);
+            fallback_type = try self.checkExpr(ce.fallback);
             self.scope = old_scope;
         } else {
-            _ = try self.checkExpr(ce.fallback);
+            fallback_type = try self.checkExpr(ce.fallback);
+        }
+        // Zig pattern: when elem_type is void but fallback produces a value,
+        // the catch expression's type is the fallback type.
+        // E.g., `voidErrUnion() catch 99` has type int, not void.
+        if (elem_type == TypeRegistry.VOID and fallback_type != TypeRegistry.VOID) {
+            return fallback_type;
         }
         return elem_type;
     }

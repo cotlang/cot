@@ -12471,6 +12471,14 @@ pub const Lowerer = struct {
         const elem_type = operand_info.error_union.elem;
         const is_compound = (elem_type == TypeRegistry.STRING);
 
+        // Zig pattern: when elem_type is void but fallback produces a non-void
+        // value, the result type is the fallback type (not void).
+        // E.g., `voidErrUnion() catch 99` has type int.
+        const fallback_type_idx = self.inferExprType(ce.fallback);
+        const is_void_eu_with_value = (elem_type == TypeRegistry.VOID and
+            fallback_type_idx != TypeRegistry.VOID);
+        const result_type = if (is_void_eu_with_value) fallback_type_idx else elem_type;
+
         // Call returns a POINTER to the error union
         const eu_ptr = try self.lowerExprNode(ce.operand);
 
@@ -12480,8 +12488,8 @@ pub const Lowerer = struct {
         const is_ok = try fb.emitBinary(.eq, tag_val, zero, TypeRegistry.BOOL, ce.span);
 
         // Allocate result local in caller's frame
-        const result_size = self.type_reg.sizeOf(elem_type);
-        const result_local = try fb.addLocalWithSize("__catch_result", elem_type, false, result_size);
+        const result_size = self.type_reg.sizeOf(result_type);
+        const result_local = try fb.addLocalWithSize("__catch_result", result_type, false, result_size);
 
         // Branch
         const ok_block = try fb.newBlock("catch.ok");
@@ -12493,7 +12501,13 @@ pub const Lowerer = struct {
         fb.nextOverlapArm();
         // OK block: read success payload from [ptr + 8], store to result
         fb.setBlock(ok_block);
-        if (is_compound) {
+        if (is_void_eu_with_value) {
+            // E!void catch with non-void fallback: OK path stores default (0).
+            // The success case discards the void payload; result gets a default value
+            // that the caller will ignore (they only care about the error path's value).
+            const default_val = try fb.emitConstInt(0, result_type, ce.span);
+            _ = try fb.emitStoreLocal(result_local, default_val, ce.span);
+        } else if (is_compound) {
             // Compound type (string): read ptr at [eu_ptr+8], len at [eu_ptr+16]
             // Must match lowerStringInit pattern — decompose into field stores
             const ptr_addr = try fb.emitAddrOffset(eu_ptr, 8, TypeRegistry.I64, ce.span);
@@ -12522,7 +12536,7 @@ pub const Lowerer = struct {
             }
             const gc_val = try fb.emitGcStructNew(st.name, chunk_values, elem_type, ce.span);
             _ = try fb.emitStoreLocal(result_local, gc_val, ce.span);
-        } else {
+        } else if (elem_type != TypeRegistry.VOID) {
             const payload_addr = try fb.emitAddrOffset(eu_ptr, 8, TypeRegistry.I64, ce.span);
             const success_val = try fb.emitPtrLoadValue(payload_addr, elem_type, ce.span);
             _ = try fb.emitStoreLocal(result_local, success_val, ce.span);
@@ -12589,7 +12603,7 @@ pub const Lowerer = struct {
 
         // Merge block: load result
         fb.setBlock(merge_block);
-        return try fb.emitLoadLocal(result_local, elem_type, ce.span);
+        return try fb.emitLoadLocal(result_local, result_type, ce.span);
     }
 
     // Helper: store a compound value (string ptr+len) into a local's fields.

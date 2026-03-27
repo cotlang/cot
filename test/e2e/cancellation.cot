@@ -72,7 +72,6 @@ test "checkCancellation try propagation" {
 test "checkCancellation propagates through try" {
     // Wrap checkCancellation (CancellationError!void) with try in a function
     // that returns CancellationError!int, then catch the propagated error.
-    // This tests the full try-propagation chain.
     fn doWork(task_ptr: i64) CancellationError!int {
         try checkCancellation(task_ptr)
         return 100
@@ -82,6 +81,16 @@ test "checkCancellation propagates through try" {
     task_cancel(raw)
     var result = doWork(raw) catch -1
     @assertEq(result, -1)
+    let _ = await task_ptr
+}
+
+test "checkCancellation catch void with value" {
+    // E!void catch with value expression — tests Bug 1 fix
+    let task_ptr = compute()
+    let raw = @intCast(i64, task_ptr)
+    task_cancel(raw)
+    var result = checkCancellation(raw) catch |err| { 99 }
+    @assertEq(result, 99)
     let _ = await task_ptr
 }
 
