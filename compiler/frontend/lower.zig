@@ -1544,8 +1544,13 @@ pub const Lowerer = struct {
             .continue_stmt => |cs| { try self.lowerContinue(cs.label); return true; },
             .expr_stmt => |es| { _ = try self.lowerExprNode(es.expr); return false; },
             .async_let => |al| {
-                // async let name = asyncCall() — lower like a var decl
-                // The value is an async fn call that returns Task(T) in eager mode
+                // async let name = asyncCall() — creates child task (SE-0317).
+                // Swift reference: swift_asyncLet_begin (AsyncLet.cpp:182-210)
+                //   - Creates child task via swift_task_create with enqueueJob=true
+                //   - Registers ChildTaskStatusRecord on parent for cancellation
+                //   - swift_asyncLet_finish at scope exit cleans up
+                // Cot Phase 1: RHS returns Task(T) eagerly. Store in local.
+                // Scope-exit cleanup via defer: release the task object.
                 const fb = self.current_func orelse return false;
                 const val_type = self.inferExprType(al.value);
                 const size = self.type_reg.sizeOf(val_type);
@@ -1553,6 +1558,22 @@ pub const Lowerer = struct {
                 const val = try self.lowerExprNode(al.value);
                 if (val != ir.null_node) {
                     _ = try fb.emitStoreLocal(local_idx, val, al.span);
+                    // Register cleanup: release task at scope exit.
+                    // Swift reference: swift_asyncLet_finish (AsyncLet.cpp:311-395)
+                    //   - Cancels child task if not consumed
+                    //   - Waits for child to complete
+                    //   - Destroys the async let record
+                    // Phase 1: just release (ARC decrement). Task completed eagerly.
+                    // Phase 2+: cancel + await + destroy.
+                    const cleanup = arc.Cleanup{
+                        .kind = .release,
+                        .value = val,
+                        .type_idx = val_type,
+                        .state = .active,
+                        .local_idx = local_idx,
+                        .func_name = null,
+                    };
+                    _ = try self.cleanup_stack.push(cleanup);
                 }
                 return false;
             },
