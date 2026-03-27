@@ -6151,8 +6151,9 @@ pub const Driver = struct {
         try func_indices.put(self.allocator, bench_runtime.BENCH_GET_N_NAME, bench_funcs.bench_get_n_idx + import_count);
         try func_indices.put(self.allocator, bench_runtime.BENCH_SUMMARY_NAME, bench_funcs.bench_summary_idx + import_count);
 
-        // Add executor runtime function index
+        // Add executor runtime function indices
         try func_indices.put(self.allocator, executor_runtime.POLL_TASK_NAME, executor_funcs.poll_task_idx + import_count);
+        try func_indices.put(self.allocator, executor_runtime.RUN_UNTIL_COMPLETE_NAME, executor_funcs.run_until_complete_idx + import_count);
 
         // Add user function names (offset by runtime func count + import count)
         for (funcs, 0..) |*ir_func, i| {

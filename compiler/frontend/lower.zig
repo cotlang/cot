@@ -1033,29 +1033,24 @@ pub const Lowerer = struct {
                 _ = try fb.emitPtrStoreValue(param_addr, param_val, span);
             }
 
-            // Poll loop: call poll until it returns JOB_READY (1).
-            // Rust: coroutine caller loops: while poll(frame) == Poll::Pending { }
-            // Swift: CooperativeExecutor.runUntil() runs until all jobs complete.
-            //
-            // Phase 1 (eager): children complete immediately, loop runs in one burst.
-            // Phase 2+: will yield to executor between polls for interleaving.
-            const loop_block = try fb.newBlock("poll.loop");
-            const done_block = try fb.newBlock("poll.done");
-            _ = try fb.emitJump(loop_block, span);
+            // Get poll function's table index for call_indirect.
+            // Swift reference: Task stores its resume function as a function pointer.
+            const poll_fn_type = try self.type_reg.add(.{ .func = .{
+                .params = &.{},
+                .return_type = TypeRegistry.I64,
+            } });
+            const poll_fn_idx = try fb.emitFuncAddr(poll_name, poll_fn_type, span);
 
-            fb.setBlock(loop_block);
-            // Call poll function — returns i64 status (0=PENDING, 1=READY).
+            // Run poll loop via executor runtime.
+            // executor_run_until_complete(poll_fn_idx, frame_ptr) loops:
+            //   call_indirect poll_fn(frame) → if PENDING, loop; if READY, done.
+            // Swift reference: CooperativeExecutor.runUntil() (lines 291-336).
+            // Phase 2+: this runtime function will be replaced with executor integration.
             const frame_for_poll = try fb.emitLoadLocal(frame_local, TypeRegistry.I64, span);
-            var poll_args = [_]ir.NodeIndex{frame_for_poll};
-            const poll_status = try fb.emitCall(poll_name, &poll_args, false, TypeRegistry.I64, span);
-
-            // Check return value: JOB_READY (1) means done.
-            const one = try fb.emitConstInt(1, TypeRegistry.I64, span);
-            const is_ready = try fb.emitBinary(.eq, poll_status, one, TypeRegistry.BOOL, span);
-            _ = try fb.emitBranch(is_ready, done_block, loop_block, span);
+            var run_args = [_]ir.NodeIndex{ poll_fn_idx, frame_for_poll };
+            _ = try fb.emitCall("executor_run_until_complete", &run_args, false, TypeRegistry.VOID, span);
 
             // Done: return frame ptr as Task
-            fb.setBlock(done_block);
             const final_frame = try fb.emitLoadLocal(frame_local, TypeRegistry.I64, span);
             _ = try fb.emitRet(final_frame, span);
 
