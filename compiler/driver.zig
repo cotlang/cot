@@ -6154,6 +6154,8 @@ pub const Driver = struct {
         // Add executor runtime function indices
         try func_indices.put(self.allocator, executor_runtime.POLL_TASK_NAME, executor_funcs.poll_task_idx + import_count);
         try func_indices.put(self.allocator, executor_runtime.RUN_UNTIL_COMPLETE_NAME, executor_funcs.run_until_complete_idx + import_count);
+        // task_cancel/task_is_cancelled are stdlib Cot functions (not runtime)
+        // — they compile from stdlib/sys.cot and work on both native and Wasm.
 
         // Add user function names (offset by runtime func count + import count)
         for (funcs, 0..) |*ir_func, i| {

@@ -12,7 +12,6 @@ const ValType = @import("wasm/wasm.zig").ValType;
 
 pub const POLL_TASK_NAME = "executor_poll_task";
 pub const RUN_UNTIL_COMPLETE_NAME = "executor_run_until_complete";
-
 pub const ExecutorFunctions = struct {
     poll_task_idx: u32,
     run_until_complete_idx: u32,

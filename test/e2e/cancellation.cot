@@ -1,0 +1,34 @@
+// Task cancellation tests — Swift SE-0340.
+// Swift reference: Task.cancel(), Task.isCancelled
+//
+// Phase 1 (eager): tasks complete immediately, cancellation is post-hoc.
+// Phase 2+: cancellation checked cooperatively at suspension points.
+
+import "std/sys"
+
+async fn compute() int { return 42 }
+
+test "cancel via raw pointer" {
+    let task_ptr = compute()
+    // Get raw pointer for cancellation API
+    let raw = @intCast(i64, task_ptr)
+    @assertEq(task_is_cancelled(raw), 0)
+    task_cancel(raw)
+    @assertEq(task_is_cancelled(raw), 1)
+    @assertEq(await task_ptr, 42)
+}
+
+test "cancel is permanent" {
+    let task_ptr = compute()
+    let raw = @intCast(i64, task_ptr)
+    task_cancel(raw)
+    task_cancel(raw)
+    @assertEq(task_is_cancelled(raw), 1)
+}
+
+test "uncancelled task" {
+    let task_ptr = compute()
+    let raw = @intCast(i64, task_ptr)
+    @assertEq(task_is_cancelled(raw), 0)
+    let _ = await task_ptr
+}
