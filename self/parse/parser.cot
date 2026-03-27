@@ -2399,10 +2399,13 @@ struct Parser {
             return self.parseDecl()
         }
         // Block-scoped @attribute fn declarations (@MainActor, @inlinable, @globalActor)
+        // Only intercept known attribute names — NOT @assertEq, @sizeOf, etc.
         if (tok == Token.at) {
-            const peek = @enumFromInt(self.peekToken()) as Token
-            if (peek == Token.ident) {
-                return self.parseDecl()
+            const peek_tok = self.peekToken()  // populates peek_text
+            if ((@enumFromInt(peek_tok) as Token) == Token.ident) {
+                if (self.peek_text == "MainActor" or self.peek_text == "globalActor" or self.peek_text == "inlinable") {
+                    return self.parseDecl()
+                }
             }
         }
         return switch (tok) {
