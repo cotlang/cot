@@ -884,16 +884,17 @@ pub const Lowerer = struct {
                 _ = try fb.addParam(param.name, param_type, param_size);
             }
 
-            // Allocate TaskObject via alloc(metadata=0, size=16).
+            // Allocate TaskObject via alloc(metadata=0, size=24).
             // alloc() adds a 32-byte ARC header (magic, size, metadata, refcount=1).
-            // User data layout (16 bytes):
-            //   offset 0: result     (i64) — the async function's return value
-            //   offset 8: cancelled  (i64) — cancellation flag (0=running, 1=cancelled)
+            // User data layout (24 bytes):
+            //   offset 0:  result      (i64) — the async function's return value
+            //   offset 8:  cancelled   (i64) — cancellation flag (0=running, 1=cancelled)
+            //   offset 16: poll_fn_idx (i64) — 0 for eager tasks (no poll needed)
             // metadata=0 means no destructor (release just frees).
-            // Swift reference: Task.h — AsyncTask has IsCancelled in ActiveTaskStatus flags.
+            // Swift reference: Task.h — AsyncTask has IsCancelled + ResumeTask.
             const zero_metadata = try fb.emitConstInt(0, TypeRegistry.I64, fn_decl.span);
-            const sixteen = try fb.emitConstInt(16, TypeRegistry.I64, fn_decl.span);
-            var alloc_args = [_]ir.NodeIndex{ zero_metadata, sixteen };
+            const twenty_four = try fb.emitConstInt(24, TypeRegistry.I64, fn_decl.span);
+            var alloc_args = [_]ir.NodeIndex{ zero_metadata, twenty_four };
             const task_ptr = try fb.emitCall("alloc", &alloc_args, false, TypeRegistry.I64, fn_decl.span);
 
             // Store the task_ptr in a local so lowerReturn can access it
@@ -1033,24 +1034,22 @@ pub const Lowerer = struct {
                 _ = try fb.emitPtrStoreValue(param_addr, param_val, span);
             }
 
-            // Get poll function's table index for call_indirect.
-            // Swift reference: Task stores its resume function as a function pointer.
+            // Store poll function's table index at frame[16] for await-site polling.
+            // Swift reference: Task stores its resume function pointer in Job.ResumeTask.
+            // The constructor returns immediately — polling happens at the await site.
+            // This matches Swift's Task {} which returns a handle without blocking.
             const poll_fn_type = try self.type_reg.add(.{ .func = .{
                 .params = &.{},
                 .return_type = TypeRegistry.I64,
             } });
             const poll_fn_idx = try fb.emitFuncAddr(poll_name, poll_fn_type, span);
+            const frame_for_store = try fb.emitLoadLocal(frame_local, TypeRegistry.I64, span);
+            const sixteen = try fb.emitConstInt(16, TypeRegistry.I64, span);
+            const poll_fn_addr = try fb.emitBinary(.add, frame_for_store, sixteen, TypeRegistry.I64, span);
+            _ = try fb.emitPtrStoreValue(poll_fn_addr, poll_fn_idx, span);
 
-            // Run poll loop via executor runtime.
-            // executor_run_until_complete(poll_fn_idx, frame_ptr) loops:
-            //   call_indirect poll_fn(frame) → if PENDING, loop; if READY, done.
-            // Swift reference: CooperativeExecutor.runUntil() (lines 291-336).
-            // Phase 2+: this runtime function will be replaced with executor integration.
-            const frame_for_poll = try fb.emitLoadLocal(frame_local, TypeRegistry.I64, span);
-            var run_args = [_]ir.NodeIndex{ poll_fn_idx, frame_for_poll };
-            _ = try fb.emitCall("executor_run_until_complete", &run_args, false, TypeRegistry.VOID, span);
-
-            // Done: return frame ptr as Task
+            // Return frame ptr as Task handle (non-blocking).
+            // The actual polling happens at the await site via executor_run_until_complete.
             const final_frame = try fb.emitLoadLocal(frame_local, TypeRegistry.I64, span);
             _ = try fb.emitRet(final_frame, span);
 
@@ -12232,11 +12231,11 @@ pub const Lowerer = struct {
     fn lowerTaskExpr(self: *Lowerer, te: ast.TaskExpr) Error!ir.NodeIndex {
         const fb = self.current_func orelse return ir.null_node;
 
-        // Allocate TaskObject via alloc(metadata=0, size=16).
-        // Layout: offset 0 = result (i64), offset 8 = cancelled flag (i64).
+        // Allocate TaskObject via alloc(metadata=0, size=24).
+        // Layout: offset 0 = result, offset 8 = cancelled, offset 16 = poll_fn_idx (0=eager).
         const zero_metadata = try fb.emitConstInt(0, TypeRegistry.I64, te.span);
-        const sixteen = try fb.emitConstInt(16, TypeRegistry.I64, te.span);
-        var alloc_args = [_]ir.NodeIndex{ zero_metadata, sixteen };
+        const twenty_four = try fb.emitConstInt(24, TypeRegistry.I64, te.span);
+        var alloc_args = [_]ir.NodeIndex{ zero_metadata, twenty_four };
         const task_ptr = try fb.emitCall("alloc", &alloc_args, false, TypeRegistry.I64, te.span);
 
         // Store task_ptr in a local
@@ -12271,9 +12270,50 @@ pub const Lowerer = struct {
         }
 
         // Async function call — operand returns a Task pointer (heap-allocated)
-        const task_ptr = try self.lowerExprNode(ae.operand);
+        const task_ptr_raw = try self.lowerExprNode(ae.operand);
 
-        // Load result from task user data (offset 0, past ARC header managed by alloc)
+        // Store task_ptr in local (needed across control flow blocks)
+        const await_task_name = try std.fmt.allocPrint(self.allocator, "__await_task_{d}", .{self.temp_counter});
+        self.temp_counter += 1;
+        const await_task_local = try fb.addLocalWithSize(await_task_name, TypeRegistry.I64, false, 8);
+        _ = try fb.emitStoreLocal(await_task_local, task_ptr_raw, ae.span);
+
+        // Poll the task to completion if it has a poll function.
+        // Constructor/poll tasks store poll_fn_idx at frame[16].
+        // Eager tasks (0-1 awaits) have 0 at frame[16] and complete immediately.
+        // Swift reference: Task.value getter suspends until task completes.
+        if (self.target.isWasm()) {
+            // Load poll_fn_idx from frame[16]
+            const task_ptr_for_poll = try fb.emitLoadLocal(await_task_local, TypeRegistry.I64, ae.span);
+            const sixteen = try fb.emitConstInt(16, TypeRegistry.I64, ae.span);
+            const poll_fn_addr = try fb.emitBinary(.add, task_ptr_for_poll, sixteen, TypeRegistry.I64, ae.span);
+            const poll_fn_idx = try fb.emitPtrLoadValue(poll_fn_addr, TypeRegistry.I64, ae.span);
+
+            // If poll_fn_idx != 0, this task needs polling
+            const zero = try fb.emitConstInt(0, TypeRegistry.I64, ae.span);
+            const needs_poll = try fb.emitBinary(.ne, poll_fn_idx, zero, TypeRegistry.BOOL, ae.span);
+
+            const poll_block = try fb.newBlock("await.poll");
+            const done_block = try fb.newBlock("await.done");
+            _ = try fb.emitBranch(needs_poll, poll_block, done_block, ae.span);
+
+            // Poll block: call executor_run_until_complete(poll_fn_idx, frame_ptr)
+            fb.setBlock(poll_block);
+            const reload_poll_fn = try fb.emitLoadLocal(await_task_local, TypeRegistry.I64, ae.span);
+            const sixteen2 = try fb.emitConstInt(16, TypeRegistry.I64, ae.span);
+            const poll_fn_addr2 = try fb.emitBinary(.add, reload_poll_fn, sixteen2, TypeRegistry.I64, ae.span);
+            const poll_fn_idx2 = try fb.emitPtrLoadValue(poll_fn_addr2, TypeRegistry.I64, ae.span);
+            const reload_frame = try fb.emitLoadLocal(await_task_local, TypeRegistry.I64, ae.span);
+            var run_args = [_]ir.NodeIndex{ poll_fn_idx2, reload_frame };
+            _ = try fb.emitCall("executor_run_until_complete", &run_args, false, TypeRegistry.VOID, ae.span);
+            _ = try fb.emitJump(done_block, ae.span);
+
+            // Done block: result is ready
+            fb.setBlock(done_block);
+        }
+
+        // Load result from task user data (offset 0)
+        const task_ptr = try fb.emitLoadLocal(await_task_local, TypeRegistry.I64, ae.span);
         const result_type = self.inferExprType(ae.operand);
         const inner_type = if (self.type_reg.get(result_type) == .task)
             self.type_reg.get(result_type).task.result_type
