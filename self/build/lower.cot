@@ -491,6 +491,13 @@ struct Lowerer {
 
         debug(.lower, "  lower fn '${fn_decl.name}' (${fn_decl.params.len()} params, export=${fn_decl.is_export})")
 
+        // Async path: route to lowerAsyncFnEager.
+        // Ported from lower.zig:729-736.
+        if (fn_decl.is_async) {
+            self.lowerAsyncFnEager(fn_decl)
+            return
+        }
+
         const return_type = if (fn_decl.return_type != null_node) {
             self.resolveTypeNode(fn_decl.return_type)
         } else { VOID }
@@ -535,6 +542,62 @@ struct Lowerer {
                     self.emitCleanups(0)
                     fb.emitRet(null_node, fn_decl.span)
                 }
+            }
+        }
+        self.builder.endFunc()
+    }
+
+    /// Lower an async function using eager evaluation.
+    /// Allocates a TaskObject via alloc(metadata=0, size=16), runs body eagerly,
+    /// stores result at task_ptr[0], returns task_ptr.
+    /// Ported from lower.zig:853-905.
+    fn lowerAsyncFnEager(fn_decl: FnDecl) void {
+        const return_type = if (fn_decl.return_type != null_node) {
+            self.resolveTypeNode(fn_decl.return_type)
+        } else { VOID }
+
+        const qualified_name = self.qualifyName(fn_decl.name)
+
+        // Async wrapper returns Task pointer (i64)
+        self.builder.startFunc(qualified_name, VOID, I64, fn_decl.span)
+        if (self.builder.func()) |fb| {
+            fb.is_export = fn_decl.is_export
+            self.clearPerFunctionState()
+
+            // Add params (same as original function)
+            for i in 0..fn_decl.params.len() {
+                const param_idx = fn_decl.params.get(i)
+                self.addParamFromNode(param_idx)
+            }
+
+            // Allocate TaskObject via alloc(metadata=0, size=16).
+            // alloc() adds a 32-byte ARC header (magic, size, metadata, refcount=1).
+            // User data layout (16 bytes):
+            //   offset 0: result     (i64)
+            //   offset 8: cancelled  (i64)
+            const zero_metadata = fb.emitConstInt(0, I64, fn_decl.span)
+            const sixteen = fb.emitConstInt(16, I64, fn_decl.span)
+            var alloc_args: List(int) = .{}
+            alloc_args.append(zero_metadata)
+            alloc_args.append(sixteen)
+            const task_ptr = fb.emitCall("alloc", alloc_args, false, I64, fn_decl.span)
+
+            // Store task_ptr in a local so lowerReturn can access it
+            const task_local = fb.addLocalWithSize("__async_task", I64, false, 8)
+            fb.emitStoreLocal(task_local, task_ptr, fn_decl.span)
+            fb.async_task_local = task_local
+            fb.async_result_type = return_type
+
+            // Lower the body — executes eagerly
+            if (fn_decl.body != null_node) {
+                self.lowerBlockNode(fn_decl.body)
+            }
+
+            // Implicit return: if body didn't return, return task_ptr
+            if (fb.needsTerminator()) {
+                self.emitCleanups(0)
+                const task_ptr2 = fb.emitLoadLocal(task_local, I64, fn_decl.span)
+                fb.emitRet(task_ptr2, fn_decl.span)
             }
         }
         self.builder.endFunc()
@@ -938,6 +1001,20 @@ struct Lowerer {
 
     fn lowerReturn(ret: ReturnStmt) void {
         if (self.builder.func()) |fb| {
+            // Phase 1 async: store result at task_ptr[0], then return task_ptr.
+            // Ported from lower.zig:1415-1429.
+            if (fb.async_task_local) |task_local| {
+                if (ret.value != null_node) {
+                    const result = self.lowerExprNode(ret.value)
+                    const task_ptr = fb.emitLoadLocal(task_local, I64, ret.span)
+                    fb.emitPtrStoreValue(task_ptr, result, ret.span)
+                }
+                self.emitCleanups(0)
+                const task_ptr2 = fb.emitLoadLocal(task_local, I64, ret.span)
+                fb.emitRet(task_ptr2, ret.span)
+                return
+            }
+
             // Determine function return type
             // Zig ref: lower.zig lines 1720-1764
             const func_return_type = fb.return_type
@@ -6731,8 +6808,84 @@ struct Lowerer {
     // Await (stub — not yet implemented)
     // ========================================================================
 
+    /// Lower an await expression.
+    /// For cross-actor/global-actor calls: just lower the operand (hop is no-op in Phase 1).
+    /// For async function calls: load result from task_ptr[0], release task, return result.
+    /// Ported from lower.zig:12033-12060.
     fn lowerAwaitExpr(ae: AwaitExpr, idx: int) int {
+        if (self.builder.func()) |fb| {
+            // Check if this is a cross-actor or global-actor call (no task wrapping)
+            if (self.isCrossActorCall(ae.operand) or self.isGlobalActorCall(ae.operand)) {
+                return self.lowerExprNode(ae.operand)
+            }
+
+            // Async function call — operand returns a Task pointer
+            const task_ptr = self.lowerExprNode(ae.operand)
+
+            // Load result from task user data (offset 0)
+            const result = fb.emitPtrLoadValue(task_ptr, I64, ae.span)
+
+            // Release the task (ARC decrement)
+            var release_args: List(int) = .{}
+            release_args.append(task_ptr)
+            fb.emitCall("release", release_args, false, VOID, ae.span)
+
+            return result
+        }
         return null_node
+    }
+
+    /// Check if an expression is a call to a @globalActor-isolated function.
+    /// Ported from lower.zig:12064-12072.
+    fn isGlobalActorCall(operand_idx: int) bool {
+        const tag = nodeTag(self.tree, operand_idx)
+        if (tag != "call") { return false }
+        var callee_idx = null_node
+        switch (self.tree.getNode(operand_idx)) { Node.expr |e| => switch (e) {
+            Expr.call |c| => { callee_idx = c.callee },
+        else => {} }, else => {} }
+        if (callee_idx == null_node) { return false }
+        const callee_tag = nodeTag(self.tree, callee_idx)
+        if (callee_tag != "ident") { return false }
+        var callee_name = ""
+        switch (self.tree.getNode(callee_idx)) { Node.expr |e| => switch (e) {
+            Expr.ident |id| => { callee_name = id.name },
+        else => {} }, else => {} }
+        return self.chk.global_actor_fns.contains(callee_name)
+    }
+
+    /// Check if an expression is a method call on an actor type.
+    /// Ported from lower.zig:12076-12095.
+    fn isCrossActorCall(operand_idx: int) bool {
+        const tag = nodeTag(self.tree, operand_idx)
+        if (tag != "call") { return false }
+        var callee_idx = null_node
+        switch (self.tree.getNode(operand_idx)) { Node.expr |e| => switch (e) {
+            Expr.call |c| => { callee_idx = c.callee },
+        else => {} }, else => {} }
+        if (callee_idx == null_node) { return false }
+        const callee_tag = nodeTag(self.tree, callee_idx)
+        if (callee_tag != "field_access") { return false }
+        var base_idx = null_node
+        switch (self.tree.getNode(callee_idx)) { Node.expr |e| => switch (e) {
+            Expr.field_access |fa| => { base_idx = fa.base },
+        else => {} }, else => {} }
+        if (base_idx == null_node) { return false }
+        const base_type = self.inferExprType(base_idx)
+        const base_info = self.types.get(base_type)
+        if (base_info.tag == TAG_STRUCT) {
+            const st = switch (base_info) { Type.struct_type |s| => s, else => StructType { name: "", field_count: 0, fields: 0, size: 0, alignment: 0, layout: 0, backing_int: 0 } }
+            return self.chk.actor_types.contains(st.name)
+        }
+        if (base_info.tag == TAG_POINTER) {
+            const p = switch (base_info) { Type.pointer |p| => p, else => PointerType { elem: 0, managed: false } }
+            const inner = self.types.get(p.elem)
+            if (inner.tag == TAG_STRUCT) {
+                const st = switch (inner) { Type.struct_type |s| => s, else => StructType { name: "", field_count: 0, fields: 0, size: 0, alignment: 0, layout: 0, backing_int: 0 } }
+                return self.chk.actor_types.contains(st.name)
+            }
+        }
+        return false
     }
 
     /// Compute the base generic name from a concrete name.

@@ -533,6 +533,10 @@ struct FuncBuilder {
     shared_sret_size: int,
     is_destructor: bool,
     is_export: bool,
+    /// Phase 1 async: local storing the TaskObject pointer (for lowerReturn to store result)
+    async_task_local: ?int,
+    /// Phase 1 async: the inner result type (T in Task(T))
+    async_result_type: ?int,
 
     static fn init(name: string, type_idx: int, return_type: int, span: Span) FuncBuilder {
         var locals: List(Local) = .{}
@@ -559,6 +563,8 @@ struct FuncBuilder {
             shared_sret_size: 0,
             is_destructor: false,
             is_export: false,
+            async_task_local: null,
+            async_result_type: null,
         }
     }
 
@@ -583,6 +589,8 @@ struct FuncBuilder {
             shared_sret_size: 0,
             is_destructor: false,
             is_export: false,
+            async_task_local: null,
+            async_result_type: null,
         }
         return ptr
     }
@@ -1113,6 +1121,8 @@ struct Builder {
     funcs: List(Func),
     globals: List(Global),
     structs: List(StructDef),
+    /// Stack of saved function contexts for nested fn declarations in blocks.
+    saved_funcs: List(*FuncBuilder),
 
     static fn init() Builder {
         var funcs: List(Func) = .{}
@@ -1124,10 +1134,15 @@ struct Builder {
             funcs: funcs,
             globals: globals,
             structs: structs,
+            saved_funcs: .{},
         }
     }
 
     fn startFunc(name: string, type_idx: int, return_type: int, span: Span) void {
+        // If there's a current function, push it onto the stack (nested fn decl)
+        if (self.current_func_ptr) |cf| {
+            self.saved_funcs.append(cf)
+        }
         self.current_func_ptr = FuncBuilder.initHeap(name, type_idx, return_type, span)
     }
 
@@ -1138,7 +1153,12 @@ struct Builder {
     fn endFunc() void {
         if (self.current_func_ptr) |fb| {
             self.funcs.append(fb.build())
-            self.current_func_ptr = null
+            // Pop the saved function context (restore parent for nested fn decl)
+            if (self.saved_funcs.len() > 0) {
+                self.current_func_ptr = self.saved_funcs.pop()
+            } else {
+                self.current_func_ptr = null
+            }
         }
     }
 

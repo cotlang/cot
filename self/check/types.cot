@@ -291,6 +291,8 @@ struct MethodInfo {
     func_type: int,
     receiver_is_ptr: bool,
     is_static: bool,
+    /// Swift SE-0313: nonisolated actor method — accessible without await.
+    is_nonisolated: bool,
     source_tree: int,  // Defining AST identifier for cross-module method resolution
 }
 
@@ -314,10 +316,17 @@ const TAG_ENUM: int = 11
 const TAG_UNION: int = 12
 const TAG_FUNC: int = 13
 const TAG_DISTINCT: int = 14
+const TAG_TASK: int = 15
 
 struct DistinctType {
     name: string,
     underlying: int,
+}
+
+/// Swift Task<T>: async function return type.
+/// 8 bytes (pointer to heap-allocated TaskObject).
+struct TaskType {
+    result_type: int,
 }
 
 union Type {
@@ -336,6 +345,7 @@ union Type {
     union_type: UnionType,
     func: FuncType,
     distinct_type: DistinctType,
+    task: TaskType,
 }
 
 // ============================================================================
@@ -599,6 +609,7 @@ struct TypeRegistry {
             Type.tuple |_| => "tuple",
             Type.func |_| => "function",
             Type.distinct_type |d| => d.name,
+            Type.task |_| => "Task",
             else => "unknown",
         }
     }
@@ -751,6 +762,18 @@ struct TypeRegistry {
         return self.add(Type.list_type(CotListType { elem: elem }))
     }
 
+    /// Create or lookup a Task(T) type. Dedup like other type constructors.
+    fn makeTask(result_type: int) int {
+        for i in FIRST_USER_TYPE..self.types.len() {
+            const t = self.get(i)
+            if (t.tag == TAG_TASK) {
+                const task = switch (t) { Type.task |task| => task, else => TaskType { result_type: 0 } }
+                if (task.result_type == result_type) { return i }
+            }
+        }
+        return self.add(Type.task(TaskType { result_type: result_type }))
+    }
+
     fn makeTuple(elems: List(int)) int {
         const count = elems.len()
         const ptr = alloc_raw(count * 8)
@@ -890,6 +913,7 @@ struct TypeRegistry {
                 return 8 + payload_aligned
             },
             Type.distinct_type |d| => self.sizeOf(d.underlying),
+            Type.task |_| => 8,
         }
     }
 
@@ -915,6 +939,7 @@ struct TypeRegistry {
             Type.struct_type |s| => s.alignment,
             Type.enum_type |e| => self.alignmentOf(e.backing_type),
             Type.distinct_type |d| => self.alignmentOf(d.underlying),
+            Type.task |_| => 8,
         }
     }
 
@@ -993,6 +1018,8 @@ struct TypeRegistry {
                 }
                 return true
             },
+            Type.distinct_type |d| => self.isTrivial(d.underlying),
+            Type.task |_| => true,
         }
     }
 
@@ -1065,6 +1092,11 @@ struct TypeRegistry {
         }
         if (ta.tag == TAG_TUPLE) { return self.equalTuple(a, b) }
         if (ta.tag == TAG_DISTINCT) { return self.typeName(a) == self.typeName(b) }
+        if (ta.tag == TAG_TASK) {
+            const task_a = switch (ta) { Type.task |task| => task, else => TaskType { result_type: 0 } }
+            const task_b = switch (tb) { Type.task |task| => task, else => TaskType { result_type: 0 } }
+            return self.equal(task_a.result_type, task_b.result_type)
+        }
         return false
     }
 
@@ -1632,7 +1664,7 @@ test "TypeRegistry makeFunc" {
 }
 
 test "MethodInfo is_static" {
-    const mi = MethodInfo { name: "create", func_name: "Foo_create", func_type: 0, receiver_is_ptr: false, is_static: true, source_tree: 0 }
+    const mi = MethodInfo { name: "create", func_name: "Foo_create", func_type: 0, receiver_is_ptr: false, is_static: true, is_nonisolated: false, source_tree: 0 }
     @assert(mi.is_static)
     @assertEq(mi.receiver_is_ptr, false)
 }

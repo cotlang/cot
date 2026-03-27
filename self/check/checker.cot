@@ -291,6 +291,17 @@ struct Checker {
     comptime_vars: Map(string, int),
     in_comptime: bool,
     body_check_depth: int,
+    // Concurrency (Swift SE-0306 actors, SE-0316 global actors, SE-0302 Sendable)
+    /// True when inside an `await` expression (suppresses cross-actor errors).
+    in_await: bool,
+    /// Tracks which type names are actors.
+    actor_types: Map(string, int),
+    /// Current actor context: non-null when inside an actor method body.
+    current_actor_type: string,
+    /// Swift SE-0316: current global actor context (e.g. "MainActor").
+    current_global_actor: string,
+    /// Swift SE-0316: functions annotated with @globalActor.
+    global_actor_fns: Map(string, string),
 
     static fn init(ast: *Ast, types: *TypeRegistry, err: *ErrorReporter) Checker {
         var gs = newScope(null)
@@ -328,6 +339,11 @@ struct Checker {
             comptime_vars: comptime_vars,
             in_comptime: false,
             body_check_depth: 0,
+            in_await: false,
+            actor_types: .{},
+            current_actor_type: "",
+            current_global_actor: "",
+            global_actor_fns: .{},
         }
     }
 
@@ -542,6 +558,11 @@ struct Checker {
             // Update placeholder in-place with the real struct data.
             // Zig reference: checker.zig:456
             self.types.updateAt(placeholder, self.types.get(struct_type))
+
+            // Swift actor isolation: register actor types
+            if (sd.is_actor) {
+                self.actor_types.set(name, 1)
+            }
         }, else => {} }, else => {} }
     }
 
@@ -725,6 +746,11 @@ struct Checker {
                 sym.is_export = f.is_export
                 self.defineSymbol(sym)
             }
+
+            // Swift SE-0316: register global actor functions
+            if (f.global_actor) |ga| {
+                self.global_actor_fns.set(name, ga)
+            }
         }, else => {} }, else => {} }
     }
 
@@ -828,6 +854,7 @@ struct Checker {
                     func_type: func_type,
                     receiver_is_ptr: !effective_static,
                     is_static: effective_static,
+                    is_nonisolated: f.is_nonisolated,
                     source_tree: 0,
                 })
             }, else => {} }, else => {} }
@@ -927,6 +954,11 @@ struct Checker {
         const node = self.ast.getNode(idx)
         switch (node) { Node.decl |d| => switch (d) { Decl.struct_decl |sd| => {
             if (sd.type_params.len() > 0) { return }
+
+            // Swift actor isolation: set current_actor_type when inside an actor
+            const saved_actor = self.current_actor_type
+            if (sd.is_actor) { self.current_actor_type = sd.name }
+
             for ni in 0..sd.nested_decls.len() {
                 const nested_idx = sd.nested_decls.get(ni)
                 if (nodeTag(self.ast, nested_idx) == "fn_decl") {
@@ -937,6 +969,8 @@ struct Checker {
                     }, else => {} }, else => {} }
                 }
             }
+
+            self.current_actor_type = saved_actor
         }, else => {} }, else => {} }
     }
 
@@ -1043,7 +1077,12 @@ struct Checker {
 
             self.pushScope()
             const old_ret = self.current_return_type
+            const old_global_actor = self.current_global_actor
             self.current_return_type = return_type
+            // Swift SE-0316: set global actor context
+            if (f.global_actor) |ga| {
+                self.current_global_actor = ga
+            }
 
             // Define parameters in scope (same substitution-aware @safe as buildFuncType)
             for pi in 0..f.params.len() {
@@ -1093,6 +1132,7 @@ struct Checker {
             self.checkBlockBody(f.body)
 
             self.current_return_type = old_ret
+            self.current_global_actor = old_global_actor
             self.popScope()
         }, else => {} }, else => {} }
         self.body_check_depth = self.body_check_depth - 1
@@ -2083,11 +2123,29 @@ struct Checker {
             }
         }
 
+        // Swift SE-0316: global-actor function check (by ident name)
+        if (nodeTag(self.ast, callee_n) == "ident") {
+            var gname = ""
+            switch (self.ast.getNode(callee_n)) { Node.expr |ce| => switch (ce) { Expr.ident |cid| => { gname = cid.name }, else => {} }, else => {} }
+            if (self.global_actor_fns.contains(gname)) {
+                const callee_actor = self.global_actor_fns.get(gname)
+                var is_same_actor = false
+                if (@lenOf(self.current_global_actor) > 0) {
+                    is_same_actor = self.current_global_actor == callee_actor
+                }
+                if (!is_same_actor and !self.in_await) {
+                    self.reportError(idx, ErrorCode.e300, "call to global actor-isolated function requires 'await'")
+                }
+            }
+        }
+
         const callee_type = self.checkExpr(callee_n)
 
         // Resolve method call
         var func_type_idx = callee_type
         var is_method = false
+        var method_is_nonisolated = false
+        var method_is_static = false
         if (nodeTag(self.ast, callee_n) == "field_access") {
             const mi = self.resolveMethodFromFieldAccess(callee_n)
             if (mi >= 0) {
@@ -2095,6 +2153,24 @@ struct Checker {
                 func_type_idx = method_info.func_type
                 // Only subtract self for instance methods, not static methods
                 is_method = !method_info.is_static
+                method_is_nonisolated = method_info.is_nonisolated
+                method_is_static = method_info.is_static
+            }
+        }
+
+        // Swift actor isolation: cross-actor method calls require `await`.
+        // Ported from checker.zig:2130-2152.
+        if (is_method and !method_is_static) {
+            const receiver_name = self.getCallReceiverActorName(callee_n)
+            if (@lenOf(receiver_name) > 0 and self.actor_types.contains(receiver_name)) {
+                var is_same_actor = false
+                if (@lenOf(self.current_actor_type) > 0) {
+                    is_same_actor = self.current_actor_type == receiver_name
+                }
+                // nonisolated methods can be called without await (Swift SE-0313)
+                if (!is_same_actor and !self.in_await and !method_is_nonisolated) {
+                    self.reportError(idx, ErrorCode.e300, "cross-actor call requires 'await'")
+                }
             }
         }
 
@@ -3779,10 +3855,145 @@ struct Checker {
         return invalid_type
     }
 
-    /// Check an await expression — not yet implemented.
+    /// Check an await expression.
+    /// Sets in_await so cross-actor calls inside this expression are allowed.
+    /// Ported from checker.zig:3376-3397.
     fn checkAwaitExpr(idx: int) int {
-        self.reportError(idx, ErrorCode.e300, "await not yet implemented")
-        return invalid_type
+        var operand_idx = null_node
+        switch (self.ast.getNode(idx)) { Node.expr |e| => switch (e) {
+            Expr.await_expr |ae| => { operand_idx = ae.operand },
+        else => {} }, else => {} }
+        if (operand_idx == null_node) { return invalid_type }
+
+        // Set in_await so cross-actor calls inside this expression are allowed
+        const saved_in_await = self.in_await
+        self.in_await = true
+        const operand_type = self.checkExpr(operand_idx)
+        self.in_await = saved_in_await
+
+        // Check if the operand is a cross-actor or global-actor call
+        // (doesn't return Task, just needs await for isolation hop)
+        if (self.isCrossActorCallExpr(operand_idx) or self.isGlobalActorCallExpr(operand_idx)) {
+            return operand_type
+        }
+
+        // Otherwise, must be an async function call returning Task(T)
+        const operand_info = self.types.get(operand_type)
+        if (operand_info.tag != TAG_TASK) {
+            self.reportError(idx, ErrorCode.e300, "cannot await non-task type")
+            return invalid_type
+        }
+        const task = switch (operand_info) { Type.task |task| => task, else => TaskType { result_type: 0 } }
+        return task.result_type
+    }
+
+    /// Check if an expression is a call to a method on an actor type.
+    /// Ported from checker.zig:3400-3407.
+    fn isCrossActorCallExpr(operand_idx: int) bool {
+        const node = self.ast.getNode(operand_idx)
+        const tag = nodeTag(self.ast, operand_idx)
+        if (tag != "call") { return false }
+        var callee_idx = null_node
+        switch (node) { Node.expr |e| => switch (e) {
+            Expr.call |c| => { callee_idx = c.callee },
+        else => {} }, else => {} }
+        if (callee_idx == null_node) { return false }
+        const rn = self.getCallReceiverActorName(callee_idx)
+        if (@lenOf(rn) > 0) {
+            return self.actor_types.contains(rn)
+        }
+        return false
+    }
+
+    /// Check if an expression is a call to a @globalActor-isolated function.
+    /// Ported from checker.zig:3410-3418.
+    fn isGlobalActorCallExpr(operand_idx: int) bool {
+        const node = self.ast.getNode(operand_idx)
+        const tag = nodeTag(self.ast, operand_idx)
+        if (tag != "call") { return false }
+        var callee_idx = null_node
+        switch (node) { Node.expr |e| => switch (e) {
+            Expr.call |c| => { callee_idx = c.callee },
+        else => {} }, else => {} }
+        if (callee_idx == null_node) { return false }
+        // Check if callee is a simple ident that's in global_actor_fns
+        const callee_tag = nodeTag(self.ast, callee_idx)
+        if (callee_tag != "ident") { return false }
+        var callee_name = ""
+        switch (self.ast.getNode(callee_idx)) { Node.expr |e| => switch (e) {
+            Expr.ident |id| => { callee_name = id.name },
+        else => {} }, else => {} }
+        return self.global_actor_fns.contains(callee_name)
+    }
+
+    /// Get the actor type name from a method call callee (field_access on an actor instance).
+    /// Ported from checker.zig:3421-3434.
+    fn getCallReceiverActorName(callee_idx: int) string {
+        const callee_tag = nodeTag(self.ast, callee_idx)
+        if (callee_tag != "field_access") { return "" }
+        var base_idx = null_node
+        switch (self.ast.getNode(callee_idx)) { Node.expr |e| => switch (e) {
+            Expr.field_access |fa| => { base_idx = fa.base },
+        else => {} }, else => {} }
+        if (base_idx == null_node) { return "" }
+        if (!self.expr_types.contains(base_idx)) { return "" }
+        const base_type_idx = self.expr_types.get(base_idx)
+        const base_type = self.types.get(base_type_idx)
+        if (base_type.tag == TAG_STRUCT) {
+            const st = switch (base_type) { Type.struct_type |s| => s, else => StructType { name: "", field_count: 0, fields: 0, size: 0, alignment: 0, layout: 0, backing_int: 0 } }
+            return st.name
+        }
+        if (base_type.tag == TAG_POINTER) {
+            const p = switch (base_type) { Type.pointer |p| => p, else => PointerType { elem: 0, managed: false } }
+            const inner = self.types.get(p.elem)
+            if (inner.tag == TAG_STRUCT) {
+                const st = switch (inner) { Type.struct_type |s| => s, else => StructType { name: "", field_count: 0, fields: 0, size: 0, alignment: 0, layout: 0, backing_int: 0 } }
+                return st.name
+            }
+        }
+        return ""
+    }
+
+    /// Check if a type is Sendable (safe to pass across concurrency boundaries).
+    /// Ported from checker.zig:3304-3349 (Swift TypeCheckConcurrency.cpp:7488).
+    fn isSendable(ty: int) bool {
+        const info = self.types.get(ty)
+        return switch (info) {
+            Type.basic |_| => true,
+            Type.struct_type |s| => {
+                for i in 0..s.field_count {
+                    const f = s.getField(i)
+                    if (!self.isSendable(f.type_idx)) { return false }
+                }
+                return true
+            },
+            Type.enum_type |_| => true,
+            Type.union_type |u| => {
+                for i in 0..u.variant_count {
+                    const v = u.getVariant(i)
+                    if (v.payload_type != invalid_type and !self.isSendable(v.payload_type)) { return false }
+                }
+                return true
+            },
+            Type.optional |o| => self.isSendable(o.elem),
+            Type.error_union |eu| => self.isSendable(eu.elem),
+            Type.list_type |l| => self.isSendable(l.elem),
+            Type.map_type |m| => self.isSendable(m.key) and self.isSendable(m.value),
+            Type.task |_| => true,
+            Type.tuple |tup| => {
+                for i in 0..tup.elem_count {
+                    const et = tup.getElemType(i)
+                    if (!self.isSendable(et)) { return false }
+                }
+                return true
+            },
+            Type.distinct_type |d| => self.isSendable(d.underlying),
+            Type.pointer |_| => false,
+            Type.func |_| => false,
+            Type.slice |_| => ty == STRING,
+            Type.array |a| => self.isSendable(a.elem),
+            Type.error_set |_| => true,
+        }
     }
 
     fn checkComptimeBlock(idx: int) int {
@@ -4617,6 +4828,7 @@ struct Checker {
                 func_type: func_type,
                 receiver_is_ptr: !effective_static_n,
                 is_static: effective_static_n,
+                is_nonisolated: false,
                 source_tree: 0,
             })
 
@@ -4723,6 +4935,7 @@ struct Checker {
                     func_type: func_type,
                     receiver_is_ptr: !effective_static_gi,
                     is_static: effective_static_gi,
+                    is_nonisolated: false,
                     source_tree: 0,
                 })
 
@@ -5100,7 +5313,8 @@ struct Checker {
     fn buildFuncType(idx: int) int {
         var fn_params: List(int) = .{}
         var ret_type_n = null_node
-        switch (self.ast.getNode(idx)) { Node.decl |d| => switch (d) { Decl.fn_decl |fd| => { fn_params = fd.params; ret_type_n = fd.return_type }, else => {} }, else => {} }
+        var is_async = false
+        switch (self.ast.getNode(idx)) { Node.decl |d| => switch (d) { Decl.fn_decl |fd| => { fn_params = fd.params; ret_type_n = fd.return_type; is_async = fd.is_async }, else => {} }, else => {} }
         const params_count = fn_params.len()
 
         const params_ptr = @intCast(i64, alloc_raw(params_count * @sizeOf(FuncParam)))
@@ -5111,6 +5325,11 @@ struct Checker {
         var ret_type: int = VOID
         if (ret_type_n != null_node) {
             ret_type = self.resolveTypeExpr(ret_type_n)
+        }
+
+        // Swift async: wrap return type in Task(T)
+        if (is_async) {
+            ret_type = self.types.makeTask(ret_type)
         }
 
         return self.types.add(Type.func(FuncType {

@@ -33,6 +33,10 @@ struct Parser {
     safe_mode: bool,
     current_impl_type: string,
     current_impl_is_generic: bool,
+    /// True when inside an actor body — forces self injection like @safe mode.
+    current_impl_is_actor: bool,
+    /// Swift SE-0316: pending @globalActor attribute for the next fn declaration.
+    pending_global_actor: ?string,
     nest_level: int,
     pending_doc: string,
 
@@ -54,6 +58,8 @@ struct Parser {
             safe_mode: false,
             current_impl_type: "",
             current_impl_is_generic: false,
+            current_impl_is_actor: false,
+            pending_global_actor: null,
             nest_level: 0,
             pending_doc: "",
         }
@@ -203,7 +209,7 @@ struct Parser {
         if (self.tok == Token.kw_export) {
             self.advance()
             if (self.tok == Token.kw_fn) {
-                return self.parseFnDecl(0, 0, 0, 1)
+                return self.parseFnDecl(0, 0, 0, 1, 0, 0)
             }
             self.errors.report(self.tok_start, ErrorCode.e200, "expected 'fn' after 'export'")
             return null_node
@@ -213,19 +219,21 @@ struct Parser {
             Token.kw_import => self.parseImportDecl(),
             Token.kw_test => self.parseTestDecl(),
             Token.kw_bench => self.parseBenchDecl(),
-            Token.kw_fn => self.parseFnDecl(0, 0, 0, 0),
+            Token.kw_fn => self.parseFnDecl(0, 0, 0, 0, 0, 0),
             Token.kw_static => {
                 self.advance()
                 if (self.tok != Token.kw_fn) {
                     self.errors.report(self.tok_start, ErrorCode.e200, "expected 'fn' after 'static'")
                     return null_node
                 }
-                self.parseFnDecl(0, 0, 1, 0)
+                self.parseFnDecl(0, 0, 1, 0, 0, 0)
             },
             Token.kw_const => self.parseVarDecl(1),
             Token.kw_var => self.parseVarDecl(0),
             Token.kw_let => self.parseVarDecl(0),
             Token.kw_struct => self.parseStructDecl(0),
+            Token.kw_actor => self.parseActorDecl(),
+            Token.kw_nonisolated => self.parseNonisolatedFn(),
             Token.kw_packed => self.parsePackedStructDecl(),
             Token.kw_extern => self.parseExternDecl(),
             Token.kw_enum => self.parseEnumDecl(),
@@ -234,6 +242,7 @@ struct Parser {
             Token.kw_trait => self.parseTraitDecl(),
             Token.kw_type => self.parseTypeAlias(),
             Token.kw_async => self.parseAsyncFn(),
+            Token.at => self.parseAttrDecl(),
             else => {
                 self.errors.report(self.tok_start, ErrorCode.e200, "expected declaration")
                 null_node
@@ -283,7 +292,7 @@ struct Parser {
     }
 
     /// fn name(T)(params) return_type { body }
-    fn parseFnDecl(is_extern: int, is_async: int, is_static: int, is_export: int) int {
+    fn parseFnDecl(is_extern: int, is_async: int, is_static: int, is_export: int, is_inlinable: int, is_nonisolated: int) int {
         const start = self.tok_start
         const doc = self.consumeDocComment()
         self.advance()  // consume 'fn'
@@ -340,7 +349,8 @@ struct Parser {
         }
 
         // @safe implicit self: inject `self: TypeName` if in impl block
-        if (self.safe_mode and @lenOf(self.current_impl_type) > 0 and !self.current_impl_is_generic and is_static == 0) {
+        // Also inject for actor methods (current_impl_is_actor), per Zig parser.zig:335
+        if ((self.safe_mode or self.current_impl_is_actor) and @lenOf(self.current_impl_type) > 0 and !self.current_impl_is_generic and is_static == 0) {
             // Check if first param is already named "self"
             var needs_self = true
             if (params.len() > 0) {
@@ -424,9 +434,9 @@ struct Parser {
             .is_export = is_export == 1,
             .is_async = is_async == 1,
             .is_static = is_static == 1,
-            .is_nonisolated = false,
-            .is_inlinable = false,
-            .global_actor = null,
+            .is_nonisolated = is_nonisolated == 1,
+            .is_inlinable = is_inlinable == 1,
+            .global_actor = self.pending_global_actor,
             .doc_comment = doc,
             .span = self.spanSE(start, self.tok_end),
         }))
@@ -734,13 +744,14 @@ struct Parser {
         self.current_impl_type = name
         self.current_impl_is_generic = (type_params.len() > 0)
 
-        // Parse nested declarations (const, enum, struct, type, fn, static fn) before fields
+        // Parse nested declarations (const, enum, struct, type, fn, static fn, async, nonisolated, @attr) before fields
         var nested: List(int) = .{}
         while (self.tok != Token.rbrace and self.tok != Token.eof) {
             self.collectDocComment()
             const tok = @enumFromInt(self.tok) as Token
             if (tok == Token.kw_const or tok == Token.kw_enum or tok == Token.kw_type or
-                tok == Token.kw_fn or tok == Token.kw_static or
+                tok == Token.kw_fn or tok == Token.kw_static or tok == Token.kw_async or tok == Token.at or
+                tok == Token.kw_nonisolated or
                 (tok == Token.kw_struct and self.peekToken() == Token.ident as int)) {
                 const nested_decl = self.parseDecl()
                 if (nested_decl != null_node) {
@@ -758,7 +769,8 @@ struct Parser {
             // Break on nested-decl keywords (methods after fields)
             const ftok = @enumFromInt(self.tok) as Token
             if (ftok == Token.kw_fn or ftok == Token.kw_static or ftok == Token.kw_const or
-                ftok == Token.kw_enum or ftok == Token.kw_type or ftok == Token.kw_struct) {
+                ftok == Token.kw_enum or ftok == Token.kw_type or ftok == Token.kw_struct or
+                ftok == Token.kw_async or ftok == Token.at or ftok == Token.kw_nonisolated) {
                 break
             }
             const fd = self.parseFieldDef()
@@ -773,7 +785,8 @@ struct Parser {
             self.collectDocComment()
             const tok = @enumFromInt(self.tok) as Token
             if (tok == Token.kw_const or tok == Token.kw_enum or tok == Token.kw_type or
-                tok == Token.kw_fn or tok == Token.kw_static or
+                tok == Token.kw_fn or tok == Token.kw_static or tok == Token.kw_async or tok == Token.at or
+                tok == Token.kw_nonisolated or
                 (tok == Token.kw_struct and self.peekToken() == Token.ident as int)) {
                 const nested_decl = self.parseDecl()
                 if (nested_decl != null_node) {
@@ -802,7 +815,7 @@ struct Parser {
         const start = self.tok_start
         self.advance()  // consume 'extern'
         if (self.tok == Token.kw_fn) {
-            return self.parseFnDecl(1, 0, 0, 0)
+            return self.parseFnDecl(1, 0, 0, 0, 0, 0)
         }
         if (self.tok == Token.kw_struct) {
             return self.parseStructDecl(2)  // extern layout
@@ -972,13 +985,13 @@ struct Parser {
                     self.errors.report(self.tok_start, ErrorCode.e200, "expected 'fn' after 'static'")
                     self.advance()
                 } else {
-                    const m = self.parseFnDecl(0, 0, 1, 0)
+                    const m = self.parseFnDecl(0, 0, 1, 0, 0, 0)
                     if (m != null_node) {
                         methods.append(m)
                     }
                 }
             } else if (self.tok == Token.kw_fn) {
-                const m = self.parseFnDecl(0, 0, 0, 0)
+                const m = self.parseFnDecl(0, 0, 0, 0, 0, 0)
                 if (m != null_node) {
                     methods.append(m)
                 }
@@ -1036,13 +1049,13 @@ struct Parser {
                     self.errors.report(self.tok_start, ErrorCode.e200, "expected 'fn' after 'static'")
                     self.advance()
                 } else {
-                    const m = self.parseFnDecl(0, 0, 1, 0)
+                    const m = self.parseFnDecl(0, 0, 1, 0, 0, 0)
                     if (m != null_node) {
                         methods.append(m)
                     }
                 }
             } else if (self.tok == Token.kw_fn) {
-                const m = self.parseFnDecl(0, 0, 0, 0)
+                const m = self.parseFnDecl(0, 0, 0, 0, 0, 0)
                 if (m != null_node) {
                     methods.append(m)
                 }
@@ -1076,7 +1089,7 @@ struct Parser {
         while (self.tok != Token.rbrace and self.tok != Token.eof) {
             self.collectDocComment()
             if (self.tok == Token.kw_fn) {
-                const m = self.parseFnDecl(0, 0, 0, 0)
+                const m = self.parseFnDecl(0, 0, 0, 0, 0, 0)
                 if (m != null_node) {
                     methods.append(m)
                 }
@@ -1117,7 +1130,157 @@ struct Parser {
             self.errors.report(self.tok_start, ErrorCode.e200, "expected fn after async")
             return null_node
         }
-        return self.parseFnDecl(0, 1, 0, 0)
+        return self.parseFnDecl(0, 1, 0, 0, 0, 0)
+    }
+
+    /// Parse `nonisolated fn name(...) { ... }` — Swift SE-0313.
+    /// Actor method accessible without await from outside the actor.
+    /// Ported from parser.zig:286-292.
+    fn parseNonisolatedFn() int {
+        self.advance()  // consume 'nonisolated'
+        if (self.tok != Token.kw_fn) {
+            self.errors.report(self.tok_start, ErrorCode.e200, "expected 'fn' after 'nonisolated'")
+            return null_node
+        }
+        return self.parseFnDecl(0, 0, 0, 0, 0, 1)
+    }
+
+    /// Parse `actor Name { fields... methods... }` — Swift SE-0306 actor declaration.
+    /// Actors are structs with compiler-enforced isolation. Parsed as struct_decl with is_actor=true.
+    /// Ported from parser.zig:619-678.
+    fn parseActorDecl() int {
+        const start = self.tok_start
+        const doc = self.consumeDocComment()
+        self.advance()  // consume 'actor'
+        if (self.tok != Token.ident) {
+            self.errors.report(self.tok_start, ErrorCode.e203, "expected actor name")
+            return null_node
+        }
+        const name = self.tok_text
+        self.advance()
+
+        if (!self.expect(Token.lbrace as int)) {
+            return null_node
+        }
+
+        // Save and set impl state — actor methods get implicit self injection
+        const saved_impl = self.current_impl_type
+        const saved_impl_generic = self.current_impl_is_generic
+        const saved_impl_is_actor = self.current_impl_is_actor
+        self.current_impl_type = name
+        self.current_impl_is_generic = false
+        self.current_impl_is_actor = true
+
+        // Parse nested declarations before fields
+        var nested: List(int) = .{}
+        while (self.tok != Token.rbrace and self.tok != Token.eof) {
+            self.collectDocComment()
+            const tok = @enumFromInt(self.tok) as Token
+            if (tok == Token.kw_const or tok == Token.kw_enum or tok == Token.kw_type or
+                tok == Token.kw_fn or tok == Token.kw_static or tok == Token.kw_async or tok == Token.at or
+                tok == Token.kw_nonisolated or
+                (tok == Token.kw_struct and self.peekToken() == Token.ident as int)) {
+                const nested_decl = self.parseDecl()
+                if (nested_decl != null_node) {
+                    nested.append(nested_decl)
+                }
+            } else {
+                break
+            }
+        }
+
+        // Fields
+        var fields: List(int) = .{}
+        while (self.tok != Token.rbrace and self.tok != Token.eof) {
+            self.collectDocComment()
+            const ftok = @enumFromInt(self.tok) as Token
+            if (ftok == Token.kw_fn or ftok == Token.kw_static or ftok == Token.kw_const or
+                ftok == Token.kw_enum or ftok == Token.kw_type or ftok == Token.kw_struct or
+                ftok == Token.kw_async or ftok == Token.at or ftok == Token.kw_nonisolated) {
+                break
+            }
+            const fd = self.parseFieldDef()
+            if (fd != null_node) {
+                fields.append(fd)
+            }
+            self.match(Token.comma as int)
+        }
+
+        // Parse nested declarations after fields (methods)
+        while (self.tok != Token.rbrace and self.tok != Token.eof) {
+            self.collectDocComment()
+            const tok = @enumFromInt(self.tok) as Token
+            if (tok == Token.kw_const or tok == Token.kw_enum or tok == Token.kw_type or
+                tok == Token.kw_fn or tok == Token.kw_static or tok == Token.kw_async or tok == Token.at or
+                tok == Token.kw_nonisolated or
+                (tok == Token.kw_struct and self.peekToken() == Token.ident as int)) {
+                const nested_decl = self.parseDecl()
+                if (nested_decl != null_node) {
+                    nested.append(nested_decl)
+                }
+            } else {
+                break
+            }
+        }
+
+        // Restore impl state
+        self.current_impl_type = saved_impl
+        self.current_impl_is_generic = saved_impl_generic
+        self.current_impl_is_actor = saved_impl_is_actor
+
+        self.expect(Token.rbrace as int)
+
+        return self.ast.addDecl(Decl.struct_decl(StructDecl {
+            .name = name,
+            .type_params = .{},
+            .fields = fields,
+            .layout = 0,
+            .nested_decls = nested,
+            .doc_comment = doc,
+            .is_actor = true,
+            .span = self.spanSE(start, self.tok_end),
+        }))
+    }
+
+    /// Parse @attribute declarations: @inlinable fn, @MainActor fn, @globalActor fn
+    /// Ported from parser.zig:224-246 (@attribute handling in parseDecl).
+    fn parseAttrDecl() int {
+        const peek_tok = self.peekToken()
+        const peek = @enumFromInt(peek_tok) as Token
+        if (peek != Token.ident) {
+            self.errors.report(self.tok_start, ErrorCode.e200, "expected attribute name after '@'")
+            return null_node
+        }
+        // Need to peek the text — advance past @ and read ident text
+        self.advance()  // consume @
+        const attr_name = self.tok_text
+
+        // @inlinable fn ... — Swift @inlinable: monomorphize generic function
+        if (attr_name == "inlinable") {
+            self.advance()  // consume 'inlinable'
+            if (self.tok != Token.kw_fn) {
+                self.errors.report(self.tok_start, ErrorCode.e200, "expected 'fn' after '@inlinable'")
+                return null_node
+            }
+            return self.parseFnDecl(0, 0, 0, 0, 1, 0)
+        }
+
+        // @MainActor fn or @globalActor fn — Swift SE-0316: global actor isolation
+        if (attr_name == "MainActor" or attr_name == "globalActor") {
+            self.advance()  // consume actor name
+            if (self.tok != Token.kw_fn and self.tok != Token.kw_async) {
+                self.errors.report(self.tok_start, ErrorCode.e200, "expected 'fn' or 'async fn' after global actor attribute")
+                return null_node
+            }
+            // Store actor name for parseFnDecl to pick up
+            self.pending_global_actor = attr_name
+            const result = self.parseDecl()
+            self.pending_global_actor = null
+            return result
+        }
+
+        self.errors.report(self.tok_start, ErrorCode.e200, "unknown attribute")
+        return null_node
     }
 
     /// Parse a field definition: name: Type or name: Type = default
@@ -2219,6 +2382,29 @@ struct Parser {
                 return self.ast.addStmt(Stmt.expr_stmt(ExprStmt { .expr = decl_idx, .span = self.ast.nodeSpan(decl_idx) }))
             }
         }
+        // Block-scoped actor declarations
+        if (tok == Token.kw_actor) {
+            return self.parseActorDecl()
+        }
+        // Block-scoped fn declarations
+        if (tok == Token.kw_fn) {
+            return self.parseDecl()
+        }
+        // Block-scoped async fn declarations
+        if (tok == Token.kw_async) {
+            return self.parseDecl()
+        }
+        // Block-scoped nonisolated fn declarations
+        if (tok == Token.kw_nonisolated) {
+            return self.parseDecl()
+        }
+        // Block-scoped @attribute fn declarations (@MainActor, @inlinable, @globalActor)
+        if (tok == Token.at) {
+            const peek = @enumFromInt(self.peekToken()) as Token
+            if (peek == Token.ident) {
+                return self.parseDecl()
+            }
+        }
         return switch (tok) {
             .kw_return => self.parseReturnStmt(),
             .kw_var, .kw_let => self.parseVarStmt(0),
@@ -2435,6 +2621,48 @@ struct Parser {
     fn parseForStmt(label: string, is_inline: int) int {
         const start = self.tok_start
         self.advance()  // consume 'for'
+
+        // Swift for-await-in desugaring (TypeCheckStmt.cpp:3443-3706 DesugarForEachStmt).
+        // `for await val in seq { body }` desugars to:
+        //   while (seq.next()) |val| { body }
+        // Uses Cot's existing while-optional with capture pattern.
+        // Swift reference: buildWhileCond() lines 3605-3620, OptionalSomePattern line 3609.
+        if (self.tok == Token.kw_await) {
+            self.advance()  // consume 'await'
+            if (self.tok != Token.ident) {
+                self.errors.report(self.tok_start, ErrorCode.e203, "expected loop variable after 'await'")
+                return null_node
+            }
+            const binding = self.tok_text
+            self.advance()
+            self.expect(Token.kw_in as int)
+            const sequence = self.parseExpr()
+            const body = self.parseBlock()
+
+            // Synthesize: seq.next() — the while condition
+            const seq_next = self.ast.addExpr(Expr.field_access(FieldAccessExpr {
+                .base = sequence,
+                .field = "next",
+                .span = self.spanSE(start, start),
+            }))
+            const seq_next_call = self.ast.addExpr(Expr.call(Call {
+                .callee = seq_next,
+                .args = .{},
+                .span = self.spanSE(start, start),
+            }))
+
+            // Desugar to: while (seq.next()) |val| { body }
+            return self.ast.addStmt(Stmt.while_stmt(WhileStmt {
+                .condition = seq_next_call,
+                .body = body,
+                .capture = binding,
+                .capture_is_ptr = false,
+                .continue_expr = null_node,
+                .label = label,
+                .span = self.spanSE(start, self.tok_end),
+            }))
+        }
+
         // Binding name
         if (self.tok != Token.ident) {
             self.errors.report(self.tok_start, ErrorCode.e203, "expected loop variable name")
