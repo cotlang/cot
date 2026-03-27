@@ -131,8 +131,10 @@ pub fn asyncSplit(f: *Func, type_registry: *const TypeRegistry) !void {
     // Step 3: Compute state struct layout
     // Layout: [state_num(8), result(8), spilled_local_0(8), spilled_local_1(8), ...]
     // Rust reference: coroutine.rs:969-1068 compute_layout
-    const state_offset: i64 = 0;
-    const result_offset: i64 = 8;
+    // Frame layout: result at offset 0 (compatible with TaskObject — lowerAwaitExpr
+    // loads from task[0]), state at offset 8, spills start at offset 16.
+    const result_offset: i64 = 0;
+    const state_offset: i64 = 8;
     const spill_offset: i64 = 16;
 
     // Compute frame layout: assign a unique offset to each spilled local
@@ -151,7 +153,6 @@ pub fn asyncSplit(f: *Func, type_registry: *const TypeRegistry) !void {
         }
     }
     const frame_size: usize = @intCast(next_offset);
-    _ = state_offset;
     _ = result_offset;
 
     debug.log(.async_split, "  state struct: {d} bytes ({d} spill slots)", .{
@@ -186,7 +187,11 @@ pub fn asyncSplit(f: *Func, type_registry: *const TypeRegistry) !void {
     // expects a frame pointer. Need to update lowerAsyncFnEager to generate
     // a constructor function when the body has 2+ suspend points, and update
     // lowerAwaitExpr to poll the state machine.
-    if (suspend_points.items.len < 2) {
+    // Gate: state machine transform produces valid SSA but the Wasm dispatch
+    // (if/else chain reading frame[state_offset]) has a bug where the state
+    // check always fails, causing infinite loops. Native path skips async_split
+    // entirely (uses eager evaluation). Re-enable after fixing Wasm dispatch.
+    if (true or suspend_points.items.len < 2) {
         debug.log(.async_split, "=== AsyncSplit skipped for '{s}': {d} suspend points (<=1, eager sufficient) ===", .{
             f.name, suspend_points.items.len,
         });
@@ -204,59 +209,73 @@ pub fn asyncSplit(f: *Func, type_registry: *const TypeRegistry) !void {
     while (i_sp > 0) {
         i_sp -= 1;
         const sp = &suspend_points.items[i_sp];
-        try splitBlockAtSuspend(f, sp, &local_to_offset);
+        try splitBlockAtSuspend(f, sp, &local_to_offset, state_offset);
         debug.log(.async_split, "  split block at state={d}, resume block created", .{sp.state_number});
     }
 
-    // Step 5: Create dispatch entry block with jump_table
+    // Step 5: Create dispatch entry as if/else chain
+    // NOT using jump_table — Wasm's br_table dispatch uses PC_B which resets to 0
+    // on each function call, making it incompatible with re-entrant state machines.
+    // Instead, emit: load frame[0] → chain of (state == N) → branch to resume block.
+    // Fallthrough → original entry (state 0 = UNRESUMED).
     // Rust reference: coroutine.rs:1085-1109 insert_switch
     const original_entry = f.entry orelse return;
-    const dispatch = try f.newBlock(.jump_table);
-
-    // Load state from frame arg (arg 0 = frame pointer)
     const pos = @import("../value.zig").Pos{ .line = 0, .col = 0 };
-    const frame_arg = try f.newValue(.arg, 0, dispatch, pos); // type 0 = i64
-    frame_arg.aux_int = 0;
-    try dispatch.addValue(f.allocator, frame_arg);
 
-    const state_load = try f.newValue(.load, 0, dispatch, pos); // load i64 from frame[0]
-    state_load.addArg(frame_arg);
-    try dispatch.addValue(f.allocator, state_load);
+    // Build if/else chain: for each suspend point, create a check block
+    // that compares state to the suspend state number and branches.
+    var prev_block = original_entry; // fallthrough target (state 0)
+    var sp_idx: usize = suspend_points.items.len;
+    while (sp_idx > 0) {
+        sp_idx -= 1;
+        const sp = suspend_points.items[sp_idx];
+        const rb = sp.resume_block orelse continue;
 
-    // Memory init for dispatch block
-    // Note: memory state not needed for dispatch — it just loads and branches
+        // Create check block: load frame[0], compare to state N, branch
+        const check_block = try f.newBlock(.if_);
 
-    dispatch.setControl(state_load);
+        // Load frame pointer (arg 0)
+        const frame_arg = try f.newValue(.arg, 0, check_block, pos);
+        frame_arg.aux_int = 0;
+        try check_block.addValue(f.allocator, frame_arg);
 
-    // Wire successors: state 0 → original entry, state 1 → unreachable, state 2 → unreachable
-    try dispatch.addEdgeTo(f.allocator, original_entry); // state 0 = UNRESUMED
+        // Load state from frame[state_offset=8]
+        const frame_state_addr = try f.newValue(.off_ptr, 0, check_block, pos);
+        frame_state_addr.aux_int = state_offset;
+        frame_state_addr.addArg(frame_arg);
+        try check_block.addValue(f.allocator, frame_state_addr);
 
-    // Create unreachable block for states 1 (RETURNED) and 2 (POISONED)
-    const unreachable_block = try f.newBlock(.exit);
-    try dispatch.addEdgeTo(f.allocator, unreachable_block); // state 1
-    try dispatch.addEdgeTo(f.allocator, unreachable_block); // state 2
+        const state_load = try f.newValue(.load, 0, check_block, pos);
+        state_load.addArg(frame_state_addr);
+        try check_block.addValue(f.allocator, state_load);
 
-    // Wire resume blocks: state 3+ → resume block for each suspend point
-    for (suspend_points.items) |sp| {
-        if (sp.resume_block) |rb| {
-            try dispatch.addEdgeTo(f.allocator, rb);
-        }
+        // Compare state == sp.state_number
+        const state_const = try f.newValue(.const_int, 0, check_block, pos);
+        state_const.aux_int = sp.state_number;
+        try check_block.addValue(f.allocator, state_const);
+
+        const cmp = try f.newValue(.eq, 0, check_block, pos);
+        cmp.addArg2(state_load, state_const);
+        try check_block.addValue(f.allocator, cmp);
+
+        check_block.setControl(cmp);
+
+        // True branch → resume block, false branch → previous check (or entry)
+        try check_block.addEdgeTo(f.allocator, rb);
+        try check_block.addEdgeTo(f.allocator, prev_block);
+
+        prev_block = check_block;
     }
 
-    f.entry = dispatch;
+    // The first check block becomes the new entry
+    f.entry = prev_block;
     f.invalidateCFG();
 
-    // Debug: log dispatch block successors
-    debug.log(.async_split, "  dispatch block b{d}: {d} successors", .{
-        dispatch.id, dispatch.succs.len,
+    debug.log(.async_split, "  dispatch: if/else chain with {d} checks, entry=b{d}", .{
+        suspend_points.items.len, prev_block.id,
     });
-    for (dispatch.succs, 0..) |edge, idx| {
-        debug.log(.async_split, "    succ[{d}] = b{d} (kind={s})", .{
-            idx, edge.b.id, @tagName(edge.b.kind),
-        });
-    }
 
-    debug.log(.async_split, "=== AsyncSplit complete for '{s}': {d} suspend points, {d}B frame, dispatch entry created ===", .{
+    debug.log(.async_split, "=== AsyncSplit complete for '{s}': {d} suspend points, {d}B frame ===", .{
         f.name, suspend_points.items.len, frame_size,
     });
 }
@@ -320,7 +339,7 @@ fn computeLiveValues(f: *const Func, sp: *SuspendPoint) !void {
 /// 4. Rewrite uses in resume block to reference restored values
 ///
 /// This eliminates cross-block value references that would violate SSA dominance.
-fn splitBlockAtSuspend(f: *Func, sp: *SuspendPoint, local_to_offset: *const std.AutoHashMapUnmanaged(u32, i64)) !void {
+fn splitBlockAtSuspend(f: *Func, sp: *SuspendPoint, local_to_offset: *const std.AutoHashMapUnmanaged(u32, i64), state_offset: i64) !void {
     const block = sp.block;
     const Pos = @import("../value.zig").Pos;
     const pos = Pos{ .line = 0, .col = 0 };
@@ -385,14 +404,19 @@ fn splitBlockAtSuspend(f: *Func, sp: *SuspendPoint, local_to_offset: *const std.
         frame_ptr_in_block = fp;
     }
 
-    // Store state number to frame[0]
+    // Store state number to frame[state_offset=8]
     // Rust: coroutine.rs — set discriminant to suspend state number
     const state_val = try f.newValue(.const_int, 0, block, pos);
     state_val.aux_int = sp.state_number;
     try block.addValue(f.allocator, state_val);
 
+    const state_addr = try f.newValue(.off_ptr, 0, block, pos);
+    state_addr.aux_int = state_offset;
+    state_addr.addArg(frame_ptr_in_block.?);
+    try block.addValue(f.allocator, state_addr);
+
     const state_store = try f.newValue(.store, 0, block, pos);
-    state_store.addArg(frame_ptr_in_block.?);
+    state_store.addArg(state_addr);
     state_store.addArg(state_val);
     try block.addValue(f.allocator, state_store);
 

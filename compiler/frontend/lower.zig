@@ -1017,9 +1017,11 @@ pub const Lowerer = struct {
             const frame_local = try fb.addLocalWithSize("__frame", TypeRegistry.I64, false, 8);
             _ = try fb.emitStoreLocal(frame_local, frame_ptr, span);
 
-            // Set state = STATE_UNRESUMED (0)
+            // Set state = STATE_UNRESUMED (0) at frame[8] (state_offset)
             const state_zero = try fb.emitConstInt(0, TypeRegistry.I64, span);
-            _ = try fb.emitPtrStoreValue(frame_ptr, state_zero, span);
+            const eight = try fb.emitConstInt(8, TypeRegistry.I64, span);
+            const state_addr = try fb.emitBinary(.add, frame_ptr, eight, TypeRegistry.I64, span);
+            _ = try fb.emitPtrStoreValue(state_addr, state_zero, span);
 
             // Store params into frame[24+idx*8]
             const param_base_offset: i64 = 24;
@@ -1046,9 +1048,11 @@ pub const Lowerer = struct {
             var poll_args = [_]ir.NodeIndex{frame_for_poll};
             _ = try fb.emitCall(poll_name, &poll_args, false, TypeRegistry.VOID, span);
 
-            // Check state: load frame[0]
+            // Check state: load frame[8] (state_offset)
             const frame_for_check = try fb.emitLoadLocal(frame_local, TypeRegistry.I64, span);
-            const state = try fb.emitPtrLoadValue(frame_for_check, TypeRegistry.I64, span);
+            const eight2 = try fb.emitConstInt(8, TypeRegistry.I64, span);
+            const state_check_addr = try fb.emitBinary(.add, frame_for_check, eight2, TypeRegistry.I64, span);
+            const state = try fb.emitPtrLoadValue(state_check_addr, TypeRegistry.I64, span);
             const one = try fb.emitConstInt(1, TypeRegistry.I64, span);
             const is_returned = try fb.emitBinary(.eq, state, one, TypeRegistry.BOOL, span);
             _ = try fb.emitBranch(is_returned, done_block, loop_block, span);
@@ -1577,20 +1581,21 @@ pub const Lowerer = struct {
         // Async return: store result in task/frame, then return.
         if (fb.async_task_local) |task_local| {
             if (fb.is_async_poll) {
-                // Poll function: store result at frame[8], set state=RETURNED(1), return void.
+                // Poll function: store result at frame[0], set state=RETURNED(1) at frame[8].
+                // Frame layout: [result(0), state(8), ...] — compatible with TaskObject.
                 // Rust reference: coroutine.rs — set discriminant to RETURNED, store result.
                 const frame_ptr = try fb.emitLoadLocal(task_local, TypeRegistry.I64, ret.span);
                 if (ret.value != null_node) {
                     const result = try self.lowerExprNode(ret.value);
-                    // Store result at frame[8] (result offset in state machine frame)
-                    const eight = try fb.emitConstInt(8, TypeRegistry.I64, ret.span);
-                    const result_addr = try fb.emitBinary(.add, frame_ptr, eight, TypeRegistry.I64, ret.span);
-                    _ = try fb.emitPtrStoreValue(result_addr, result, ret.span);
+                    // Store result at frame[0] (result_offset = 0)
+                    _ = try fb.emitPtrStoreValue(frame_ptr, result, ret.span);
                 }
-                // Set state = STATE_RETURNED (1) at frame[0]
+                // Set state = STATE_RETURNED (1) at frame[8] (state_offset)
                 const one = try fb.emitConstInt(1, TypeRegistry.I64, ret.span);
                 const frame_ptr2 = try fb.emitLoadLocal(task_local, TypeRegistry.I64, ret.span);
-                _ = try fb.emitPtrStoreValue(frame_ptr2, one, ret.span);
+                const eight = try fb.emitConstInt(8, TypeRegistry.I64, ret.span);
+                const state_addr = try fb.emitBinary(.add, frame_ptr2, eight, TypeRegistry.I64, ret.span);
+                _ = try fb.emitPtrStoreValue(state_addr, one, ret.span);
                 // Run cleanup stack before returning
                 try self.emitCleanups(0);
                 // Return void (poll function returns nothing)
