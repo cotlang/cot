@@ -720,8 +720,12 @@ pub const Lowerer = struct {
         const saved_cleanup = self.cleanup_stack;
         const saved_loop_stack_len = self.loop_stack.items.len;
 
-        // Async functions: Phase 1 eager evaluation — body runs immediately,
-        // result wrapped in heap-allocated TaskObject. Phase 2 adds state machines.
+        // Async functions: eager evaluation.
+        // All async functions use the eager path — the body executes immediately.
+        // For functions with 2+ await points, the SSA pass (async_split.zig)
+        // transforms the body into a state machine. The external interface
+        // (returns Task pointer) is the same regardless of transformation.
+        // Kotlin reference: AbstractSuspendFunctionsLowering.kt:66-92
         if (fn_decl.is_async) {
             try self.lowerAsyncFnEager(fn_decl);
             // Restore parent state (same as end of lowerFnDecl)
