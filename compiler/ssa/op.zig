@@ -246,6 +246,17 @@ pub const Op = enum(u16) {
     pub fn isRematerializable(self: Op) bool { return self.info().rematerializable; }
     pub fn readsMemory(self: Op) bool { return self.info().reads_memory; }
     pub fn writesMemory(self: Op) bool { return self.info().writes_memory; }
+
+    /// Returns true if this op computes an address and pushes an i64 to the Wasm stack
+    /// despite having VOID type_idx. These ops need setReg in the Wasm codegen.
+    pub fn producesAddressValue(self: Op) bool {
+        return switch (self) {
+            .off_ptr, .local_addr, .global_addr, .metadata_addr, .addr,
+            .add_ptr, .sub_ptr,
+            => true,
+            else => false,
+        };
+    }
 };
 
 pub const OpInfo = struct {

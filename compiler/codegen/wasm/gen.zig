@@ -1506,12 +1506,9 @@ pub const GenState = struct {
                 try self.setReg(v); // stores ptr to v's main local
             }
         } else if (v.uses > 0 and v.type_idx != TypeRegistry.VOID and v.type_idx != TypeRegistry.SSA_MEM) {
-            // Memory-state values (SSA_MEM) don't produce wasm stack values — skip setReg.
-            // Most VOID-typed values (memory copies, etc.) also don't produce stack values.
+            // Non-VOID, non-SSA_MEM values with uses always need setReg.
             try self.setReg(v);
-        } else if (v.uses > 0 and v.type_idx == TypeRegistry.VOID and
-            (v.op == .off_ptr or v.op == .local_addr))
-        {
+        } else if (v.uses > 0 and v.type_idx == TypeRegistry.VOID and v.op.producesAddressValue()) {
             // Address-computing ops have VOID type but DO produce an i64 stack value.
             // They need setReg to pop from the wasm stack into a local.
             try self.setReg(v);
