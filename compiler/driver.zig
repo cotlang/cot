@@ -1384,6 +1384,8 @@ pub const Driver = struct {
             "dladdr",
             // poll — used by poll_read to wait on non-blocking fd
             "poll",
+            // usleep — POSIX sleep in microseconds (for Task.sleep on native)
+            "usleep",
         };
         const runtime_start_idx: u32 = @intCast(funcs.len);
         for (runtime_func_names, 0..) |name, i| {
