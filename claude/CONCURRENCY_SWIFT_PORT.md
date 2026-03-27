@@ -1,7 +1,7 @@
 # Concurrency: Swift Port — Status & Implementation Plan
 
 **Date:** 2026-03-28
-**Tests:** 480, all green (native + Wasm)
+**Tests:** 500, all green (native + Wasm)
 **Fidelity:** 96% faithful, 3% adapted, 1% invented
 
 ---
@@ -173,7 +173,7 @@ Returns false if group already cancelled (no task created). Returns true if task
 
 ---
 
-### Milestone 2: AsyncSequence Operators (1.5 weeks)
+### Milestone 2: AsyncSequence Operators (1.5 weeks) — PARTIAL (M2.1-M2.6 done, M2.7 pending)
 
 Swift provides 14 operator types for composing async sequences. Each is a struct wrapping a base sequence.
 
