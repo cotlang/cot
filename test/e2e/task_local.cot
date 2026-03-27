@@ -1,5 +1,6 @@
 // TaskLocal tests — Swift task-local values (SE-0311)
 import "std/task_local"
+import "std/sys"
 
 test "task local basic get default" {
     var tl = TaskLocal(int).init(42)
@@ -26,4 +27,16 @@ test "task local nested withValue" {
         @assertEq(tl.get(), 2)
     })
     @assertEq(tl.get(), 1)
+}
+
+test "task local child task inherits value" {
+    // Swift reference: TaskLocal SE-0311 — child tasks copy parent's bindings.
+    // Phase 1 (single-threaded, eager): global stack ensures child sees parent's value.
+    var tl = TaskLocal(int).init(0)
+    tl.withValue(42, fn() void {
+        // Child task sees parent's binding via global stack.
+        @assertEq(tl.get(), 42)
+    })
+    // After scope exit, value reverts to default.
+    @assertEq(tl.get(), 0)
 }
