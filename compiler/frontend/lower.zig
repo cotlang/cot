@@ -580,7 +580,6 @@ pub const Lowerer = struct {
         if (self.builder.func()) |fb| {
             self.current_func = fb;
             const ptr_type = self.type_reg.makePointer(TypeRegistry.U8) catch TypeRegistry.VOID;
-            const err_void_type = self.type_reg.makeErrorUnion(TypeRegistry.VOID) catch TypeRegistry.VOID;
 
             // Initialize globals and type metadata before any test code runs
             {
@@ -611,12 +610,11 @@ pub const Lowerer = struct {
                 var print_args = [_]ir.NodeIndex{ name_ptr, name_len };
                 _ = try fb.emitCall("__test_print_name", &print_args, false, TypeRegistry.VOID, span);
 
-                // Call test function — returns pointer to error union (!void)
+                // Call test function — returns i64 tag: 0 = success, non-zero = error
                 var no_args = [_]ir.NodeIndex{};
-                const eu_ptr = try fb.emitCall(test_name, &no_args, false, err_void_type, span);
+                const tag_val = try fb.emitCall(test_name, &no_args, false, TypeRegistry.I64, span);
 
-                // Read error union tag at [eu_ptr + 0]
-                const tag_val = try fb.emitPtrLoadValue(eu_ptr, TypeRegistry.I64, span);
+                // Check tag: 0 = pass, non-zero = fail
                 const zero = try fb.emitConstInt(0, TypeRegistry.I64, span);
                 const is_error = try fb.emitBinary(.ne, tag_val, zero, TypeRegistry.BOOL, span);
 
@@ -1275,10 +1273,11 @@ pub const Lowerer = struct {
         const qualified_test = try self.qualifyName(test_name);
         try self.test_names.append(self.allocator, qualified_test);
         try self.test_display_names.append(self.allocator, test_decl.name);
-        // Test functions return !void (error union) — Zig pattern: test blocks return errors
-        // on assertion failure, runner catches and continues to next test
-        const err_void_type = try self.type_reg.makeErrorUnion(TypeRegistry.VOID);
-        self.builder.startFunc(qualified_test, TypeRegistry.VOID, err_void_type, test_decl.span);
+        // Test functions return i64: 0 = success, non-zero = error tag.
+        // Previous design returned !void pointer (error union on stack), but on Wasm
+        // the stack frame is freed before the caller reads the pointer → stale memory.
+        // Returning the tag value directly avoids stack-use-after-free.
+        self.builder.startFunc(qualified_test, TypeRegistry.VOID, TypeRegistry.I64, test_decl.span);
         if (self.builder.func()) |fb| {
             self.current_func = fb;
             self.current_test_name = test_decl.name;
@@ -1289,15 +1288,9 @@ pub const Lowerer = struct {
                 _ = try self.lowerBlockNode(test_decl.body);
                 if (fb.needsTerminator()) {
                     try self.emitCleanups(0);
-                    // Return success: error union with tag=0 (no error)
-                    const eu_size = self.type_reg.sizeOf(err_void_type);
-                    const tmp_local = try fb.addLocalWithSize("__test_ok", err_void_type, false, eu_size);
+                    // Return success: 0 (no error)
                     const tag_zero = try fb.emitConstInt(0, TypeRegistry.I64, test_decl.span);
-                    _ = try fb.emitStoreLocalField(tmp_local, 0, 0, tag_zero, test_decl.span);
-                    const zero_payload = try fb.emitConstInt(0, TypeRegistry.I64, test_decl.span);
-                    _ = try fb.emitStoreLocalField(tmp_local, 1, 8, zero_payload, test_decl.span);
-                    const ret_ptr = try fb.emitAddrLocal(tmp_local, TypeRegistry.I64, test_decl.span);
-                    _ = try fb.emitRet(ret_ptr, test_decl.span);
+                    _ = try fb.emitRet(tag_zero, test_decl.span);
                 }
             }
             self.current_test_name = null;
@@ -10971,15 +10964,9 @@ pub const Lowerer = struct {
                 _ = try fb.emitBranch(cond, then_block, fail_block, bc.span);
                 fb.setBlock(fail_block);
                 if (self.current_test_name != null) {
-                    const ret_type = fb.return_type;
-                    const eu_size = self.type_reg.sizeOf(ret_type);
-                    const tmp_local = try fb.addLocalWithSize("__assert_err", ret_type, false, eu_size);
+                    // Return error tag (1) directly — test functions return i64, not error union ptr
                     const tag_one = try fb.emitConstInt(1, TypeRegistry.I64, bc.span);
-                    _ = try fb.emitStoreLocalField(tmp_local, 0, 0, tag_one, bc.span);
-                    const payload = try fb.emitConstInt(0, TypeRegistry.I64, bc.span);
-                    _ = try fb.emitStoreLocalField(tmp_local, 1, 8, payload, bc.span);
-                    const err_ret = try fb.emitAddrLocal(tmp_local, TypeRegistry.I64, bc.span);
-                    _ = try fb.emitRet(err_ret, bc.span);
+                    _ = try fb.emitRet(tag_one, bc.span);
                 } else {
                     const msg = try self.allocator.dupe(u8, "assertion failed\n");
                     const msg_idx = try fb.addStringLiteral(msg);
@@ -11063,15 +11050,9 @@ pub const Lowerer = struct {
                         var store_args = [_]ir.NodeIndex{ lv, rv, is_str_val, zero_len, zero_len };
                         _ = try fb.emitCall("__test_store_fail_values", &store_args, false, TypeRegistry.VOID, bc.span);
                     }
-                    const ret_type = fb.return_type;
-                    const eu_size = self.type_reg.sizeOf(ret_type);
-                    const tmp_local = try fb.addLocalWithSize("__assertEq_err", ret_type, false, eu_size);
+                    // Return error tag (1) directly — test functions return i64, not error union ptr
                     const tag_one = try fb.emitConstInt(1, TypeRegistry.I64, bc.span);
-                    _ = try fb.emitStoreLocalField(tmp_local, 0, 0, tag_one, bc.span);
-                    const payload = try fb.emitConstInt(0, TypeRegistry.I64, bc.span);
-                    _ = try fb.emitStoreLocalField(tmp_local, 1, 8, payload, bc.span);
-                    const err_ret = try fb.emitAddrLocal(tmp_local, TypeRegistry.I64, bc.span);
-                    _ = try fb.emitRet(err_ret, bc.span);
+                    _ = try fb.emitRet(tag_one, bc.span);
                 } else {
                     const msg = try self.allocator.dupe(u8, "assertEq failed\n");
                     const msg_idx = try fb.addStringLiteral(msg);
