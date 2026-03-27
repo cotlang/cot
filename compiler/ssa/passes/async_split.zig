@@ -193,11 +193,6 @@ pub fn asyncSplit(f: *Func, type_registry: *const TypeRegistry) !void {
     // (if/else chain reading frame[state_offset]) has a bug where the state
     // check always fails, causing infinite loops. Native path skips async_split
     // entirely (uses eager evaluation). Re-enable after fixing Wasm dispatch.
-    // Gate: state machine works for individual files but produces truncated Wasm
-    // when the full concurrency.cot test file is compiled (139 functions).
-    // The constructor/poll split + state machine transform work correctly for
-    // isolated tests. The issue is in the Wasm linker when many functions are
-    // present. TODO: investigate section size calculation in link.zig.
     if (true or suspend_points.items.len < 2) {
         debug.log(.async_split, "=== AsyncSplit skipped for '{s}': {d} suspend points (<=1, eager sufficient) ===", .{
             f.name, suspend_points.items.len,

@@ -1590,15 +1590,22 @@ pub const Lowerer = struct {
                 // Poll function: store result at frame[0], set state=RETURNED(1) at frame[8].
                 // Frame layout: [result(0), state(8), ...] — compatible with TaskObject.
                 // Rust reference: coroutine.rs — set discriminant to RETURNED, store result.
-                const frame_ptr = try fb.emitLoadLocal(task_local, TypeRegistry.I64, ret.span);
+                // Load frame pointer from PARAM 0 (not __async_task local — may be stale
+                // after state machine resumes from a different suspension point).
+                const frame_param_local: ir.LocalIdx = 0; // poll function's first param
                 if (ret.value != null_node) {
+                    // Lower the return value BEFORE loading frame pointer.
+                    // This handles `return await expr` correctly: the await is lowered
+                    // as a call + load + release, then the result is stored at frame[0].
+                    // If we loaded frame ptr first, the await call might corrupt locals.
                     const result = try self.lowerExprNode(ret.value);
+                    const frame_ptr = try fb.emitLoadLocal(frame_param_local, TypeRegistry.I64, ret.span);
                     // Store result at frame[0] (result_offset = 0)
                     _ = try fb.emitPtrStoreValue(frame_ptr, result, ret.span);
                 }
                 // Set state = STATE_RETURNED (1) at frame[8] (state_offset)
                 const one = try fb.emitConstInt(1, TypeRegistry.I64, ret.span);
-                const frame_ptr2 = try fb.emitLoadLocal(task_local, TypeRegistry.I64, ret.span);
+                const frame_ptr2 = try fb.emitLoadLocal(frame_param_local, TypeRegistry.I64, ret.span);
                 const eight = try fb.emitConstInt(8, TypeRegistry.I64, ret.span);
                 const state_addr = try fb.emitBinary(.add, frame_ptr2, eight, TypeRegistry.I64, ret.span);
                 _ = try fb.emitPtrStoreValue(state_addr, one, ret.span);
