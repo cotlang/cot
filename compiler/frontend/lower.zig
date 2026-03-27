@@ -1550,6 +1550,19 @@ pub const Lowerer = struct {
             .break_stmt => |bs| { try self.lowerBreak(bs.label, bs.value); return true; },
             .continue_stmt => |cs| { try self.lowerContinue(cs.label); return true; },
             .expr_stmt => |es| { _ = try self.lowerExprNode(es.expr); return false; },
+            .async_let => |al| {
+                // async let name = asyncCall() — lower like a var decl
+                // The value is an async fn call that returns Task(T) in eager mode
+                const fb = self.current_func orelse return false;
+                const val_type = self.inferExprType(al.value);
+                const size = self.type_reg.sizeOf(val_type);
+                const local_idx = try fb.addLocalWithSize(al.name, val_type, false, size);
+                const val = try self.lowerExprNode(al.value);
+                if (val != ir.null_node) {
+                    _ = try fb.emitStoreLocal(local_idx, val, al.span);
+                }
+                return false;
+            },
             .defer_stmt => |ds| {
                 // Push defer/errdefer as cleanup entry on unified stack (Swift's DeferCleanup pattern)
                 // Zig reference: AstGen.zig:3132-3200 — .defer_normal vs .defer_error
@@ -7900,6 +7913,9 @@ pub const Lowerer = struct {
                 .defer_stmt => |ds| try self.detectCaptures(ds.expr, parent_fb, captures),
                 .destructure_stmt => |ds| {
                     try self.detectCaptures(ds.value, parent_fb, captures);
+                },
+                .async_let => |al| {
+                    try self.detectCaptures(al.value, parent_fb, captures);
                 },
                 .break_stmt, .continue_stmt, .bad_stmt => {},
             },

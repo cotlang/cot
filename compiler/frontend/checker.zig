@@ -3635,6 +3635,13 @@ pub const Checker = struct {
             .continue_stmt => |cs| if (!self.in_loop) self.err.errorWithCode(cs.span.start, .e300, "continue outside of loop"),
             .defer_stmt => |ds| _ = try self.checkExpr(ds.expr),
             .destructure_stmt => |ds| try self.checkDestructureStmt(ds, idx),
+            .async_let => |al| {
+                // async let name = asyncCall() — type-check value, define binding with its type
+                const val_type = try self.checkExpr(al.value);
+                if (!self.scope.isDefined(al.name)) {
+                    try self.scope.define(Symbol.init(al.name, .constant, val_type, idx, false));
+                }
+            },
             .bad_stmt => {},
         }
     }

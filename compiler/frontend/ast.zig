@@ -438,6 +438,7 @@ pub const Stmt = union(enum) {
     break_stmt: BreakStmt,
     continue_stmt: ContinueStmt,
     defer_stmt: DeferStmt,
+    async_let: AsyncLet,
     destructure_stmt: DestructureStmt,
     bad_stmt: BadStmt,
 
@@ -479,6 +480,9 @@ pub const BlockStmt = struct { stmts: []const NodeIndex, span: Span };
 pub const BreakStmt = struct { label: ?[]const u8 = null, value: NodeIndex = null_node, span: Span };
 pub const ContinueStmt = struct { label: ?[]const u8 = null, span: Span };
 pub const DeferStmt = struct { expr: NodeIndex, is_errdefer: bool = false, span: Span };
+/// async let x = expr — Swift SE-0317 parallel binding.
+/// Phase 1 (eager): evaluates expr immediately, binds result as Task.
+pub const AsyncLet = struct { name: []const u8, value: NodeIndex, span: Span };
 pub const BadStmt = struct { span: Span };
 
 // Unified Node

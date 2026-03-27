@@ -670,6 +670,13 @@ pub const Formatter = struct {
                 self.write(if (s.is_errdefer) "errdefer " else "defer ") catch {};
                 self.printNode(s.expr);
             },
+            .async_let => |al| {
+                self.writeIndent();
+                self.write("async let ") catch {};
+                self.write(al.name) catch {};
+                self.write(" = ") catch {};
+                self.printNode(al.value);
+            },
             .bad_stmt => {},
         }
     }

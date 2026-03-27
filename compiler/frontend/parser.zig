@@ -278,8 +278,25 @@ pub const Parser = struct {
     }
 
     fn parseAsyncFn(self: *Parser) ParseError!?NodeIndex {
+        const start = self.pos();
         self.advance(); // consume 'async'
-        if (!self.check(.kw_fn)) { self.syntaxError("expected 'fn' after 'async'"); return null; }
+
+        // async let x = expr — Swift SE-0317 parallel bindings
+        if (self.check(.kw_let) or self.check(.kw_var) or self.check(.kw_const)) {
+            self.advance(); // consume let/var/const
+            if (!self.check(.ident)) { self.syntaxError("expected variable name after 'async let'"); return null; }
+            const name = self.tok.text;
+            self.advance();
+            if (!self.expect(.assign)) { self.syntaxError("expected '=' in async let"); return null; }
+            const value = try self.parseExpr() orelse return null;
+            return try self.tree.addStmt(.{ .async_let = .{
+                .name = name,
+                .value = value,
+                .span = Span.init(start, self.pos()),
+            } });
+        }
+
+        if (!self.check(.kw_fn)) { self.syntaxError("expected 'fn' or 'let' after 'async'"); return null; }
         return self.parseFnDecl(false, true, false, false, false);
     }
 

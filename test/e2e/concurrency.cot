@@ -235,3 +235,30 @@ test "sendable closure captures multiple Sendable values" {
     const f = @Sendable fn() i64 { return a + b }
     @assertEq(f(), 30)
 }
+
+// === async let tests (SE-0317) ===
+
+test "async let basic" {
+    async fn getValue() int { return 42 }
+    async let x = getValue()
+    @assertEq(await x, 42)
+}
+
+test "async let parallel bindings" {
+    async fn getA() int { return 10 }
+    async fn getB() int { return 20 }
+    async let a = getA()
+    async let b = getB()
+    @assertEq(await a + await b, 30)
+}
+
+test "async let with computation" {
+    async fn compute(n: int) int {
+        var sum = 0
+        var i = 0
+        while (i < n) : (i = i + 1) { sum = sum + i }
+        return sum
+    }
+    async let result = compute(5)
+    @assertEq(await result, 10)
+}

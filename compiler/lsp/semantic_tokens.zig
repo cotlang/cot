@@ -405,6 +405,10 @@ const TokenCollector = struct {
                 self.walkNode(d.value);
             },
             .break_stmt => |bs| self.walkNode(bs.value),
+            .async_let => |al| {
+                self.emitName(al.span, al.name, .variable, MOD_DECLARATION);
+                self.walkNode(al.value);
+            },
             .continue_stmt, .bad_stmt => {},
         }
     }
