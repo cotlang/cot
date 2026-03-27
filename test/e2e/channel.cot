@@ -3,9 +3,9 @@ import "std/channel"
 
 test "channel send and recv" {
     var ch = Channel(int).init(10)
-    ch.send(42)
-    ch.send(100)
-    ch.send(7)
+    @assert(ch.send(42))
+    @assert(ch.send(100))
+    @assert(ch.send(7))
 
     let a = ch.recv()
     @assert(a != null)
@@ -25,9 +25,9 @@ test "channel send and recv" {
 
 test "channel for-await iteration" {
     var ch = Channel(int).init(10)
-    ch.send(10)
-    ch.send(20)
-    ch.send(30)
+    @assert(ch.send(10))
+    @assert(ch.send(20))
+    @assert(ch.send(30))
     ch.close()
 
     var sum = 0
@@ -39,9 +39,9 @@ test "channel for-await iteration" {
 
 test "channel close prevents send" {
     var ch = Channel(int).init(10)
-    ch.send(1)
+    @assert(ch.send(1))
     ch.close()
-    ch.send(2)
+    @assert(!ch.send(2))
 
     let a = ch.recv()
     @assert(a != null)
@@ -59,11 +59,35 @@ test "channel recv from empty returns null" {
 
 test "channel multiple send recv cycles" {
     var ch = Channel(int).init(5)
-    ch.send(1)
+    @assert(ch.send(1))
     @assertEq(ch.recv().?, 1)
-    ch.send(2)
-    ch.send(3)
+    @assert(ch.send(2))
+    @assert(ch.send(3))
     @assertEq(ch.recv().?, 2)
     @assertEq(ch.recv().?, 3)
     @assert(ch.recv() == null)
+}
+
+test "channel capacity enforcement" {
+    var ch = Channel(int).init(2)
+    @assert(ch.send(1))
+    @assert(ch.send(2))
+    // Buffer full (capacity 2, 2 items buffered)
+    @assert(!ch.send(3))
+    // Consume one — now space available
+    @assertEq(ch.recv().?, 1)
+    @assert(ch.send(3))
+    @assertEq(ch.recv().?, 2)
+    @assertEq(ch.recv().?, 3)
+}
+
+test "channel len" {
+    var ch = Channel(int).init(10)
+    @assertEq(ch.len(), 0)
+    @assert(ch.send(1))
+    @assertEq(ch.len(), 1)
+    @assert(ch.send(2))
+    @assertEq(ch.len(), 2)
+    ch.recv()
+    @assertEq(ch.len(), 1)
 }
