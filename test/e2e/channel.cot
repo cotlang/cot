@@ -50,3 +50,20 @@ test "channel close prevents send" {
     let b = ch.recv()
     @assert(b == null)
 }
+
+test "channel recv from empty returns null" {
+    var ch = Channel(int).init(10)
+    let result = ch.recv()
+    @assert(result == null)
+}
+
+test "channel multiple send recv cycles" {
+    var ch = Channel(int).init(5)
+    ch.send(1)
+    @assertEq(ch.recv().?, 1)
+    ch.send(2)
+    ch.send(3)
+    @assertEq(ch.recv().?, 2)
+    @assertEq(ch.recv().?, 3)
+    @assert(ch.recv() == null)
+}

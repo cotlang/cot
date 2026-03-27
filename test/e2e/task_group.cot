@@ -37,3 +37,30 @@ test "task group for-await iteration" {
     }
     @assertEq(sum, 15)
 }
+
+test "empty task group next returns null" {
+    var group = TaskGroup(int).init()
+    let result = group.next()
+    @assert(result == null)
+}
+
+test "task group single element" {
+    var group = TaskGroup(int).init()
+    group.addTask(42)
+
+    let val = group.next()
+    @assert(val != null)
+    @assertEq(val.?, 42)
+
+    let done = group.next()
+    @assert(done == null)
+}
+
+test "for-await over empty group does nothing" {
+    var group = TaskGroup(int).init()
+    var count = 0
+    for await val in group {
+        count = count + 1
+    }
+    @assertEq(count, 0)
+}

@@ -154,3 +154,64 @@ test "multiple awaits in sequence" {
 
     @assertEq(await combined(), 30)
 }
+
+test "async fn returning zero" {
+    async fn zero() int {
+        return 0
+    }
+
+    @assertEq(await zero(), 0)
+}
+
+test "actor with multiple fields" {
+    actor BankAccount {
+        balance: int,
+        name: string,
+
+        fn deposit(amount: int) void {
+            self.balance = self.balance + amount
+        }
+
+        fn withdraw(amount: int) void {
+            if (self.balance >= amount) {
+                self.balance = self.balance - amount
+            }
+        }
+
+        fn getBalance() int {
+            return self.balance
+        }
+
+        nonisolated fn accountType() string {
+            return "checking"
+        }
+    }
+
+    var acct = BankAccount { .balance = 100, .name = "savings" }
+    await acct.deposit(50)
+    await acct.withdraw(30)
+    @assertEq(await acct.getBalance(), 120)
+    @assertEq(acct.accountType(), "checking")
+}
+
+test "async fn chain of three" {
+    async fn a() int { return 1 }
+    async fn b() int { return await a() + 2 }
+    async fn c() int { return await b() + 3 }
+
+    @assertEq(await c(), 6)
+}
+
+test "async fn with loop" {
+    async fn sumTo(n: int) int {
+        var total = 0
+        var i = 1
+        while (i <= n) {
+            total = total + i
+            i = i + 1
+        }
+        return total
+    }
+
+    @assertEq(await sumTo(10), 55)
+}
