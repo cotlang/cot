@@ -1,12 +1,65 @@
-// Executor tests — Swift CooperativeExecutor
+// Executor tests — Swift CooperativeExecutor faithful port.
+// Tests the cooperative event loop: priority queue, timer queue, run loop.
+
 import "std/executor"
+import "std/sys"
+
+test "executor init and empty run" {
+    var exec = CooperativeExecutor_init()
+    CooperativeExecutor_run(&exec)
+    @assert(!exec.should_stop)
+}
 
 test "executor enqueue and run" {
-    var exec = Executor.init()
-    exec.enqueue(0, 0)
-    exec.enqueue(0, 0)
-    exec.enqueue(0, 0)
-    @assertEq(exec.tasks.len(), 3)
-    exec.run()
-    @assert(!exec.running)
+    var exec = CooperativeExecutor_init()
+    CooperativeExecutor_enqueueDefault(&exec, 0, 0)
+    CooperativeExecutor_enqueueDefault(&exec, 0, 0)
+    CooperativeExecutor_enqueueDefault(&exec, 0, 0)
+    @assertEq(exec.run_queue.len(), 3)
+    CooperativeExecutor_run(&exec)
+    @assertEq(exec.run_queue.len(), 0)
+}
+
+test "executor priority ordering" {
+    var exec = CooperativeExecutor_init()
+    CooperativeExecutor_enqueue(&exec, 0, 40, PRIORITY_BACKGROUND)
+    CooperativeExecutor_enqueue(&exec, 0, 10, PRIORITY_HIGH)
+    CooperativeExecutor_enqueue(&exec, 0, 30, PRIORITY_LOW)
+    CooperativeExecutor_enqueue(&exec, 0, 20, PRIORITY_MEDIUM)
+    @assertEq(exec.run_queue.get(0).context, 10)
+    @assertEq(exec.run_queue.get(1).context, 20)
+    @assertEq(exec.run_queue.get(2).context, 30)
+    @assertEq(exec.run_queue.get(3).context, 40)
+}
+
+test "executor timer queue ordering" {
+    var exec = CooperativeExecutor_init()
+    CooperativeExecutor_enqueueDelayed(&exec, 0, 30, PRIORITY_DEFAULT, 3000000000)
+    CooperativeExecutor_enqueueDelayed(&exec, 0, 10, PRIORITY_DEFAULT, 1000000000)
+    CooperativeExecutor_enqueueDelayed(&exec, 0, 20, PRIORITY_DEFAULT, 2000000000)
+    @assertEq(exec.timer_queue.get(0).context, 10)
+    @assertEq(exec.timer_queue.get(1).context, 20)
+    @assertEq(exec.timer_queue.get(2).context, 30)
+}
+
+test "executor stop" {
+    var exec = CooperativeExecutor_init()
+    CooperativeExecutor_stop(&exec)
+    @assert(exec.should_stop)
+}
+
+test "executor drain timer queue" {
+    var exec = CooperativeExecutor_init()
+    CooperativeExecutor_insertTimerByDeadline(&exec, ExecutorJob {
+        .poll_fn = 0,
+        .context = 42,
+        .priority = PRIORITY_DEFAULT,
+        .deadline = 1,
+    })
+    @assertEq(exec.timer_queue.len(), 1)
+    @assertEq(exec.run_queue.len(), 0)
+    CooperativeExecutor_drainTimerQueue(&exec)
+    @assertEq(exec.timer_queue.len(), 0)
+    @assertEq(exec.run_queue.len(), 1)
+    @assertEq(exec.run_queue.get(0).context, 42)
 }
