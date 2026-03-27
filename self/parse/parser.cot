@@ -931,6 +931,36 @@ struct Parser {
         const start = self.tok_start
         const doc = self.consumeDocComment()
         self.advance()  // consume 'impl'
+
+        // impl @unchecked Sendable for Type — escape hatch (SE-0302)
+        // Registers type as unconditionally Sendable.
+        // Ported from parser.zig:702-724
+        if (self.tok == Token.at) {
+            const peek = self.peekToken()
+            if ((@enumFromInt(peek) as Token) == Token.ident and self.peek_text == "unchecked") {
+                self.advance()  // consume @
+                self.advance()  // consume unchecked
+                if (self.tok != Token.ident or self.tok_text != "Sendable") {
+                    self.errors.report(self.tok_start, ErrorCode.e203, "expected 'Sendable' after @unchecked")
+                    return null_node
+                }
+                self.advance()  // consume Sendable
+                self.expect(Token.kw_for as int)
+                if (self.tok != Token.ident) {
+                    self.errors.report(self.tok_start, ErrorCode.e203, "expected type name after 'for'")
+                    return null_node
+                }
+                const target_type = self.tok_text
+                self.advance()
+                self.expect(Token.lbrace as int)
+                self.expect(Token.rbrace as int)
+                return self.ast.addDecl(Decl.unchecked_sendable(UncheckedSendable {
+                    .type_name = target_type,
+                    .span = self.spanSE(start, self.tok_end),
+                }))
+            }
+        }
+
         if (self.tok != Token.ident) {
             self.errors.report(self.tok_start, ErrorCode.e203, "expected type name after impl")
             return null_node
@@ -1124,10 +1154,35 @@ struct Parser {
     }
 
     /// async fn name(...) { ... }
+    /// async let x = expr — Swift SE-0317 parallel bindings
+    /// Ported from parser.zig:280-301
     fn parseAsyncFn() int {
+        const start = self.tok_start
         self.advance()  // consume 'async'
+
+        // async let x = expr — Swift SE-0317 parallel bindings
+        if (self.tok == Token.kw_let or self.tok == Token.kw_var or self.tok == Token.kw_const) {
+            self.advance()  // consume let/var/const
+            if (self.tok != Token.ident) {
+                self.errors.report(self.tok_start, ErrorCode.e200, "expected variable name after 'async let'")
+                return null_node
+            }
+            const name = self.tok_text
+            self.advance()
+            if (!self.expect(Token.assign as int)) {
+                self.errors.report(self.tok_start, ErrorCode.e200, "expected '=' in async let")
+                return null_node
+            }
+            const value = self.parseExpr()
+            return self.ast.addStmt(Stmt.async_let(AsyncLet {
+                .name = name,
+                .value = value,
+                .span = self.spanSE(start, self.tok_end),
+            }))
+        }
+
         if (self.tok != Token.kw_fn) {
-            self.errors.report(self.tok_start, ErrorCode.e200, "expected fn after async")
+            self.errors.report(self.tok_start, ErrorCode.e200, "expected 'fn' or 'let' after 'async'")
             return null_node
         }
         return self.parseFnDecl(0, 1, 0, 0, 0, 0)
@@ -1701,8 +1756,35 @@ struct Parser {
             return self.parseClosureExpr()
         }
 
-        // Builtin call: @name(args)
+        // Check for @Sendable fn(...) — closure with Sendable annotation (SE-0302)
+        // Ported from parser.zig:1642-1669
         if (tok == Token.at) {
+            const peek = self.peekToken()
+            if ((@enumFromInt(peek) as Token) == Token.ident and self.peek_text == "Sendable") {
+                self.advance()  // consume @
+                self.advance()  // consume Sendable
+                if (self.tok == Token.kw_fn) {
+                    // Parse closure with is_sendable = true
+                    self.advance()  // consume fn
+                    if (!self.expect(Token.lparen as int)) { return null_node }
+                    var params: List(int) = .{}
+                    while (self.tok != Token.rparen and self.tok != Token.eof) {
+                        const param = self.parseFieldDef()
+                        if (param != null_node) { params.append(param) }
+                        if (!self.match(Token.comma as int)) { break }
+                    }
+                    if (!self.expect(Token.rparen as int)) { return null_node }
+                    var ret_type = null_node
+                    if (self.tok != Token.lbrace and self.tok != Token.eof) {
+                        ret_type = self.parseType()
+                    }
+                    const body = self.parseBlock()
+                    return self.ast.addExpr(Expr.closure_expr(ClosureExpr { .params = params, .return_type = ret_type, .body = body, .is_sendable = true, .span = self.spanSE(start, self.tok_end) }))
+                }
+                // Not followed by fn — error
+                self.errors.report(self.tok_start, ErrorCode.e201, "@Sendable must be followed by 'fn'")
+                return null_node
+            }
             return self.parseBuiltinCall()
         }
 
@@ -1901,7 +1983,7 @@ struct Parser {
             ret_type = self.parseType()
         }
         const body = self.parseBlock()
-        return self.ast.addExpr(Expr.closure_expr(ClosureExpr { .params = params, .return_type = ret_type, .body = body, .span = self.spanSE(start, self.tok_end) }))
+        return self.ast.addExpr(Expr.closure_expr(ClosureExpr { .params = params, .return_type = ret_type, .body = body, .is_sendable = false, .span = self.spanSE(start, self.tok_end) }))
     }
 
     /// Parse struct init fields after detecting { in postfix position.

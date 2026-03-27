@@ -321,6 +321,7 @@ struct ClosureExpr {
     params: List(int),
     return_type: int,
     body: int,
+    is_sendable: bool,
     span: Span,
 }
 
@@ -499,7 +500,21 @@ struct DestructureStmt {
     span: Span,
 }
 
+/// async let x = expr — Swift SE-0317 parallel binding.
+/// Phase 1 (eager): evaluates expr immediately, binds result as Task.
+struct AsyncLet {
+    name: string,
+    value: int,
+    span: Span,
+}
+
 struct BadStmt {
+    span: Span,
+}
+
+/// impl @unchecked Sendable for Type { } — escape hatch for Sendable checking.
+struct UncheckedSendable {
+    type_name: string,
     span: Span,
 }
 
@@ -519,6 +534,7 @@ union Decl {
     trait_decl: TraitDecl,
     impl_trait: ImplTraitBlock,
     error_set_decl: ErrorSetDecl,
+    unchecked_sendable: UncheckedSendable,
     test_decl: TestDecl,
     bench_decl: BenchDecl,
     bad_decl: BadDecl,
@@ -577,6 +593,7 @@ union Stmt {
     break_stmt: BreakStmt,
     continue_stmt: ContinueStmt,
     defer_stmt: DeferStmt,
+    async_let: AsyncLet,
     destructure_stmt: DestructureStmt,
     bad_stmt: BadStmt,
 }
@@ -730,6 +747,7 @@ fn declSpan(d: Decl) Span {
         Decl.trait_decl |v| => v.span,
         Decl.impl_trait |v| => v.span,
         Decl.error_set_decl |v| => v.span,
+        Decl.unchecked_sendable |v| => v.span,
         Decl.test_decl |v| => v.span,
         Decl.bench_decl |v| => v.span,
         Decl.bad_decl |v| => v.span,
@@ -794,6 +812,7 @@ fn stmtSpan(s: Stmt) Span {
         Stmt.break_stmt |v| => v.span,
         Stmt.continue_stmt |v| => v.span,
         Stmt.defer_stmt |v| => v.span,
+        Stmt.async_let |v| => v.span,
         Stmt.destructure_stmt |v| => v.span,
         Stmt.bad_stmt |v| => v.span,
     }
@@ -821,6 +840,7 @@ fn nodeDeclTag(ast: *Ast, idx: int) string {
                 Decl.trait_decl |_| => { result = "trait_decl" },
                 Decl.impl_trait |_| => { result = "impl_trait" },
                 Decl.error_set_decl |_| => { result = "error_set_decl" },
+                Decl.unchecked_sendable |_| => { result = "unchecked_sendable" },
                 Decl.test_decl |_| => { result = "test_decl" },
                 Decl.bench_decl |_| => { result = "bench_decl" },
                 Decl.bad_decl |_| => { result = "bad_decl" },
@@ -914,6 +934,7 @@ fn declTagStr(d: Decl) string {
         Decl.trait_decl |_| => "trait_decl",
         Decl.impl_trait |_| => "impl_trait",
         Decl.error_set_decl |_| => "error_set_decl",
+        Decl.unchecked_sendable |_| => "unchecked_sendable",
         Decl.test_decl |_| => "test_decl",
         Decl.bench_decl |_| => "bench_decl",
         Decl.bad_decl |_| => "bad_decl",
@@ -985,6 +1006,7 @@ fn stmtTagStr(s: Stmt) string {
         Stmt.break_stmt |_| => "break_stmt",
         Stmt.continue_stmt |_| => "continue_stmt",
         Stmt.defer_stmt |_| => "defer_stmt",
+        Stmt.async_let |_| => "async_let",
         Stmt.destructure_stmt |_| => "destructure_stmt",
         Stmt.bad_stmt |_| => "bad_stmt",
     }

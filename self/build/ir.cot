@@ -537,6 +537,9 @@ struct FuncBuilder {
     async_task_local: ?int,
     /// Phase 1 async: the inner result type (T in Task(T))
     async_result_type: ?int,
+    /// Phase 2 async: true if this is a poll function (constructor/poll split).
+    /// Poll functions store result at frame[0] and return void.
+    is_async_poll: bool,
 
     static fn init(name: string, type_idx: int, return_type: int, span: Span) FuncBuilder {
         var locals: List(Local) = .{}
@@ -565,6 +568,7 @@ struct FuncBuilder {
             is_export: false,
             async_task_local: null,
             async_result_type: null,
+            is_async_poll: false,
         }
     }
 
@@ -591,6 +595,7 @@ struct FuncBuilder {
             is_export: false,
             async_task_local: null,
             async_result_type: null,
+            is_async_poll: false,
         }
         return ptr
     }

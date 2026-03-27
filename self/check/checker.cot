@@ -292,6 +292,9 @@ struct Checker {
     in_comptime: bool,
     body_check_depth: int,
     // Concurrency (Swift SE-0306 actors, SE-0316 global actors, SE-0302 Sendable)
+    /// Types with `impl @unchecked Sendable for Type` — bypass recursive Sendable check.
+    /// Swift reference: TypeCheckConcurrency.cpp:7488 — @unchecked Sendable conformance.
+    unchecked_sendable_types: Map(string, int),
     /// True when inside an `await` expression (suppresses cross-actor errors).
     in_await: bool,
     /// Tracks which type names are actors.
@@ -339,6 +342,7 @@ struct Checker {
             comptime_vars: comptime_vars,
             in_comptime: false,
             body_check_depth: 0,
+            unchecked_sendable_types: .{},
             in_await: false,
             actor_types: .{},
             current_actor_type: "",
@@ -514,6 +518,16 @@ struct Checker {
         else if (tag == "var_decl") { self.collectVarDecl(idx) }
         else if (tag == "impl_block") { self.collectImplBlock(idx) }
         else if (tag == "impl_trait") { self.collectImplTrait(idx) }
+        else if (tag == "unchecked_sendable") {
+            // impl @unchecked Sendable for Type — register bypass
+            // Ported from checker.zig:826-828
+            switch (self.ast.getNode(idx)) { Node.decl |d| => switch (d) {
+                Decl.unchecked_sendable |us| => {
+                    self.unchecked_sendable_types.set(us.type_name, 1)
+                },
+                else => {},
+            }, else => {} }
+        }
     }
 
     fn collectStructDecl(idx: int) void {
@@ -1224,6 +1238,16 @@ struct Checker {
             const node = self.ast.getNode(idx)
             switch (node) { Node.stmt |s| => switch (s) { Stmt.defer_stmt |ds| => {
                 self.checkExpr(ds.expr)
+            }, else => {} }, else => {} }
+        }
+        else if (tag == "async_let") {
+            // async let name = asyncCall() — type-check value, define binding with its type
+            // Ported from checker.zig:3638-3644
+            switch (self.ast.getNode(idx)) { Node.stmt |s| => switch (s) { Stmt.async_let |al| => {
+                const val_type = self.checkExpr(al.value)
+                if (!self.isDefined(al.name)) {
+                    self.defineSymbol(makeSymbol(al.name, val_type, idx, false))
+                }
             }, else => {} }, else => {} }
         }
         else if (tag == "destructure_stmt") { self.checkDestructureStmt(idx) }
@@ -3961,6 +3985,8 @@ struct Checker {
         return switch (info) {
             Type.basic |_| => true,
             Type.struct_type |s| => {
+                // @unchecked Sendable: bypass recursive check
+                if (self.unchecked_sendable_types.contains(s.name)) { return true }
                 for i in 0..s.field_count {
                     const f = s.getField(i)
                     if (!self.isSendable(f.type_idx)) { return false }
@@ -4172,7 +4198,8 @@ struct Checker {
         var cl_params: List(int) = .{}
         var ret_type_n = null_node
         var body_n = null_node
-        switch (self.ast.getNode(idx)) { Node.expr |e| => switch (e) { Expr.closure_expr |cl| => { cl_params = cl.params; ret_type_n = cl.return_type; body_n = cl.body }, else => {} }, else => {} }
+        var is_sendable = false
+        switch (self.ast.getNode(idx)) { Node.expr |e| => switch (e) { Expr.closure_expr |cl| => { cl_params = cl.params; ret_type_n = cl.return_type; body_n = cl.body; is_sendable = cl.is_sendable }, else => {} }, else => {} }
         const params_count = cl_params.len()
 
         // Build function type from closure signature
@@ -4220,7 +4247,97 @@ struct Checker {
             self.popScope()
         }
 
+        // @Sendable closures: verify all captured variables are Sendable.
+        // Swift reference: TypeCheckConcurrency.cpp:2971-3098 checkLocalCaptures
+        // Ported from checker.zig:2034-2039
+        if (is_sendable and body_n != null_node) {
+            self.checkSendableCaptures(body_n)
+        }
+
         return func_type
+    }
+
+    /// Check that all variables captured by a @Sendable closure are Sendable.
+    /// Swift reference: TypeCheckConcurrency.cpp:2971-3098 checkLocalCaptures.
+    /// Walks the closure body AST, finds identifiers that resolve to the enclosing
+    /// scope (not the closure's own params), and verifies each is Sendable.
+    /// Ported from checker.zig:2045-2111.
+    fn checkSendableCaptures(body: int) void {
+        if (body == null_node) { return }
+        const tag = nodeTag(self.ast, body)
+        const node = self.ast.getNode(body)
+
+        // Check expressions for captured identifiers
+        if (tag == "ident") {
+            var name = ""
+            switch (node) { Node.expr |e| => switch (e) { Expr.ident |id| => { name = id.name }, else => {} }, else => {} }
+            if (@lenOf(name) > 0) {
+                const sym = self.lookupSymbol(name)
+                if (sym) |s| {
+                    if (!self.isSendable(s.type_idx)) {
+                        self.reportError(body, ErrorCode.e300, "capture of non-Sendable type in @Sendable closure")
+                    }
+                }
+            }
+        } else if (tag == "call") {
+            switch (node) { Node.expr |e| => switch (e) { Expr.call |c| => {
+                self.checkSendableCaptures(c.callee)
+                for i in 0..c.args.len() {
+                    self.checkSendableCaptures(c.args.get(i))
+                }
+            }, else => {} }, else => {} }
+        } else if (tag == "binary") {
+            switch (node) { Node.expr |e| => switch (e) { Expr.binary |b| => {
+                self.checkSendableCaptures(b.left)
+                self.checkSendableCaptures(b.right)
+            }, else => {} }, else => {} }
+        } else if (tag == "unary") {
+            switch (node) { Node.expr |e| => switch (e) { Expr.unary |u| => {
+                self.checkSendableCaptures(u.operand)
+            }, else => {} }, else => {} }
+        } else if (tag == "field_access") {
+            switch (node) { Node.expr |e| => switch (e) { Expr.field_access |f| => {
+                self.checkSendableCaptures(f.base)
+            }, else => {} }, else => {} }
+        } else if (tag == "index_expr") {
+            switch (node) { Node.expr |e| => switch (e) { Expr.index_expr |ie| => {
+                self.checkSendableCaptures(ie.base)
+                self.checkSendableCaptures(ie.idx)
+            }, else => {} }, else => {} }
+        } else if (tag == "block_expr") {
+            switch (node) { Node.expr |e| => switch (e) { Expr.block_expr |b| => {
+                for i in 0..b.stmts.len() {
+                    self.checkSendableCaptures(b.stmts.get(i))
+                }
+                if (b.result_expr != null_node) {
+                    self.checkSendableCaptures(b.result_expr)
+                }
+            }, else => {} }, else => {} }
+        } else if (tag == "return_stmt") {
+            switch (node) { Node.stmt |s| => switch (s) { Stmt.return_stmt |r| => {
+                if (r.value != null_node) { self.checkSendableCaptures(r.value) }
+            }, else => {} }, else => {} }
+        } else if (tag == "var_stmt") {
+            switch (node) { Node.stmt |s| => switch (s) { Stmt.var_stmt |v| => {
+                if (v.value != null_node) { self.checkSendableCaptures(v.value) }
+            }, else => {} }, else => {} }
+        } else if (tag == "expr_stmt") {
+            switch (node) { Node.stmt |s| => switch (s) { Stmt.expr_stmt |e| => {
+                self.checkSendableCaptures(e.expr)
+            }, else => {} }, else => {} }
+        } else if (tag == "if_stmt") {
+            switch (node) { Node.stmt |s| => switch (s) { Stmt.if_stmt |i| => {
+                self.checkSendableCaptures(i.condition)
+                if (i.then_branch != null_node) { self.checkSendableCaptures(i.then_branch) }
+                if (i.else_branch != null_node) { self.checkSendableCaptures(i.else_branch) }
+            }, else => {} }, else => {} }
+        } else if (tag == "block_stmt") {
+            switch (node) { Node.stmt |s| => switch (s) { Stmt.block_stmt |b| => {
+                for i in 0..b.stmts.len() {
+                    self.checkSendableCaptures(b.stmts.get(i))
+                }
+            }, else => {} }, else => {} }
+        }
     }
 
     // ---- Type resolution ----
