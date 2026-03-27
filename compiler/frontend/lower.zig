@@ -933,11 +933,12 @@ pub const Lowerer = struct {
         // Phase 1: Emit the POLL function ({name}__poll).
         // Contains the original body. async_split.zig will transform it.
         // Single param: frame pointer (i64).
-        // Returns void (result stored in frame[8]).
+        // Returns i64: JOB_PENDING (0) or JOB_READY (1).
+        // Rust reference: Poll<T> { Ready(T), Pending }
         const poll_name = try std.fmt.allocPrint(self.allocator, "{s}__poll", .{link_name});
         try self.builder.declareFunc(poll_name);
 
-        self.builder.startFunc(poll_name, TypeRegistry.VOID, TypeRegistry.VOID, span);
+        self.builder.startFunc(poll_name, TypeRegistry.VOID, TypeRegistry.I64, span);
         if (self.builder.func()) |fb| {
             self.current_func = fb;
             self.cleanup_stack.clear();
@@ -1032,28 +1033,26 @@ pub const Lowerer = struct {
                 _ = try fb.emitPtrStoreValue(param_addr, param_val, span);
             }
 
-            // Poll loop: call poll until state == STATE_RETURNED (1)
+            // Poll loop: call poll until it returns JOB_READY (1).
             // Rust: coroutine caller loops: while poll(frame) == Poll::Pending { }
-            // With eager evaluation, all child tasks complete immediately,
-            // so the loop runs through all states in one burst.
+            // Swift: CooperativeExecutor.runUntil() runs until all jobs complete.
+            //
+            // Phase 1 (eager): children complete immediately, loop runs in one burst.
+            // Phase 2+: will yield to executor between polls for interleaving.
             const loop_block = try fb.newBlock("poll.loop");
             const done_block = try fb.newBlock("poll.done");
             _ = try fb.emitJump(loop_block, span);
 
             fb.setBlock(loop_block);
-            // Call poll function
+            // Call poll function — returns i64 status (0=PENDING, 1=READY).
             const frame_for_poll = try fb.emitLoadLocal(frame_local, TypeRegistry.I64, span);
             var poll_args = [_]ir.NodeIndex{frame_for_poll};
-            _ = try fb.emitCall(poll_name, &poll_args, false, TypeRegistry.VOID, span);
+            const poll_status = try fb.emitCall(poll_name, &poll_args, false, TypeRegistry.I64, span);
 
-            // Check state: load frame[8] (state_offset)
-            const frame_for_check = try fb.emitLoadLocal(frame_local, TypeRegistry.I64, span);
-            const eight2 = try fb.emitConstInt(8, TypeRegistry.I64, span);
-            const state_check_addr = try fb.emitBinary(.add, frame_for_check, eight2, TypeRegistry.I64, span);
-            const state = try fb.emitPtrLoadValue(state_check_addr, TypeRegistry.I64, span);
+            // Check return value: JOB_READY (1) means done.
             const one = try fb.emitConstInt(1, TypeRegistry.I64, span);
-            const is_returned = try fb.emitBinary(.eq, state, one, TypeRegistry.BOOL, span);
-            _ = try fb.emitBranch(is_returned, done_block, loop_block, span);
+            const is_ready = try fb.emitBinary(.eq, poll_status, one, TypeRegistry.BOOL, span);
+            _ = try fb.emitBranch(is_ready, done_block, loop_block, span);
 
             // Done: return frame ptr as Task
             fb.setBlock(done_block);
@@ -1611,8 +1610,11 @@ pub const Lowerer = struct {
                 _ = try fb.emitPtrStoreValue(state_addr, one, ret.span);
                 // Run cleanup stack before returning
                 try self.emitCleanups(0);
-                // Return void (poll function returns nothing)
-                _ = try fb.emitRet(null, ret.span);
+                // Return JOB_READY (1) — task complete, result in frame[0].
+                // Swift reference: ExecutorJob.runSynchronously returns when job done.
+                // Rust reference: Poll::Ready(T)
+                const ready_val = try fb.emitConstInt(1, TypeRegistry.I64, ret.span);
+                _ = try fb.emitRet(ready_val, ret.span);
                 return;
             }
 
