@@ -424,6 +424,9 @@ struct Parser {
             .is_export = is_export == 1,
             .is_async = is_async == 1,
             .is_static = is_static == 1,
+            .is_nonisolated = false,
+            .is_inlinable = false,
+            .global_actor = null,
             .doc_comment = doc,
             .span = self.spanSE(start, self.tok_end),
         }))
@@ -630,7 +633,7 @@ struct Parser {
                 self.expect(Token.rbrace as int)
                 self.current_impl_type = saved_impl
                 self.current_impl_is_generic = saved_impl_generic
-                return self.ast.addDecl(Decl.struct_decl(StructDecl { .name = name, .type_params = type_params, .fields = sfields, .layout = 0, .nested_decls = nested, .doc_comment = doc, .span = self.spanSE(start, self.tok_end) }))
+                return self.ast.addDecl(Decl.struct_decl(StructDecl { .name = name, .type_params = type_params, .fields = sfields, .layout = 0, .nested_decls = nested, .doc_comment = doc, .is_actor = false, .span = self.spanSE(start, self.tok_end) }))
             }
 
             // Not a type declaration — restore parser + scanner state
@@ -786,7 +789,7 @@ struct Parser {
 
         self.expect(Token.rbrace as int)
 
-        return self.ast.addDecl(Decl.struct_decl(StructDecl { .name = name, .type_params = type_params, .fields = fields, .layout = layout, .nested_decls = nested, .doc_comment = doc, .span = self.spanSE(start, self.tok_end) }))
+        return self.ast.addDecl(Decl.struct_decl(StructDecl { .name = name, .type_params = type_params, .fields = fields, .layout = layout, .nested_decls = nested, .doc_comment = doc, .is_actor = false, .span = self.spanSE(start, self.tok_end) }))
     }
 
     fn parsePackedStructDecl() int {

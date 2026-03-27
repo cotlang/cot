@@ -56,6 +56,9 @@ struct FnDecl {
     is_export: bool,
     is_async: bool,
     is_static: bool,
+    is_nonisolated: bool,
+    is_inlinable: bool,
+    global_actor: ?string,
     doc_comment: string,
     span: Span,
 }
@@ -76,6 +79,7 @@ struct StructDecl {
     layout: int,
     nested_decls: List(int),
     doc_comment: string,
+    is_actor: bool,
     span: Span,
 }
 
@@ -1333,6 +1337,9 @@ test "Ast addDecl fn_decl" {
         .is_export = false,
         .is_async = false,
         .is_static = false,
+        .is_nonisolated = false,
+        .is_inlinable = false,
+        .global_actor = null,
         .doc_comment = "",
         .span = s,
     }))
