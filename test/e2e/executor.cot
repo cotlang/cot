@@ -1,0 +1,12 @@
+// Executor tests — Swift CooperativeExecutor
+import "std/executor"
+
+test "executor enqueue and run" {
+    var exec = Executor.init()
+    exec.enqueue(0, 0)
+    exec.enqueue(0, 0)
+    exec.enqueue(0, 0)
+    @assertEq(exec.tasks.len(), 3)
+    exec.run()
+    @assert(!exec.running)
+}

@@ -3,7 +3,7 @@
 **Date:** 2026-03-27 (updated)
 **Prerequisite:** 0.4 release (DONE — version bumped)
 **Design doc:** `claude/SWIFT_CONCURRENCY_PORT.md` (1,971 lines, audited)
-**Status:** Phases 0-8 COMPLETE. 13/13 concurrency tests + 370/370 features pass.
+**Status:** Phases 0-10 ALL IMPLEMENTED. 15/15 concurrency tests + 370/370 features pass.
 
 ---
 
