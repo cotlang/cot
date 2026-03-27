@@ -3330,7 +3330,10 @@ pub const Checker = struct {
                 return true;
             },
             .distinct => |d| self.isSendable(d.underlying),
-            .existential => false, // TODO: Sendable if trait requires Sendable conformance
+            // Swift: existential is Sendable if the constraint includes Sendable.
+            // `any Sendable` is Sendable. `any MyProtocol & Sendable` is Sendable.
+            // Reference: TypeCheckConcurrency.cpp:7488 (existential Sendable check)
+            .existential => |e| std.mem.eql(u8, e.trait_name, "Sendable"),
             .pointer => false,
             .func => false,
             .slice => false,
