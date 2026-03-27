@@ -193,7 +193,7 @@ pub fn asyncSplit(f: *Func, type_registry: *const TypeRegistry) !void {
     // (if/else chain reading frame[state_offset]) has a bug where the state
     // check always fails, causing infinite loops. Native path skips async_split
     // entirely (uses eager evaluation). Re-enable after fixing Wasm dispatch.
-    if (true or suspend_points.items.len < 2) {
+    if (suspend_points.items.len < 2) {
         debug.log(.async_split, "=== AsyncSplit skipped for '{s}': {d} suspend points (<=1, eager sufficient) ===", .{
             f.name, suspend_points.items.len,
         });
