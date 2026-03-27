@@ -1,0 +1,16 @@
+// Continuation tests — Swift CheckedContinuation (SE-0300)
+import "std/continuation"
+
+test "continuation resume and get result" {
+    var cont = Continuation(int).init()
+    cont.resume(42)
+    @assertEq(cont.getResult(), 42)
+}
+
+test "continuation tracks resumed state" {
+    var cont = Continuation(int).init()
+    @assert(!cont.resumed)
+    cont.resume(100)
+    @assert(cont.resumed)
+    @assertEq(cont.getResult(), 100)
+}
