@@ -1,0 +1,29 @@
+// TaskLocal tests — Swift task-local values (SE-0311)
+import "std/task_local"
+
+test "task local basic get default" {
+    var tl = TaskLocal(int).init(42)
+    @assertEq(tl.get(), 42)
+}
+
+test "task local withValue scoping" {
+    var tl = TaskLocal(int).init(0)
+    @assertEq(tl.get(), 0)
+    tl.withValue(99, fn() void {
+        @assertEq(tl.get(), 99)
+    })
+    @assertEq(tl.get(), 0)
+}
+
+test "task local nested withValue" {
+    var tl = TaskLocal(int).init(1)
+    @assertEq(tl.get(), 1)
+    tl.withValue(2, fn() void {
+        @assertEq(tl.get(), 2)
+        tl.withValue(3, fn() void {
+            @assertEq(tl.get(), 3)
+        })
+        @assertEq(tl.get(), 2)
+    })
+    @assertEq(tl.get(), 1)
+}
