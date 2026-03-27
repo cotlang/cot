@@ -180,6 +180,12 @@ pub fn asyncSplit(f: *Func, type_registry: *const TypeRegistry) !void {
     // Value rewriting handles memory state but not all SSA value references.
     // CLIF codegen creates vregs that span blocks → EntryLivein error.
     // Need aggressive value rewriting or CLIF-level handling.
+    // Transform produces valid SSA but caller/callee coordination incomplete.
+    // The caller (lowerAwaitExpr) still uses eager evaluation and expects
+    // a task pointer. The transformed function has a dispatch entry that
+    // expects a frame pointer. Need to update lowerAsyncFnEager to generate
+    // a constructor function when the body has 2+ suspend points, and update
+    // lowerAwaitExpr to poll the state machine.
     if (true or suspend_points.items.len < 2) {
         debug.log(.async_split, "=== AsyncSplit skipped for '{s}': {d} suspend points (<=1, eager sufficient) ===", .{
             f.name, suspend_points.items.len,
@@ -239,6 +245,16 @@ pub fn asyncSplit(f: *Func, type_registry: *const TypeRegistry) !void {
 
     f.entry = dispatch;
     f.invalidateCFG();
+
+    // Debug: log dispatch block successors
+    debug.log(.async_split, "  dispatch block b{d}: {d} successors", .{
+        dispatch.id, dispatch.succs.len,
+    });
+    for (dispatch.succs, 0..) |edge, idx| {
+        debug.log(.async_split, "    succ[{d}] = b{d} (kind={s})", .{
+            idx, edge.b.id, @tagName(edge.b.kind),
+        });
+    }
 
     debug.log(.async_split, "=== AsyncSplit complete for '{s}': {d} suspend points, {d}B frame, dispatch entry created ===", .{
         f.name, suspend_points.items.len, frame_size,
@@ -343,7 +359,15 @@ fn splitBlockAtSuspend(f: *Func, sp: *SuspendPoint, local_to_offset: *const std.
     block.succs = &.{};
     block.controls = .{ null, null };
 
-    // === SPILL: store state + return PENDING ===
+    // === SPILL: store await result + state + return PENDING ===
+
+    // Store the await call result (task pointer) to frame[result_offset]
+    // This is needed because the resume block references the call result
+    // (for loading the task's return value and releasing the task).
+    // Rust: the callee future is stored as a field in the caller's coroutine struct.
+    // The result_offset (8) stores the task pointer for later retrieval.
+    const call_result_offset: i64 = 8; // frame[8] = task pointer from await call
+
     // Store state number to frame[0]
     const state_val = try f.newValue(.const_int, 0, block, pos);
     state_val.aux_int = sp.state_number;
@@ -403,6 +427,19 @@ fn splitBlockAtSuspend(f: *Func, sp: *SuspendPoint, local_to_offset: *const std.
         try block.insertValueBefore(f.allocator, frame_store, block.values.items[block.values.items.len - 2]);
     }
 
+    // Spill the await call result (task pointer) to frame[result_offset]
+    {
+        const call_frame_off = try f.newValue(.off_ptr, 0, block, pos);
+        call_frame_off.aux_int = call_result_offset;
+        call_frame_off.addArg(frame_ptr_in_block.?);
+        try block.insertValueBefore(f.allocator, call_frame_off, block.values.items[block.values.items.len - 2]);
+
+        const call_store = try f.newValue(.store, 0, block, pos);
+        call_store.addArg(call_frame_off);
+        call_store.addArg(sp.call_value);
+        try block.insertValueBefore(f.allocator, call_store, block.values.items[block.values.items.len - 2]);
+    }
+
     // === RESTORE: at resume block entry ===
     // Add frame arg reference + restore live locals from frame
     const frame_in_resume = try f.newValue(.arg, 0, resume_block, pos);
@@ -439,18 +476,36 @@ fn splitBlockAtSuspend(f: *Func, sp: *SuspendPoint, local_to_offset: *const std.
         try resume_block.insertValueBefore(f.allocator, local_store, resume_block.values.items[4]);
     }
 
+    // Restore the await call result (task pointer) from frame[result_offset]
+    // This provides a valid value for resume block code that references the call result.
+    const call_frame_off_r = try f.newValue(.off_ptr, sp.call_value.type_idx, resume_block, pos);
+    call_frame_off_r.aux_int = call_result_offset;
+    call_frame_off_r.addArg(frame_in_resume);
+    const insert_after_restores = @min(resume_block.values.items.len - 1, 1 + sp.live_locals.items.len * 4 + 1);
+    if (insert_after_restores < resume_block.values.items.len) {
+        try resume_block.insertValueBefore(f.allocator, call_frame_off_r, resume_block.values.items[insert_after_restores]);
+    } else {
+        try resume_block.addValue(f.allocator, call_frame_off_r);
+    }
+
+    const restored_call = try f.newValue(.load, sp.call_value.type_idx, resume_block, pos);
+    restored_call.addArg(call_frame_off_r);
+    if (insert_after_restores + 1 < resume_block.values.items.len) {
+        try resume_block.insertValueBefore(f.allocator, restored_call, resume_block.values.items[insert_after_restores + 1]);
+    } else {
+        try resume_block.addValue(f.allocator, restored_call);
+    }
+
     // === REWRITE: fix cross-block SSA references ===
-    // Values in the resume block may reference values from the pre-split block
-    // (especially memory state .copy values). These violate SSA dominance.
-    // Fix: create init_mem at resume entry, rewrite all memory args to chain from it.
-    // For non-memory values: if an arg is from the pre-split block and was stored to a local,
-    // it will be loaded from the local (which was restored from the frame).
+    // Values in the resume block may reference values from the pre-split block.
+    // The call result (task pointer) is the most common cross-block ref.
+    // Pre-populate the remap with the call value → restored value.
     // Rust reference: coroutine.rs TransformVisitor visit_place (line 414-418)
     const init_mem_val = try f.newValue(.init_mem, 0, resume_block, pos);
-    // Insert after frame arg + restore loads
-    const insert_pos = @min(resume_block.values.items.len, 1 + sp.live_locals.items.len * 4);
-    if (insert_pos < resume_block.values.items.len) {
-        try resume_block.insertValueBefore(f.allocator, init_mem_val, resume_block.values.items[insert_pos]);
+    // Insert init_mem as SECOND value (right after frame arg, before everything else).
+    // This ensures all subsequent values in the block can reference it.
+    if (resume_block.values.items.len > 1) {
+        try resume_block.insertValueBefore(f.allocator, init_mem_val, resume_block.values.items[1]);
     } else {
         try resume_block.addValue(f.allocator, init_mem_val);
     }
@@ -464,21 +519,100 @@ fn splitBlockAtSuspend(f: *Func, sp: *SuspendPoint, local_to_offset: *const std.
         try resume_vals.put(f.allocator, v, {});
     }
 
-    // Rewrite args that reference values NOT in the resume block
+    // Rewrite ALL args that reference values NOT in the resume block.
+    // Rust TransformVisitor (coroutine.rs:414-418): every local reference
+    // becomes a coroutine struct field access. Cot equivalent: every
+    // cross-block ref must be re-emitted or replaced.
+    //
+    // Strategy per value type:
+    // - const_int/float/bool → re-emit constant in resume block
+    // - Memory state (.copy, .init_mem, .store) → replace with init_mem
+    // - arg op → re-emit arg in resume block
+    // - local_addr → re-emit local_addr in resume block
+    // - Everything else → replace with init_mem (conservative safe fallback)
+    var remapped = std.AutoHashMapUnmanaged(*Value, *Value){};
+    defer remapped.deinit(f.allocator);
+
+    // Pre-populate with known mappings
+    try remapped.put(f.allocator, init_mem_val, init_mem_val);
+    try remapped.put(f.allocator, frame_in_resume, frame_in_resume);
+    // Map the original call value to the restored call value
+    try remapped.put(f.allocator, sp.call_value, restored_call);
+
     for (resume_block.values.items) |v| {
         for (0..v.args.len) |arg_idx| {
             const arg = v.args[arg_idx];
-            if (arg == init_mem_val) continue; // Don't rewrite self-ref
-            if (arg == frame_in_resume) continue; // Frame arg is valid
-            if (!resume_vals.contains(arg)) {
-                // This arg references a value outside the resume block.
-                // If it's a memory state (.copy, .init_mem, .store result),
-                // replace with our init_mem. Otherwise it's likely a const
-                // that should be re-emitted.
-                if (arg.op == .copy or arg.op == .init_mem or arg.op == .store or
-                    arg.type_idx == 0) // type 0 = void = memory state type
-                {
-                    v.setArg(@intCast(arg_idx), init_mem_val);
+            if (resume_vals.contains(arg)) continue; // Already in resume block
+
+            // Check if we already remapped this value
+            if (remapped.get(arg)) |replacement| {
+                v.setArg(@intCast(arg_idx), replacement);
+                continue;
+            }
+
+            // Re-emit or skip based on op type.
+            // Memory state values (.copy SSA_MEM, .init_mem, .store) are compile-time
+            // ordering only — the CLIF translator skips them. Don't replace these
+            // with init_mem (which also has no CLIF value).
+            // Non-memory values: re-emit in the resume block.
+            const is_memory_state = arg.op == .copy and arg.type_idx == @import("../../frontend/types.zig").TypeRegistry.SSA_MEM;
+            const is_ordering_only = arg.op == .init_mem or arg.op == .store or is_memory_state;
+
+            if (is_ordering_only) {
+                // Memory/ordering args: skip rewriting — CLIF ignores them.
+                // Just leave the cross-block ref; CLIF translator doesn't create
+                // vregs for these ops so no EntryLivein issue.
+                continue;
+            }
+
+            const replacement: *Value = blk_remap: {
+                if (arg.op == .const_int or arg.op == .const_float or arg.op == .const_bool or arg.op == .const_nil) {
+                    const new_const = try f.newValue(arg.op, arg.type_idx, resume_block, pos);
+                    new_const.aux_int = arg.aux_int;
+                    new_const.aux = arg.aux;
+                    try resume_block.insertValueBefore(f.allocator, new_const, v);
+                    try resume_vals.put(f.allocator, new_const, {});
+                    break :blk_remap new_const;
+                }
+                if (arg.op == .arg) {
+                    const new_arg = try f.newValue(.arg, arg.type_idx, resume_block, pos);
+                    new_arg.aux_int = arg.aux_int;
+                    try resume_block.insertValueBefore(f.allocator, new_arg, v);
+                    try resume_vals.put(f.allocator, new_arg, {});
+                    break :blk_remap new_arg;
+                }
+                if (arg.op == .local_addr) {
+                    const new_la = try f.newValue(.local_addr, arg.type_idx, resume_block, pos);
+                    new_la.aux_int = arg.aux_int;
+                    try resume_block.insertValueBefore(f.allocator, new_la, v);
+                    try resume_vals.put(f.allocator, new_la, {});
+                    break :blk_remap new_la;
+                }
+                // Fallback: re-emit as const 0. This is a PLACEHOLDER that produces
+                // a valid CLIF vreg but with wrong value. Used to make SSA valid
+                // while debugging. The spill/restore for locals should provide the
+                // correct values; this fallback catches edge cases.
+                debug.log(.async_split, "  WARN: replacing cross-block ref op={s} type={d} with const 0", .{
+                    @tagName(arg.op), arg.type_idx,
+                });
+                const placeholder = try f.newValue(.const_int, arg.type_idx, resume_block, pos);
+                placeholder.aux_int = 0;
+                try resume_block.insertValueBefore(f.allocator, placeholder, v);
+                try resume_vals.put(f.allocator, placeholder, {});
+                break :blk_remap placeholder;
+            };
+
+            try remapped.put(f.allocator, arg, replacement);
+            v.setArg(@intCast(arg_idx), replacement);
+        }
+    }
+
+    // Also rewrite block controls if they reference pre-split values
+    for (0..2) |ctrl_idx| {
+        if (resume_block.controls[ctrl_idx]) |ctrl| {
+            if (!resume_vals.contains(ctrl)) {
+                if (remapped.get(ctrl)) |replacement| {
+                    resume_block.controls[ctrl_idx] = replacement;
                 }
             }
         }
