@@ -1,11 +1,33 @@
 // TaskGroup tests — Swift structured concurrency (SE-0304)
 import "std/task_group"
 
-test "task group addTask and next" {
+test "task group addTask with closure and next" {
     var group = TaskGroup(int).init()
-    group.addTask(10)
-    group.addTask(20)
-    group.addTask(30)
+    group.addTask(fn() int { return 10 })
+    group.addTask(fn() int { return 20 })
+    group.addTask(fn() int { return 30 })
+
+    let a = group.next()
+    @assert(a != null)
+    @assertEq(a.?, 10)
+
+    let b = group.next()
+    @assert(b != null)
+    @assertEq(b.?, 20)
+
+    let c = group.next()
+    @assert(c != null)
+    @assertEq(c.?, 30)
+
+    let d = group.next()
+    @assert(d == null)
+}
+
+test "task group addValue convenience" {
+    var group = TaskGroup(int).init()
+    group.addValue(10)
+    group.addValue(20)
+    group.addValue(30)
 
     let a = group.next()
     @assert(a != null)
@@ -25,11 +47,11 @@ test "task group addTask and next" {
 
 test "task group for-await iteration" {
     var group = TaskGroup(int).init()
-    group.addTask(1)
-    group.addTask(2)
-    group.addTask(3)
-    group.addTask(4)
-    group.addTask(5)
+    group.addTask(fn() int { return 1 })
+    group.addTask(fn() int { return 2 })
+    group.addTask(fn() int { return 3 })
+    group.addTask(fn() int { return 4 })
+    group.addTask(fn() int { return 5 })
 
     var sum = 0
     for await val in group {
@@ -46,7 +68,7 @@ test "empty task group next returns null" {
 
 test "task group single element" {
     var group = TaskGroup(int).init()
-    group.addTask(42)
+    group.addTask(fn() int { return 42 })
 
     let val = group.next()
     @assert(val != null)
@@ -63,4 +85,18 @@ test "for-await over empty group does nothing" {
         count = count + 1
     }
     @assertEq(count, 0)
+}
+
+test "task group closure captures" {
+    var base = 100
+    var group = TaskGroup(int).init()
+    group.addTask(fn() int { return base + 1 })
+    group.addTask(fn() int { return base + 2 })
+    group.addTask(fn() int { return base + 3 })
+
+    var sum = 0
+    for await val in group {
+        sum = sum + val
+    }
+    @assertEq(sum, 306)
 }
