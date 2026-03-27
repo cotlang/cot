@@ -166,6 +166,7 @@ pub fn isRuntimeFunction(name: []const u8) bool {
         "retain", "release",  // ARC noops on Wasm (bump allocator, no refcounting)
         "growslice", "nextslicecap",
         "println", "eprintln", "print_int", "eprint_int", "int_to_string",
+        "executor_poll_task",
     };
     for (&runtime_names) |rn| {
         if (std.mem.eql(u8, name, rn)) return true;

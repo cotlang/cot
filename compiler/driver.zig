@@ -47,6 +47,7 @@ const print_runtime = @import("codegen/print_runtime.zig"); // Print runtime (Go
 const wasi_runtime = @import("codegen/wasi_runtime.zig"); // WASI runtime (fd_write)
 const test_runtime = @import("codegen/test_runtime.zig"); // Test runtime (Zig)
 const bench_runtime = @import("codegen/bench_runtime.zig"); // Bench runtime (Go testing.B)
+const executor_runtime = @import("codegen/executor_runtime.zig"); // Executor runtime (Swift CooperativeExecutor)
 
 // Native codegen modules (Cranelift-style AOT compiler)
 const native_compile = @import("codegen/native/compile.zig");
@@ -6037,6 +6038,12 @@ pub const Driver = struct {
         // ====================================================================
         const bench_funcs = try bench_runtime.addToLinker(self.allocator, &linker, print_funcs.write_idx, print_funcs.eprint_int_idx, wasi_funcs.time_idx, self.bench_n);
 
+        // ====================================================================
+        // Add executor runtime (call_indirect bridge for task polling)
+        // Swift reference: ExecutorJob.runSynchronously(on:)
+        // ====================================================================
+        const executor_funcs = try executor_runtime.addToLinker(self.allocator, &linker);
+
         // Get actual count from linker - never hardcode (Go: len(hostImports))
         const runtime_func_count = linker.funcCount();
 
@@ -6143,6 +6150,9 @@ pub const Driver = struct {
         try func_indices.put(self.allocator, bench_runtime.BENCH_MEASURE_END_NAME, bench_funcs.bench_measure_end_idx + import_count);
         try func_indices.put(self.allocator, bench_runtime.BENCH_GET_N_NAME, bench_funcs.bench_get_n_idx + import_count);
         try func_indices.put(self.allocator, bench_runtime.BENCH_SUMMARY_NAME, bench_funcs.bench_summary_idx + import_count);
+
+        // Add executor runtime function index
+        try func_indices.put(self.allocator, executor_runtime.POLL_TASK_NAME, executor_funcs.poll_task_idx + import_count);
 
         // Add user function names (offset by runtime func count + import count)
         for (funcs, 0..) |*ir_func, i| {
