@@ -1,0 +1,74 @@
+// DiscardingTaskGroup tests — Swift DiscardingTaskGroup + ThrowingDiscardingTaskGroup
+// Swift reference: DiscardingTaskGroup.swift:171-750
+//
+// Phase 1 (eager): tasks execute immediately, results discarded.
+
+import "std/discarding_task_group"
+
+// --- DiscardingTaskGroup ---
+
+test "discarding task group runs tasks" {
+    var group = DiscardingTaskGroup.init()
+    group.addTask(fn() void { })
+    group.addTask(fn() void { })
+    group.addTask(fn() void { })
+    @assertEq(group.task_count, 3)
+}
+
+test "discarding task group cancelAll" {
+    var group = DiscardingTaskGroup.init()
+    @assert(!group.isCancelled())
+    group.cancelAll()
+    @assert(group.isCancelled())
+}
+
+test "discarding task group addTaskUnlessCancelled" {
+    var group = DiscardingTaskGroup.init()
+    var added = group.addTaskUnlessCancelled(fn() void { })
+    @assert(added)
+    @assertEq(group.task_count, 1)
+
+    group.cancelAll()
+    added = group.addTaskUnlessCancelled(fn() void { })
+    @assert(!added)
+    @assertEq(group.task_count, 1)
+}
+
+test "discarding task group isEmpty always true" {
+    var group = DiscardingTaskGroup.init()
+    @assert(group.isEmpty())
+    group.addTask(fn() void { })
+    @assert(group.isEmpty())
+}
+
+// --- ThrowingDiscardingTaskGroup ---
+
+test "throwing discarding runs tasks" {
+    var group = ThrowingDiscardingTaskGroup.init()
+    group.addTask(fn() void { })
+    group.addTask(fn() void { })
+    @assertEq(group.task_count, 2)
+    @assert(!group.hasErrors())
+}
+
+test "throwing discarding tracks errors" {
+    var group = ThrowingDiscardingTaskGroup.init()
+    group.addTask(fn() void { })
+    group.addError()
+    group.addError()
+    group.addTask(fn() void { })
+
+    @assert(group.hasErrors())
+    @assertEq(group.getErrorCount(), 2)
+    @assertEq(group.task_count, 4)
+}
+
+test "throwing discarding cancelAll" {
+    var group = ThrowingDiscardingTaskGroup.init()
+    group.addTask(fn() void { })
+    group.cancelAll()
+    @assert(group.isCancelled())
+    var added = group.addTaskUnlessCancelled(fn() void { })
+    @assert(!added)
+    @assertEq(group.task_count, 1)
+}

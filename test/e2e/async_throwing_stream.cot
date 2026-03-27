@@ -1,0 +1,151 @@
+// AsyncThrowingStream tests — Swift AsyncThrowingStream (SE-0314)
+// Swift reference: AsyncThrowingStream.swift, AsyncStreamBuffer.swift:282-539
+//
+// Parallel to async_stream.cot tests with error support.
+
+import "std/async_throwing_stream"
+
+test "throwing stream yields and consumes" {
+    var stream = AsyncThrowingStream_init(int)(POLICY_UNBOUNDED, 0,
+        fn(cont: *AsyncThrowingStreamContinuation(int)) void {
+            cont.yield(10)
+            cont.yield(20)
+            cont.yield(30)
+            cont.finish()
+        }
+    )
+    var first = stream.next() orelse -1
+    @assertEq(first, 10)
+    var second = stream.next() orelse -1
+    @assertEq(second, 20)
+    var third = stream.next() orelse -1
+    @assertEq(third, 30)
+    var done = stream.next()
+    @assert(done == null)
+}
+
+test "throwing stream finishThrowing sets error" {
+    var stream = AsyncThrowingStream_init(int)(POLICY_UNBOUNDED, 0,
+        fn(cont: *AsyncThrowingStreamContinuation(int)) void {
+            cont.yield(1)
+            cont.finishThrowing()
+        }
+    )
+    var first = stream.next() orelse -1
+    @assertEq(first, 1)
+    var done = stream.next()
+    @assert(done == null)
+    @assert(stream.hasError())
+    @assert(stream.isFinished())
+}
+
+test "throwing stream normal finish no error" {
+    var stream = AsyncThrowingStream_init(int)(POLICY_UNBOUNDED, 0,
+        fn(cont: *AsyncThrowingStreamContinuation(int)) void {
+            cont.yield(42)
+            cont.finish()
+        }
+    )
+    var first = stream.next() orelse -1
+    @assertEq(first, 42)
+    var done = stream.next()
+    @assert(done == null)
+    @assert(!stream.hasError())
+    @assert(stream.isFinished())
+}
+
+test "throwing stream for-await iteration" {
+    var stream = AsyncThrowingStream_init(int)(POLICY_UNBOUNDED, 0,
+        fn(cont: *AsyncThrowingStreamContinuation(int)) void {
+            cont.yield(1)
+            cont.yield(2)
+            cont.yield(3)
+            cont.finish()
+        }
+    )
+    var sum = 0
+    for await val in stream {
+        sum = sum + val
+    }
+    @assertEq(sum, 6)
+}
+
+test "throwing stream oldest buffering policy" {
+    var stream = AsyncThrowingStream_init(int)(POLICY_OLDEST, 2,
+        fn(cont: *AsyncThrowingStreamContinuation(int)) void {
+            cont.yield(1)
+            cont.yield(2)
+            var r = cont.yield(3)
+            @assertEq(r.kind, YIELD_DROPPED)
+            cont.finish()
+        }
+    )
+    var first = stream.next() orelse -1
+    @assertEq(first, 1)
+    var second = stream.next() orelse -1
+    @assertEq(second, 2)
+    var done = stream.next()
+    @assert(done == null)
+}
+
+test "throwing stream newest buffering policy" {
+    var stream = AsyncThrowingStream_init(int)(POLICY_NEWEST, 2,
+        fn(cont: *AsyncThrowingStreamContinuation(int)) void {
+            cont.yield(1)
+            cont.yield(2)
+            cont.yield(3)
+            cont.finish()
+        }
+    )
+    // Newest policy: drops oldest when full. Buffer had [1,2], yield(3) drops 1.
+    var first = stream.next() orelse -1
+    @assertEq(first, 2)
+    var second = stream.next() orelse -1
+    @assertEq(second, 3)
+    var done = stream.next()
+    @assert(done == null)
+}
+
+test "throwing stream yield after finish returns terminated" {
+    var stream = AsyncThrowingStream_init(int)(POLICY_UNBOUNDED, 0,
+        fn(cont: *AsyncThrowingStreamContinuation(int)) void {
+            cont.yield(1)
+            cont.finishThrowing()
+            var r = cont.yield(2)
+            @assertEq(r.kind, YIELD_TERMINATED)
+        }
+    )
+    var first = stream.next() orelse -1
+    @assertEq(first, 1)
+}
+
+test "throwing stream makeStream factory" {
+    var cont: AsyncThrowingStreamContinuation(int) = undefined
+    var stream = AsyncThrowingStream_makeStream(int)(POLICY_UNBOUNDED, 0, &cont)
+    cont.yield(100)
+    cont.yield(200)
+    cont.finish()
+
+    var first = stream.next() orelse -1
+    @assertEq(first, 100)
+    var second = stream.next() orelse -1
+    @assertEq(second, 200)
+    @assert(!stream.hasError())
+}
+
+test "throwing stream error then no more elements" {
+    var cont: AsyncThrowingStreamContinuation(int) = undefined
+    var stream = AsyncThrowingStream_makeStream(int)(POLICY_UNBOUNDED, 0, &cont)
+    cont.yield(10)
+    cont.finishThrowing()
+
+    var first = stream.next() orelse -1
+    @assertEq(first, 10)
+    var second = stream.next()
+    @assert(second == null)
+    @assert(stream.hasError())
+
+    // Further reads also return null
+    var third = stream.next()
+    @assert(third == null)
+}

@@ -116,3 +116,21 @@ test "task group cancelAll" {
     @assertEq(task_is_cancelled(group.tasks.get(1)), 1)
     @assertEq(task_is_cancelled(group.tasks.get(2)), 1)
 }
+
+// --- M1.9: addTaskUnlessCancelled ---
+
+test "task group addTaskUnlessCancelled" {
+    var group = TaskGroup(int).init()
+    var added = group.addTaskUnlessCancelled(fn() int { return 42 })
+    @assert(added)
+    var val = group.next()
+    @assertEq(val.?, 42)
+}
+
+test "task group addTaskUnlessCancelled after cancel" {
+    var group = TaskGroup(int).init()
+    group.addTask(fn() int { return 1 })
+    group.cancelAll()
+    var added = group.addTaskUnlessCancelled(fn() int { return 99 })
+    @assert(!added)
+}

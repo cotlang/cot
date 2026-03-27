@@ -1,0 +1,135 @@
+// ThrowingTaskGroup tests — Swift ThrowingTaskGroup (TaskGroup.swift:574-770)
+// Swift reference: ThrowingTaskGroup<ChildTaskResult, Failure: Error>
+//
+// Phase 1 (eager): tasks complete immediately, error flags tracked inline.
+// Phase 2+: async execution, next() throws child errors.
+
+import "std/throwing_task_group"
+
+test "throwing task group basic success" {
+    var group = ThrowingTaskGroup(int).init()
+    group.addTask(fn() int { return 10 })
+    group.addTask(fn() int { return 20 })
+    group.addTask(fn() int { return 30 })
+
+    var sum = 0
+    if (group.next()) |val| { sum = sum + val }
+    if (group.next()) |val| { sum = sum + val }
+    if (group.next()) |val| { sum = sum + val }
+    @assertEq(sum, 60)
+    @assert(group.isEmpty())
+}
+
+test "throwing task group addValue" {
+    var group = ThrowingTaskGroup(int).init()
+    group.addValue(42)
+    group.addValue(99)
+
+    var first = group.next() orelse -1
+    @assertEq(first, 42)
+    var second = group.next() orelse -1
+    @assertEq(second, 99)
+    @assert(group.isEmpty())
+}
+
+test "throwing task group addError" {
+    var group = ThrowingTaskGroup(int).init()
+    group.addValue(10)
+    group.addError()
+    group.addValue(30)
+
+    // First: success
+    var first = group.next() orelse -1
+    @assertEq(first, 10)
+
+    // Second: error — next() returns null
+    var second = group.next()
+    @assert(second == null)
+    @assert(group.lastWasError())
+
+    // Third: success
+    var third = group.next() orelse -1
+    @assertEq(third, 30)
+    @assert(!group.lastWasError())
+}
+
+test "throwing task group empty returns null" {
+    var group = ThrowingTaskGroup(int).init()
+    var result = group.next()
+    @assert(result == null)
+    @assert(!group.lastWasError())
+    @assert(group.isEmpty())
+}
+
+test "throwing task group error count" {
+    var group = ThrowingTaskGroup(int).init()
+    group.addValue(1)
+    group.addError()
+    group.addValue(3)
+    group.addError()
+    group.addValue(5)
+
+    @assertEq(group.count(), 5)
+    @assertEq(group.errorCount(), 2)
+}
+
+test "throwing task group mixed consumption" {
+    var group = ThrowingTaskGroup(int).init()
+    group.addError()
+    group.addValue(42)
+
+    // First is error
+    var first = group.next()
+    @assert(first == null)
+    @assert(group.lastWasError())
+
+    // Second is success
+    var second = group.next() orelse -1
+    @assertEq(second, 42)
+    @assert(!group.lastWasError())
+}
+
+test "throwing task group all errors" {
+    var group = ThrowingTaskGroup(int).init()
+    group.addError()
+    group.addError()
+    group.addError()
+
+    var count = 0
+    while (!group.isEmpty()) {
+        var result = group.next()
+        if (result == null and group.lastWasError()) {
+            count = count + 1
+        }
+    }
+    @assertEq(count, 3)
+}
+
+test "throwing task group cancelAll is safe" {
+    var group = ThrowingTaskGroup(int).init()
+    group.addValue(1)
+    group.addValue(2)
+    group.cancelAll()
+    // After cancelAll, remaining tasks should still be consumable
+    var first = group.next() orelse -1
+    @assertEq(first, 1)
+}
+
+// --- M1.9: addTaskUnlessCancelled ---
+
+test "throwing task group addTaskUnlessCancelled success" {
+    var group = ThrowingTaskGroup(int).init()
+    var added = group.addTaskUnlessCancelled(fn() int { return 42 })
+    @assert(added)
+    var result = group.next() orelse -1
+    @assertEq(result, 42)
+}
+
+test "throwing task group addTaskUnlessCancelled after cancel" {
+    var group = ThrowingTaskGroup(int).init()
+    group.addValue(1)
+    group.cancelAll()
+    var added = group.addTaskUnlessCancelled(fn() int { return 99 })
+    @assert(!added)
+    @assertEq(group.count(), 1)
+}

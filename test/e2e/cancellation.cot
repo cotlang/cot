@@ -1,10 +1,12 @@
 // Task cancellation tests — Swift SE-0340.
-// Swift reference: Task.cancel(), Task.isCancelled
+// Swift reference: Task.cancel(), Task.isCancelled, CancellationError,
+//   checkCancellation, withTaskCancellationHandler
 //
 // Phase 1 (eager): tasks complete immediately, cancellation is post-hoc.
 // Phase 2+: cancellation checked cooperatively at suspension points.
 
 import "std/sys"
+import "std/cancellation"
 
 async fn compute() int { return 42 }
 
@@ -31,4 +33,73 @@ test "uncancelled task" {
     let raw = @intCast(i64, task_ptr)
     @assertEq(task_is_cancelled(raw), 0)
     let _ = await task_ptr
+}
+
+// --- M1.1: CancellationError type ---
+
+fn failIfCancelled(task_ptr: i64) CancellationError!int {
+    try checkCancellation(task_ptr)
+    return 42
+}
+
+test "checkCancellation succeeds on uncancelled task" {
+    let task_ptr = compute()
+    let raw = @intCast(i64, task_ptr)
+    var result = failIfCancelled(raw) catch -1
+    @assertEq(result, 42)
+    let _ = await task_ptr
+}
+
+test "checkCancellation throws on cancelled task" {
+    let task_ptr = compute()
+    let raw = @intCast(i64, task_ptr)
+    task_cancel(raw)
+    var result = failIfCancelled(raw) catch -1
+    @assertEq(result, -1)
+    let _ = await task_ptr
+}
+
+test "checkCancellation try propagation" {
+    // failIfCancelled uses try to propagate CancellationError from checkCancellation
+    let task_ptr = compute()
+    let raw = @intCast(i64, task_ptr)
+    task_cancel(raw)
+    var result = failIfCancelled(raw) catch |err| { -99 }
+    @assertEq(result, -99)
+    let _ = await task_ptr
+}
+
+test "checkCancellation propagates through try" {
+    // Wrap checkCancellation (CancellationError!void) with try in a function
+    // that returns CancellationError!int, then catch the propagated error.
+    // This tests the full try-propagation chain.
+    fn doWork(task_ptr: i64) CancellationError!int {
+        try checkCancellation(task_ptr)
+        return 100
+    }
+    let task_ptr = compute()
+    let raw = @intCast(i64, task_ptr)
+    task_cancel(raw)
+    var result = doWork(raw) catch -1
+    @assertEq(result, -1)
+    let _ = await task_ptr
+}
+
+// --- M1.3: withTaskCancellationHandler ---
+
+test "withTaskCancellationHandler runs operation" {
+    var cancelled = false
+    var result = withTaskCancellationHandler(int)(
+        fn() int { return 42 },
+        fn() void { cancelled = true }
+    )
+    @assertEq(result, 42)
+}
+
+test "withTaskCancellationHandler returns operation result" {
+    var result = withTaskCancellationHandler(int)(
+        fn() int { return 100 },
+        fn() void { }
+    )
+    @assertEq(result, 100)
 }

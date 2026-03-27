@@ -1,5 +1,9 @@
 // Continuation tests — Swift CheckedContinuation (SE-0300)
+// Non-throwing: Continuation(T) = CheckedContinuation<T, Never>
+// Throwing: ThrowingContinuation(T) = CheckedContinuation<T, Error>
 import "std/continuation"
+
+// --- Non-throwing Continuation(T) ---
 
 test "continuation resume and get result" {
     var cont = Continuation(int).init()
@@ -13,4 +17,41 @@ test "continuation tracks resumed state" {
     cont.resume(100)
     @assert(cont.resumed)
     @assertEq(cont.getResult(), 100)
+}
+
+// --- ThrowingContinuation(T) — M1.4 ---
+
+test "throwing continuation resume success" {
+    var cont = ThrowingContinuation(int).init()
+    cont.resume(42)
+    @assert(cont.resumed)
+    @assert(!cont.isError())
+    if (cont.getResult()) |val| {
+        @assertEq(val, 42)
+    } else {
+        @assert(false)
+    }
+}
+
+test "throwing continuation resume with error" {
+    var cont = ThrowingContinuation(int).init()
+    cont.resumeThrowing()
+    @assert(cont.resumed)
+    @assert(cont.isError())
+    var result = cont.getResult()
+    @assert(result == null)
+}
+
+test "throwing continuation success unwrap" {
+    var cont = ThrowingContinuation(int).init()
+    cont.resume(99)
+    var val = cont.getResult() orelse -1
+    @assertEq(val, 99)
+}
+
+test "throwing continuation error gives null" {
+    var cont = ThrowingContinuation(int).init()
+    cont.resumeThrowing()
+    var val = cont.getResult() orelse -1
+    @assertEq(val, -1)
 }
