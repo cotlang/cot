@@ -1,7 +1,7 @@
 # Concurrency: Swift Port — Status & Implementation Plan
 
 **Date:** 2026-03-28
-**Tests:** 442, all green (native + Wasm)
+**Tests:** 480, all green (native + Wasm)
 **Fidelity:** 96% faithful, 3% adapted, 1% invented
 
 ---
@@ -31,13 +31,13 @@
 
 ## Remaining Work for 1:1 Swift Parity
 
-### Milestone 1: Error Handling in Concurrency (2 weeks)
+### Milestone 1: Error Handling in Concurrency (2 weeks) — COMPLETE
 
-The biggest gap is error propagation through async code. Swift's concurrency deeply integrates with error handling. Every major type has a throwing variant.
+All 9 sub-tasks implemented. 38 new tests, all pass native + Wasm.
 
-#### M1.1: CancellationError type
+#### M1.1: CancellationError type ✅
 **Reference:** Swift CancellationError (Task.swift:801-810)
-**Effort:** 0.5 days
+**Effort:** 0.5 days — **DONE**
 
 Define `CancellationError` as an error set:
 ```cot
@@ -46,9 +46,9 @@ const CancellationError = error { Cancelled }
 
 This is the standard error thrown by `Task.checkCancellation()` and `withTaskCancellationHandler`.
 
-#### M1.2: Task.checkCancellation()
+#### M1.2: Task.checkCancellation() ✅
 **Reference:** Swift Task.checkCancellation() (Task.swift:826-832)
-**Effort:** 0.5 days
+**Effort:** 0.5 days — **DONE**
 
 ```cot
 fn Task_checkCancellation(task_ptr: i64) CancellationError!void {
@@ -60,9 +60,9 @@ fn Task_checkCancellation(task_ptr: i64) CancellationError!void {
 
 Stdlib function. Reads cancellation flag, throws if set. Used at cooperative cancellation points inside async code.
 
-#### M1.3: withTaskCancellationHandler
+#### M1.3: withTaskCancellationHandler ✅
 **Reference:** Swift withTaskCancellationHandler (TaskCancellation.swift:18-71)
-**Effort:** 1 day
+**Effort:** 1 day — **DONE**
 
 ```cot
 fn withTaskCancellationHandler(T)(
@@ -75,9 +75,9 @@ Phase 1 (eager): calls `operation()`, checks cancellation after, calls `onCancel
 
 Swift reference: `TaskCancellation.swift` — wraps operation, registers CancellationNotificationStatusRecord, invokes handler on cancel.
 
-#### M1.4: withCheckedThrowingContinuation
+#### M1.4: withCheckedThrowingContinuation ✅
 **Reference:** Swift CheckedContinuation (CheckedContinuation.swift:1-180)
-**Effort:** 1 day
+**Effort:** 1 day — **DONE**
 
 ```cot
 struct ThrowingContinuation(T, E) {
@@ -94,15 +94,13 @@ Extends existing `Continuation(T)` with error variant. `resume(value)` stores su
 
 Swift reference: `CheckedContinuation<T, E: Error>` — same contract with double-resume panic.
 
-#### M1.5: withUnsafeContinuation / withUnsafeThrowingContinuation
+#### M1.5: withUnsafeContinuation / withUnsafeThrowingContinuation ✅
 **Reference:** Swift UnsafeContinuation (UnsafeContinuation.swift)
-**Effort:** 0.5 days
+**Effort:** 0.5 days — **DONE** (aliases for checked variants in Phase 1)
 
-Same as checked variants but without double-resume detection. In Cot Phase 1, these can be aliases for the checked versions (no performance difference in eager mode).
-
-#### M1.6: ThrowingTaskGroup + withThrowingTaskGroup
+#### M1.6: ThrowingTaskGroup + withThrowingTaskGroup ✅
 **Reference:** Swift ThrowingTaskGroup (TaskGroup.swift:500-800)
-**Effort:** 2 days
+**Effort:** 2 days — **DONE**
 
 ```cot
 struct ThrowingTaskGroup(T, E) {
@@ -121,9 +119,9 @@ Like TaskGroup but `addTask` takes a throwing closure, `next()` returns error un
 
 Swift reference: `TaskGroup+addTask.swift.gyb` with `IS_THROWING=true`. `next()` async throws → rethrows child errors.
 
-#### M1.7: DiscardingTaskGroup + ThrowingDiscardingTaskGroup
+#### M1.7: DiscardingTaskGroup + ThrowingDiscardingTaskGroup ✅
 **Reference:** Swift DiscardingTaskGroup (TaskGroup.swift:850-1100)
-**Effort:** 1.5 days
+**Effort:** 1.5 days — **DONE**
 
 ```cot
 struct DiscardingTaskGroup {
@@ -141,9 +139,9 @@ Fire-and-forget task groups. No `next()` — results discarded. ThrowingDiscardi
 
 Swift reference: `TaskGroup.swift` with `IS_DISCARDING=true`. `Builtin.createDiscardingTask` instead of `Builtin.createTask`.
 
-#### M1.8: AsyncThrowingStream
+#### M1.8: AsyncThrowingStream ✅
 **Reference:** Swift AsyncThrowingStream (AsyncStreamBuffer.swift:282-539)
-**Effort:** 2 days
+**Effort:** 2 days — **DONE**
 
 Parallel implementation to AsyncStream with error support:
 ```cot
@@ -163,9 +161,9 @@ struct AsyncThrowingStreamContinuation(T, E) {
 
 Swift reference: `AsyncStreamBuffer.swift:282-539` — identical to AsyncStream except terminal state carries error, `next()` throws.
 
-#### M1.9: addTaskUnlessCancelled
+#### M1.9: addTaskUnlessCancelled ✅
 **Reference:** Swift TaskGroup.addTaskUnlessCancelled (TaskGroup+addTask.swift.gyb:258-264)
-**Effort:** 0.5 days
+**Effort:** 0.5 days — **DONE**
 
 ```cot
 fn addTaskUnlessCancelled(body: fn() -> T) bool
@@ -500,16 +498,19 @@ Priority order: M1 (blocking) > M2 (expected) > M3 (expected) > M6 (architecture
 
 ```bash
 zig build
-./zig-out/bin/cot test test/e2e/features.cot          # 370
-./zig-out/bin/cot test test/e2e/concurrency.cot        # 21
-./zig-out/bin/cot test test/e2e/task_expr.cot          # 6
-./zig-out/bin/cot test test/e2e/executor.cot           # 6
-./zig-out/bin/cot test test/e2e/task_group.cot         # 8
-./zig-out/bin/cot test test/e2e/channel.cot            # 7
-./zig-out/bin/cot test test/e2e/continuation.cot       # 2
-./zig-out/bin/cot test test/e2e/task_local.cot         # 4
-./zig-out/bin/cot test test/e2e/cancellation.cot       # 3
-./zig-out/bin/cot test test/e2e/assoc_types.cot        # 3
-./zig-out/bin/cot test test/e2e/async_stream.cot       # 9
-./zig-out/bin/cot test test/e2e/sending.cot            # 3
+./zig-out/bin/cot test test/e2e/features.cot              # 370
+./zig-out/bin/cot test test/e2e/concurrency.cot            # 21
+./zig-out/bin/cot test test/e2e/task_expr.cot              # 6
+./zig-out/bin/cot test test/e2e/executor.cot               # 6
+./zig-out/bin/cot test test/e2e/task_group.cot             # 10
+./zig-out/bin/cot test test/e2e/channel.cot                # 7
+./zig-out/bin/cot test test/e2e/continuation.cot           # 6
+./zig-out/bin/cot test test/e2e/task_local.cot             # 4
+./zig-out/bin/cot test test/e2e/cancellation.cot           # 9
+./zig-out/bin/cot test test/e2e/assoc_types.cot            # 3
+./zig-out/bin/cot test test/e2e/async_stream.cot           # 9
+./zig-out/bin/cot test test/e2e/sending.cot                # 3
+./zig-out/bin/cot test test/e2e/throwing_task_group.cot    # 10
+./zig-out/bin/cot test test/e2e/discarding_task_group.cot  # 7
+./zig-out/bin/cot test test/e2e/async_throwing_stream.cot  # 9
 ```
