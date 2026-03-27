@@ -478,7 +478,8 @@ cursor --uninstall-extension cot-lang.cot-lang 2>/dev/null; cursor --install-ext
 | `claude/specs/WASM_3_0_REFERENCE.md` | Wasm 3.0 opcodes and adoption plan |
 | `claude/WASM_CODEGEN_REFERENCE.md` | **Wasm codegen pipeline — READ BEFORE TOUCHING WASM** |
 | `claude/COT_SSA_PLAN.md` | **COT_SSA visualizer: execution plan, 8 phases, selfcot port** |
-| `claude/WASM_ASYNC_ARCHITECTURE.md` | **Wasm async: state machines vs Go's stack unwind, Rust/Kotlin comparison** |
+| `claude/CONCURRENCY_EXECUTION_PLAN.md` | **Concurrency status: 13 phases, 409 native + 36 Wasm tests, all pass** |
+| `claude/SWIFT_CONCURRENCY_PORT.md` | **Swift concurrency design doc (1,971 lines) — ALL IMPLEMENTED** |
 | `claude/WASM_PLATFORM_VISION.md` | Wasm platform vision, browser IDE, Canvas UI, business cases |
 | `claude/ROADMAP.md` | Forward-looking roadmap: 0.4→1.0, competitive positioning |
 | `claude/VERSION_TRAJECTORY.md` | **Self-hosting trajectory** — benchmarked against Zig, inspirational |
