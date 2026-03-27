@@ -259,6 +259,10 @@ pub const FuncBuilder = struct {
     async_task_local: ?LocalIdx = null,
     /// Phase 1 async: the inner result type (T in Task(T))
     async_result_type: ?TypeIndex = null,
+    /// Phase 2 async: true if this is a poll function (constructor/poll split).
+    /// Poll functions store result at frame[8] and return void.
+    /// Non-poll async fns store result at frame[0] and return the frame ptr.
+    is_async_poll: bool = false,
     /// Shared SRET local: reused across function calls returning large structs.
     /// Avoids allocating a new __sret_tmp for every call. Grown to max needed size.
     shared_sret_local: ?LocalIdx = null,

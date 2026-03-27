@@ -25,6 +25,7 @@
 | - | Selfcot port: parser+checker+types+IR+lowerer (677 lines) | all pass | `af9697e` |
 | - | 8 additional concurrency tests | 27 total | `63e69b5` |
 | - | Fix @attr parsing regression (was intercepting @assertEq) | fixed | `a504640` |
+| - | Fix Wasm store codegen after memory threading (stores silently dropped) | 15/15 wasm | `08050b1` |
 
 ## Selfcot Port Status — COMPLETE
 
@@ -86,13 +87,15 @@ The state machine is only needed for REAL SUSPENSION (yielding to executor).
 
 ## Remaining Work
 
+**Detailed plan:** `claude/CONCURRENCY_NEXT_PHASES.md` (5 phases, full Swift reference audit)
+
 | Feature | Status | Notes |
 |---------|--------|-------|
 | Enable state machine transform | Gated | Need constructor/poll split in lowerer |
-| @TaskLocal (SE-0311) | Not started | Needs @attribute parser syntax + $var.withValue scoping |
-| @Sendable closures (SE-0302) | Not started | Closure capture checking |
-| @unchecked Sendable | Not started | Escape hatch for unverifiable Sendable |
 | TaskGroup.addTask closure API | Not started | Currently takes pre-computed value, should take fn() -> T |
+| @Sendable closures (SE-0302) | Not started | Closure capture checking |
+| @TaskLocal (SE-0311) | Not started | Needs @attribute parser syntax + $var.withValue scoping |
+| @unchecked Sendable | Not started | Escape hatch for unverifiable Sendable |
 
 ## Test Summary (27 tests)
 

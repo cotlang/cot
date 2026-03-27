@@ -186,7 +186,7 @@ pub fn asyncSplit(f: *Func, type_registry: *const TypeRegistry) !void {
     // expects a frame pointer. Need to update lowerAsyncFnEager to generate
     // a constructor function when the body has 2+ suspend points, and update
     // lowerAwaitExpr to poll the state machine.
-    if (true or suspend_points.items.len < 2) {
+    if (suspend_points.items.len < 2) {
         debug.log(.async_split, "=== AsyncSplit skipped for '{s}': {d} suspend points (<=1, eager sufficient) ===", .{
             f.name, suspend_points.items.len,
         });
@@ -354,35 +354,19 @@ fn splitBlockAtSuspend(f: *Func, sp: *SuspendPoint, local_to_offset: *const std.
     if (block.controls[0]) |c| resume_block.controls[0] = c;
     if (block.controls[1]) |c| resume_block.controls[1] = c;
 
-    // Pre-await block becomes ret (returns PENDING)
+    // Pre-await block becomes ret (returns void — poll function returns void)
     block.kind = .ret;
     block.succs = &.{};
     block.controls = .{ null, null };
 
-    // === SPILL: store await result + state + return PENDING ===
+    // === SPILL: store state + await result + live locals to frame, return void ===
 
-    // Store the await call result (task pointer) to frame[result_offset]
-    // This is needed because the resume block references the call result
-    // (for loading the task's return value and releasing the task).
+    // The await call result (task pointer) is stored to frame[result_offset]
+    // so the resume block can load it to extract the task's return value.
     // Rust: the callee future is stored as a field in the caller's coroutine struct.
-    // The result_offset (8) stores the task pointer for later retrieval.
     const call_result_offset: i64 = 8; // frame[8] = task pointer from await call
 
-    // Store state number to frame[0]
-    const state_val = try f.newValue(.const_int, 0, block, pos);
-    state_val.aux_int = sp.state_number;
-    try block.addValue(f.allocator, state_val);
-
-    // Return PENDING (0)
-    const pending_val = try f.newValue(.const_int, 0, block, pos);
-    pending_val.aux_int = 0;
-    try block.addValue(f.allocator, pending_val);
-    block.setControl(pending_val);
-
-    // === SPILL: store live locals to frame before returning PENDING ===
-    // Rust reference: coroutine.rs TransformVisitor — rewrite locals to struct fields.
-    // We need the frame pointer. In the pre-await block, arg(0) is the frame.
-    // Find or create it:
+    // Get frame pointer (arg 0) in this block
     var frame_ptr_in_block: ?*Value = null;
     for (block.values.items) |v| {
         if (v.op == .arg and v.aux_int == 0) {
@@ -391,7 +375,6 @@ fn splitBlockAtSuspend(f: *Func, sp: *SuspendPoint, local_to_offset: *const std.
         }
     }
     if (frame_ptr_in_block == null) {
-        // Create frame arg reference at block start
         const fp = try f.newValue(.arg, 0, block, pos);
         fp.aux_int = 0;
         if (block.values.items.len > 0) {
@@ -402,6 +385,17 @@ fn splitBlockAtSuspend(f: *Func, sp: *SuspendPoint, local_to_offset: *const std.
         frame_ptr_in_block = fp;
     }
 
+    // Store state number to frame[0]
+    // Rust: coroutine.rs — set discriminant to suspend state number
+    const state_val = try f.newValue(.const_int, 0, block, pos);
+    state_val.aux_int = sp.state_number;
+    try block.addValue(f.allocator, state_val);
+
+    const state_store = try f.newValue(.store, 0, block, pos);
+    state_store.addArg(frame_ptr_in_block.?);
+    state_store.addArg(state_val);
+    try block.addValue(f.allocator, state_store);
+
     // Spill each live local to frame[offset]
     for (sp.live_locals.items) |local_slot| {
         const offset = local_to_offset.get(local_slot) orelse continue;
@@ -409,22 +403,22 @@ fn splitBlockAtSuspend(f: *Func, sp: *SuspendPoint, local_to_offset: *const std.
         // Load from local
         const local_addr_spill = try f.newValue(.local_addr, 0, block, pos);
         local_addr_spill.aux_int = @intCast(local_slot);
-        try block.insertValueBefore(f.allocator, local_addr_spill, block.values.items[block.values.items.len - 2]); // before state/pending
+        try block.addValue(f.allocator, local_addr_spill);
 
         const local_load = try f.newValue(.load, 0, block, pos);
         local_load.addArg(local_addr_spill);
-        try block.insertValueBefore(f.allocator, local_load, block.values.items[block.values.items.len - 2]);
+        try block.addValue(f.allocator, local_load);
 
         // Store to frame[offset]
         const frame_off = try f.newValue(.off_ptr, 0, block, pos);
         frame_off.aux_int = offset;
         frame_off.addArg(frame_ptr_in_block.?);
-        try block.insertValueBefore(f.allocator, frame_off, block.values.items[block.values.items.len - 2]);
+        try block.addValue(f.allocator, frame_off);
 
         const frame_store = try f.newValue(.store, 0, block, pos);
         frame_store.addArg(frame_off);
         frame_store.addArg(local_load);
-        try block.insertValueBefore(f.allocator, frame_store, block.values.items[block.values.items.len - 2]);
+        try block.addValue(f.allocator, frame_store);
     }
 
     // Spill the await call result (task pointer) to frame[result_offset]
@@ -432,12 +426,12 @@ fn splitBlockAtSuspend(f: *Func, sp: *SuspendPoint, local_to_offset: *const std.
         const call_frame_off = try f.newValue(.off_ptr, 0, block, pos);
         call_frame_off.aux_int = call_result_offset;
         call_frame_off.addArg(frame_ptr_in_block.?);
-        try block.insertValueBefore(f.allocator, call_frame_off, block.values.items[block.values.items.len - 2]);
+        try block.addValue(f.allocator, call_frame_off);
 
         const call_store = try f.newValue(.store, 0, block, pos);
         call_store.addArg(call_frame_off);
         call_store.addArg(sp.call_value);
-        try block.insertValueBefore(f.allocator, call_store, block.values.items[block.values.items.len - 2]);
+        try block.addValue(f.allocator, call_store);
     }
 
     // === RESTORE: at resume block entry ===

@@ -816,7 +816,7 @@ pub const Lowerer = struct {
                 .block_expr => |b| blk: {
                     var count: u32 = 0;
                     for (b.stmts) |s| count += self.countAwaits(s);
-                    if (b.result != null_node) count += self.countAwaits(b.result);
+                    if (b.expr != null_node) count += self.countAwaits(b.expr);
                     break :blk count;
                 },
                 else => 0,
@@ -846,10 +846,11 @@ pub const Lowerer = struct {
     /// Async function lowering.
     /// For functions with 0-1 await points: eager evaluation (body runs inline).
     /// For functions with 2+ await points: constructor + poll split.
-    ///   Constructor allocates task, calls poll(task_ptr), returns task.
-    ///   Poll function contains the body, SSA pass transforms to state machine.
+    ///   Poll function: takes frame ptr, contains body, SSA pass transforms to state machine.
+    ///   Constructor: allocates frame, stores params, polls in loop, returns Task ptr.
     /// Kotlin reference: AbstractSuspendFunctionsLowering.kt:66-92
     /// Swift reference: Task.swift — Task<Success> wraps a NativeObject.
+    /// Rust reference: coroutine.rs — StateTransform splits into resume + drop functions.
     fn lowerAsyncFnEager(self: *Lowerer, fn_decl: ast.FnDecl) !void {
         const return_type = if (fn_decl.return_type != null_node) self.resolveTypeNode(fn_decl.return_type) else TypeRegistry.VOID;
         const link_name = if (fn_decl.is_export or std.mem.eql(u8, fn_decl.name, "main"))
@@ -857,7 +858,18 @@ pub const Lowerer = struct {
         else
             try self.qualifyName(fn_decl.name);
 
-        // The async wrapper returns a Task pointer (i64)
+        const num_awaits = self.countAwaits(fn_decl.body);
+
+        if (num_awaits >= 2 and self.target.isWasm()) {
+            // Constructor + poll split for multi-await functions (Wasm only).
+            // Poll function contains the body; async_split.zig transforms it to state machine.
+            // Constructor allocates frame, calls poll in loop until done.
+            // Native path: stays eager (CLIF can't handle jump_table dispatch from async_split).
+            try self.lowerAsyncConstructorPoll(fn_decl, link_name, return_type);
+            return;
+        }
+
+        // 0-1 await: eager evaluation (body runs inline, no state machine needed).
         self.builder.startFunc(link_name, TypeRegistry.VOID, TypeRegistry.I64, fn_decl.span);
         if (self.builder.func()) |fb| {
             fb.is_export = fn_decl.is_export;
@@ -898,6 +910,153 @@ pub const Lowerer = struct {
             if (fn_decl.body != null_node) {
                 _ = try self.lowerBlockNode(fn_decl.body);
             }
+
+            self.current_func = null;
+        }
+        try self.builder.endFunc();
+    }
+
+    /// Emit constructor + poll function pair for async functions with 2+ awaits.
+    /// Rust reference: coroutine.rs StateTransform — creates resume + drop functions.
+    /// Kotlin reference: AbstractSuspendFunctionsLowering.kt:66-92 — buildConstructor + invokeSuspend.
+    ///
+    /// Frame layout (allocated by constructor, passed to poll):
+    ///   offset 0: state_num  (i64) — current state (0=unresumed, 1=returned, 3+=suspend points)
+    ///   offset 8: result     (i64) — the async function's return value
+    ///   offset 16: cancelled (i64) — cancellation flag
+    ///   offset 24+: params   (i64 each) — original function parameters
+    ///   offset 24+N*8+: spill slots — live locals across suspension points (async_split computes)
+    ///
+    /// The poll function takes frame ptr as single i64 param. async_split.zig transforms
+    /// its body into a state machine with jump_table dispatch on frame[0].
+    fn lowerAsyncConstructorPoll(self: *Lowerer, fn_decl: ast.FnDecl, link_name: []const u8, return_type: TypeIndex) !void {
+        const span = fn_decl.span;
+
+        // Phase 1: Emit the POLL function ({name}__poll).
+        // Contains the original body. async_split.zig will transform it.
+        // Single param: frame pointer (i64).
+        // Returns void (result stored in frame[8]).
+        const poll_name = try std.fmt.allocPrint(self.allocator, "{s}__poll", .{link_name});
+        try self.builder.declareFunc(poll_name);
+
+        self.builder.startFunc(poll_name, TypeRegistry.VOID, TypeRegistry.VOID, span);
+        if (self.builder.func()) |fb| {
+            self.current_func = fb;
+            self.cleanup_stack.clear();
+            self.comptime_value_vars.clearRetainingCapacity();
+            self.weak_locals.clearRetainingCapacity();
+
+            // Single param: frame pointer
+            const frame_param_local = try fb.addParam("__frame", TypeRegistry.I64, 8);
+
+            // Store frame ptr in async_task_local so lowerReturn stores result at frame[8]
+            // (same offset as TaskObject result field)
+            const frame_local = try fb.addLocalWithSize("__async_task", TypeRegistry.I64, false, 8);
+            const frame_val = try fb.emitLoadLocal(frame_param_local, TypeRegistry.I64, span);
+            _ = try fb.emitStoreLocal(frame_local, frame_val, span);
+            fb.async_task_local = frame_local;
+            fb.async_result_type = return_type;
+            fb.is_async_poll = true;
+
+            // Load params from frame into named locals
+            // Frame layout: [state(8), result(8), cancelled(8), param0(8), param1(8), ...]
+            const param_base_offset: i64 = 24;
+            for (fn_decl.params, 0..) |param, idx| {
+                var param_type = self.resolveTypeNode(param.type_expr);
+                param_type = self.chk.safeWrapType(param_type) catch param_type;
+                const param_size = self.type_reg.sizeOf(param_type);
+
+                // Load param from frame[param_base_offset + idx*8]
+                const frame_ptr = try fb.emitLoadLocal(frame_local, TypeRegistry.I64, span);
+                const offset_val = try fb.emitConstInt(param_base_offset + @as(i64, @intCast(idx)) * 8, TypeRegistry.I64, span);
+                const param_addr = try fb.emitBinary(.add, frame_ptr, offset_val, TypeRegistry.I64, span);
+                const param_val = try fb.emitPtrLoadValue(param_addr, param_type, span);
+
+                // Store into named local (so body code can reference by name)
+                const local_idx = try fb.addLocalWithSize(param.name, param_type, false, param_size);
+                _ = try fb.emitStoreLocal(local_idx, param_val, span);
+            }
+
+            // Lower the body
+            if (fn_decl.body != null_node) {
+                _ = try self.lowerBlockNode(fn_decl.body);
+            }
+
+            self.current_func = null;
+        }
+        try self.builder.endFunc();
+
+        // Phase 2: Emit the CONSTRUCTOR function (original name).
+        // Allocates frame, stores params, calls poll in loop, returns frame as Task ptr.
+        self.builder.startFunc(link_name, TypeRegistry.VOID, TypeRegistry.I64, span);
+        if (self.builder.func()) |fb| {
+            fb.is_export = fn_decl.is_export;
+            self.current_func = fb;
+            self.cleanup_stack.clear();
+            self.comptime_value_vars.clearRetainingCapacity();
+            self.weak_locals.clearRetainingCapacity();
+
+            // Add original params
+            for (fn_decl.params) |param| {
+                var param_type = self.resolveTypeNode(param.type_expr);
+                param_type = self.chk.safeWrapType(param_type) catch param_type;
+                const param_size = self.type_reg.sizeOf(param_type);
+                _ = try fb.addParam(param.name, param_type, param_size);
+            }
+
+            // Allocate frame: state(8) + result(8) + cancelled(8) + params(N*8) + spill slots
+            // Use generous size — async_split determines actual spill needs
+            const num_params: i64 = @intCast(fn_decl.params.len);
+            const frame_size = 24 + num_params * 8 + 128; // 128 bytes for spill slots
+            const zero_metadata = try fb.emitConstInt(0, TypeRegistry.I64, span);
+            const size_val = try fb.emitConstInt(frame_size, TypeRegistry.I64, span);
+            var alloc_args = [_]ir.NodeIndex{ zero_metadata, size_val };
+            const frame_ptr = try fb.emitCall("alloc", &alloc_args, false, TypeRegistry.I64, span);
+
+            // Store frame in local
+            const frame_local = try fb.addLocalWithSize("__frame", TypeRegistry.I64, false, 8);
+            _ = try fb.emitStoreLocal(frame_local, frame_ptr, span);
+
+            // Set state = STATE_UNRESUMED (0)
+            const state_zero = try fb.emitConstInt(0, TypeRegistry.I64, span);
+            _ = try fb.emitPtrStoreValue(frame_ptr, state_zero, span);
+
+            // Store params into frame[24+idx*8]
+            const param_base_offset: i64 = 24;
+            for (fn_decl.params, 0..) |param, idx| {
+                const param_local = fb.local_map.get(param.name) orelse continue;
+                const param_val = try fb.emitLoadLocal(param_local, TypeRegistry.I64, span);
+                const frame_ptr2 = try fb.emitLoadLocal(frame_local, TypeRegistry.I64, span);
+                const offset_val = try fb.emitConstInt(param_base_offset + @as(i64, @intCast(idx)) * 8, TypeRegistry.I64, span);
+                const param_addr = try fb.emitBinary(.add, frame_ptr2, offset_val, TypeRegistry.I64, span);
+                _ = try fb.emitPtrStoreValue(param_addr, param_val, span);
+            }
+
+            // Poll loop: call poll until state == STATE_RETURNED (1)
+            // Rust: coroutine caller loops: while poll(frame) == Poll::Pending { }
+            // With eager evaluation, all child tasks complete immediately,
+            // so the loop runs through all states in one burst.
+            const loop_block = try fb.newBlock("poll.loop");
+            const done_block = try fb.newBlock("poll.done");
+            _ = try fb.emitJump(loop_block, span);
+
+            fb.setBlock(loop_block);
+            // Call poll function
+            const frame_for_poll = try fb.emitLoadLocal(frame_local, TypeRegistry.I64, span);
+            var poll_args = [_]ir.NodeIndex{frame_for_poll};
+            _ = try fb.emitCall(poll_name, &poll_args, false, TypeRegistry.VOID, span);
+
+            // Check state: load frame[0]
+            const frame_for_check = try fb.emitLoadLocal(frame_local, TypeRegistry.I64, span);
+            const state = try fb.emitPtrLoadValue(frame_for_check, TypeRegistry.I64, span);
+            const one = try fb.emitConstInt(1, TypeRegistry.I64, span);
+            const is_returned = try fb.emitBinary(.eq, state, one, TypeRegistry.BOOL, span);
+            _ = try fb.emitBranch(is_returned, done_block, loop_block, span);
+
+            // Done: return frame ptr as Task
+            fb.setBlock(done_block);
+            const final_frame = try fb.emitLoadLocal(frame_local, TypeRegistry.I64, span);
+            _ = try fb.emitRet(final_frame, span);
 
             self.current_func = null;
         }
@@ -1415,8 +1574,31 @@ pub const Lowerer = struct {
     fn lowerReturn(self: *Lowerer, ret: ast.ReturnStmt) !void {
         const fb = self.current_func orelse return;
 
-        // Phase 1 async: store result at task_ptr+0 (user data), then return task_ptr
+        // Async return: store result in task/frame, then return.
         if (fb.async_task_local) |task_local| {
+            if (fb.is_async_poll) {
+                // Poll function: store result at frame[8], set state=RETURNED(1), return void.
+                // Rust reference: coroutine.rs — set discriminant to RETURNED, store result.
+                const frame_ptr = try fb.emitLoadLocal(task_local, TypeRegistry.I64, ret.span);
+                if (ret.value != null_node) {
+                    const result = try self.lowerExprNode(ret.value);
+                    // Store result at frame[8] (result offset in state machine frame)
+                    const eight = try fb.emitConstInt(8, TypeRegistry.I64, ret.span);
+                    const result_addr = try fb.emitBinary(.add, frame_ptr, eight, TypeRegistry.I64, ret.span);
+                    _ = try fb.emitPtrStoreValue(result_addr, result, ret.span);
+                }
+                // Set state = STATE_RETURNED (1) at frame[0]
+                const one = try fb.emitConstInt(1, TypeRegistry.I64, ret.span);
+                const frame_ptr2 = try fb.emitLoadLocal(task_local, TypeRegistry.I64, ret.span);
+                _ = try fb.emitPtrStoreValue(frame_ptr2, one, ret.span);
+                // Run cleanup stack before returning
+                try self.emitCleanups(0);
+                // Return void (poll function returns nothing)
+                _ = try fb.emitRet(null, ret.span);
+                return;
+            }
+
+            // Eager async (0-1 awaits): store result at task_ptr[0], return task_ptr.
             if (ret.value != null_node) {
                 const result = try self.lowerExprNode(ret.value);
                 const task_ptr = try fb.emitLoadLocal(task_local, TypeRegistry.I64, ret.span);

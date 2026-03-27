@@ -1516,8 +1516,9 @@ pub const Driver = struct {
             }
 
             // Run SSA passes (native path)
-            // Async state machine splitting — must run FIRST.
-            try async_split.asyncSplit(ssa_func, type_reg);
+            // Skip async state machine splitting on native — CLIF can't handle jump_table dispatch.
+            // Native async functions use eager evaluation (body runs inline).
+            // async_split only runs on the Wasm path where br_table dispatch works.
 
             try rewritegeneric.rewrite(func_alloc, ssa_func, &string_offsets);
             if (html_writer_native != null) html_writer_native.?.writePhase("rewritegeneric", "rewritegeneric", ssa_func);
