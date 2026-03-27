@@ -3116,9 +3116,11 @@ pub const Lowerer = struct {
                         try parts.append(self.allocator, str_node);
                     } else if (expr_type == TypeRegistry.F32 or expr_type == TypeRegistry.F64 or expr_type == TypeRegistry.FLOAT or expr_type == TypeRegistry.UNTYPED_FLOAT) {
                         // Float expression: convert via float_to_string
+                        // float_to_string takes i64 bits (not f64). Reinterpret for Wasm ABI.
+                        const float_bits = try fb.emitUnary(.i64_reinterpret_f64, expr_val, TypeRegistry.I64, si.span);
                         const buf_local = try fb.addLocalWithSize("__interp_buf", TypeRegistry.I64, true, 32);
                         const buf_addr = try fb.emitAddrLocal(buf_local, TypeRegistry.I64, si.span);
-                        var fts_args = [_]ir.NodeIndex{ expr_val, buf_addr };
+                        var fts_args = [_]ir.NodeIndex{ float_bits, buf_addr };
                         const str_len = try fb.emitCall("float_to_string", &fts_args, false, TypeRegistry.I64, si.span);
                         const str_node = try fb.emit(ir.Node.init(.{ .string_header = .{ .ptr = buf_addr, .len = str_len } }, TypeRegistry.STRING, si.span));
                         try parts.append(self.allocator, str_node);
@@ -10833,7 +10835,10 @@ pub const Lowerer = struct {
             _ = try fb.emitCall("write", &write_args, false, TypeRegistry.I64, call.span);
         } else if (is_float) {
             const float_val = try self.lowerExprNode(call.args[0]);
-            var print_args = [_]ir.NodeIndex{float_val};
+            // print_float takes i64 bits (not f64). Reinterpret float → i64 for the call.
+            // Native CLIF handles this implicitly; Wasm needs explicit i64.reinterpret_f64.
+            const bits_val = try fb.emitUnary(.i64_reinterpret_f64, float_val, TypeRegistry.I64, call.span);
+            var print_args = [_]ir.NodeIndex{bits_val};
             _ = try fb.emitCall(if (fd == 2) "eprint_float" else "print_float", &print_args, false, TypeRegistry.VOID, call.span);
         } else {
             const str_val = try self.lowerExprNode(call.args[0]);
