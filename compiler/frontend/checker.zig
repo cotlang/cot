@@ -3064,6 +3064,11 @@ pub const Checker = struct {
             for (si.fields) |fi| if (std.mem.eql(u8, sf.name, fi.name)) { provided = true; break; };
             if (!provided) self.err.errorWithCode(si.span.start, .e300, "missing field in struct init");
         }
+        // Actors are reference types — struct init returns *Actor, not Actor.
+        // Swift reference: actor init always returns a reference (ARC heap object).
+        if (self.actor_types.contains(struct_type.struct_type.name)) {
+            return try self.types.makePointer(struct_type_idx);
+        }
         return struct_type_idx;
     }
 

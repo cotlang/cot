@@ -2753,8 +2753,23 @@ pub const Lowerer = struct {
                 break :blk self.type_reg.lookupByName(struct_init.type_name) orelse return;
         };
         if (struct_type_idx == TypeRegistry.VOID) return;
-        const type_info = self.type_reg.get(struct_type_idx);
+        var resolved_type_idx = struct_type_idx;
+        var type_info = self.type_reg.get(resolved_type_idx);
+        // Unwrap pointer for actor types: checker returns *Actor for actor init
+        if (type_info == .pointer) {
+            resolved_type_idx = type_info.pointer.elem;
+            type_info = self.type_reg.get(resolved_type_idx);
+        }
         const struct_type = if (type_info == .struct_type) type_info.struct_type else return;
+
+        // Actor types: allocate on heap (reference semantics) via same path as `new`.
+        // Swift reference: Actors are reference types (ARC heap objects).
+        // The local stores a pointer, not the struct value.
+        if (self.chk.actor_types.contains(struct_type.name)) {
+            const result = try self.lowerActorInit(struct_init, struct_type, struct_type_idx, span);
+            _ = try fb.emitStoreLocal(local_idx, result, span);
+            return;
+        }
 
         // WasmGC path: ALL structs are GC objects — no stack allocation
         // Reference: Kotlin/Dart WasmGC strategy — no dual representation
@@ -7051,8 +7066,20 @@ pub const Lowerer = struct {
                 break :blk self.type_reg.lookupByName(si.type_name) orelse return ir.null_node;
         };
         if (struct_type_idx == TypeRegistry.VOID) return ir.null_node;
-        const type_info = self.type_reg.get(struct_type_idx);
+        var resolved_si_idx = struct_type_idx;
+        var type_info = self.type_reg.get(resolved_si_idx);
+        // Unwrap pointer for actor types
+        if (type_info == .pointer) {
+            resolved_si_idx = type_info.pointer.elem;
+            type_info = self.type_reg.get(resolved_si_idx);
+        }
         const struct_type = if (type_info == .struct_type) type_info.struct_type else return ir.null_node;
+
+        // Actor types: always heap-allocated (reference semantics).
+        // Swift reference: Actors are reference types.
+        if (self.chk.actor_types.contains(struct_type.name)) {
+            return try self.lowerActorInit(si, struct_type, resolved_si_idx, si.span);
+        }
 
         // WasmGC path: emit gc_struct_new directly — no temp local, no memory stores.
         // Same pattern as lowerStructInit's WasmGC path.
@@ -7346,6 +7373,48 @@ pub const Lowerer = struct {
     /// ARC path: cot_alloc call + field stores via linear memory.
     /// WasmGC path: gc_struct_new with field values (GC-managed object).
     /// Reference: Go's walkNew (walk/builtin.go:601-616)
+    /// Lower actor struct init to heap allocation (reference semantics).
+    /// Swift reference: Actors are always reference types (ARC heap objects).
+    /// DefaultActor is 96 bytes (12 words) + HeapObject header.
+    /// Cot Phase 1: allocate via alloc(), store fields, return pointer.
+    /// Phase 2+: will call swift_defaultActor_initialize for queue setup.
+    fn lowerActorInit(self: *Lowerer, struct_init: ast.StructInit, struct_type: types.StructType, struct_type_idx: TypeIndex, span: Span) !ir.NodeIndex {
+        const fb = self.current_func orelse return ir.null_node;
+        debug.log(.lower, "lowerActorInit: type={s}, fields={d}, payload_size={d}", .{ struct_type.name, struct_init.fields.len, self.type_reg.sizeOf(struct_type_idx) });
+
+        // Allocate heap object: alloc(metadata=0, size=payload_size)
+        // alloc() prepends a 16-byte ARC header automatically.
+        const payload_size = self.type_reg.sizeOf(struct_type_idx);
+        const zero_metadata = try fb.emitConstInt(0, TypeRegistry.I64, span);
+        const size_val = try fb.emitConstInt(@intCast(payload_size), TypeRegistry.I64, span);
+        var alloc_args = [_]ir.NodeIndex{ zero_metadata, size_val };
+        const actor_ptr = try fb.emitCall("alloc", &alloc_args, false, TypeRegistry.I64, span);
+
+        // Store actor_ptr in temp local (needed for field stores)
+        const temp_name = try std.fmt.allocPrint(self.allocator, "__actor_ptr_{d}", .{self.temp_counter});
+        self.temp_counter += 1;
+        const temp_local = try fb.addLocalWithSize(temp_name, TypeRegistry.I64, false, 8);
+        _ = try fb.emitStoreLocal(temp_local, actor_ptr, span);
+
+        // Store fields via pointer offsets (same as new expr path)
+        for (struct_init.fields) |field_init| {
+            for (struct_type.fields) |struct_field| {
+                if (std.mem.eql(u8, struct_field.name, field_init.name)) {
+                    const field_offset: i64 = @intCast(struct_field.offset);
+                    const value_node_ir = try self.lowerExprNode(field_init.value);
+                    const ptr = try fb.emitLoadLocal(temp_local, TypeRegistry.I64, span);
+                    const offset_const = try fb.emitConstInt(field_offset, TypeRegistry.I64, span);
+                    const field_addr = try fb.emitBinary(.add, ptr, offset_const, TypeRegistry.I64, span);
+                    _ = try fb.emitPtrStoreValue(field_addr, value_node_ir, span);
+                    break;
+                }
+            }
+        }
+
+        // Return actor pointer (reference type)
+        return try fb.emitLoadLocal(temp_local, TypeRegistry.I64, span);
+    }
+
     fn lowerNewExpr(self: *Lowerer, ne: ast.NewExpr, node_idx: ?NodeIndex) Error!ir.NodeIndex {
         const fb = self.current_func orelse return ir.null_node;
 
