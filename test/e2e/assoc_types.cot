@@ -1,0 +1,50 @@
+// Associated type tests — Swift protocol associated types (SE-0142).
+// Tests type parameters on traits and `type` declarations in trait bodies.
+
+import "std/sys"
+
+// Basic trait with type parameter declaration
+trait Containable(Element) {
+    fn count() int
+}
+
+// Trait with associated type
+trait Sequenceable(Element) {
+    type Iterator
+    fn size() int
+}
+
+// Concrete types
+struct MyList {
+    len: int,
+}
+
+impl Containable for MyList {
+    fn count(self: *MyList) int {
+        return self.len
+    }
+}
+
+test "trait with type parameter parses" {
+    var list = MyList { .len = 5 }
+    @assertEq(list.count(), 5)
+}
+
+test "trait with associated type parses" {
+    // Verify the trait with `type Iterator` compiles.
+    @assert(true)
+}
+
+// AsyncSequence-style trait (the target use case for Phase K)
+trait AsyncSeq(Element) {
+    type Iterator: Iterable
+    fn makeIterator() int
+}
+
+trait Iterable {
+    fn next() ?int
+}
+
+test "trait with bounded associated type parses" {
+    @assert(true)
+}

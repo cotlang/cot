@@ -129,9 +129,12 @@ pub const GenericInstInfo = struct {
 };
 
 /// Info about a trait definition.
+/// Swift reference: protocol declaration with associated types (SE-0142).
 pub const TraitDef = struct {
     name: []const u8,
+    type_params: []const []const u8 = &.{},
     method_names: []const []const u8,
+    assoc_type_names: []const []const u8 = &.{},
 };
 
 /// Shared generic context — lives across all checkers in multi-file mode.
@@ -690,14 +693,25 @@ pub const Checker = struct {
                 }
             },
             .trait_decl => |td| {
-                // Collect trait method names for validation
+                // Collect trait method names and associated type names.
+                // Swift reference: protocol declaration with associated types (SE-0142).
                 var method_names = std.ArrayListUnmanaged([]const u8){};
                 defer method_names.deinit(self.allocator);
                 for (td.methods) |method_idx| {
                     const method_decl = (self.tree.getNode(method_idx) orelse continue).asDecl() orelse continue;
                     if (method_decl == .fn_decl) try method_names.append(self.allocator, method_decl.fn_decl.name);
                 }
-                try self.generics.trait_defs.put(td.name, .{ .name = td.name, .method_names = try self.allocator.dupe([]const u8, method_names.items) });
+                var assoc_type_names = std.ArrayListUnmanaged([]const u8){};
+                defer assoc_type_names.deinit(self.allocator);
+                for (td.assoc_types) |at| {
+                    try assoc_type_names.append(self.allocator, at.name);
+                }
+                try self.generics.trait_defs.put(td.name, .{
+                    .name = td.name,
+                    .type_params = td.type_params,
+                    .method_names = try self.allocator.dupe([]const u8, method_names.items),
+                    .assoc_type_names = try self.allocator.dupe([]const u8, assoc_type_names.items),
+                });
             },
             .impl_trait => |it| {
                 // Validate trait exists

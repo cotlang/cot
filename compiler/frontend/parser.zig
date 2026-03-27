@@ -792,19 +792,68 @@ pub const Parser = struct {
         if (!self.check(.ident)) { self.err.errorWithCode(self.pos(), .e203, "expected trait name"); return null; }
         const name = self.tok.text;
         self.advance();
+
+        // Optional type parameters: trait MyTrait(T, U) { ... }
+        // Swift reference: protocol associated types with generic parameters.
+        var type_params = std.ArrayListUnmanaged([]const u8){};
+        defer type_params.deinit(self.allocator);
+        if (self.match(.lparen)) {
+            while (!self.check(.rparen) and !self.check(.eof)) {
+                if (self.check(.ident)) {
+                    try type_params.append(self.allocator, self.tok.text);
+                    self.advance();
+                }
+                if (!self.match(.comma)) break;
+            }
+            if (!self.expect(.rparen)) return null;
+        }
+
         if (!self.expect(.lbrace)) return null;
 
         var methods = std.ArrayListUnmanaged(NodeIndex){};
         defer methods.deinit(self.allocator);
+        var assoc_types = std.ArrayListUnmanaged(ast.AssocTypeDecl){};
+        defer assoc_types.deinit(self.allocator);
+
         while (!self.check(.rbrace) and !self.check(.eof)) {
             self.collectDocComment();
             if (self.check(.kw_fn)) {
-                // Parse method signature (fn_decl with body = null_node)
                 if (try self.parseFnDecl(false, false, false, false, false)) |idx| try methods.append(self.allocator, idx);
-            } else { self.syntaxError("expected 'fn' in trait declaration"); self.advance(); }
+            } else if (self.check(.kw_type)) {
+                // Associated type: `type Iterator: AsyncIterator(Element)`
+                // Swift reference: protocol associated types (SE-0142).
+                const type_start = self.pos();
+                self.advance(); // consume 'type'
+                if (!self.check(.ident)) { self.syntaxError("expected associated type name"); self.advance(); continue; }
+                const assoc_name = self.tok.text;
+                self.advance();
+                var bound: []const u8 = "";
+                if (self.match(.colon)) {
+                    if (self.check(.ident)) {
+                        bound = self.tok.text;
+                        self.advance();
+                        // Skip optional type args: AsyncIterator(Element)
+                        if (self.match(.lparen)) {
+                            while (!self.check(.rparen) and !self.check(.eof)) {
+                                self.advance();
+                                if (!self.match(.comma)) break;
+                            }
+                            _ = self.match(.rparen);
+                        }
+                    }
+                }
+                try assoc_types.append(self.allocator, .{ .name = assoc_name, .bound = bound, .span = Span.init(type_start, self.pos()) });
+            } else { self.syntaxError("expected 'fn' or 'type' in trait declaration"); self.advance(); }
         }
         if (!self.expect(.rbrace)) return null;
-        return try self.tree.addDecl(.{ .trait_decl = .{ .name = name, .methods = try self.allocator.dupe(NodeIndex, methods.items), .doc_comment = doc_comment, .span = Span.init(start, self.pos()) } });
+        return try self.tree.addDecl(.{ .trait_decl = .{
+            .name = name,
+            .type_params = try self.allocator.dupe([]const u8, type_params.items),
+            .methods = try self.allocator.dupe(NodeIndex, methods.items),
+            .assoc_types = try self.allocator.dupe(ast.AssocTypeDecl, assoc_types.items),
+            .doc_comment = doc_comment,
+            .span = Span.init(start, self.pos()),
+        } });
     }
 
     fn parseImplTraitBlock(self: *Parser, start: Pos, trait_name: []const u8, type_params: []const []const u8, doc_comment: []const u8) ParseError!?NodeIndex {

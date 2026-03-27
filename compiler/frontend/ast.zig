@@ -73,8 +73,18 @@ pub const VarDecl = struct { name: []const u8, type_expr: NodeIndex, value: Node
 pub const StructLayout = enum { auto, @"packed", @"extern" };
 pub const StructDecl = struct { name: []const u8, type_params: []const []const u8 = &.{}, fields: []const Field, layout: StructLayout = .auto, nested_decls: []const NodeIndex = &.{}, doc_comment: []const u8 = "", is_actor: bool = false, span: Span };
 pub const ImplBlock = struct { type_name: []const u8, type_params: []const []const u8 = &.{}, methods: []const NodeIndex, consts: []const NodeIndex = &.{}, doc_comment: []const u8 = "", span: Span };
-pub const TraitDecl = struct { name: []const u8, methods: []const NodeIndex, doc_comment: []const u8 = "", span: Span };
-pub const ImplTraitBlock = struct { trait_name: []const u8, target_type: []const u8, type_params: []const []const u8 = &.{}, methods: []const NodeIndex, doc_comment: []const u8 = "", span: Span };
+/// Associated type declaration inside a trait: `type Iterator: AsyncIterator(Element)`
+/// Swift reference: protocol associated types (SE-0142).
+pub const AssocTypeDecl = struct { name: []const u8, bound: []const u8 = "", span: Span };
+pub const TraitDecl = struct {
+    name: []const u8,
+    type_params: []const []const u8 = &.{}, // trait MyTrait(T, U) { ... }
+    methods: []const NodeIndex,
+    assoc_types: []const AssocTypeDecl = &.{}, // type Iterator: Bound
+    doc_comment: []const u8 = "",
+    span: Span,
+};
+pub const ImplTraitBlock = struct { trait_name: []const u8, target_type: []const u8, type_params: []const []const u8 = &.{}, methods: []const NodeIndex, assoc_types: []const AssocTypeDecl = &.{}, doc_comment: []const u8 = "", span: Span };
 pub const TestDecl = struct { name: []const u8, body: NodeIndex, span: Span };
 pub const BenchDecl = struct { name: []const u8, body: NodeIndex, span: Span };
 pub const EnumDecl = struct { name: []const u8, backing_type: NodeIndex, variants: []const EnumVariant, nested_decls: []const NodeIndex = &.{}, doc_comment: []const u8 = "", span: Span };
