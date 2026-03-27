@@ -98,6 +98,50 @@ test "task cancellation flag" {
     // Phase 2+ will test: task.cancel() sets flag, Task.isCancelled reads it
 }
 
+test "async fn returning string" {
+    async fn greet(name: string) string {
+        return "hello " ++ name
+    }
+
+    let msg = await greet("world")
+    @assertEq(msg, "hello world")
+}
+
+test "nested async calls" {
+    async fn double(x: int) int { return x * 2 }
+    async fn quadruple(x: int) int {
+        let d = await double(x)
+        return await double(d)
+    }
+
+    @assertEq(await quadruple(5), 20)
+}
+
+test "actor field access requires await" {
+    actor Timer {
+        elapsed: int,
+
+        fn tick() void {
+            self.elapsed = self.elapsed + 1
+        }
+
+        fn getElapsed() int {
+            return self.elapsed
+        }
+
+        nonisolated fn name() string {
+            return "Timer"
+        }
+    }
+
+    var t = Timer { .elapsed = 0 }
+    await t.tick()
+    await t.tick()
+    await t.tick()
+    @assertEq(await t.getElapsed(), 3)
+    @assertEq(t.name(), "Timer")
+}
+
 test "multiple awaits in sequence" {
     async fn getX() int { return 10 }
     async fn getY() int { return 20 }

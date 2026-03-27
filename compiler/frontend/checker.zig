@@ -3335,8 +3335,14 @@ pub const Checker = struct {
             // Reference: TypeCheckConcurrency.cpp:7488 (existential Sendable check)
             .existential => |e| std.mem.eql(u8, e.trait_name, "Sendable"),
             .pointer => false,
+            // Swift SE-0302: closures are NOT Sendable by default.
+            // @Sendable closures (which capture only Sendable values) are Sendable.
+            // Cot: all closures are non-Sendable for now. @Sendable annotation
+            // will be added when closure capture checking is implemented.
             .func => false,
-            .slice => false,
+            // Slices are borrowed references — NOT Sendable.
+            // Exception: string (STRING = slice(u8)) is COW and immutable = Sendable.
+            .slice => ty == TypeRegistry.STRING,
             .array => |a| self.isSendable(a.elem),
             .error_set => true,
         };
