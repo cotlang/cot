@@ -798,10 +798,57 @@ pub const Lowerer = struct {
         self.loop_stack.shrinkRetainingCapacity(saved_loop_stack_len);
     }
 
-    /// Phase 1 async: eager evaluation. The async function runs its body immediately
-    /// and wraps the result in a heap-allocated TaskObject (16 bytes: refcount + result).
-    /// The wrapper function has the same params as the original, returns i64 (task ptr).
-    /// Phase 2 will replace this with state machine splitting.
+    /// Count await expressions in an AST subtree.
+    /// Used to determine if an async function needs state machine splitting.
+    fn countAwaits(self: *Lowerer, idx: NodeIndex) u32 {
+        if (idx == null_node) return 0;
+        const node = self.tree.getNode(idx) orelse return 0;
+        if (node.asExpr()) |expr| {
+            return switch (expr) {
+                .await_expr => |ae| 1 + self.countAwaits(ae.operand),
+                .call => |c| blk: {
+                    var count: u32 = self.countAwaits(c.callee);
+                    for (c.args) |arg| count += self.countAwaits(arg);
+                    break :blk count;
+                },
+                .binary => |b| self.countAwaits(b.left) + self.countAwaits(b.right),
+                .unary => |u| self.countAwaits(u.operand),
+                .block_expr => |b| blk: {
+                    var count: u32 = 0;
+                    for (b.stmts) |s| count += self.countAwaits(s);
+                    if (b.result != null_node) count += self.countAwaits(b.result);
+                    break :blk count;
+                },
+                else => 0,
+            };
+        }
+        if (node.asStmt()) |stmt| {
+            return switch (stmt) {
+                .return_stmt => |r| self.countAwaits(r.value),
+                .var_stmt => |v| self.countAwaits(v.value),
+                .assign_stmt => |a| self.countAwaits(a.value),
+                .if_stmt => |i| self.countAwaits(i.condition) + self.countAwaits(i.then_branch) + self.countAwaits(i.else_branch),
+                .while_stmt => |w| self.countAwaits(w.condition) + self.countAwaits(w.body),
+                .for_stmt => |f| self.countAwaits(f.iterable) + self.countAwaits(f.body),
+                .block_stmt => |b| blk: {
+                    var count: u32 = 0;
+                    for (b.stmts) |s| count += self.countAwaits(s);
+                    break :blk count;
+                },
+                .expr_stmt => |e| self.countAwaits(e.expr),
+                .defer_stmt => |d| self.countAwaits(d.expr),
+                else => 0,
+            };
+        }
+        return 0;
+    }
+
+    /// Async function lowering.
+    /// For functions with 0-1 await points: eager evaluation (body runs inline).
+    /// For functions with 2+ await points: constructor + poll split.
+    ///   Constructor allocates task, calls poll(task_ptr), returns task.
+    ///   Poll function contains the body, SSA pass transforms to state machine.
+    /// Kotlin reference: AbstractSuspendFunctionsLowering.kt:66-92
     /// Swift reference: Task.swift — Task<Success> wraps a NativeObject.
     fn lowerAsyncFnEager(self: *Lowerer, fn_decl: ast.FnDecl) !void {
         const return_type = if (fn_decl.return_type != null_node) self.resolveTypeNode(fn_decl.return_type) else TypeRegistry.VOID;
@@ -845,8 +892,8 @@ pub const Lowerer = struct {
             fb.async_task_local = task_local;
             fb.async_result_type = return_type;
 
-            // Lower the function body — executes eagerly.
-            // Return statements in the body will store result at task_ptr+8
+            // Lower the body — executes eagerly.
+            // Return statements in the body will store result at task_ptr[0]
             // and return the task_ptr (handled by async path in lowerReturn).
             if (fn_decl.body != null_node) {
                 _ = try self.lowerBlockNode(fn_decl.body);
