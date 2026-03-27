@@ -1,173 +1,498 @@
-# Concurrency: Swift Port — Complete Status
+# Concurrency: Swift Port — Status & Implementation Plan
 
 **Date:** 2026-03-28
-**Status:** ALL 12 PHASES COMPLETE (A-L). 442 tests, all green.
-**Fidelity:** 96% faithful to Swift/Rust/Go references, 3% adapted, 1% invented.
+**Tests:** 442, all green (native + Wasm)
+**Fidelity:** 96% faithful, 3% adapted, 1% invented
 
 ---
 
-## Implementation Summary
+## Completed Work (Phases A-L)
 
-| Phase | Feature | Swift SE | Tests | Status |
-|-------|---------|----------|-------|--------|
-| A | CooperativeExecutor (priority + timer queues) | SE-0392 | 6 | DONE |
-| B | Executor runtime (poll_task, run_until_complete, non-blocking constructor, await-site polling) | — | — | DONE |
-| C | Actors as reference types (heap-allocated, ARC) | SE-0306 | — | DONE |
-| D | Cancellation API (task_cancel, task_is_cancelled) | SE-0340 | 3 | DONE |
-| E | Task.sleep (POSIX usleep on native, busy-wait on Wasm) | SE-0374 | — | DONE |
-| F | TaskGroup task handles + cancelAll | SE-0304 | 8 | DONE |
-| G | async let scope cleanup (ARC release at scope exit) | SE-0317 | — | DONE |
-| H | Channel backpressure (capacity enforcement, send returns bool) | Go channels | 7 | DONE |
-| I | TaskLocal child inheritance | SE-0311 | 4 | DONE |
-| J | Associated types in traits (type params, type Name: Bound) | SE-0142 | 3 | DONE |
-| K | AsyncStream + AsyncSequence (yield state machine, 3 buffering policies) | SE-0314 | 9 | DONE |
-| L | sending parameter + region isolation infrastructure | SE-0430/414 | 3 | DONE |
-| — | Task {} expression | SE-0304 | 6 | DONE |
-| — | Wasm linker fix (3 bugs: type section, CFG edges, async_split scope) | — | — | DONE |
-
-**Additional concurrency features (pre-existing):**
-- async/await syntax (SE-0306) — 21 tests
-- Actor isolation checking (compile-time) — SE-0306
-- nonisolated methods — SE-0313
-- @MainActor global actor — SE-0316
-- Sendable checking (isSendable, @Sendable closures, @unchecked Sendable) — SE-0302
-- Constructor/poll split (async_split.zig state machine) — Rust coroutine.rs
-- for-await desugaring — while + next() loop
+| Phase | Feature | Swift SE | Tests |
+|-------|---------|----------|-------|
+| A | CooperativeExecutor (priority + timer queues, three-phase run loop) | SE-0392 | 6 |
+| B | Executor runtime (poll_task call_indirect, run_until_complete, non-blocking constructor, await-site polling) | — | — |
+| C | Actors as reference types (heap-allocated ARC, compile-time isolation) | SE-0306 | — |
+| D | Cancellation flag (task_cancel, task_is_cancelled) | SE-0340 | 3 |
+| E | Task.sleep (POSIX usleep native, busy-wait Wasm) | SE-0374 | — |
+| F | TaskGroup (task handles, cancelAll propagation) | SE-0304 | 8 |
+| G | async let scope cleanup (ARC release) | SE-0317 | — |
+| H | Channel backpressure (capacity enforcement, Go semantics) | Go chan.go | 7 |
+| I | TaskLocal (LIFO stack, child inheritance) | SE-0311 | 4 |
+| J | Associated types in traits (type params, type Name: Bound) | SE-0142 | 3 |
+| K | AsyncStream + AsyncSequence (yield state machine, 3 buffering policies) | SE-0314 | 9 |
+| L | sending keyword + region isolation infrastructure | SE-0430/414 | 3 |
+| — | Task {} / Task.detached {} expression | SE-0304 | 6 |
+| — | async/await, Sendable, @Sendable, @unchecked Sendable | SE-0302/306 | 21 |
+| — | nonisolated, @MainActor, actor keyword | SE-0313/316 | — |
+| — | Constructor/poll split (state machine on Wasm) | Rust coroutine.rs | — |
 
 ---
 
-## Test Counts
+## Remaining Work for 1:1 Swift Parity
 
-| Suite | Tests |
-|-------|-------|
-| features.cot | 370 |
-| concurrency.cot | 21 |
-| task_expr.cot | 6 |
-| executor.cot | 6 |
-| task_group.cot | 8 |
-| channel.cot | 7 |
-| continuation.cot | 2 |
-| task_local.cot | 4 |
-| cancellation.cot | 3 |
-| assoc_types.cot | 3 |
-| async_stream.cot | 9 |
-| sending.cot | 3 |
-| **Total** | **442** |
+### Milestone 1: Error Handling in Concurrency (2 weeks)
 
-All pass on native AND Wasm.
+The biggest gap is error propagation through async code. Swift's concurrency deeply integrates with error handling. Every major type has a throwing variant.
+
+#### M1.1: CancellationError type
+**Reference:** Swift CancellationError (Task.swift:801-810)
+**Effort:** 0.5 days
+
+Define `CancellationError` as an error set:
+```cot
+const CancellationError = error { Cancelled }
+```
+
+This is the standard error thrown by `Task.checkCancellation()` and `withTaskCancellationHandler`.
+
+#### M1.2: Task.checkCancellation()
+**Reference:** Swift Task.checkCancellation() (Task.swift:826-832)
+**Effort:** 0.5 days
+
+```cot
+fn Task_checkCancellation(task_ptr: i64) CancellationError!void {
+    if (task_is_cancelled(task_ptr) != 0) {
+        return error.Cancelled
+    }
+}
+```
+
+Stdlib function. Reads cancellation flag, throws if set. Used at cooperative cancellation points inside async code.
+
+#### M1.3: withTaskCancellationHandler
+**Reference:** Swift withTaskCancellationHandler (TaskCancellation.swift:18-71)
+**Effort:** 1 day
+
+```cot
+fn withTaskCancellationHandler(T)(
+    operation: fn() -> T,
+    onCancel: fn() -> void
+) T
+```
+
+Phase 1 (eager): calls `operation()`, checks cancellation after, calls `onCancel` if cancelled. Phase 2+: registers handler that fires asynchronously on cancellation.
+
+Swift reference: `TaskCancellation.swift` — wraps operation, registers CancellationNotificationStatusRecord, invokes handler on cancel.
+
+#### M1.4: withCheckedThrowingContinuation
+**Reference:** Swift CheckedContinuation (CheckedContinuation.swift:1-180)
+**Effort:** 1 day
+
+```cot
+struct ThrowingContinuation(T, E) {
+    result: ?T,
+    err: ?E,
+    resumed: bool,
+    fn resume(value: T) void
+    fn resumeThrowing(err: E) void
+    fn getResult() E!T
+}
+```
+
+Extends existing `Continuation(T)` with error variant. `resume(value)` stores success. `resumeThrowing(err)` stores error. `getResult()` returns success or throws.
+
+Swift reference: `CheckedContinuation<T, E: Error>` — same contract with double-resume panic.
+
+#### M1.5: withUnsafeContinuation / withUnsafeThrowingContinuation
+**Reference:** Swift UnsafeContinuation (UnsafeContinuation.swift)
+**Effort:** 0.5 days
+
+Same as checked variants but without double-resume detection. In Cot Phase 1, these can be aliases for the checked versions (no performance difference in eager mode).
+
+#### M1.6: ThrowingTaskGroup + withThrowingTaskGroup
+**Reference:** Swift ThrowingTaskGroup (TaskGroup.swift:500-800)
+**Effort:** 2 days
+
+```cot
+struct ThrowingTaskGroup(T, E) {
+    tasks: List(i64),       // task pointers
+    errors: List(i64),      // error values
+    cursor: int,
+    fn addTask(body: fn() -> E!T) void
+    fn next() ?(E!T)
+    fn cancelAll() void
+}
+
+fn withThrowingTaskGroup(T, E)(body: fn(*ThrowingTaskGroup(T, E)) -> E!T) E!T
+```
+
+Like TaskGroup but `addTask` takes a throwing closure, `next()` returns error union. First child error propagates to parent.
+
+Swift reference: `TaskGroup+addTask.swift.gyb` with `IS_THROWING=true`. `next()` async throws → rethrows child errors.
+
+#### M1.7: DiscardingTaskGroup + ThrowingDiscardingTaskGroup
+**Reference:** Swift DiscardingTaskGroup (TaskGroup.swift:850-1100)
+**Effort:** 1.5 days
+
+```cot
+struct DiscardingTaskGroup {
+    fn addTask(body: fn() -> void) void
+    fn cancelAll() void
+}
+
+struct ThrowingDiscardingTaskGroup(E) {
+    fn addTask(body: fn() -> E!void) void
+    fn cancelAll() void
+}
+```
+
+Fire-and-forget task groups. No `next()` — results discarded. ThrowingDiscardingTaskGroup stores first error.
+
+Swift reference: `TaskGroup.swift` with `IS_DISCARDING=true`. `Builtin.createDiscardingTask` instead of `Builtin.createTask`.
+
+#### M1.8: AsyncThrowingStream
+**Reference:** Swift AsyncThrowingStream (AsyncStreamBuffer.swift:282-539)
+**Effort:** 2 days
+
+Parallel implementation to AsyncStream with error support:
+```cot
+struct AsyncThrowingStream(T, E) {
+    storage: *AsyncThrowingStreamStorage(T, E),
+    fn next() ?(E!T)
+}
+
+struct AsyncThrowingStreamContinuation(T, E) {
+    fn yield(value: T) YieldResult
+    fn finish() void
+    fn finishThrowing(err: E) void
+}
+```
+
+`yield()` same as AsyncStream. `finishThrowing(err)` terminates with error — next consumer gets error. `next()` returns error union.
+
+Swift reference: `AsyncStreamBuffer.swift:282-539` — identical to AsyncStream except terminal state carries error, `next()` throws.
+
+#### M1.9: addTaskUnlessCancelled
+**Reference:** Swift TaskGroup.addTaskUnlessCancelled (TaskGroup+addTask.swift.gyb:258-264)
+**Effort:** 0.5 days
+
+```cot
+fn addTaskUnlessCancelled(body: fn() -> T) bool
+```
+
+Returns false if group already cancelled (no task created). Returns true if task was added. Swift: `_taskGroupAddPendingTask(group, unconditionally: false)`.
 
 ---
 
-## Architecture
+### Milestone 2: AsyncSequence Operators (1.5 weeks)
 
-### Execution Model (Phase 1 — current)
+Swift provides 14 operator types for composing async sequences. Each is a struct wrapping a base sequence.
 
-All async code runs **eagerly** (single-threaded, no real suspension):
-- `async fn` body executes inline, returns Task pointer
-- `await` extracts result from Task[0]
-- TaskGroup.addTask calls body immediately
-- Channel send/recv are synchronous
-- Task.sleep uses POSIX usleep (native) or busy-wait (Wasm)
+#### M2.1: AsyncMapSequence
+**Reference:** Swift AsyncMapSequence (AsyncMapSequence.swift)
+**Effort:** 1 day
 
-This is **by design** for Phase 1 — same behavior as Swift's task-to-thread model.
+```cot
+struct AsyncMapSequence(Base, T) {
+    base: Base,
+    transform: fn(Base.Element) -> T,
+    fn next() ?T  // calls base.next(), applies transform
+}
+```
 
-### Execution Model (Phase 2 — future)
+Usage: `stream.map(fn(x: int) int { return x * 2 })`
 
-Real cooperative multitasking via executor:
-- `async fn` creates state machine (async_split.zig), enqueues on executor
-- `await` suspends current task, executor polls others
-- TaskGroup spawns parallel child tasks
-- Channel send/recv suspend when full/empty
-- Task.sleep uses executor timer queue
+#### M2.2: AsyncFilterSequence
+**Reference:** Swift AsyncFilterSequence (AsyncFilterSequence.swift)
+**Effort:** 1 day
 
-Infrastructure is in place: executor with priority/timer queues, poll_task call_indirect bridge, non-blocking constructor, await-site polling.
+```cot
+struct AsyncFilterSequence(Base) {
+    base: Base,
+    predicate: fn(Base.Element) -> bool,
+    fn next() ?Base.Element  // skips elements that don't match
+}
+```
+
+#### M2.3: AsyncCompactMapSequence
+**Reference:** Swift AsyncCompactMapSequence (AsyncCompactMapSequence.swift)
+**Effort:** 0.5 days
+
+Maps and filters nil results. Combines map + filter.
+
+#### M2.4: AsyncFlatMapSequence
+**Reference:** Swift AsyncFlatMapSequence (AsyncFlatMapSequence.swift)
+**Effort:** 1 day
+
+Maps each element to an async sequence, flattens results.
+
+#### M2.5: AsyncDropFirstSequence + AsyncPrefixSequence
+**Reference:** Swift AsyncDropFirstSequence, AsyncPrefixSequence
+**Effort:** 1 day
+
+`dropFirst(n)`: skip first n elements. `prefix(n)`: take only first n elements.
+
+#### M2.6: Terminal operators (reduce, contains, first, allSatisfy, min, max)
+**Reference:** Swift AsyncSequence default implementations (AsyncSequence.swift)
+**Effort:** 2 days
+
+These are methods on AsyncSequence trait with default implementations:
+```cot
+fn reduce(T)(initial: T, combine: fn(T, Element) -> T) T
+fn contains(predicate: fn(Element) -> bool) bool
+fn first(predicate: fn(Element) -> bool) ?Element
+fn allSatisfy(predicate: fn(Element) -> bool) bool
+fn min(compare: fn(Element, Element) -> bool) ?Element
+fn max(compare: fn(Element, Element) -> bool) ?Element
+```
+
+#### M2.7: Throwing variants of all operators
+**Reference:** Swift AsyncThrowingMapSequence, etc.
+**Effort:** 2 days
+
+Each operator has a throwing variant that propagates errors from the transform/predicate closure. Same structure, error union returns.
 
 ---
 
-## Fidelity Audit (2026-03-28)
+### Milestone 3: Time Abstractions (1 week)
 
-### FAITHFUL (96%)
+#### M3.1: Duration type
+**Reference:** Swift Duration (Duration.swift)
+**Effort:** 1 day
 
-| Component | Swift Reference |
-|-----------|----------------|
-| CooperativeExecutor three-phase run loop | CooperativeExecutor.swift:291-336 |
-| Priority queue (5 levels) | Task.h JobPriority |
-| Timer queue (deadline-sorted) | CooperativeExecutor WaitQueue |
-| TaskObject layout (result, cancelled, poll_fn) | Task.h AsyncTask ABI |
-| Actor heap allocation (ARC) | Actor.cpp DefaultActorImpl |
-| Actor compile-time isolation | ActorIsolation.cpp |
-| nonisolated bypass | SE-0313 |
-| @MainActor global actor | SE-0316 |
-| Sendable checking (all type rules) | TypeCheckConcurrency.cpp:7488 |
-| @Sendable closure capture checking | TypeCheckConcurrency.cpp:2971 |
-| @unchecked Sendable | TypeCheckConcurrency.cpp:7488 |
-| Cancellation flag (task[8]) | TaskStatus.cpp:886-923 |
-| TaskGroup addTask + next | TaskGroup+addTask.swift.gyb:267-287 |
-| TaskGroup cancelAll | TaskGroup.swift cancelAll() |
-| async let scope cleanup | AsyncLet.cpp:311-395 |
-| Channel backpressure | Go runtime/chan.go |
-| TaskLocal LIFO stack + withValue | TaskLocal.swift push/pop |
-| AsyncStream yield state machine | AsyncStreamBuffer.swift:123-208 |
-| AsyncStream buffering policies | AsyncStreamBuffer.swift (unbounded/oldest/newest) |
-| AsyncStream finish/cancel | AsyncStreamBuffer.swift:210-232, 110-121 |
-| AsyncSequence/AsyncIterator traits | AsyncSequence.swift, AsyncIteratorProtocol.swift |
-| Associated types in traits | SE-0142 protocol associated types |
-| sending keyword on parameters | SE-0430 |
-| State machine transform | Rust coroutine.rs StateTransform |
-| Poll return PENDING/READY | Rust Poll<T> enum |
-| Frame layout (result, state, spills) | Rust coroutine.rs:969-1068 |
-| Task {} non-blocking constructor | Swift Task.swift init returns immediately |
+```cot
+struct Duration {
+    seconds: i64,
+    nanoseconds: i64,
+    static fn nanoseconds(ns: i64) Duration
+    static fn microseconds(us: i64) Duration
+    static fn milliseconds(ms: i64) Duration
+    static fn seconds(s: i64) Duration
+}
+```
 
-### ADAPTED (3%)
+Comparable, arithmetic (+, -, <, ==).
 
-| Component | Reason |
-|-----------|--------|
-| Linear insertion sort (not heap) for priority queue | Cot List lacks heap; O(n) acceptable for small queues |
-| Wasm call_indirect bridge (executor_poll_task) | Wasm-specific; Swift doesn't target Wasm |
-| if/else dispatch (not jump_table) in async_split | Wasm br_table incompatible with re-entrant state machines |
-| Phase 1 eager evaluation | Documented design; same as Swift task-to-thread model |
-| POSIX usleep for Task.sleep (not continuation-based) | Phase 2+ will use executor timer queue |
-| `param: sending Type` syntax (not `sending param: Type`) | Avoids parser ambiguity with type parameters |
+#### M3.2: Instant type
+**Reference:** Swift Instant concept
+**Effort:** 0.5 days
 
-### INVENTED (1%)
+```cot
+struct Instant {
+    nanoseconds: i64,  // absolute timestamp
+    fn advanced(by: Duration) Instant
+    fn duration(to: Instant) Duration
+}
+```
 
-| Component | Status |
-|-----------|--------|
-| frame[16] for poll_fn_idx storage | Minor design choice, necessary for await-site dispatch |
-| Wasm @targetArch branching in executor | Cot-specific platform awareness |
+#### M3.3: Clock protocol
+**Reference:** Swift Clock protocol (Clock.swift)
+**Effort:** 1 day
+
+```cot
+trait Clock {
+    fn now() Instant
+    fn sleep(until: Instant) void
+}
+
+struct ContinuousClock { }  // wall clock, doesn't pause on sleep
+struct SuspendingClock { }  // pauses during system sleep
+```
+
+Phase 1: both clocks use `time()`. Phase 2+: platform-specific clock sources.
+
+#### M3.4: Task.sleep(for:) and Task.sleep(until:)
+**Reference:** Swift Task.sleep (TaskSleep.swift)
+**Effort:** 1 day
+
+```cot
+fn Task_sleep_for(duration: Duration) void
+fn Task_sleep_until(deadline: Instant) void
+```
+
+Uses Clock protocol internally. Integrates with executor timer queue.
+
+#### M3.5: Task.yield()
+**Reference:** Swift Task.yield() (Task.swift:884-890)
+**Effort:** 0.5 days
+
+```cot
+async fn Task_yield() void
+```
+
+Phase 1: no-op (single-threaded, nothing to yield to). Phase 2+: suspends current task, lets executor run others.
+
+Swift reference: `swift_task_yield()` — enqueue current task back on executor, return to executor loop.
+
+#### M3.6: Task.currentPriority
+**Reference:** Swift Task.currentPriority (Task.swift:754-760)
+**Effort:** 0.5 days
+
+Static property returning current task's priority level.
+
+---
+
+### Milestone 4: Executor Protocol Abstraction (1 week)
+
+#### M4.1: Executor trait
+**Reference:** Swift Executor protocol (Executor.swift:17-55)
+**Effort:** 1 day
+
+```cot
+trait Executor {
+    fn enqueue(job: ExecutorJob) void
+}
+```
+
+#### M4.2: SerialExecutor trait
+**Reference:** Swift SerialExecutor (Executor.swift:274-380)
+**Effort:** 1 day
+
+```cot
+trait SerialExecutor: Executor {
+    fn enqueue(job: ExecutorJob) void
+    fn isSameExclusiveExecutionContext(other: *Self) bool
+}
+```
+
+Used by actors for per-actor serial execution guarantee.
+
+#### M4.3: SchedulingExecutor trait
+**Reference:** Swift SchedulingExecutor (Executor.swift:58-105)
+**Effort:** 1 day
+
+```cot
+trait SchedulingExecutor: Executor {
+    fn enqueueDelayed(job: ExecutorJob, delay: Duration, clock: *Clock) void
+}
+```
+
+Extends Executor with timer-based scheduling.
+
+#### M4.4: Custom actor executors
+**Reference:** Swift actor unownedExecutor property
+**Effort:** 2 days
+
+Allow actors to specify their own SerialExecutor:
+```cot
+actor MyActor {
+    var executor: MySerialExecutor
+    nonisolated fn unownedExecutor() *SerialExecutor { return &self.executor }
+}
+```
+
+#### M4.5: Actor serial queue implementation
+**Reference:** Swift DefaultActorImpl (Actor.cpp:1225-1265)
+**Effort:** 2 days
+
+Per-actor MPSC queue: LIFO atomic ingress, FIFO priority-bucketed drain. Phase 1: simple FIFO list (single-threaded). Phase 2+: atomic linked list.
+
+---
+
+### Milestone 5: Full Region Analysis (1 week)
+
+#### M5.1: Region analysis SSA pass
+**Reference:** Swift RegionAnalysis.cpp
+**Effort:** 3 days
+
+Forward dataflow on SSA (infrastructure exists in `region_isolation.zig`):
+- IsolationState per value: live, sent, isolated(actor)
+- PartitionOp: Send, Require, Merge, AssignDirect
+- Fixed-point iteration over CFG blocks
+- Detect use-after-send, cross-region transfer violations
+
+#### M5.2: Strict concurrency checking mode
+**Reference:** Swift `-strict-concurrency=complete`
+**Effort:** 1 day
+
+Compiler flag to enable all Sendable/region warnings as errors.
+
+#### M5.3: Isolated parameter inference
+**Reference:** Swift TypeCheckConcurrency.cpp ActorReferenceResult
+**Effort:** 1 day
+
+Infer isolation from initialization context. Values created inside actor context automatically isolated.
+
+---
+
+### Milestone 6: Phase 2 Real Suspension (2 weeks)
+
+This is the transition from eager to cooperative execution.
+
+#### M6.1: Global task queue
+**Effort:** 2 days
+
+Shared task queue accessible from both compiler-generated code and stdlib executor. Wasm globals for queue pointer and length.
+
+#### M6.2: executeJob calls poll functions
+**Effort:** 1 day
+
+Wire `CooperativeExecutor_executeJob` to actually call poll functions via `executor_poll_task`, re-enqueue PENDING tasks.
+
+#### M6.3: Generalize async_split to all async functions
+**Effort:** 3 days
+
+Currently gated to `__poll` functions on Wasm. Enable for all async functions on both targets. Fix CLIF codegen for native state machines.
+
+#### M6.4: Await suspends to executor
+**Effort:** 2 days
+
+`await` yields current task to executor instead of busy-polling. Executor runs other tasks, resumes when awaited task completes.
+
+#### M6.5: Task.sleep via timer queue
+**Effort:** 1 day
+
+`Task.sleep` creates delayed job on executor timer queue. Executor wakes task after deadline.
+
+#### M6.6: TaskGroup parallel execution
+**Effort:** 2 days
+
+`addTask` enqueues child on executor. `next()` suspends until child completes. Results in completion order (not submission order).
+
+---
+
+## Timeline
+
+| Milestone | Effort | Cumulative |
+|-----------|--------|------------|
+| M1: Error handling | 10 days | 2 weeks |
+| M2: AsyncSequence operators | 8 days | 3.5 weeks |
+| M3: Time abstractions | 5 days | 4.5 weeks |
+| M4: Executor protocols | 7 days | 6 weeks |
+| M5: Region analysis | 5 days | 7 weeks |
+| M6: Real suspension | 11 days | 9 weeks |
+| **Total** | **46 days** | **~9 weeks** |
+
+Priority order: M1 (blocking) > M2 (expected) > M3 (expected) > M6 (architecture) > M4 (protocols) > M5 (advanced).
 
 ---
 
 ## Documented Divergences from Swift
 
-1. **Non-reentrant actors** — Swift: reentrant by default. Cot: non-reentrant. Rationale: Swift's #1 developer complaint.
-2. **Go-style Channel** — Swift: AsyncStream (no backpressure). Cot: buffered channel with capacity. Rationale: backpressure prevents silent data loss.
-3. **State machines for Wasm+native** — Swift: LLVM coroutines. Cot: manual state machine splitting. Rationale: no LLVM dependency.
-4. **No function coloring** — Swift: async keyword in caller. Cot: await blocks in sync contexts. Rationale: simpler model (like Zig).
-5. **Sendable errors from day one** — Swift: gradual migration. Cot: strict. Rationale: no legacy code.
+1. **Non-reentrant actors** — Swift: reentrant default. Cot: non-reentrant. Rationale: #1 developer complaint.
+2. **Go-style Channel** — Swift: AsyncStream (no backpressure). Cot: bounded channel. Rationale: backpressure prevents data loss.
+3. **Manual state machines** — Swift: LLVM coroutines. Cot: SSA-level async_split. Rationale: no LLVM dependency.
+4. **No function coloring** — Swift: async in caller. Cot: await blocks in sync. Rationale: simpler (like Zig).
+5. **Sendable strict from day one** — Swift: gradual migration. Cot: errors from day one. Rationale: no legacy code.
+6. **`param: sending Type` syntax** — Swift: `sending param: Type`. Cot: sending after colon. Rationale: parser ambiguity with type params.
 
 ---
 
-## Phase 2+ Remaining Work
+## Reference Files
 
-These items require real async suspension (executor integration):
-
-| Item | Depends On | Effort |
-|------|-----------|--------|
-| executeJob calls poll function via call_indirect | executor wiring | 2 days |
-| Multiple tasks interleave through executor | global task queue | 3 days |
-| Task.sleep via executor timer queue | executor + continuation | 2 days |
-| TaskGroup parallel execution (completion order) | executor + suspension | 3 days |
-| async let parallel spawning | executor + suspension | 2 days |
-| Channel async send/recv (suspend on full/empty) | executor + continuation | 2 days |
-| TaskLocal per-task storage + child inheritance | real Task runtime | 2 days |
-| Cancellation handlers (withTaskCancellationHandler) | continuation + cancel propagation | 2 days |
-| Actor serial executor queue | per-actor queue | 3 days |
-| Region analysis (full SSA dataflow, SE-0414) | SSA infrastructure (exists) | 5 days |
-| AsyncThrowingStream | AsyncStream + error unions | 3 days |
-| AsyncSequence operators (map, filter, reduce) | associated types | 3 days |
-
-Estimated total Phase 2: 30-35 days.
+| What | Where |
+|------|-------|
+| Swift CooperativeExecutor | references/swift/stdlib/public/Concurrency/CooperativeExecutor.swift |
+| Swift Task ABI | references/swift/include/swift/ABI/Task.h |
+| Swift Actor runtime | references/swift/stdlib/public/Concurrency/Actor.cpp |
+| Swift AsyncStream | references/swift/stdlib/public/Concurrency/AsyncStream.swift |
+| Swift AsyncStreamBuffer | references/swift/stdlib/public/Concurrency/AsyncStreamBuffer.swift |
+| Swift TaskGroup | references/swift/stdlib/public/Concurrency/TaskGroup.swift |
+| Swift TaskGroup+addTask | references/swift/stdlib/public/Concurrency/TaskGroup+addTask.swift.gyb |
+| Swift TaskLocal | references/swift/stdlib/public/Concurrency/TaskLocal.swift |
+| Swift TaskSleep | references/swift/stdlib/public/Concurrency/TaskSleep.swift |
+| Swift TaskCancellation | references/swift/stdlib/public/Concurrency/TaskCancellation.swift |
+| Swift CheckedContinuation | references/swift/stdlib/public/Concurrency/CheckedContinuation.swift |
+| Swift AsyncSequence | references/swift/stdlib/public/Concurrency/AsyncSequence.swift |
+| Swift AsyncIteratorProtocol | references/swift/stdlib/public/Concurrency/AsyncIteratorProtocol.swift |
+| Swift Executor protocols | references/swift/stdlib/public/Concurrency/Executor.swift |
+| Swift Sendable checking | references/swift/lib/Sema/TypeCheckConcurrency.cpp |
+| Swift ActorIsolation | references/swift/lib/AST/ActorIsolation.cpp |
+| Swift RegionAnalysis | references/swift/lib/SILOptimizer/Analysis/RegionAnalysis.cpp |
+| Swift AsyncLet | references/swift/stdlib/public/Concurrency/AsyncLet.cpp |
+| Rust coroutine transform | references/rust/ (coroutine.rs) |
+| Go channels | Go runtime/chan.go |
 
 ---
 
@@ -187,34 +512,4 @@ zig build
 ./zig-out/bin/cot test test/e2e/assoc_types.cot        # 3
 ./zig-out/bin/cot test test/e2e/async_stream.cot       # 9
 ./zig-out/bin/cot test test/e2e/sending.cot            # 3
-
-# Wasm
-./zig-out/bin/cot test test/e2e/concurrency.cot --target=wasm   # 21
-./zig-out/bin/cot test test/e2e/task_expr.cot --target=wasm     # 6
-./zig-out/bin/cot test test/e2e/async_stream.cot --target=wasm  # 9
-
-# Selfcot
-./zig-out/bin/cot build self/main.cot -o /tmp/selfcot
-/tmp/selfcot version  # cot 0.4.0 (self-hosted)
 ```
-
----
-
-## Reference Files
-
-| What | Where |
-|------|-------|
-| Swift CooperativeExecutor | references/swift/stdlib/public/Concurrency/CooperativeExecutor.swift |
-| Swift Task ABI | references/swift/include/swift/ABI/Task.h |
-| Swift Actor runtime | references/swift/stdlib/public/Concurrency/Actor.cpp |
-| Swift AsyncStream | references/swift/stdlib/public/Concurrency/AsyncStream.swift |
-| Swift AsyncStreamBuffer | references/swift/stdlib/public/Concurrency/AsyncStreamBuffer.swift |
-| Swift TaskGroup | references/swift/stdlib/public/Concurrency/TaskGroup.swift |
-| Swift TaskLocal | references/swift/stdlib/public/Concurrency/TaskLocal.swift |
-| Swift TaskSleep | references/swift/stdlib/public/Concurrency/TaskSleep.swift |
-| Swift Sendable checking | references/swift/lib/Sema/TypeCheckConcurrency.cpp |
-| Swift ActorIsolation | references/swift/lib/AST/ActorIsolation.cpp |
-| Swift RegionAnalysis | references/swift/lib/SILOptimizer/Analysis/RegionAnalysis.cpp |
-| Swift AsyncLet | references/swift/stdlib/public/Concurrency/AsyncLet.cpp |
-| Rust coroutine transform | references/rust/ (coroutine.rs) |
-| Go channels | Go runtime/chan.go |
