@@ -96,7 +96,14 @@ pub const ErrorSetDecl = struct { name: []const u8, variants: []const []const u8
 pub const UncheckedSendable = struct { type_name: []const u8, span: Span };
 pub const BadDecl = struct { span: Span };
 
-pub const Field = struct { name: []const u8, type_expr: NodeIndex, default_value: NodeIndex, doc_comment: []const u8 = "", span: Span };
+pub const Field = struct {
+    name: []const u8,
+    type_expr: NodeIndex,
+    default_value: NodeIndex,
+    doc_comment: []const u8 = "",
+    is_sending: bool = false, // Swift SE-0430: parameter transfers ownership to callee
+    span: Span,
+};
 pub const EnumVariant = struct { name: []const u8, value: NodeIndex, span: Span };
 pub const UnionVariant = struct { name: []const u8, type_expr: NodeIndex, span: Span };
 

@@ -109,7 +109,11 @@ pub const EnumVariant = struct { name: []const u8, value: i64 };
 pub const EnumType = struct { name: []const u8, variants: []const EnumVariant, backing_type: TypeIndex };
 pub const UnionVariant = struct { name: []const u8, payload_type: TypeIndex };
 pub const UnionType = struct { name: []const u8, variants: []const UnionVariant, tag_type: TypeIndex };
-pub const FuncParam = struct { name: []const u8, type_idx: TypeIndex };
+pub const FuncParam = struct {
+    name: []const u8,
+    type_idx: TypeIndex,
+    is_sending: bool = false, // Swift SE-0430: parameter transfers ownership
+};
 pub const FuncType = struct { params: []const FuncParam, return_type: TypeIndex };
 
 pub const Type = union(enum) {

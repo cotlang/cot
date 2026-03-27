@@ -1,0 +1,33 @@
+// sending parameter tests — Swift SE-0430.
+// Syntax: `param: sending Type` — transfers ownership to callee.
+// Phase 1: parsing + type system. Phase 2+: use-after-send enforcement.
+
+import "std/sys"
+
+// Function with sending parameter.
+// Swift reference: func processItem(sending item: NonSendable)
+// Cot syntax: `value: sending int` (sending before type, after colon)
+fn consume(value: sending int) int {
+    return value * 2
+}
+
+fn normal(value: int) int {
+    return value + 1
+}
+
+test "sending parameter parsed" {
+    let result = consume(21)
+    @assertEq(result, 42)
+}
+
+test "non-sending parameter works" {
+    let result = normal(41)
+    @assertEq(result, 42)
+}
+
+test "sending with multiple params" {
+    fn transfer(a: sending int, b: int) int {
+        return a + b
+    }
+    @assertEq(transfer(10, 20), 30)
+}

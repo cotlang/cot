@@ -241,6 +241,10 @@ pub const Checker = struct {
     current_actor_type: ?[]const u8 = null,
     /// Tracks cross-actor calls that require `await`. Keyed by source offset.
     cross_actor_calls: std.AutoHashMap(u32, void) = std.AutoHashMap(u32, void).init(std.heap.page_allocator),
+    /// Swift SE-0430: variables that have been sent (transferred ownership).
+    /// Any use after sending is a compile-time error.
+    /// Swift reference: RegionAnalysis.cpp — PartitionOp::Send marks region as transferred.
+    sent_variables: std.StringHashMap(void) = std.StringHashMap(void).init(std.heap.page_allocator),
     /// Swift SE-0316: functions annotated with @globalActor (e.g. @MainActor).
     /// Keyed by function name, value is the actor name.
     global_actor_fns: std.StringHashMap([]const u8) = std.StringHashMap([]const u8).init(std.heap.page_allocator),

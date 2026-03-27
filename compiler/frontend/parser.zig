@@ -433,10 +433,17 @@ pub const Parser = struct {
             const field_name = self.tok.text;
             self.advance();
             if (!self.expect(.colon)) break;
+            // Check for `sending` keyword before type (Swift SE-0430).
+            // Syntax: `param: sending Type` — value is transferred to callee.
+            var is_sending = false;
+            if (self.check(.ident) and std.mem.eql(u8, self.tok.text, "sending")) {
+                is_sending = true;
+                self.advance(); // consume 'sending'
+            }
             const type_expr = try self.parseType() orelse break;
             var default_value: NodeIndex = null_node;
             if (self.match(.assign)) default_value = try self.parseExpr() orelse break;
-            try fields.append(self.allocator, .{ .name = field_name, .type_expr = type_expr, .default_value = default_value, .doc_comment = field_doc, .span = Span.init(field_start, self.pos()) });
+            try fields.append(self.allocator, .{ .name = field_name, .type_expr = type_expr, .default_value = default_value, .is_sending = is_sending, .doc_comment = field_doc, .span = Span.init(field_start, self.pos()) });
             if (!self.match(.comma)) break;
         }
         return try self.allocator.dupe(ast.Field, fields.items);

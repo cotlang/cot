@@ -760,7 +760,11 @@ pub const Lowerer = struct {
             for (fn_decl.params) |param| {
                 var param_type = self.resolveTypeNode(param.type_expr);
                 param_type = self.chk.safeWrapType(param_type) catch param_type;
-                _ = try fb.addParam(param.name, param_type, self.type_reg.sizeOf(param_type));
+                if (param.is_sending) {
+                    _ = try fb.addSendingParam(param.name, param_type, self.type_reg.sizeOf(param_type));
+                } else {
+                    _ = try fb.addParam(param.name, param_type, self.type_reg.sizeOf(param_type));
+                }
             }
             // Initialize globals and type metadata before user code in main()
             if (std.mem.eql(u8, fn_decl.name, "main")) {

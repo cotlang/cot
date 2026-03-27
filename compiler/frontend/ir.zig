@@ -209,6 +209,9 @@ pub const Local = struct {
     /// can share the same stack region. 0 = no overlap (independent slot).
     overlap_group: u16 = 0,
     overlap_arm: u16 = 0,
+    /// Swift SE-0430: parameter transfers ownership to callee.
+    /// When true, the value is "sent" at the call site — caller must not use it after.
+    is_sending: bool = false,
 
     pub fn init(name: []const u8, type_idx: TypeIndex, mutable: bool) Local { return .{ .name = name, .type_idx = type_idx, .mutable = mutable }; }
     pub fn initParam(name: []const u8, type_idx: TypeIndex, param_idx: ParamIdx, size: u32) Local { return .{ .name = name, .type_idx = type_idx, .mutable = false, .is_param = true, .param_idx = param_idx, .size = size, .alignment = @min(size, 8) }; }
@@ -302,6 +305,16 @@ pub const FuncBuilder = struct {
     pub fn addParam(self: *FuncBuilder, name: []const u8, type_idx: TypeIndex, size: u32) !LocalIdx {
         const idx: LocalIdx = @intCast(self.locals.items.len);
         try self.locals.append(self.allocator, Local.initParam(name, type_idx, idx, size));
+        try self.local_map.put(name, idx);
+        return idx;
+    }
+
+    /// Add a sending parameter (Swift SE-0430). The value is transferred to callee.
+    pub fn addSendingParam(self: *FuncBuilder, name: []const u8, type_idx: TypeIndex, size: u32) !LocalIdx {
+        const idx: LocalIdx = @intCast(self.locals.items.len);
+        var local = Local.initParam(name, type_idx, idx, size);
+        local.is_sending = true;
+        try self.locals.append(self.allocator, local);
         try self.local_map.put(name, idx);
         return idx;
     }
