@@ -133,6 +133,13 @@ fn stripMemoryThreading(f: *Func) void {
                     debug.log(.codegen, "  strip args: v{d} {s} {d} → {d}", .{ v.id, @tagName(v.op), v.args.len, expected });
                     v.args = v.args[0..expected];
                 }
+                // Store ops have SSA_MEM type from the SSA builder (they produce
+                // a new memory state). After stripping, they no longer participate
+                // in memory threading — change type to VOID so ssaGenValue doesn't
+                // skip them as pure memory-state values.
+                if (info.writes_memory and v.type_idx == TypeRegistry.SSA_MEM) {
+                    v.type_idx = TypeRegistry.VOID;
+                }
                 continue;
             }
             // (b) Variable-arg ops (calls): check if last arg is a memory state.
