@@ -12550,10 +12550,26 @@ pub const Lowerer = struct {
     }
 
     fn inferBinaryType(self: *Lowerer, op: Token, left: NodeIndex, right: NodeIndex) TypeIndex {
-        _ = right;
         return switch (op) {
             .eql, .neq, .lss, .leq, .gtr, .geq => TypeRegistry.BOOL,
-            else => self.inferExprType(left),
+            else => {
+                const left_type = self.inferExprType(left);
+                const right_type = self.inferExprType(right);
+                // Resolve untyped int/float to concrete types.
+                // If left is untyped or void, try right for a concrete type.
+                // Go reference: types2/assignments.go — untyped values inherit context type.
+                if (left_type == TypeRegistry.UNTYPED_INT or left_type == TypeRegistry.VOID) {
+                    if (right_type != TypeRegistry.UNTYPED_INT and right_type != TypeRegistry.VOID and
+                        right_type != TypeRegistry.UNTYPED_FLOAT)
+                    {
+                        return right_type;
+                    }
+                    // Both untyped — default to i64
+                    return TypeRegistry.I64;
+                }
+                if (left_type == TypeRegistry.UNTYPED_FLOAT) return TypeRegistry.F64;
+                return left_type;
+            },
         };
     }
 };

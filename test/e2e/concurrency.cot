@@ -239,16 +239,16 @@ test "sendable closure captures multiple Sendable values" {
 // === async let tests (SE-0317) ===
 
 test "async let basic" {
-    async fn getValue() int { return 42 }
-    async let x = getValue()
+    async fn getVal42() int { return 42 }
+    async let x = getVal42()
     @assertEq(await x, 42)
 }
 
 test "async let parallel bindings" {
-    async fn getA() int { return 10 }
-    async fn getB() int { return 20 }
-    async let a = getA()
-    async let b = getB()
+    async fn getFirst() int { return 10 }
+    async fn getSecond() int { return 20 }
+    async let a = getFirst()
+    async let b = getSecond()
     @assertEq(await a + await b, 30)
 }
 

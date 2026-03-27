@@ -2314,14 +2314,18 @@ pub const Parser = struct {
             const body = try self.parseBlockExpr() orelse return null;
 
             // Synthesize: seq.next() — the while condition
+            // Swift reference: TypeCheckStmt.cpp:3605-3620 buildWhileCond
+            // Allocate empty args on arena (NOT stack) to avoid dangling pointer.
+            const empty_args = try self.allocator.alloc(NodeIndex, 0);
+            const callee_span = Span.init(start, self.pos());
             const seq_next_call = try self.tree.addExpr(.{ .call = .{
                 .callee = try self.tree.addExpr(.{ .field_access = .{
                     .base = sequence,
                     .field = "next",
-                    .span = Span.init(start, start),
+                    .span = callee_span,
                 } }),
-                .args = &.{},
-                .span = Span.init(start, start),
+                .args = empty_args,
+                .span = callee_span,
             } });
 
             // Desugar to: while (seq.next()) |val| { body }
