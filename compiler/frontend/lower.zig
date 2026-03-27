@@ -5642,6 +5642,7 @@ pub const Lowerer = struct {
             .slice_expr => |se| return try self.lowerSliceExpr(se),
             .try_expr => |te| return try self.lowerTryExpr(te),
             .await_expr => |ae| return try self.lowerAwaitExpr(ae),
+            .task_expr => |te| return try self.lowerTaskExpr(te),
             .catch_expr => |ce| return try self.lowerCatchExpr(ce),
             .orelse_expr => |oe| return try self.lowerOrElseExpr(oe),
             .error_literal => |el| return try self.lowerErrorLiteral(el),
@@ -7873,6 +7874,7 @@ pub const Lowerer = struct {
                 },
                 .try_expr => |te| try self.detectCaptures(te.operand, parent_fb, captures),
                 .await_expr => |ae| try self.detectCaptures(ae.operand, parent_fb, captures),
+                .task_expr => |te| try self.detectCaptures(te.body, parent_fb, captures),
                 .catch_expr => |ce| {
                     try self.detectCaptures(ce.operand, parent_fb, captures);
                     if (ce.fallback != null_node) try self.detectCaptures(ce.fallback, parent_fb, captures);
@@ -12226,6 +12228,40 @@ pub const Lowerer = struct {
     ///    compiled method returns T directly. Lower: hop to actor executor (Phase 1: no-op),
     ///    call method normally, hop back (Phase 1: no-op). No task allocation needed.
     ///    Swift reference: SILGenApply.cpp:6155-6240, swift_task_switch in Actor.cpp:2448.
+    /// Lower Task { body } — Unstructured task creation (Swift SE-0304).
+    /// Phase 1 (eager): allocate TaskObject inline, run body, store last expr as result.
+    /// Body is a block expression; the trailing expression value is the task result.
+    /// Swift reference: Task+init.swift.gyb — Builtin.createAsyncTask(flags, operation)
+    fn lowerTaskExpr(self: *Lowerer, te: ast.TaskExpr) Error!ir.NodeIndex {
+        const fb = self.current_func orelse return ir.null_node;
+
+        // Allocate TaskObject via alloc(metadata=0, size=16).
+        // Layout: offset 0 = result (i64), offset 8 = cancelled flag (i64).
+        const zero_metadata = try fb.emitConstInt(0, TypeRegistry.I64, te.span);
+        const sixteen = try fb.emitConstInt(16, TypeRegistry.I64, te.span);
+        var alloc_args = [_]ir.NodeIndex{ zero_metadata, sixteen };
+        const task_ptr = try fb.emitCall("alloc", &alloc_args, false, TypeRegistry.I64, te.span);
+
+        // Store task_ptr in a local
+        const task_local_name = try std.fmt.allocPrint(self.allocator, "__task_ptr_{d}", .{self.temp_counter});
+        self.temp_counter += 1;
+        const task_local = try fb.addLocalWithSize(task_local_name, TypeRegistry.I64, false, 8);
+        _ = try fb.emitStoreLocal(task_local, task_ptr, te.span);
+
+        // Lower the body as a block expression — trailing value is the result.
+        // No `return` interception needed; body is an expression context.
+        const body_result = try self.lowerExprNode(te.body);
+
+        // Store result at task[0]
+        if (body_result != ir.null_node) {
+            const reload_ptr = try fb.emitLoadLocal(task_local, TypeRegistry.I64, te.span);
+            _ = try fb.emitPtrStoreValue(reload_ptr, body_result, te.span);
+        }
+
+        // Return the task pointer
+        return try fb.emitLoadLocal(task_local, TypeRegistry.I64, te.span);
+    }
+
     fn lowerAwaitExpr(self: *Lowerer, ae: ast.AwaitExpr) Error!ir.NodeIndex {
         const fb = self.current_func orelse return ir.null_node;
 

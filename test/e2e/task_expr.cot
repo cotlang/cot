@@ -1,0 +1,54 @@
+// Task {} expression tests — Swift SE-0304 unstructured task creation.
+// Phase 1 (eager): body runs immediately, result wrapped in Task(T).
+// Body result is the last expression (no return needed).
+
+import "std/sys"
+
+async fn getValue() int {
+    return 42
+}
+
+test "task creation and await" {
+    let task = Task { 42 }
+    let result = await task
+    @assertEq(result, 42)
+}
+
+test "task with computation" {
+    let task = Task {
+        var sum = 0
+        var i = 0
+        while (i < 10) : (i = i + 1) {
+            sum = sum + i
+        }
+        sum
+    }
+    @assertEq(await task, 45)
+}
+
+test "multiple tasks" {
+    let t1 = Task { 10 }
+    let t2 = Task { 20 }
+    let t3 = Task { 30 }
+    let r1 = await t1
+    let r2 = await t2
+    let r3 = await t3
+    @assertEq(r1 + r2 + r3, 60)
+}
+
+test "task with expression" {
+    let x = 7
+    let task = Task { x * 6 }
+    @assertEq(await task, 42)
+}
+
+test "detached task" {
+    let task = Task.detached { 99 }
+    let result = await task
+    @assertEq(result, 99)
+}
+
+test "task with async call" {
+    let task = Task { await getValue() }
+    @assertEq(await task, 42)
+}

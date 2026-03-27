@@ -893,6 +893,14 @@ pub const Formatter = struct {
                 self.write("await ") catch {};
                 self.printNode(e.operand);
             },
+            .task_expr => |e| {
+                if (e.is_detached) {
+                    self.write("Task.detached ") catch {};
+                } else {
+                    self.write("Task ") catch {};
+                }
+                self.printNode(e.body);
+            },
             .catch_expr => |e| {
                 self.printNode(e.operand);
                 self.write(" catch ") catch {};

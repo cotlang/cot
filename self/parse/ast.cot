@@ -335,6 +335,13 @@ struct ComptimeBlock {
     span: Span,
 }
 
+/// Task { body } — Unstructured task creation (Swift SE-0304).
+struct TaskExpr {
+    body: int,
+    is_detached: bool,
+    span: Span,
+}
+
 struct ZeroInit {
     span: Span,
 }
@@ -567,6 +574,7 @@ union Expr {
     closure_expr: ClosureExpr,
     tuple_literal: TupleLiteral,
     comptime_block: ComptimeBlock,
+    task_expr: TaskExpr,
     zero_init: ZeroInit,
     addr_of: AddrOf,
     deref: Deref,
@@ -783,6 +791,7 @@ fn exprSpan(e: Expr) Span {
         Expr.closure_expr |v| => v.span,
         Expr.tuple_literal |v| => v.span,
         Expr.comptime_block |v| => v.span,
+        Expr.task_expr |v| => v.span,
         Expr.zero_init |v| => v.span,
         Expr.addr_of |v| => v.span,
         Expr.deref |v| => v.span,
@@ -976,6 +985,7 @@ fn exprTagStr2(e: Expr) string {
         Expr.closure_expr |_| => "closure_expr",
         Expr.tuple_literal |_| => "tuple_literal",
         Expr.comptime_block |_| => "comptime_block",
+        Expr.task_expr |_| => "task_expr",
         Expr.zero_init |_| => "zero_init",
         Expr.addr_of |_| => "addr_of",
         Expr.deref |_| => "deref",

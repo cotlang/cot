@@ -2,7 +2,7 @@
 
 **Date:** 2026-03-27 (final update)
 **Design doc:** `claude/SWIFT_CONCURRENCY_PORT.md` (1,971 lines, audited)
-**Status:** ALL PASS. 409 native, 36/36 Wasm concurrency, 22/22 Wasm cases. Zero failures.
+**Status:** ALL PASS. 409 native, 38/38 Wasm concurrency, 22/22 Wasm cases. Zero failures.
 
 ---
 
@@ -34,6 +34,14 @@
 | **Total Wasm** | **60** | **60/60** |
 
 **Remaining Wasm issue:** features.cot test mode fails (print.cot `expected i64, found f64` — float/int type confusion in print codegen). Build mode works. Not a concurrency bug.
+
+### Wasm Linker Bugs Fixed (2026-03-27 session 2)
+
+| Bug | Root Cause | Fix |
+|-----|-----------|-----|
+| Type section 0xAA corruption | `addType` used SSA `param_count` but `params[]` only filled for IR `wasm_param_idx` entries | Fill remaining param slots with i64 for async poll state pointer |
+| CFG pred/succ invariant | `splitBlockAtSuspend` transferred succs without updating pred back-pointers | Patch pred entries in successor blocks |
+| async_split transforms non-poll fns | Test fns with 2+ `async let` treated as state machines | Only transform `__poll` functions |
 
 ### Wasm Bugs Fixed This Session
 
@@ -92,13 +100,19 @@
 - ~~Fix test runner~~ → return i64 tag directly (`c7fded6`)
 - ~~Selfcot port~~ → all features ported (`2c54c63`)
 
+### Fixed (2026-03-27 session 2)
+
+1. **Wasm linker truncation (was the blocker)** — NOT a truncated file. 21KB binary was written correctly. Real bug: type section had uninitialized `0xAA` byte in function type params. Root cause: `addType(params[0..param_count])` used SSA arg count but `params[]` was only filled for `wasm_param_idx` entries from IR params. Async poll functions have extra SSA args (state pointer) not in `ir_func.params`. Fixed by filling remaining slots with i64.
+
+2. **CFG edge invariant in async_split** — `splitBlockAtSuspend` transferred successor edges to resume block but didn't update predecessor back-pointers in successor blocks. Fixed by iterating successors and patching pred entries.
+
+3. **async_split scope too broad** — Non-poll functions with 2+ await points (like test functions using `async let`) were incorrectly transformed into state machines, changing their signature and breaking callers. Fixed by only transforming `__poll` functions.
+
 ### Open
 
-1. **Ungate state machine SSA transform** — async_split produces valid SSA but Wasm dispatch has bug (if/else chain state doesn't persist across poll calls). Gate remains at `async_split.zig:189`. Native uses eager path.
+1. **Wasm print.cot float type mismatch** — `expected i64, found f64` in test mode. Build mode works. Not a concurrency bug.
 
-2. **Wasm print.cot float type mismatch** — `expected i64, found f64` in test mode. Build mode works. Not a concurrency bug.
-
-3. **AsyncSequence formal protocol** — Deferred. Requires associated types in traits. Duck typing via `next()` works. Generic impl methods with closure params hit a compiler bug.
+2. **AsyncSequence formal protocol** — Deferred. Requires associated types in traits. Duck typing via `next()` works. Generic impl methods with closure params hit a compiler bug.
 
 ### Future Swift Features
 

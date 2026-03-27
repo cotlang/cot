@@ -342,6 +342,7 @@ const TokenCollector = struct {
             },
             .try_expr => |t| self.walkNode(t.operand),
             .await_expr => |a| self.walkNode(a.operand),
+            .task_expr => |t| self.walkNode(t.body),
             .string_interp => |s| {
                 for (s.segments) |seg| switch (seg) {
                     .expr => |e| self.walkNode(e),

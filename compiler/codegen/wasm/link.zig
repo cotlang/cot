@@ -271,7 +271,21 @@ pub const Linker = struct {
         }
 
         try self.types.append(self.allocator, new_type);
-        return @intCast(self.types.items.len - 1);
+        const new_idx: u32 = @intCast(self.types.items.len - 1);
+        // Validate all param/result bytes are valid Wasm types
+        for (params, 0..) |p, pi| {
+            const vb = @intFromEnum(p.val);
+            if (vb != 0x7F and vb != 0x7E and vb != 0x7D and vb != 0x7C and vb != 0x70 and vb != 0x6F and p.gc_ref == null) {
+                debugLog("  !!! addTypeWasm: NEW type[{d}] param[{d}] invalid val=0x{X:0>2}", .{ new_idx, pi, vb });
+            }
+        }
+        for (results, 0..) |r, ri| {
+            const vb = @intFromEnum(r.val);
+            if (vb != 0x7F and vb != 0x7E and vb != 0x7D and vb != 0x7C and vb != 0x70 and vb != 0x6F and r.gc_ref == null) {
+                debugLog("  !!! addTypeWasm: NEW type[{d}] result[{d}] invalid val=0x{X:0>2}", .{ new_idx, ri, vb });
+            }
+        }
+        return new_idx;
     }
 
     /// Add a host import (Go: collecting hostImports in asm.go)
@@ -353,7 +367,7 @@ pub const Linker = struct {
     }
 
     /// Link and emit the Wasm module
-    pub fn emit(self: *Linker, writer: anytype) !void {
+    pub fn emit(self: *Linker, output: *std.ArrayListUnmanaged(u8)) !void {
         debugLog("link: emitting module ({d} types, {d} imports, {d} funcs, {d} globals, {d} data segments)", .{
             self.types.items.len,
             self.imports.items.len,
@@ -365,8 +379,8 @@ pub const Linker = struct {
         // ====================================================================
         // Header
         // ====================================================================
-        try writer.writeAll(&c.WASM_MAGIC);
-        try writer.writeAll(&c.WASM_VERSION);
+        try output.appendSlice(self.allocator, &c.WASM_MAGIC);
+        try output.appendSlice(self.allocator, &c.WASM_VERSION);
 
         // ====================================================================
         // Type Section (Go: asm.go writeTypeSec)
@@ -422,30 +436,39 @@ pub const Linker = struct {
 
                 // Emit function types (indices N..N+M-1)
                 // Reference: Kotlin/Wasm encodes ref types as 0x64 + LEB128(typeidx)
-                for (self.types.items) |t| {
+                for (self.types.items, 0..) |t, type_idx| {
                     const t_params = t.getParams(self.type_storage.items);
                     const t_results = t.getResults(self.type_storage.items);
                     try type_buf.append(self.allocator, c.FUNC_TYPE_TAG); // 0x60
                     try assemble.writeULEB128(self.allocator, &type_buf, t_params.len);
-                    for (t_params) |p| {
+                    for (t_params, 0..) |p, pi| {
+                        const val_byte = @intFromEnum(p.val);
                         if (p.gc_ref) |gc_idx| {
                             try type_buf.append(self.allocator, c.GC_REF_TYPE_NULL); // 0x63
                             try assemble.writeULEB128(self.allocator, &type_buf, gc_idx);
                         } else {
-                            try type_buf.append(self.allocator, @intFromEnum(p.val));
+                            // Validate value type is a known Wasm type
+                            if (val_byte != 0x7F and val_byte != 0x7E and val_byte != 0x7D and val_byte != 0x7C and val_byte != 0x70 and val_byte != 0x6F) {
+                                debugLog("  !!! type[{d}] param[{d}] has invalid val_byte=0x{X:0>2}", .{ type_idx, pi, val_byte });
+                            }
+                            try type_buf.append(self.allocator, val_byte);
                         }
                     }
                     try assemble.writeULEB128(self.allocator, &type_buf, t_results.len);
-                    for (t_results) |r| {
+                    for (t_results, 0..) |r, ri| {
+                        const val_byte = @intFromEnum(r.val);
                         if (r.gc_ref) |gc_idx| {
                             try type_buf.append(self.allocator, c.GC_REF_TYPE_NULL); // 0x63
                             try assemble.writeULEB128(self.allocator, &type_buf, gc_idx);
                         } else {
-                            try type_buf.append(self.allocator, @intFromEnum(r.val));
+                            if (val_byte != 0x7F and val_byte != 0x7E and val_byte != 0x7D and val_byte != 0x7C and val_byte != 0x70 and val_byte != 0x6F) {
+                                debugLog("  !!! type[{d}] result[{d}] has invalid val_byte=0x{X:0>2}", .{ type_idx, ri, val_byte });
+                            }
+                            try type_buf.append(self.allocator, val_byte);
                         }
                     }
                 }
-                try writeSection(writer, self.allocator, .type, type_buf.items);
+                try writeSection(output, self.allocator, .type, type_buf.items);
             }
         }
 
@@ -469,7 +492,7 @@ pub const Linker = struct {
                 // Function type index
                 try assemble.writeULEB128(self.allocator, &import_buf, imp.type_idx);
             }
-            try writeSection(writer, self.allocator, .import, import_buf.items);
+            try writeSection(output, self.allocator, .import, import_buf.items);
         }
 
         // ====================================================================
@@ -484,7 +507,7 @@ pub const Linker = struct {
             for (self.funcs.items) |f| {
                 try assemble.writeULEB128(self.allocator, &func_buf, f.type_idx + gc_offset);
             }
-            try writeSection(writer, self.allocator, .function, func_buf.items);
+            try writeSection(output, self.allocator, .function, func_buf.items);
         }
 
         // ====================================================================
@@ -498,7 +521,7 @@ pub const Linker = struct {
             try table_buf.append(self.allocator, @intFromEnum(c.ValType.funcref)); // funcref type
             try table_buf.append(self.allocator, c.LIMITS_NO_MAX);
             try assemble.writeULEB128(self.allocator, &table_buf, self.table_size);
-            try writeSection(writer, self.allocator, .table, table_buf.items);
+            try writeSection(output, self.allocator, .table, table_buf.items);
         }
 
         // ====================================================================
@@ -517,7 +540,7 @@ pub const Linker = struct {
                 try mem_buf.append(self.allocator, c.LIMITS_NO_MAX);
                 try assemble.writeULEB128(self.allocator, &mem_buf, self.memory_min_pages);
             }
-            try writeSection(writer, self.allocator, .memory, mem_buf.items);
+            try writeSection(output, self.allocator, .memory, mem_buf.items);
         }
 
         // ====================================================================
@@ -554,7 +577,7 @@ pub const Linker = struct {
                 }
                 try global_buf.append(self.allocator, c.As.end.opcode().?);
             }
-            try writeSection(writer, self.allocator, .global, global_buf.items);
+            try writeSection(output, self.allocator, .global, global_buf.items);
         }
 
         // ====================================================================
@@ -591,7 +614,7 @@ pub const Linker = struct {
             try export_buf.append(self.allocator, @intFromEnum(c.ExportKind.memory));
             try assemble.writeULEB128(self.allocator, &export_buf, 0); // memory index 0
 
-            try writeSection(writer, self.allocator, .@"export", export_buf.items);
+            try writeSection(output, self.allocator, .@"export", export_buf.items);
         }
 
         // ====================================================================
@@ -615,7 +638,7 @@ pub const Linker = struct {
                 // Function indices must account for imports
                 try assemble.writeULEB128(self.allocator, &elem_buf, import_count + func_idx);
             }
-            try writeSection(writer, self.allocator, .element, elem_buf.items);
+            try writeSection(output, self.allocator, .element, elem_buf.items);
         }
 
         // ====================================================================
@@ -626,7 +649,7 @@ pub const Linker = struct {
             var dc_buf = std.ArrayListUnmanaged(u8){};
             defer dc_buf.deinit(self.allocator);
             try assemble.writeULEB128(self.allocator, &dc_buf, self.data_segments.items.len);
-            try writeSection(writer, self.allocator, .data_count, dc_buf.items);
+            try writeSection(output, self.allocator, .data_count, dc_buf.items);
         }
 
         // ====================================================================
@@ -641,7 +664,7 @@ pub const Linker = struct {
                 try assemble.writeULEB128(self.allocator, &code_buf, f.code.len);
                 try code_buf.appendSlice(self.allocator, f.code);
             }
-            try writeSection(writer, self.allocator, .code, code_buf.items);
+            try writeSection(output, self.allocator, .code, code_buf.items);
         }
 
         // ====================================================================
@@ -664,7 +687,7 @@ pub const Linker = struct {
                 try assemble.writeULEB128(self.allocator, &data_buf, seg.data.len);
                 try data_buf.appendSlice(self.allocator, seg.data);
             }
-            try writeSection(writer, self.allocator, .data, data_buf.items);
+            try writeSection(output, self.allocator, .data, data_buf.items);
         }
 
         debugLog( "  link complete", .{});
@@ -678,17 +701,17 @@ pub const DataSegment = struct {
 };
 
 /// Write a section with ID and content
-fn writeSection(writer: anytype, allocator: std.mem.Allocator, section: c.Section, content: []const u8) !void {
+fn writeSection(output: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, section: c.Section, content: []const u8) !void {
     debugLog("  section {s}: {d} bytes", .{ @tagName(section), content.len });
-    try writer.writeByte(@intFromEnum(section));
+    try output.append(allocator, @intFromEnum(section));
 
     // Write size as LEB128
     var size_buf = std.ArrayListUnmanaged(u8){};
     defer size_buf.deinit(allocator);
     try assemble.writeULEB128(allocator, &size_buf, content.len);
-    try writer.writeAll(size_buf.items);
+    try output.appendSlice(allocator, size_buf.items);
 
-    try writer.writeAll(content);
+    try output.appendSlice(allocator, content);
 }
 
 // ============================================================================
@@ -740,7 +763,7 @@ test "linker emit" {
     // Emit
     var output = std.ArrayListUnmanaged(u8){};
     defer output.deinit(allocator);
-    try linker.emit(output.writer(allocator));
+    try linker.emit(&output);
 
     // Verify header
     try testing.expectEqualSlices(u8, &c.WASM_MAGIC, output.items[0..4]);
@@ -818,7 +841,7 @@ test "linker with imports" {
     // Emit
     var output = std.ArrayListUnmanaged(u8){};
     defer output.deinit(allocator);
-    try linker.emit(output.writer(allocator));
+    try linker.emit(&output);
 
     // Verify header
     try testing.expectEqualSlices(u8, &c.WASM_MAGIC, output.items[0..4]);

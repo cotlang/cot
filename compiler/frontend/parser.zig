@@ -1283,6 +1283,24 @@ pub const Parser = struct {
             } else if (self.check(.lbrace)) {
                 if (self.tree.getNode(expr)) |n| {
                     if (n.asExpr()) |e| {
+                        // Task.detached { body } — Unstructured detached task (Swift SE-0304)
+                        if (e == .field_access and std.mem.eql(u8, e.field_access.field, "detached")) {
+                            if (self.tree.getNode(e.field_access.base)) |base_node| {
+                                if (base_node.asExpr()) |base_expr| {
+                                    if (base_expr == .ident and std.mem.eql(u8, base_expr.ident.name, "Task")) {
+                                        const peek_after_brace = self.peekToken();
+                                        const is_struct_init = peek_after_brace.tok == .rbrace or
+                                            peek_after_brace.tok == .period;
+                                        if (!is_struct_init) {
+                                            const s = self.tree.getNode(expr).?.span();
+                                            const body = try self.parseBlockExprBody() orelse return null;
+                                            expr = try self.tree.addExpr(.{ .task_expr = .{ .body = body, .is_detached = true, .span = Span.init(s.start, self.pos()) } });
+                                            continue;
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         // Generic struct literal: List(i64) { .items = 0, ... }
                         // Detected when expr is call(UppercaseIdent, args) followed by { .
                         if (e == .call and (self.peekNextIsPeriod() or (self.safe_mode and self.peekNextIsIdentColon()))) {
@@ -1326,6 +1344,21 @@ pub const Parser = struct {
                         }
                         if (e == .ident) {
                             const type_name = e.ident.name;
+                            // Task { body } — Unstructured task creation (Swift SE-0304)
+                            // Disambiguated from struct init: body is a block, not field inits.
+                            if (std.mem.eql(u8, type_name, "Task") and self.check(.lbrace)) {
+                                const peek_after_brace = self.peekToken();
+                                const is_struct_init = peek_after_brace.tok == .rbrace or
+                                    peek_after_brace.tok == .period or
+                                    (peek_after_brace.tok == .ident and self.peekNextIsIdentColon());
+                                if (!is_struct_init) {
+                                    const s = self.tree.getNode(expr).?.span();
+                                    // Parse as block expression: stmts + trailing expr
+                                    const body = try self.parseBlockExprBody() orelse return null;
+                                    expr = try self.tree.addExpr(.{ .task_expr = .{ .body = body, .span = Span.init(s.start, self.pos()) } });
+                                    continue;
+                                }
+                            }
                             // Empty struct init: Type {} (all fields have defaults)
                             if (type_name.len > 0 and std.ascii.isUpper(type_name[0]) and self.check(.lbrace) and self.peekToken().tok == .rbrace) {
                                 const s = self.tree.getNode(expr).?.span();
@@ -2000,6 +2033,41 @@ pub const Parser = struct {
 
 
     // Statement parsing
+
+    /// Parse { stmts... trailing_expr } as a BlockExpr (expression block).
+    /// The last item is treated as the trailing expression if it's an expression statement.
+    /// Used for Task { body } where the body produces a value.
+    fn parseBlockExprBody(self: *Parser) ParseError!?NodeIndex {
+        const start = self.pos();
+        if (!self.expect(.lbrace)) return null;
+        var stmts = std.ArrayListUnmanaged(NodeIndex){};
+        defer stmts.deinit(self.allocator);
+        while (!self.check(.rbrace) and !self.check(.eof)) {
+            if (try self.parseStmt()) |s| try stmts.append(self.allocator, s) else self.advance();
+        }
+        if (!self.expect(.rbrace)) return null;
+
+        // If the last statement is an expression statement, promote it to trailing expr.
+        // This gives Task { 42 } and Task { x + 1 } the expected value semantics.
+        var trailing_expr: NodeIndex = null_node;
+        if (stmts.items.len > 0) {
+            const last = stmts.items[stmts.items.len - 1];
+            const last_node = self.tree.getNode(last);
+            if (last_node) |ln| {
+                if (ln.asStmt()) |s| {
+                    if (s == .expr_stmt) {
+                        trailing_expr = s.expr_stmt.expr;
+                        stmts.items.len -= 1; // remove from stmts
+                    }
+                }
+            }
+        }
+        return try self.tree.addExpr(.{ .block_expr = .{
+            .stmts = try self.allocator.dupe(NodeIndex, stmts.items),
+            .expr = trailing_expr,
+            .span = Span.init(start, self.pos()),
+        } });
+    }
 
     fn parseBlock(self: *Parser) ParseError!?NodeIndex {
         const start = self.pos();

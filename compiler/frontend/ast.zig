@@ -113,6 +113,7 @@ pub const Expr = union(enum) {
     type_expr: TypeExpr,
     try_expr: TryExpr,
     await_expr: AwaitExpr,
+    task_expr: TaskExpr,
     catch_expr: CatchExpr,
     orelse_expr: OrElseExpr,
     error_literal: ErrorLiteral,
@@ -407,6 +408,10 @@ pub const TypeKind = union(enum) {
 };
 pub const TryExpr = struct { operand: NodeIndex, span: Span };
 pub const AwaitExpr = struct { operand: NodeIndex, span: Span };
+/// Task { body } — Unstructured task creation (Swift SE-0304).
+/// Phase 1 (eager): evaluates body immediately, wraps result in Task(T).
+/// is_detached: true for Task.detached { body } (no inherited context).
+pub const TaskExpr = struct { body: NodeIndex, is_detached: bool = false, span: Span };
 pub const CatchExpr = struct { operand: NodeIndex, capture: []const u8, capture_is_ptr: bool = false, fallback: NodeIndex, span: Span };
 pub const OrElseExpr = struct {
     operand: NodeIndex, // LHS: the optional expression

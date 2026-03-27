@@ -6509,7 +6509,16 @@ pub const Driver = struct {
                     for (results, 0..) |r, ri| gc_results[ri] = wasm.WasmType.fromVal(r);
                 }
                 break :blk try linker.addTypeWasm(gc_params[0..wasm_param_idx], gc_results[0..gc_results_len]);
-            } else try linker.addType(params[0..param_count], results);
+            } else blk: {
+                // Fill remaining params (e.g., state pointer for async poll functions)
+                // SSA may have more args than ir_func.params due to async split.
+                for (wasm_param_idx..param_count) |i| {
+                    params[i] = .i64;
+                    gc_params[i] = wasm.WasmType.fromVal(.i64);
+                }
+                if (wasm_param_idx < param_count) wasm_param_idx = param_count;
+                break :blk try linker.addType(params[0..wasm_param_idx], results);
+            };
 
             // Register this function's Wasm type index for call_indirect resolution
             try func_type_indices.put(ir_func.name, type_idx);
@@ -6639,7 +6648,7 @@ pub const Driver = struct {
         // Emit Wasm binary using Go-style linker
         // This includes proper sections: type, function, memory, global (SP), export, code, data
         var output: std.ArrayListUnmanaged(u8) = .{};
-        try linker.emit(output.writer(self.allocator));
+        try linker.emit(&output);
         return output.toOwnedSlice(self.allocator);
     }
 };

@@ -1759,6 +1759,7 @@ struct Checker {
         if (tag == "zero_init") { return self.checkZeroInit() }
         if (tag == "await_expr") { return self.checkAwaitExpr(idx) }
         if (tag == "comptime_block") { return self.checkComptimeBlock(idx) }
+        if (tag == "task_expr") { return self.checkTaskExpr(idx) }
         return invalid_type
     }
 
@@ -3909,6 +3910,18 @@ struct Checker {
         }
         const task = switch (operand_info) { Type.task |task| => task, else => TaskType { result_type: 0 } }
         return task.result_type
+    }
+
+    /// Type-check Task { body } expression (Swift SE-0304).
+    fn checkTaskExpr(idx: int) int {
+        var body_n = null_node
+        switch (self.ast.getNode(idx)) { Node.expr |e| => switch (e) {
+            Expr.task_expr |te| => { body_n = te.body },
+        else => {} }, else => {} }
+        if (body_n != null_node) {
+            self.checkBlockExpr(body_n)
+        }
+        return self.types.makeTask(I64)
     }
 
     /// Check if an expression is a call to a method on an actor type.

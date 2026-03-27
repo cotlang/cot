@@ -1717,6 +1717,7 @@ pub const Checker = struct {
             .string_interp => |si| self.checkStringInterp(si),
             .try_expr => |te| self.checkTryExpr(te),
             .await_expr => |ae| self.checkAwaitExpr(ae),
+            .task_expr => |te| self.checkTaskExpr(te),
             .catch_expr => |ce| self.checkCatchExpr(ce),
             .orelse_expr => |oe| self.checkOrElseExpr(oe),
             .error_literal => |el| self.checkErrorLiteral(el),
@@ -3479,6 +3480,28 @@ pub const Checker = struct {
             return invalid_type;
         }
         return operand_info.task.result_type;
+    }
+
+    /// Type-check Task { body } expression (Swift SE-0304).
+    /// The body is a block whose return statements determine the Task's result type.
+    /// Phase 1 (eager): body runs immediately, result wrapped in Task(T).
+    /// Swift reference: Task+init.swift.gyb — Task<Success, Failure>
+    fn checkTaskExpr(self: *Checker, te: ast.TaskExpr) CheckError!TypeIndex {
+        // Check body in a child scope (captures allowed, like closures)
+        var task_scope = Scope.init(self.allocator, self.scope);
+        defer task_scope.deinit();
+        const old_scope = self.scope;
+        const old_return = self.current_return_type;
+        self.scope = &task_scope;
+        // Phase 1: Task body return type defaults to i64.
+        // Future: infer from return statements in body.
+        self.current_return_type = TypeRegistry.I64;
+        if (te.body != null_node) try self.checkBlockExpr(te.body);
+        self.scope = old_scope;
+        self.current_return_type = old_return;
+
+        // Wrap in Task(i64) — Phase 1 all task results are i64
+        return try self.types.makeTask(TypeRegistry.I64);
     }
 
     /// Check if an expression is a call to a method on an actor type.

@@ -2676,6 +2676,7 @@ struct Lowerer {
                 Expr.tuple_literal |tl| => { return self.lowerTupleLiteral(tl, idx) },
                 Expr.closure_expr |ce| => { return self.lowerClosureExpr(ce) },
                 Expr.await_expr |ae| => { return self.lowerAwaitExpr(ae, idx) },
+                Expr.task_expr |te| => { return self.lowerTaskExpr(te) },
                 else => {
                     return null_node
                 },
@@ -7115,6 +7116,38 @@ struct Lowerer {
             fb.emitCall("release", release_args, false, VOID, ae.span)
 
             return result
+        }
+        return null_node
+    }
+
+    /// Lower Task { body } — Unstructured task creation (Swift SE-0304).
+    /// Phase 1 (eager): allocate TaskObject, lower body as block expr, store result.
+    /// Ported from lower.zig lowerTaskExpr.
+    fn lowerTaskExpr(te: TaskExpr) int {
+        if (self.builder.func()) |fb| {
+            // Allocate TaskObject: alloc(0, 16)
+            const zero = fb.emitConstInt(0, I64, te.span)
+            const sixteen = fb.emitConstInt(16, I64, te.span)
+            var alloc_args: List(int) = .{}
+            alloc_args.append(zero)
+            alloc_args.append(sixteen)
+            const task_ptr = fb.emitCall("alloc", alloc_args, false, I64, te.span)
+
+            // Store task_ptr in a local
+            const task_local = fb.addLocalWithSize("__task_ptr", I64, false, 8)
+            fb.emitStoreLocal(task_local, task_ptr, te.span)
+
+            // Lower body as block expression — trailing value is the result
+            const body_result = self.lowerExprNode(te.body)
+
+            // Store result at task[0]
+            if (body_result != null_node) {
+                const reload_ptr = fb.emitLoadLocal(task_local, I64, te.span)
+                fb.emitPtrStoreValue(reload_ptr, body_result, te.span)
+            }
+
+            // Return task pointer
+            return fb.emitLoadLocal(task_local, I64, te.span)
         }
         return null_node
     }
