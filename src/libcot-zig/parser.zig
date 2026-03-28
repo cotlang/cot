@@ -399,14 +399,44 @@ pub const Parser = struct {
             _ = try p.expectToken(.lparen);
         }
 
-        // Value parameters
-        const params = try p.parseFieldList(.rparen);
+        var params = try p.parseFieldList(.rparen);
         _ = p.eatToken(.rparen) orelse {
             try p.addError(.expected_rparen);
             return null;
         };
 
-        // Return type (anything before { or ; or where or eof)
+        // @safe implicit self injection: prepend `self: TypeName` if needed
+        if ((p.safe_mode or p.current_impl_is_actor) and p.current_impl_type != null and
+            !p.current_impl_is_generic and !mods.is_static)
+        {
+            const has_self = blk: {
+                if (params.len() == 0) break :blk false;
+                const first_field = p.extra_data.items[@intFromEnum(params.start)];
+                break :blk p.isTokenText(first_field, "self");
+            };
+            if (!has_self) {
+                const self_type = try p.addNode(.{
+                    .tag = .type_named,
+                    .main_token = p.current_impl_type.?,
+                    .data = .{ .none = {} },
+                });
+                const self_field = try p.addExtra(Ast.Field{
+                    .name_token = p.current_impl_type.?, // reuse type token for "self" name
+                    .type_expr = self_type,
+                    .default_value = .none,
+                    .flags = .{},
+                });
+                // Rebuild params with self prepended
+                const scratch_top = p.scratch.items.len;
+                defer p.scratch.shrinkRetainingCapacity(scratch_top);
+                try p.scratch.append(p.gpa, @intFromEnum(self_field));
+                for (p.extra_data.items[@intFromEnum(params.start)..@intFromEnum(params.end)]) |item| {
+                    try p.scratch.append(p.gpa, item);
+                }
+                params = try p.listToSpan(p.scratch.items[scratch_top..]);
+            }
+        }
+
         var return_type: OptionalIndex = .none;
         if (p.currentTag() != .lbrace and p.currentTag() != .semicolon and
             p.currentTag() != .eof and p.currentTag() != .kw_where)
@@ -2050,10 +2080,31 @@ pub const Parser = struct {
             const trait = try p.parseType() orelse return null;
             return try p.addNode(.{ .tag = .type_existential, .main_token = t, .data = .{ .node = trait } });
         }
-        // Named type, possibly generic: Type(T, U)
         if (p.currentTag() == .ident or p.currentTag().isTypeKeyword()) {
-            const name_token = p.advance();
-            // Check for generic args: Type(T, U)
+            var name_token = p.advance();
+            // Nested type namespace: Outer.Inner
+            if (p.currentTag() == .period and p.peekTag() == .ident) {
+                _ = p.advance(); // consume .
+                name_token = p.advance(); // use inner name as the token
+            }
+            // Legacy angle bracket syntax: Map<K,V> and List<T>
+            if (p.eatToken(.lss) != null) {
+                const name_text = p.tokenText(name_token);
+                if (std.mem.eql(u8, name_text, "Map")) {
+                    const key = try p.parseType() orelse return null;
+                    _ = p.eatToken(.comma);
+                    const val = try p.parseType() orelse return null;
+                    _ = p.eatToken(.gtr);
+                    return try p.addNode(.{ .tag = .type_map, .main_token = name_token, .data = .{ .node_and_node = .{ key, val } } });
+                } else if (std.mem.eql(u8, name_text, "List")) {
+                    const elem = try p.parseType() orelse return null;
+                    _ = p.eatToken(.gtr);
+                    return try p.addNode(.{ .tag = .type_list, .main_token = name_token, .data = .{ .node = elem } });
+                }
+                try p.addError(.unexpected_token);
+                return null;
+            }
+            // Generic args: Type(T, U)
             if (p.eatToken(.lparen) != null) {
                 const scratch_top = p.scratch.items.len;
                 defer p.scratch.shrinkRetainingCapacity(scratch_top);
@@ -2065,15 +2116,42 @@ pub const Parser = struct {
                 }
                 _ = p.eatToken(.rparen);
                 const type_args = try p.listToSpan(p.scratch.items[scratch_top..]);
-                const extra = try p.addExtra(Ast.GenericInstance{
+                const extra_gi = try p.addExtra(Ast.GenericInstance{
                     .name_token = name_token,
                     .type_args = type_args,
                 });
-                return try p.addNode(.{ .tag = .type_generic, .main_token = name_token, .data = .{ .node_and_extra = .{ @enumFromInt(0), extra } } });
+                return try p.addNode(.{ .tag = .type_generic, .main_token = name_token, .data = .{ .node_and_extra = .{ @enumFromInt(0), extra_gi } } });
+            }
+            // E!T error union with named error set
+            if (p.eatToken(.lnot) != null) {
+                const error_set = try p.addNode(.{ .tag = .type_named, .main_token = name_token, .data = .{ .none = {} } });
+                const elem = try p.parseType() orelse return null;
+                return try p.addNode(.{ .tag = .type_error_union_set, .main_token = name_token, .data = .{ .node_and_node = .{ error_set, elem } } });
             }
             return try p.addNode(.{ .tag = .type_named, .main_token = name_token, .data = .{ .none = {} } });
         }
-        // fn(A, B) -> R
+        // Tuple type: (T1, T2, ...)
+        if (p.currentTag() == .lparen) {
+            const lparen = p.advance();
+            const first = try p.parseType() orelse return null;
+            if (p.eatToken(.comma) != null) {
+                const scratch_top = p.scratch.items.len;
+                defer p.scratch.shrinkRetainingCapacity(scratch_top);
+                try p.scratch.append(p.gpa, @intFromEnum(first));
+                while (p.currentTag() != .rparen and p.currentTag() != .eof) {
+                    if (try p.parseType()) |elem| {
+                        try p.scratch.append(p.gpa, @intFromEnum(elem));
+                    } else break;
+                    if (p.eatToken(.comma) == null) break;
+                }
+                _ = p.eatToken(.rparen);
+                const range = try p.listToSpan(p.scratch.items[scratch_top..]);
+                return try p.addNode(.{ .tag = .type_tuple, .main_token = lparen, .data = .{ .extra_range = range } });
+            }
+            _ = p.eatToken(.rparen);
+            return first;
+        }
+        // fn(A, B) R
         if (p.currentTag() == .kw_fn) {
             const fn_token = p.advance();
             _ = p.eatToken(.lparen);
