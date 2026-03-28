@@ -1001,9 +1001,33 @@ pub const Parser = struct {
 
     fn parseImplDecl(p: *Parser) Error!?Index {
         const doc = p.consumeDocComment();
-        const impl_token = p.advance(); // consume 'impl'
+        const impl_token = p.advance();
 
-        // impl Trait for Type { ... } OR impl Type { ... }
+        // impl @unchecked Sendable for Type {} — escape hatch (SE-0302)
+        if (p.currentTag() == .at) {
+            if (p.peekTag() == .ident and p.isTokenText(p.tok_i + 1, "unchecked")) {
+                _ = p.advance(); // @
+                _ = p.advance(); // unchecked
+                if (p.currentTag() == .ident and p.isTokenText(p.tok_i, "Sendable")) {
+                    _ = p.advance(); // Sendable
+                    _ = p.eatToken(.kw_for);
+                    const type_name = p.eatToken(.ident) orelse {
+                        try p.addError(.expected_identifier);
+                        return null;
+                    };
+                    _ = p.eatToken(.lbrace);
+                    _ = p.eatToken(.rbrace);
+                    return try p.addNode(.{
+                        .tag = .unchecked_sendable,
+                        .main_token = impl_token,
+                        .data = .{ .token = type_name },
+                    });
+                }
+                try p.addError(.unexpected_token);
+                return null;
+            }
+        }
+
         const first_name = p.eatToken(.ident) orelse {
             try p.addError(.expected_identifier);
             return null;
@@ -1109,23 +1133,64 @@ pub const Parser = struct {
             return null;
         };
 
-        const scratch_top = p.scratch.items.len;
-        defer p.scratch.shrinkRetainingCapacity(scratch_top);
+        const methods_top = p.scratch.items.len;
+        const assoc_top = p.extra_data.items.len;
+        var assoc_count: u32 = 0;
 
         while (p.currentTag() != .rbrace and p.currentTag() != .eof) {
             p.collectDocComment();
-            if (try p.parseDecl()) |decl_idx| {
-                try p.scratch.append(p.gpa, @intFromEnum(decl_idx));
-            } else break;
+            if (p.currentTag() == .kw_fn) {
+                if (try p.parseFnDeclFull(.{})) |idx|
+                    try p.scratch.append(p.gpa, @intFromEnum(idx));
+            } else if (p.currentTag() == .kw_type) {
+                _ = p.advance(); // consume 'type'
+                const assoc_name = p.eatToken(.ident) orelse {
+                    try p.addError(.expected_identifier);
+                    _ = p.advance();
+                    continue;
+                };
+                var bound_token: OptionalTokenIndex = .none;
+                if (p.eatToken(.colon) != null) {
+                    if (p.currentTag() == .ident) {
+                        bound_token = @enumFromInt(p.advance());
+                        // Skip optional type args: AsyncIterator(Element)
+                        if (p.eatToken(.lparen) != null) {
+                            while (p.currentTag() != .rparen and p.currentTag() != .eof) {
+                                _ = p.advance();
+                                if (p.eatToken(.comma) == null) break;
+                            }
+                            _ = p.eatToken(.rparen);
+                        }
+                    }
+                }
+                const ae = try p.addExtra(Ast.AssocType{
+                    .name_token = assoc_name,
+                    .bound_token = bound_token,
+                });
+                _ = ae;
+                assoc_count += 1;
+            } else {
+                if (try p.parseDecl()) |idx|
+                    try p.scratch.append(p.gpa, @intFromEnum(idx))
+                else
+                    break;
+            }
         }
         _ = p.eatToken(.rbrace);
 
-        const methods = try p.listToSpan(p.scratch.items[scratch_top..]);
+        const methods = try p.listToSpan(p.scratch.items[methods_top..]);
+        p.scratch.shrinkRetainingCapacity(methods_top);
+
+        const assoc_types: SubRange = if (assoc_count > 0) .{
+            .start = @enumFromInt(assoc_top),
+            .end = @enumFromInt(assoc_top + assoc_count * 2), // 2 u32s per AssocType
+        } else SubRange.empty;
+
         const extra = try p.addExtra(Ast.TraitDecl{
             .name_token = name_token,
             .type_params = type_params,
             .methods = methods,
-            .assoc_types = SubRange.empty,
+            .assoc_types = assoc_types,
             .doc_comment = doc,
         });
 
@@ -1868,35 +1933,94 @@ pub const Parser = struct {
     }
 
     fn parseBuiltinCall(p: *Parser) Error!?Index {
-        const at_token = p.advance(); // consume '@'
-        if (p.currentTag() != .ident) {
+        const at_token = p.advance();
+        // @string and @as are keywords but valid builtin names
+        const name_text = if (p.currentTag() == .kw_string)
+            "string"
+        else if (p.currentTag() == .kw_as)
+            "as"
+        else if (p.currentTag() == .ident)
+            p.tokenText(p.tok_i)
+        else {
             try p.addError(.expected_identifier);
             return null;
-        }
-        const name_text = p.tokenText(p.tok_i);
+        };
+        _ = p.advance();
+        _ = p.eatToken(.lparen);
+
         const kind = Ast.BuiltinKind.fromString(name_text) orelse {
             try p.addError(.unexpected_token);
             return null;
         };
-        _ = p.advance(); // consume builtin name
 
-        _ = p.eatToken(.lparen);
-        const type_arg: OptionalIndex = .none;
+        var type_arg: OptionalIndex = .none;
         var args: [3]OptionalIndex = .{ .none, .none, .none };
-        var arg_count: usize = 0;
 
-        while (p.currentTag() != .rparen and p.currentTag() != .eof and arg_count < 4) {
-            if (try p.parseExpr()) |arg| {
-                if (arg_count == 0 and p.currentTag() == .rparen and type_arg == .none) {
-                    // Could be type arg or regular arg — treat as type_arg if single capitalized ident
-                    args[0] = arg.toOptional();
-                    arg_count = 1;
-                } else if (arg_count < 3) {
-                    args[arg_count] = arg.toOptional();
-                    arg_count += 1;
+        switch (kind) {
+            // 0 args
+            .trap, .target_os, .target_arch, .target => {},
+
+            // 1 type arg
+            .size_of, .align_of, .enum_len, .type_name, .type_info => {
+                if (try p.parseType()) |t| type_arg = t.toOptional();
+            },
+
+            // @enumFromInt: try 2-arg (Type, val) then fall back to 1-arg (val)
+            .enum_from_int => {
+                const saved = p.tok_i;
+                const saved_nodes = p.nodes.len;
+                const saved_extra = p.extra_data.items.len;
+                if (try p.parseType()) |maybe_type| {
+                    if (p.eatToken(.comma) != null) {
+                        type_arg = maybe_type.toOptional();
+                        if (try p.parseExpr()) |v| args[0] = v.toOptional();
+                    } else {
+                        // Backtrack: was actually a 1-arg form
+                        p.tok_i = saved;
+                        p.nodes.len = saved_nodes;
+                        p.extra_data.shrinkRetainingCapacity(saved_extra);
+                        if (try p.parseExpr()) |v| args[0] = v.toOptional();
+                    }
                 }
-            } else break;
-            if (p.eatToken(.comma) == null) break;
+            },
+
+            // 1 type + 1 value
+            .int_cast, .float_cast, .float_from_int, .ptr_cast, .int_to_ptr, .has_field,
+            .bit_cast, .truncate, .as, .offset_of, .align_cast, .enum_name,
+            => {
+                if (try p.parseType()) |t| type_arg = t.toOptional();
+                _ = p.eatToken(.comma);
+                if (try p.parseExpr()) |v| args[0] = v.toOptional();
+            },
+
+            // 1 value
+            .ptr_to_int, .assert, .ptr_of, .len_of, .compile_error,
+            .abs, .ceil, .floor, .trunc, .round, .sqrt, .embed_file,
+            .type_of, .int_from_enum, .tag_name, .error_name, .int_from_bool,
+            .const_cast, .int_from_float,
+            .arc_retain, .arc_release, .is_unique,
+            .panic, .ctz, .clz, .pop_count, .atomic_load,
+            => {
+                if (try p.parseExpr()) |a| args[0] = a.toOptional();
+            },
+
+            // 2 values
+            .string, .assert_eq, .fmin, .fmax, .field, .min, .max,
+            .atomic_store, .atomic_add, .atomic_exchange,
+            => {
+                if (try p.parseExpr()) |a| args[0] = a.toOptional();
+                _ = p.eatToken(.comma);
+                if (try p.parseExpr()) |b| args[1] = b.toOptional();
+            },
+
+            // 3 values
+            .atomic_cas => {
+                if (try p.parseExpr()) |a| args[0] = a.toOptional();
+                _ = p.eatToken(.comma);
+                if (try p.parseExpr()) |b| args[1] = b.toOptional();
+                _ = p.eatToken(.comma);
+                if (try p.parseExpr()) |c| args[2] = c.toOptional();
+            },
         }
         _ = p.eatToken(.rparen);
 
@@ -2463,7 +2587,8 @@ pub const Parser = struct {
     fn parseForStmtFull(p: *Parser, label: ?TokenIndex, is_inline: bool) Error!?Index {
         const for_token = p.advance();
 
-        // for await val in seq { body } — desugar to while
+        // for await val in seq { body } — store as for_stmt with is_await flag
+        // Desugaring to while(seq.next()) happens in the lowerer, not the parser
         if (p.eatToken(.kw_await) != null) {
             const binding = p.eatToken(.ident) orelse {
                 try p.addError(.expected_identifier);
@@ -2471,24 +2596,22 @@ pub const Parser = struct {
             };
             _ = p.eatToken(.kw_in);
             const sequence = try p.parseExpr() orelse return null;
-
-            // Synthesize seq.next() call
-            const field = try p.addNode(.{ .tag = .field_access, .main_token = p.tok_i, .data = .{ .node_and_token = .{ sequence, p.tok_i } } });
-            const next_call = try p.addNode(.{ .tag = .call_zero, .main_token = p.tok_i, .data = .{ .node = field } });
-
             const body = try p.parseBlockStmt() orelse {
                 try p.addError(.expected_block);
                 return null;
             };
             const label_tok: OptionalTokenIndex = if (label) |l| @enumFromInt(l) else .none;
-            const extra = try p.addExtra(Ast.WhileData{
+            const extra = try p.addExtra(Ast.ForData{
+                .binding_token = binding,
+                .index_binding_token = .none,
+                .iterable = sequence.toOptional(),
+                .range_start = .none,
+                .range_end = .none,
                 .body = body,
                 .label_token = label_tok,
-                .capture_token = @enumFromInt(binding),
-                .continue_expr = .none,
-                .flags = .{},
+                .flags = .{ .is_await = true },
             });
-            return try p.addNode(.{ .tag = .while_stmt, .main_token = for_token, .data = .{ .node_and_extra = .{ next_call, extra } } });
+            return try p.addNode(.{ .tag = .for_stmt, .main_token = for_token, .data = .{ .node_and_extra = .{ @enumFromInt(0), extra } } });
         }
 
         const first_binding = p.eatToken(.ident) orelse {
