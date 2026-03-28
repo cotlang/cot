@@ -2797,209 +2797,2578 @@ pub const Checker = struct {
     }
 
     // ---------------------------------------------------------------
-    // Stub declarations for functions that will be ported in subsequent chunks.
-    // These are referenced by the functions above and must exist for compilation.
+    // Builtin checking (ported from compiler/ lines 2325-2773)
     // ---------------------------------------------------------------
-    fn buildFuncType(self: *Checker, params: SubRange, return_type: OptionalIndex) CheckError!TypeIndex {
-        _ = self;
-        _ = params;
-        _ = return_type;
-        @panic("buildFuncType not yet ported");
+
+    fn checkBuiltinLen(self: *Checker, call_idx: Index) CheckError!TypeIndex {
+        const args = self.getCallArgNodes(call_idx);
+        const span_start = self.tree.nodeSpan(call_idx).start;
+        if (args.len != 1) { self.err.errorWithCode(span_start, .e300, "len() expects one argument"); return .invalid; }
+        const arg_type = try self.checkExpr(args[0]);
+        if (arg_type == TypeRegistry.STRING) return TypeRegistry.INT;
+        const arg = self.types.get(arg_type);
+        return switch (arg) { .array, .slice, .list => TypeRegistry.INT, else => blk: { self.err.errorWithCode(span_start, .e300, "len() argument must be string, array, slice, or list"); break :blk .invalid; } };
     }
-    fn buildEnumType(self: *Checker, idx: Index) CheckError!TypeIndex {
-        _ = self;
-        _ = idx;
-        @panic("buildEnumType not yet ported");
+
+    fn checkBuiltinAppend(self: *Checker, call_idx: Index) CheckError!TypeIndex {
+        const args = self.getCallArgNodes(call_idx);
+        const span_start = self.tree.nodeSpan(call_idx).start;
+        if (args.len != 2) { self.err.errorWithCode(span_start, .e300, "append() expects two arguments"); return .invalid; }
+        const slice_type = try self.checkExpr(args[0]);
+        const elem_type = try self.checkExpr(args[1]);
+        const slice = self.types.get(slice_type);
+        const expected_elem = switch (slice) {
+            .array => |a| a.elem,
+            .slice => |s| s.elem,
+            else => { self.err.errorWithCode(span_start, .e300, "append() first argument must be array or slice"); return .invalid; },
+        };
+        if (!self.types.isAssignable(elem_type, expected_elem))
+            self.err.errorWithCode(span_start, .e300, "append() element type mismatch");
+        return self.types.makeSlice(expected_elem) catch .invalid;
     }
-    fn buildUnionType(self: *Checker, idx: Index) CheckError!TypeIndex {
-        _ = self;
-        _ = idx;
-        @panic("buildUnionType not yet ported");
-    }
-    fn buildStructTypeWithLayout(self: *Checker, name: []const u8, fields: SubRange, layout: ast.StructLayout) CheckError!TypeIndex {
-        _ = self;
-        _ = name;
-        _ = fields;
-        _ = layout;
-        @panic("buildStructTypeWithLayout not yet ported");
-    }
-    fn resolveTypeExpr(self: *Checker, idx: Index) CheckError!TypeIndex {
-        _ = self;
-        _ = idx;
-        @panic("resolveTypeExpr not yet ported");
-    }
-    fn safeWrapType(self: *Checker, type_idx: TypeIndex) CheckError!TypeIndex {
-        _ = self;
-        _ = type_idx;
-        @panic("safeWrapType not yet ported");
-    }
-    fn isSendable(self: *Checker, type_idx: TypeIndex) bool {
-        _ = self;
-        _ = type_idx;
-        @panic("isSendable not yet ported");
-    }
-    fn checkStmt(self: *Checker, idx: Index) CheckError!void {
-        _ = self;
-        _ = idx;
-        @panic("checkStmt not yet ported");
-    }
-    fn checkBlockExpr(self: *Checker, idx: Index) CheckError!void {
-        _ = self;
-        _ = idx;
-        @panic("checkBlockExpr not yet ported");
-    }
-    fn materializeType(self: *Checker, type_idx: TypeIndex) TypeIndex {
-        _ = self;
-        _ = type_idx;
-        @panic("materializeType not yet ported");
-    }
-    fn errWithSuggestion(self: *Checker, pos: Pos, msg: []const u8, suggestion: ?[]const u8) void {
-        _ = suggestion;
-        self.err.errorWithCode(pos, .e300, msg);
-    }
-    fn findSimilarName(self: *Checker, name: []const u8) ?[]const u8 {
-        _ = self;
-        _ = name;
-        return null; // Will be ported in a later chunk
-    }
-    fn findSimilarTrait(self: *Checker, name: []const u8) ?[]const u8 {
-        _ = self;
-        _ = name;
-        return null; // Will be ported in a later chunk
-    }
-    fn checkIndex(self: *Checker, idx: Index) CheckError!TypeIndex {
-        _ = self;
-        _ = idx;
-        @panic("checkIndex not yet ported");
-    }
-    fn checkSliceExpr(self: *Checker, idx: Index) CheckError!TypeIndex {
-        _ = self;
-        _ = idx;
-        @panic("checkSliceExpr not yet ported");
-    }
-    fn checkFieldAccess(self: *Checker, idx: Index) CheckError!TypeIndex {
-        _ = self;
-        _ = idx;
-        @panic("checkFieldAccess not yet ported");
-    }
-    fn checkArrayLiteral(self: *Checker, idx: Index) CheckError!TypeIndex {
-        _ = self;
-        _ = idx;
-        @panic("checkArrayLiteral not yet ported");
-    }
-    fn checkIfExpr(self: *Checker, idx: Index) CheckError!TypeIndex {
-        _ = self;
-        _ = idx;
-        @panic("checkIfExpr not yet ported");
-    }
-    fn checkSwitchExpr(self: *Checker, idx: Index) CheckError!TypeIndex {
-        _ = self;
-        _ = idx;
-        @panic("checkSwitchExpr not yet ported");
-    }
-    fn checkBlock(self: *Checker, idx: Index) CheckError!TypeIndex {
-        _ = self;
-        _ = idx;
-        @panic("checkBlock not yet ported");
-    }
-    fn checkStructInit(self: *Checker, idx: Index) CheckError!TypeIndex {
-        _ = self;
-        _ = idx;
-        @panic("checkStructInit not yet ported");
-    }
-    fn checkNewExpr(self: *Checker, idx: Index) CheckError!TypeIndex {
-        _ = self;
-        _ = idx;
-        @panic("checkNewExpr not yet ported");
-    }
+
     fn checkBuiltinCall(self: *Checker, idx: Index) CheckError!TypeIndex {
-        _ = self;
-        _ = idx;
-        @panic("checkBuiltinCall not yet ported");
+        const bc = self.tree.builtinCallData(idx);
+        const span_start = self.tree.nodeSpan(idx).start;
+        switch (bc.kind) {
+            .size_of, .align_of => {
+                const type_arg = bc.type_arg.unwrap() orelse return .invalid;
+                const type_idx = try self.resolveTypeExpr(type_arg);
+                if (type_idx == .invalid) { self.err.errorWithCode(span_start, .e300, "requires valid type"); return .invalid; }
+                return TypeRegistry.I64;
+            },
+            .enum_len => {
+                const type_arg = bc.type_arg.unwrap() orelse return .invalid;
+                const type_idx = try self.resolveTypeExpr(type_arg);
+                if (type_idx == .invalid) { self.err.errorWithCode(span_start, .e300, "@enumLen requires valid type"); return .invalid; }
+                const info = self.types.get(type_idx);
+                if (info != .enum_type) { self.err.errorWithCode(span_start, .e300, "@enumLen requires enum type"); return .invalid; }
+                return TypeRegistry.I64;
+            },
+            .string => {
+                if (bc.arg0.unwrap()) |a0| _ = try self.checkExpr(a0);
+                if (bc.arg1.unwrap()) |a1| _ = try self.checkExpr(a1);
+                return TypeRegistry.STRING;
+            },
+            .int_cast => {
+                const type_arg = bc.type_arg.unwrap() orelse return .invalid;
+                const target_type = try self.resolveTypeExpr(type_arg);
+                if (!types_mod.isInteger(self.types.get(target_type))) { self.err.errorWithCode(span_start, .e300, "@intCast target must be integer type"); return .invalid; }
+                if (bc.arg0.unwrap()) |a0| _ = try self.checkExpr(a0);
+                return target_type;
+            },
+            .float_cast => {
+                const type_arg = bc.type_arg.unwrap() orelse return .invalid;
+                const target_type = try self.resolveTypeExpr(type_arg);
+                const target_info = self.types.get(target_type);
+                if (target_info != .basic or !target_info.basic.isFloat()) {
+                    self.err.errorWithCode(span_start, .e300, "@floatCast target must be float type");
+                    return .invalid;
+                }
+                if (bc.arg0.unwrap()) |a0| _ = try self.checkExpr(a0);
+                return target_type;
+            },
+            .float_from_int => {
+                const type_arg = bc.type_arg.unwrap() orelse return .invalid;
+                const target_type = try self.resolveTypeExpr(type_arg);
+                if (bc.arg0.unwrap()) |a0| _ = try self.checkExpr(a0);
+                return target_type;
+            },
+            .int_from_float => {
+                const arg0 = bc.arg0.unwrap() orelse return .invalid;
+                const arg_type = try self.checkExpr(arg0);
+                const info = self.types.get(arg_type);
+                if (info != .basic or !info.basic.isFloat()) {
+                    self.err.errorWithCode(span_start, .e300, "@intFromFloat operand must be a float type");
+                }
+                return TypeRegistry.I64;
+            },
+            .ptr_cast => {
+                const type_arg = bc.type_arg.unwrap() orelse return .invalid;
+                const target_type = try self.resolveTypeExpr(type_arg);
+                if (self.types.get(target_type) != .pointer) { self.err.errorWithCode(span_start, .e300, "@ptrCast target must be pointer"); return .invalid; }
+                if (bc.arg0.unwrap()) |a0| _ = try self.checkExpr(a0);
+                return target_type;
+            },
+            .ptr_to_int => {
+                const arg0 = bc.arg0.unwrap() orelse return .invalid;
+                const arg_type = try self.checkExpr(arg0);
+                const arg_info = self.types.get(arg_type);
+                if (arg_info != .pointer and arg_info != .func and arg_type != TypeRegistry.I64) {
+                    self.err.errorWithCode(span_start, .e300, "@ptrToInt operand must be a pointer");
+                    return .invalid;
+                }
+                return TypeRegistry.I64;
+            },
+            .int_to_ptr => {
+                const type_arg = bc.type_arg.unwrap() orelse return .invalid;
+                const target_type = try self.resolveTypeExpr(type_arg);
+                if (self.types.get(target_type) != .pointer) { self.err.errorWithCode(span_start, .e300, "@intToPtr target must be pointer"); return .invalid; }
+                if (bc.arg0.unwrap()) |a0| _ = try self.checkExpr(a0);
+                const elem = self.types.get(target_type).pointer.elem;
+                return self.types.makeRawPointer(elem) catch .invalid;
+            },
+            .assert => {
+                if (bc.arg0.unwrap()) |a0| _ = try self.checkExpr(a0);
+                return TypeRegistry.VOID;
+            },
+            .assert_eq => {
+                if (bc.arg0.unwrap()) |a0| _ = try self.checkExpr(a0);
+                if (bc.arg1.unwrap()) |a1| _ = try self.checkExpr(a1);
+                return TypeRegistry.VOID;
+            },
+            .ptr_of => {
+                const arg0 = bc.arg0.unwrap() orelse return .invalid;
+                const arg_type = try self.checkExpr(arg0);
+                if (arg_type != TypeRegistry.STRING) { self.err.errorWithCode(span_start, .e300, "@ptrOf requires string argument"); return .invalid; }
+                return TypeRegistry.I64;
+            },
+            .len_of => {
+                const arg0 = bc.arg0.unwrap() orelse return .invalid;
+                const arg_type = try self.checkExpr(arg0);
+                if (arg_type != TypeRegistry.STRING) { self.err.errorWithCode(span_start, .e300, "@lenOf requires string argument"); return .invalid; }
+                return TypeRegistry.I64;
+            },
+            .trap => return TypeRegistry.NORETURN,
+            .target_os, .target_arch, .target => return TypeRegistry.STRING,
+            .compile_error => {
+                const arg0 = bc.arg0.unwrap() orelse {
+                    self.err.errorWithCode(span_start, .e300, "compile error");
+                    return TypeRegistry.NORETURN;
+                };
+                const msg = self.evalConstString(arg0) orelse "compile error";
+                self.err.errorWithCode(span_start, .e300, msg);
+                return TypeRegistry.NORETURN;
+            },
+            .embed_file => {
+                if (bc.arg0.unwrap()) |a0| {
+                    const arg_tag = self.tree.nodeTag(a0);
+                    if (arg_tag != .literal_string) {
+                        self.err.errorWithCode(span_start, .e300, "@embedFile requires a string literal path");
+                    }
+                }
+                return TypeRegistry.STRING;
+            },
+            .abs, .ceil, .floor, .trunc, .round, .sqrt => {
+                const arg0 = bc.arg0.unwrap() orelse return .invalid;
+                const arg_type = try self.checkExpr(arg0);
+                if (arg_type != TypeRegistry.F64 and arg_type != TypeRegistry.F32 and arg_type != TypeRegistry.UNTYPED_FLOAT) {
+                    self.err.errorWithCode(span_start, .e300, "math builtin requires float argument");
+                    return .invalid;
+                }
+                return TypeRegistry.F64;
+            },
+            .fmin, .fmax => {
+                const a0 = bc.arg0.unwrap() orelse return .invalid;
+                const a1 = bc.arg1.unwrap() orelse return .invalid;
+                const arg1_type = try self.checkExpr(a0);
+                const arg2_type = try self.checkExpr(a1);
+                const a1_float = arg1_type == TypeRegistry.F64 or arg1_type == TypeRegistry.F32 or arg1_type == TypeRegistry.UNTYPED_FLOAT;
+                const a2_float = arg2_type == TypeRegistry.F64 or arg2_type == TypeRegistry.F32 or arg2_type == TypeRegistry.UNTYPED_FLOAT;
+                if (!a1_float or !a2_float) {
+                    self.err.errorWithCode(span_start, .e300, "@fmin/@fmax require float arguments");
+                    return .invalid;
+                }
+                return TypeRegistry.F64;
+            },
+            .has_field => {
+                const type_arg = bc.type_arg.unwrap() orelse { self.err.errorWithCode(span_start, .e300, "@hasField requires valid type"); return .invalid; };
+                const type_idx = try self.resolveTypeExpr(type_arg);
+                if (type_idx == .invalid) { self.err.errorWithCode(span_start, .e300, "@hasField requires valid type"); return .invalid; }
+                const arg0 = bc.arg0.unwrap() orelse { self.err.errorWithCode(span_start, .e300, "@hasField requires string literal field name"); return .invalid; };
+                _ = self.evalConstString(arg0) orelse {
+                    self.err.errorWithCode(span_start, .e300, "@hasField requires string literal field name");
+                    return .invalid;
+                };
+                return TypeRegistry.BOOL;
+            },
+            .type_of => {
+                const arg0 = bc.arg0.unwrap() orelse return .invalid;
+                return try self.checkExpr(arg0);
+            },
+            .field => {
+                const arg0 = bc.arg0.unwrap() orelse return .invalid;
+                const arg1 = bc.arg1.unwrap() orelse return .invalid;
+                var base_type = try self.checkExpr(arg0);
+                while (self.types.get(base_type) == .pointer) base_type = self.types.get(base_type).pointer.elem;
+                const name_str = self.evalConstString(arg1) orelse {
+                    self.err.errorWithCode(span_start, .e300, "@field requires string literal field name");
+                    return .invalid;
+                };
+                const info = self.types.get(base_type);
+                if (info == .struct_type) {
+                    for (info.struct_type.fields) |sf| {
+                        if (std.mem.eql(u8, sf.name, name_str)) return sf.type_idx;
+                    }
+                    if (findSimilarField(name_str, info.struct_type.fields)) |suggestion| {
+                        const fmsg = std.fmt.allocPrint(self.allocator, "struct has no field with this name; did you mean '{s}'?", .{suggestion}) catch "struct has no field with this name";
+                        self.err.errorWithCode(span_start, .e300, fmsg);
+                    } else {
+                        self.err.errorWithCode(span_start, .e300, "struct has no field with this name");
+                    }
+                    return .invalid;
+                }
+                self.err.errorWithCode(span_start, .e300, "@field requires struct type");
+                return .invalid;
+            },
+            .int_from_enum => {
+                const arg0 = bc.arg0.unwrap() orelse return .invalid;
+                const arg_type = try self.checkExpr(arg0);
+                if (self.types.get(arg_type) != .enum_type) {
+                    self.err.errorWithCode(span_start, .e300, "@intFromEnum requires enum argument");
+                    return .invalid;
+                }
+                return TypeRegistry.I64;
+            },
+            .enum_from_int => {
+                const target_type = blk: {
+                    if (bc.type_arg.unwrap()) |ta| break :blk try self.resolveTypeExpr(ta);
+                    if (self.expected_type != .invalid) break :blk self.expected_type;
+                    self.err.errorWithCode(span_start, .e300, "@enumFromInt requires type argument or type context (use @as(T, @enumFromInt(val)))");
+                    return .invalid;
+                };
+                const target_info = self.types.get(target_type);
+                if (target_info != .enum_type) {
+                    self.err.errorWithCode(span_start, .e300, "@enumFromInt target must be enum type");
+                    return .invalid;
+                }
+                const arg0 = bc.arg0.unwrap() orelse return .invalid;
+                _ = try self.checkExpr(arg0);
+                if (self.evalConstExpr(arg0)) |val| {
+                    const num_variants: i64 = @intCast(target_info.enum_type.variants.len);
+                    if (val < 0 or val >= num_variants) {
+                        self.err.errorWithCode(span_start, .e300, "@enumFromInt value out of range for enum type");
+                        return .invalid;
+                    }
+                }
+                return target_type;
+            },
+            .tag_name => {
+                const arg0 = bc.arg0.unwrap() orelse return .invalid;
+                const arg_type = try self.checkExpr(arg0);
+                const info = self.types.get(arg_type);
+                if (info != .enum_type and info != .union_type) {
+                    self.err.errorWithCode(span_start, .e300, "@tagName requires enum or union argument");
+                    return .invalid;
+                }
+                return TypeRegistry.STRING;
+            },
+            .error_name => {
+                const arg0 = bc.arg0.unwrap() orelse return .invalid;
+                const arg_type = try self.checkExpr(arg0);
+                const arg_info = self.types.get(arg_type);
+                if (arg_info != .error_set and arg_info != .error_union) {
+                    self.err.errorWithCode(span_start, .e300, "@errorName operand must be error type");
+                    return .invalid;
+                }
+                return TypeRegistry.STRING;
+            },
+            .int_from_bool => {
+                const arg0 = bc.arg0.unwrap() orelse return .invalid;
+                const arg_type = try self.checkExpr(arg0);
+                if (arg_type != TypeRegistry.BOOL and arg_type != TypeRegistry.UNTYPED_BOOL) {
+                    self.err.errorWithCode(span_start, .e300, "@intFromBool requires bool argument");
+                    return .invalid;
+                }
+                return TypeRegistry.I64;
+            },
+            .bit_cast => {
+                const type_arg = bc.type_arg.unwrap() orelse return .invalid;
+                const arg0 = bc.arg0.unwrap() orelse return .invalid;
+                const target_type = try self.resolveTypeExpr(type_arg);
+                const arg_type = try self.checkExpr(arg0);
+                const target_info = self.types.get(target_type);
+                const arg_info = self.types.get(arg_type);
+                if (target_info == .pointer or target_info == .enum_type) {
+                    self.err.errorWithCode(span_start, .e300, "@bitCast target cannot be pointer or enum type");
+                    return .invalid;
+                }
+                if (arg_info == .pointer or arg_info == .enum_type) {
+                    self.err.errorWithCode(span_start, .e300, "@bitCast source cannot be pointer or enum type");
+                    return .invalid;
+                }
+                const target_size = self.types.sizeOf(target_type);
+                const arg_size = self.types.sizeOf(arg_type);
+                if (target_size != arg_size) {
+                    self.err.errorWithCode(span_start, .e300, "@bitCast requires same-size types");
+                    return .invalid;
+                }
+                return target_type;
+            },
+            .truncate => {
+                const type_arg = bc.type_arg.unwrap() orelse return .invalid;
+                const target_type = try self.resolveTypeExpr(type_arg);
+                if (!types_mod.isInteger(self.types.get(target_type))) {
+                    self.err.errorWithCode(span_start, .e300, "@truncate target must be integer type");
+                    return .invalid;
+                }
+                if (bc.arg0.unwrap()) |a0| _ = try self.checkExpr(a0);
+                return target_type;
+            },
+            .as => {
+                const type_arg = bc.type_arg.unwrap() orelse return .invalid;
+                const target_type = try self.resolveTypeExpr(type_arg);
+                const saved_expected = self.expected_type;
+                self.expected_type = target_type;
+                defer self.expected_type = saved_expected;
+                if (bc.arg0.unwrap()) |a0| _ = try self.checkExpr(a0);
+                return target_type;
+            },
+            .offset_of => {
+                const type_arg = bc.type_arg.unwrap() orelse return .invalid;
+                const type_idx = try self.resolveTypeExpr(type_arg);
+                const info = self.types.get(type_idx);
+                if (info != .struct_type) {
+                    self.err.errorWithCode(span_start, .e300, "@offsetOf requires struct type");
+                    return .invalid;
+                }
+                const arg0 = bc.arg0.unwrap() orelse { self.err.errorWithCode(span_start, .e300, "@offsetOf requires string literal field name"); return .invalid; };
+                const name_str = self.evalConstString(arg0) orelse {
+                    self.err.errorWithCode(span_start, .e300, "@offsetOf requires string literal field name");
+                    return .invalid;
+                };
+                var found = false;
+                for (info.struct_type.fields) |sf| {
+                    if (std.mem.eql(u8, sf.name, name_str)) { found = true; break; }
+                }
+                if (!found) {
+                    self.err.errorWithCode(span_start, .e300, "struct has no field with this name");
+                    return .invalid;
+                }
+                return TypeRegistry.I64;
+            },
+            .min, .max => {
+                const a0 = bc.arg0.unwrap() orelse return .invalid;
+                const a1 = bc.arg1.unwrap() orelse return .invalid;
+                const a_type = try self.checkExpr(a0);
+                const b_type = try self.checkExpr(a1);
+                if (!types_mod.isNumeric(self.types.get(a_type))) {
+                    self.err.errorWithCode(span_start, .e300, "@min/@max requires numeric types");
+                    return .invalid;
+                }
+                if (!types_mod.isNumeric(self.types.get(b_type))) {
+                    self.err.errorWithCode(span_start, .e300, "@min/@max requires numeric types");
+                    return .invalid;
+                }
+                return TypeRegistry.commonType(a_type, b_type);
+            },
+            .align_cast => {
+                if (bc.type_arg.unwrap()) |ta| _ = try self.resolveTypeExpr(ta);
+                if (bc.arg0.unwrap()) |a0| _ = try self.checkExpr(a0);
+                return TypeRegistry.I64;
+            },
+            .const_cast => {
+                const arg0 = bc.arg0.unwrap() orelse return .invalid;
+                return try self.checkExpr(arg0);
+            },
+            .arc_retain, .arc_release => {
+                if (bc.arg0.unwrap()) |a0| _ = try self.checkExpr(a0);
+                return TypeRegistry.VOID;
+            },
+            .is_unique => {
+                if (bc.arg0.unwrap()) |a0| _ = try self.checkExpr(a0);
+                return TypeRegistry.BOOL;
+            },
+            .panic => {
+                if (bc.arg0.unwrap()) |a0| _ = try self.checkExpr(a0);
+                return TypeRegistry.NORETURN;
+            },
+            .ctz, .clz, .pop_count => {
+                if (bc.arg0.unwrap()) |a0| _ = try self.checkExpr(a0);
+                return TypeRegistry.I64;
+            },
+            .type_name => {
+                const type_arg = bc.type_arg.unwrap() orelse { self.err.errorWithCode(span_start, .e300, "@typeName requires valid type"); return .invalid; };
+                const type_idx = try self.resolveTypeExpr(type_arg);
+                if (type_idx == .invalid) { self.err.errorWithCode(span_start, .e300, "@typeName requires valid type"); return .invalid; }
+                return TypeRegistry.STRING;
+            },
+            .enum_name => {
+                const type_arg = bc.type_arg.unwrap() orelse { self.err.errorWithCode(span_start, .e300, "@enumName requires valid type"); return .invalid; };
+                const type_idx = try self.resolveTypeExpr(type_arg);
+                if (type_idx == .invalid) { self.err.errorWithCode(span_start, .e300, "@enumName requires valid type"); return .invalid; }
+                const info = self.types.get(type_idx);
+                if (info != .enum_type) { self.err.errorWithCode(span_start, .e300, "@enumName requires enum type"); return .invalid; }
+                if (bc.arg0.unwrap()) |a0| _ = try self.checkExpr(a0);
+                return TypeRegistry.STRING;
+            },
+            .type_info => {
+                const type_arg = bc.type_arg.unwrap() orelse { self.err.errorWithCode(span_start, .e300, "@typeInfo requires valid type"); return .invalid; };
+                const type_idx = try self.resolveTypeExpr(type_arg);
+                if (type_idx == .invalid) { self.err.errorWithCode(span_start, .e300, "@typeInfo requires valid type"); return .invalid; }
+                return TypeRegistry.I64;
+            },
+            .atomic_load => {
+                const arg0 = bc.arg0.unwrap() orelse return .invalid;
+                const arg_type = try self.checkExpr(arg0);
+                if (self.types.get(arg_type) != .pointer) { self.err.errorWithCode(span_start, .e300, "@atomicLoad requires pointer argument"); return .invalid; }
+                return TypeRegistry.I64;
+            },
+            .atomic_store => {
+                const arg0 = bc.arg0.unwrap() orelse return .invalid;
+                const arg_type = try self.checkExpr(arg0);
+                if (self.types.get(arg_type) != .pointer) { self.err.errorWithCode(span_start, .e300, "@atomicStore requires pointer argument"); return .invalid; }
+                if (bc.arg1.unwrap()) |a1| _ = try self.checkExpr(a1);
+                return TypeRegistry.VOID;
+            },
+            .atomic_add => {
+                const arg0 = bc.arg0.unwrap() orelse return .invalid;
+                const arg_type = try self.checkExpr(arg0);
+                if (self.types.get(arg_type) != .pointer) { self.err.errorWithCode(span_start, .e300, "@atomicAdd requires pointer argument"); return .invalid; }
+                if (bc.arg1.unwrap()) |a1| _ = try self.checkExpr(a1);
+                return TypeRegistry.I64;
+            },
+            .atomic_cas => {
+                const arg0 = bc.arg0.unwrap() orelse return .invalid;
+                const arg_type = try self.checkExpr(arg0);
+                if (self.types.get(arg_type) != .pointer) { self.err.errorWithCode(span_start, .e300, "@atomicCAS requires pointer argument"); return .invalid; }
+                if (bc.arg1.unwrap()) |a1| _ = try self.checkExpr(a1);
+                if (bc.arg2.unwrap()) |a2| _ = try self.checkExpr(a2);
+                return TypeRegistry.I64;
+            },
+            .atomic_exchange => {
+                const arg0 = bc.arg0.unwrap() orelse return .invalid;
+                const arg_type = try self.checkExpr(arg0);
+                if (self.types.get(arg_type) != .pointer) { self.err.errorWithCode(span_start, .e300, "@atomicExchange requires pointer argument"); return .invalid; }
+                if (bc.arg1.unwrap()) |a1| _ = try self.checkExpr(a1);
+                return TypeRegistry.I64;
+            },
+        }
     }
-    fn checkStringInterp(self: *Checker, idx: Index) CheckError!TypeIndex {
-        _ = self;
-        _ = idx;
-        @panic("checkStringInterp not yet ported");
+
+    // ---------------------------------------------------------------
+    // Complex expressions (ported from compiler/ lines 2774-3706)
+    // ---------------------------------------------------------------
+
+    fn checkIndex(self: *Checker, idx: Index) CheckError!TypeIndex {
+        const data = self.tree.nodeData(idx).node_and_node;
+        const base_idx = data[0];
+        const index_idx = data[1];
+        // Check if base is a comptime array
+        if (self.evalComptimeValue(base_idx)) |base_cv| {
+            if (base_cv == .array) {
+                if (base_cv.array.elements.items.len > 0) {
+                    const first = base_cv.array.elements.items[0];
+                    return switch (first) {
+                        .int => TypeRegistry.I64,
+                        .string => TypeRegistry.STRING,
+                        .boolean => TypeRegistry.BOOL,
+                        .enum_field => TypeRegistry.I64,
+                        else => TypeRegistry.I64,
+                    };
+                }
+                return TypeRegistry.I64;
+            }
+        }
+        var base_type = try self.checkExpr(base_idx);
+        const index_type = try self.checkExpr(index_idx);
+        if (!types_mod.isInteger(self.types.get(index_type))) { self.err.errorWithCode(self.tree.nodeSpan(idx).start, .e300, "index must be integer"); return .invalid; }
+        while (self.types.get(base_type) == .pointer) base_type = self.types.get(base_type).pointer.elem;
+        if (base_type == TypeRegistry.STRING) return TypeRegistry.U8;
+        const base = self.types.get(base_type);
+        return switch (base) { .array => |a| a.elem, .slice => |s| s.elem, .list => |l| l.elem, else => blk: { self.err.errorWithCode(self.tree.nodeSpan(idx).start, .e300, "cannot index this type"); break :blk .invalid; } };
     }
-    fn checkTryExpr(self: *Checker, idx: Index) CheckError!TypeIndex {
-        _ = self;
-        _ = idx;
-        @panic("checkTryExpr not yet ported");
+
+    fn checkSliceExpr(self: *Checker, idx: Index) CheckError!TypeIndex {
+        const data = self.tree.nodeData(idx);
+        const base_idx: Index = data.node_and_extra[0];
+        const extra = self.tree.extraData(data.node_and_extra[1], ast.SliceData);
+        var base_type = try self.checkExpr(base_idx);
+        if (extra.start.unwrap()) |s| _ = try self.checkExpr(s);
+        if (extra.end.unwrap()) |e| _ = try self.checkExpr(e);
+        while (self.types.get(base_type) == .pointer) base_type = self.types.get(base_type).pointer.elem;
+        const base = self.types.get(base_type);
+        if (base_type == TypeRegistry.STRING) return TypeRegistry.STRING;
+        return switch (base) { .array => |a| self.types.makeSlice(a.elem), .slice => base_type, else => blk: { self.err.errorWithCode(self.tree.nodeSpan(idx).start, .e300, "cannot slice this type"); break :blk .invalid; } };
     }
-    fn checkAwaitExpr(self: *Checker, idx: Index) CheckError!TypeIndex {
-        _ = self;
-        _ = idx;
-        @panic("checkAwaitExpr not yet ported");
+
+    fn checkFieldAccess(self: *Checker, idx: Index) CheckError!TypeIndex {
+        const data = self.tree.nodeData(idx);
+        const base_node: Index = data.node_and_token[0];
+        const field_tok = data.node_and_token[1];
+        const field_name = self.tree.tokenSlice(field_tok);
+        const span_start = self.tree.nodeSpan(idx).start;
+
+        // Check if base is a comptime value
+        if (self.evalComptimeValue(base_node)) |base_cv| {
+            switch (base_cv) {
+                .type_info => {
+                    if (std.mem.eql(u8, field_name, "fields")) return TypeRegistry.I64;
+                    if (std.mem.eql(u8, field_name, "name")) return TypeRegistry.STRING;
+                    self.err.errorWithCode(span_start, .e300, "no such field on type info");
+                    return .invalid;
+                },
+                .enum_field => {
+                    if (std.mem.eql(u8, field_name, "name")) return TypeRegistry.STRING;
+                    if (std.mem.eql(u8, field_name, "value")) return TypeRegistry.I64;
+                    self.err.errorWithCode(span_start, .e300, "no such field on enum field");
+                    return .invalid;
+                },
+                .array => {
+                    if (std.mem.eql(u8, field_name, "len")) return TypeRegistry.I64;
+                    self.err.errorWithCode(span_start, .e300, "no such field on array");
+                    return .invalid;
+                },
+                else => {},
+            }
+        }
+
+        // Check for shorthand .variant in enum/union context
+        const base_tag = self.tree.nodeTag(base_node);
+        _ = base_tag;
+        // If base is "none" (shorthand), resolve from context
+        // In the compact AST, field_access with no base = shorthand .variant.
+        // The base node might be a sentinel/none. Check by examining if it's valid.
+        // Actually in compact AST, field_access always has base + field_token.
+        // Shorthand .variant uses a different representation or has a dummy base.
+
+        // Check if this is enum shorthand: .variant in switch/comparison context
+        // In the compact AST, shorthand .field has base_node that is an ident for empty string
+        // or the base is simply the expression being accessed.
+
+        // Nested type namespace: TypeName.NestedType
+        if (self.tree.nodeTag(base_node) == .ident) {
+            const base_name = self.tree.tokenSlice(self.tree.nodeMainToken(base_node));
+            var buf: [512]u8 = undefined;
+            const qualified = std.fmt.bufPrint(&buf, "{s}_{s}", .{ base_name, field_name }) catch "";
+            if (qualified.len > 0) {
+                if (self.resolveTypeByName(qualified)) |nested_type_idx| {
+                    return nested_type_idx;
+                }
+                if (self.scope.lookup(qualified)) |sym| {
+                    if (sym.kind == .constant) {
+                        if (sym.type_idx != .invalid) return sym.type_idx;
+                    }
+                    if (sym.kind == .function and sym.type_idx != .invalid) {
+                        if (self.lookupMethod(base_name, field_name)) |m| {
+                            if (m.is_static) {
+                                if (self.resolveTypeByName(base_name)) |base_type_idx| {
+                                    try self.expr_types.put(base_node, base_type_idx);
+                                }
+                                return sym.type_idx;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        var base_type = try self.checkExpr(base_node);
+
+        // Auto-deref
+        while (true) {
+            switch (self.types.get(base_type)) {
+                .pointer => |ptr| base_type = ptr.elem,
+                else => break,
+            }
+        }
+
+        const base = self.types.get(base_type);
+
+        switch (base) {
+            .struct_type => |st| {
+                for (st.fields) |fld| if (std.mem.eql(u8, fld.name, field_name)) return fld.type_idx;
+                if (self.lookupMethod(st.name, field_name)) |m| return m.func_type;
+                self.errWithSuggestion(span_start, "undefined field", findSimilarField(field_name, st.fields));
+                return .invalid;
+            },
+            .enum_type => |et| {
+                for (et.variants) |v| if (std.mem.eql(u8, v.name, field_name)) return base_type;
+                if (self.lookupMethod(et.name, field_name)) |m| return m.func_type;
+                self.errWithSuggestion(span_start, "undefined variant", findSimilarVariant(field_name, et.variants));
+                return .invalid;
+            },
+            .union_type => |ut| {
+                if (std.mem.eql(u8, field_name, "tag")) return TypeRegistry.I64;
+                // Check if base is a type name (constructor) vs value (extraction)
+                const is_type_access = blk: {
+                    if (self.tree.nodeTag(base_node) == .ident) {
+                        const bname = self.tree.tokenSlice(self.tree.nodeMainToken(base_node));
+                        if (self.scope.lookup(bname)) |sym| {
+                            break :blk sym.kind == .type_name;
+                        }
+                    }
+                    break :blk false;
+                };
+                for (ut.variants) |v| if (std.mem.eql(u8, v.name, field_name)) {
+                    if (v.payload_type == .invalid) return base_type;
+                    if (!is_type_access) return v.payload_type;
+                    // Constructor: Result.Ok returns function type
+                    const params = try self.allocator.alloc(types_mod.FuncParam, 1);
+                    params[0] = .{ .name = "payload", .type_idx = v.payload_type };
+                    return try self.types.add(.{ .func = .{ .params = params, .return_type = base_type } });
+                };
+                self.errWithSuggestion(span_start, "undefined variant", findSimilarVariant(field_name, ut.variants));
+                return .invalid;
+            },
+            .map => |mt| {
+                if (std.mem.eql(u8, field_name, "set")) {
+                    const params = try self.allocator.alloc(types_mod.FuncParam, 2);
+                    params[0] = .{ .name = "key", .type_idx = mt.key };
+                    params[1] = .{ .name = "value", .type_idx = mt.value };
+                    return try self.types.add(.{ .func = .{ .params = params, .return_type = TypeRegistry.VOID } });
+                } else if (std.mem.eql(u8, field_name, "get")) {
+                    const params = try self.allocator.alloc(types_mod.FuncParam, 1);
+                    params[0] = .{ .name = "key", .type_idx = mt.key };
+                    return try self.types.add(.{ .func = .{ .params = params, .return_type = mt.value } });
+                } else if (std.mem.eql(u8, field_name, "has")) {
+                    const params = try self.allocator.alloc(types_mod.FuncParam, 1);
+                    params[0] = .{ .name = "key", .type_idx = mt.key };
+                    return try self.types.add(.{ .func = .{ .params = params, .return_type = TypeRegistry.BOOL } });
+                }
+                self.errWithSuggestion(span_start, "undefined field", editDistSuggest(field_name, &.{ "set", "get", "has" }));
+                return .invalid;
+            },
+            .list => |lt| {
+                if (std.mem.eql(u8, field_name, "push")) {
+                    const params = try self.allocator.alloc(types_mod.FuncParam, 1);
+                    params[0] = .{ .name = "value", .type_idx = lt.elem };
+                    return try self.types.add(.{ .func = .{ .params = params, .return_type = TypeRegistry.VOID } });
+                } else if (std.mem.eql(u8, field_name, "get")) {
+                    const params = try self.allocator.alloc(types_mod.FuncParam, 1);
+                    params[0] = .{ .name = "index", .type_idx = TypeRegistry.INT };
+                    return try self.types.add(.{ .func = .{ .params = params, .return_type = lt.elem } });
+                } else if (std.mem.eql(u8, field_name, "len")) {
+                    return try self.types.add(.{ .func = .{ .params = &.{}, .return_type = TypeRegistry.INT } });
+                }
+                self.errWithSuggestion(span_start, "undefined field", editDistSuggest(field_name, &.{ "push", "get", "len" }));
+                return .invalid;
+            },
+            .slice => |sl| {
+                if (std.mem.eql(u8, field_name, "ptr")) return try self.types.add(.{ .pointer = .{ .elem = sl.elem } })
+                else if (std.mem.eql(u8, field_name, "len")) return TypeRegistry.I64;
+                if (base_type == TypeRegistry.STRING) {
+                    if (self.lookupMethod("string", field_name)) |m| return m.func_type;
+                }
+                self.errWithSuggestion(span_start, "undefined field", editDistSuggest(field_name, &.{ "ptr", "len" }));
+                return .invalid;
+            },
+            .tuple => |tup| {
+                const tup_idx = std.fmt.parseInt(u32, field_name, 10) catch {
+                    self.err.errorWithCode(span_start, .e300, "tuple fields must be numeric (e.g. .0, .1)");
+                    return .invalid;
+                };
+                if (tup_idx >= tup.element_types.len) {
+                    self.err.errorWithCode(span_start, .e300, "tuple index out of bounds");
+                    return .invalid;
+                }
+                return tup.element_types[tup_idx];
+            },
+            .basic => |bk| {
+                if (self.lookupMethod(bk.name(), field_name)) |m| return m.func_type;
+                self.err.errorWithCode(span_start, .e300, "cannot access field on this type");
+                return .invalid;
+            },
+            .existential => |exist| {
+                for (exist.method_names) |mn| {
+                    if (std.mem.eql(u8, mn, field_name)) {
+                        if (exist.conforming_types.len > 0) {
+                            if (self.lookupMethod(exist.conforming_types[0], field_name)) |m| {
+                                const ft = self.types.get(m.func_type);
+                                if (ft == .func and ft.func.params.len > 0) {
+                                    const new_params = ft.func.params[1..];
+                                    return try self.types.add(.{ .func = .{ .params = new_params, .return_type = ft.func.return_type } });
+                                }
+                                return m.func_type;
+                            }
+                        }
+                        return TypeRegistry.VOID;
+                    }
+                }
+                self.err.errorWithCode(span_start, .e300, "trait has no such method");
+                return .invalid;
+            },
+            else => {
+                self.err.errorWithCode(span_start, .e300, "cannot access field on this type");
+                return .invalid;
+            },
+        }
     }
-    fn checkTaskExpr(self: *Checker, idx: Index) CheckError!TypeIndex {
-        _ = self;
-        _ = idx;
-        @panic("checkTaskExpr not yet ported");
+
+    fn checkStructInit(self: *Checker, idx: Index) CheckError!TypeIndex {
+        const tag = self.tree.nodeTag(idx);
+        const span_start = self.tree.nodeSpan(idx).start;
+        // Extract type name, type args, and field info from compact AST
+        var type_name: []const u8 = "";
+        var field_pairs: []const u32 = &.{};
+        var type_args_range = SubRange.empty;
+        if (tag == .struct_init_one) {
+            const data = self.tree.nodeData(idx);
+            const si1 = self.tree.extraData(data.node_and_extra[1], ast.StructInitOne);
+            if (si1.type_name_token.unwrap()) |tn_tok| type_name = self.tree.tokenSlice(tn_tok);
+            // Single field: name_token + value_node
+            const fname = self.tree.tokenSlice(si1.field_name_token);
+            _ = fname;
+            field_pairs = &.{}; // handled specially below
+            // For struct_init_one, check the single field inline
+            const struct_type_idx = if (type_name.len == 0) blk: {
+                if (self.expected_type != .invalid and self.types.get(self.expected_type) == .struct_type) break :blk self.expected_type;
+                self.err.errorWithCode(span_start, .e300, "cannot infer type for anonymous struct literal");
+                return .invalid;
+            } else self.resolveTypeByName(type_name) orelse {
+                self.errWithSuggestion(span_start, "undefined type", self.findSimilarType(type_name));
+                return .invalid;
+            };
+            const struct_type = self.types.get(struct_type_idx);
+            if (struct_type != .struct_type) { self.err.errorWithCode(span_start, .e300, "not a struct type"); return .invalid; }
+            // Check single field
+            const fi_name = self.tree.tokenSlice(si1.field_name_token);
+            var found = false;
+            for (struct_type.struct_type.fields) |sf| if (std.mem.eql(u8, sf.name, fi_name)) {
+                found = true;
+                const saved_expected = self.expected_type;
+                self.expected_type = sf.type_idx;
+                const vt = try self.checkExpr(si1.field_value);
+                self.expected_type = saved_expected;
+                if (!self.types.isAssignable(vt, sf.type_idx)) {
+                    const vt_t = self.types.get(vt);
+                    const is_safe_deref = self.safe_mode and vt_t == .pointer and
+                        self.types.isAssignable(vt_t.pointer.elem, sf.type_idx);
+                    const sf_t = self.types.get(sf.type_idx);
+                    const is_safe_ref = self.safe_mode and sf_t == .pointer and
+                        self.types.isAssignable(vt, sf_t.pointer.elem);
+                    if (!is_safe_deref and !is_safe_ref) self.err.errorWithCode(span_start, .e300, "type mismatch in field");
+                }
+                break;
+            };
+            if (!found) self.errWithSuggestion(span_start, "unknown field", findSimilarField(fi_name, struct_type.struct_type.fields));
+            // Check required fields
+            for (struct_type.struct_type.fields) |sf| {
+                if (sf.default_value != .none) continue;
+                if (!std.mem.eql(u8, sf.name, fi_name)) self.err.errorWithCode(span_start, .e300, "missing field in struct init");
+            }
+            if (self.actor_types.contains(struct_type.struct_type.name)) return try self.types.makePointer(struct_type_idx);
+            return struct_type_idx;
+        } else {
+            // struct_init: multiple fields
+            const data = self.tree.nodeData(idx);
+            const si = self.tree.extraData(data.node_and_extra[1], ast.StructInit);
+            if (si.type_name_token.unwrap()) |tn_tok| type_name = self.tree.tokenSlice(tn_tok);
+            type_args_range = si.type_args;
+            field_pairs = self.tree.extraSlice(si.fields);
+        }
+        const struct_type_idx = if (type_name.len == 0) blk: {
+            if (self.expected_type != .invalid and self.types.get(self.expected_type) == .struct_type) break :blk self.expected_type;
+            self.err.errorWithCode(span_start, .e300, "cannot infer type for anonymous struct literal");
+            return .invalid;
+        } else if (type_args_range.len() > 0)
+            try self.resolveGenericInstance_byName(type_name, type_args_range, self.tree.nodeSpan(idx))
+        else
+            self.resolveTypeByName(type_name) orelse {
+                self.errWithSuggestion(span_start, "undefined type", self.findSimilarType(type_name));
+                return .invalid;
+            };
+        const struct_type = self.types.get(struct_type_idx);
+        if (struct_type != .struct_type) { self.err.errorWithCode(span_start, .e300, "not a struct type"); return .invalid; }
+        // Check field pairs (name_token, value_node alternating)
+        var fi: usize = 0;
+        while (fi + 1 < field_pairs.len) : (fi += 2) {
+            const fname_tok: TokenIndex = @enumFromInt(field_pairs[fi]);
+            const fval_node: Index = @enumFromInt(field_pairs[fi + 1]);
+            const fi_name = self.tree.tokenSlice(fname_tok);
+            var found = false;
+            for (struct_type.struct_type.fields) |sf| if (std.mem.eql(u8, sf.name, fi_name)) {
+                found = true;
+                const saved_expected = self.expected_type;
+                self.expected_type = sf.type_idx;
+                const vt = try self.checkExpr(fval_node);
+                self.expected_type = saved_expected;
+                if (!self.types.isAssignable(vt, sf.type_idx)) {
+                    const vt_t = self.types.get(vt);
+                    const is_safe_deref = self.safe_mode and vt_t == .pointer and
+                        self.types.isAssignable(vt_t.pointer.elem, sf.type_idx);
+                    const sf_t = self.types.get(sf.type_idx);
+                    const is_safe_ref = self.safe_mode and sf_t == .pointer and
+                        self.types.isAssignable(vt, sf_t.pointer.elem);
+                    if (!is_safe_deref and !is_safe_ref) self.err.errorWithCode(span_start, .e300, "type mismatch in field");
+                }
+                break;
+            };
+            if (!found) self.errWithSuggestion(span_start, "unknown field", findSimilarField(fi_name, struct_type.struct_type.fields));
+        }
+        // Check required fields
+        for (struct_type.struct_type.fields) |sf| {
+            if (sf.default_value != .none) continue;
+            var provided = false;
+            var fi2: usize = 0;
+            while (fi2 + 1 < field_pairs.len) : (fi2 += 2) {
+                const ftok: TokenIndex = @enumFromInt(field_pairs[fi2]);
+                if (std.mem.eql(u8, sf.name, self.tree.tokenSlice(ftok))) { provided = true; break; }
+            }
+            if (!provided) self.err.errorWithCode(span_start, .e300, "missing field in struct init");
+        }
+        if (self.actor_types.contains(struct_type.struct_type.name)) return try self.types.makePointer(struct_type_idx);
+        return struct_type_idx;
     }
-    fn checkCatchExpr(self: *Checker, idx: Index) CheckError!TypeIndex {
-        _ = self;
-        _ = idx;
-        @panic("checkCatchExpr not yet ported");
+
+    /// Helper for resolving generic instance from a name + type_args SubRange.
+    fn resolveGenericInstance_byName(self: *Checker, name: []const u8, type_args_range: SubRange, span: Span) CheckError!TypeIndex {
+        const type_arg_nodes = self.tree.extraNodes(type_args_range);
+        // Use the same logic as resolveGenericInstance
+        const gen_info = self.generics.generic_structs.get(name) orelse {
+            if (std.mem.eql(u8, name, "List") and type_arg_nodes.len == 1) {
+                const elem_type = try self.resolveTypeExpr(type_arg_nodes[0]);
+                return try self.types.makeList(elem_type);
+            }
+            if (std.mem.eql(u8, name, "Map") and type_arg_nodes.len == 2) {
+                const key_type = try self.resolveTypeExpr(type_arg_nodes[0]);
+                const val_type = try self.resolveTypeExpr(type_arg_nodes[1]);
+                return try self.types.makeMap(key_type, val_type);
+            }
+            self.errWithSuggestion(span.start, "undefined generic type", self.findSimilarType(name));
+            return .invalid;
+        };
+        if (type_arg_nodes.len != gen_info.type_params.len) {
+            self.err.errorWithCode(span.start, .e300, "wrong number of type arguments");
+            return .invalid;
+        }
+        var resolved_args = std.ArrayListUnmanaged(TypeIndex){};
+        defer resolved_args.deinit(self.allocator);
+        for (type_arg_nodes) |arg_node| {
+            try resolved_args.append(self.allocator, try self.resolveTypeExpr(arg_node));
+        }
+        const cache_key = try self.buildGenericCacheKey(name, resolved_args.items);
+        if (self.generics.instantiation_cache.get(cache_key)) |cached| return cached;
+        // Build the concrete type
+        var sub_map = std.StringHashMap(TypeIndex).init(self.allocator);
+        defer sub_map.deinit();
+        for (gen_info.type_params, 0..) |param_name, i| {
+            try sub_map.put(param_name, resolved_args.items[i]);
+        }
+        const saved_tree = self.tree;
+        const saved_safe_mode = self.safe_mode;
+        const saved_scope = self.scope;
+        self.tree = gen_info.tree;
+        if (gen_info.tree.file) |file| self.safe_mode = file.safe_mode;
+        if (gen_info.scope) |s| self.scope = s;
+        defer { self.tree = saved_tree; self.safe_mode = saved_safe_mode; self.scope = saved_scope; }
+        const struct_decl = self.tree.structDeclData(gen_info.node_idx);
+        const old_sub = self.type_substitution;
+        self.type_substitution = sub_map;
+        const concrete_type = try self.buildStructTypeWithLayout(cache_key, struct_decl.fields, struct_decl.layout);
+        self.type_substitution = old_sub;
+        try self.types.registerNamed(cache_key, concrete_type);
+        try self.generics.instantiation_cache.put(cache_key, concrete_type);
+        try self.instantiateGenericImplMethods(name, cache_key, resolved_args.items);
+        return concrete_type;
     }
-    fn checkOrElseExpr(self: *Checker, idx: Index) CheckError!TypeIndex {
-        _ = self;
-        _ = idx;
-        @panic("checkOrElseExpr not yet ported");
+
+    fn checkNewExpr(self: *Checker, idx: Index) CheckError!TypeIndex {
+        const data = self.tree.nodeData(idx);
+        const ne = self.tree.extraData(data.node_and_extra[1], ast.NewExprData);
+        const type_name = self.tree.tokenSlice(ne.type_name_token);
+        const span_start = self.tree.nodeSpan(idx).start;
+        const type_args = self.tree.extraSlice(ne.type_args);
+        const struct_type_idx = if (type_args.len > 0)
+            try self.resolveGenericInstance_byName(type_name, ne.type_args, self.tree.nodeSpan(idx))
+        else
+            self.resolveTypeByName(type_name) orelse {
+                self.errWithSuggestion(span_start, "undefined type", self.findSimilarType(type_name));
+                return .invalid;
+            };
+        const struct_type = self.types.get(struct_type_idx);
+        if (struct_type != .struct_type) {
+            self.err.errorWithCode(span_start, .e300, "new requires a struct type");
+            return .invalid;
+        }
+        // Constructor sugar: `new Point(10, 20)` calls init() method
+        if (ne.flags.is_constructor) {
+            const resolved_name = if (type_args.len > 0) struct_type.struct_type.name else type_name;
+            const init_method = self.types.lookupMethod(resolved_name, "init") orelse {
+                self.err.errorWithCode(span_start, .e301, "no init method for constructor call");
+                return .invalid;
+            };
+            const func_type = self.types.get(init_method.func_type);
+            if (func_type == .func) {
+                const init_params = func_type.func.params;
+                const expected_args = if (init_params.len > 0) init_params.len - 1 else 0;
+                const constructor_arg_nodes = self.tree.extraNodes(ne.constructor_args);
+                if (constructor_arg_nodes.len != expected_args) {
+                    self.err.errorWithCode(span_start, .e300, "wrong number of constructor arguments");
+                } else {
+                    for (constructor_arg_nodes, 0..) |arg_idx, i| {
+                        const arg_type = try self.checkExpr(arg_idx);
+                        if (!self.types.isAssignable(arg_type, init_params[i + 1].type_idx)) {
+                            self.err.errorWithCode(span_start, .e300, "type mismatch in constructor argument");
+                        }
+                    }
+                }
+                if (func_type.func.return_type != TypeRegistry.VOID) {
+                    self.err.errorWithCode(span_start, .e300, "init method must return void");
+                }
+            }
+            return self.types.makePointer(struct_type_idx) catch .invalid;
+        }
+        // Validate field initializers
+        const field_pair_raw = self.tree.extraSlice(ne.fields);
+        var fpi: usize = 0;
+        while (fpi + 1 < field_pair_raw.len) : (fpi += 2) {
+            const fname_tok: TokenIndex = @enumFromInt(field_pair_raw[fpi]);
+            const fval_node: Index = @enumFromInt(field_pair_raw[fpi + 1]);
+            const fi_name = self.tree.tokenSlice(fname_tok);
+            var found = false;
+            for (struct_type.struct_type.fields) |sf| if (std.mem.eql(u8, sf.name, fi_name)) {
+                found = true;
+                const saved_expected = self.expected_type;
+                self.expected_type = sf.type_idx;
+                const vt = try self.checkExpr(fval_node);
+                self.expected_type = saved_expected;
+                if (!self.types.isAssignable(vt, sf.type_idx)) {
+                    const vt_t = self.types.get(vt);
+                    const is_safe_deref = self.safe_mode and vt_t == .pointer and
+                        self.types.isAssignable(vt_t.pointer.elem, sf.type_idx);
+                    const sf_t = self.types.get(sf.type_idx);
+                    const is_safe_ref = self.safe_mode and sf_t == .pointer and
+                        self.types.isAssignable(vt, sf_t.pointer.elem);
+                    if (!is_safe_deref and !is_safe_ref) self.err.errorWithCode(span_start, .e300, "type mismatch in field");
+                }
+                break;
+            };
+            if (!found) self.errWithSuggestion(span_start, "unknown field", findSimilarField(fi_name, struct_type.struct_type.fields));
+        }
+        for (struct_type.struct_type.fields) |sf| {
+            if (sf.default_value != .none) continue;
+            var provided = false;
+            var fpi2: usize = 0;
+            while (fpi2 + 1 < field_pair_raw.len) : (fpi2 += 2) {
+                const ftok: TokenIndex = @enumFromInt(field_pair_raw[fpi2]);
+                if (std.mem.eql(u8, sf.name, self.tree.tokenSlice(ftok))) { provided = true; break; }
+            }
+            if (!provided) self.err.errorWithCode(span_start, .e300, "missing field in struct init");
+        }
+        return self.types.makePointer(struct_type_idx) catch .invalid;
     }
-    fn checkErrorLiteral(self: *Checker, idx: Index) CheckError!TypeIndex {
-        _ = self;
-        _ = idx;
-        @panic("checkErrorLiteral not yet ported");
+
+    fn checkArrayLiteral(self: *Checker, idx: Index) CheckError!TypeIndex {
+        const tag = self.tree.nodeTag(idx);
+        const span_start = self.tree.nodeSpan(idx).start;
+        switch (tag) {
+            .array_literal_empty => {
+                self.err.errorWithCode(span_start, .e300, "cannot infer type of empty array");
+                return .invalid;
+            },
+            .array_literal_one => {
+                const elem_node: Index = self.tree.nodeData(idx).node;
+                const first_type = try self.checkExpr(elem_node);
+                if (first_type == .invalid) return .invalid;
+                return self.types.makeArray(first_type, 1) catch .invalid;
+            },
+            .array_literal => {
+                const elems = self.tree.extraNodes(self.tree.nodeData(idx).extra_range);
+                if (elems.len == 0) { self.err.errorWithCode(span_start, .e300, "cannot infer type of empty array"); return .invalid; }
+                const first_type = try self.checkExpr(elems[0]);
+                if (first_type == .invalid) return .invalid;
+                for (elems[1..]) |elem_idx| {
+                    const elem_type = try self.checkExpr(elem_idx);
+                    if (!self.types.equal(first_type, elem_type) and !self.types.isAssignable(elem_type, first_type))
+                        self.err.errorWithCode(span_start, .e300, "array elements must have same type");
+                }
+                return self.types.makeArray(first_type, elems.len) catch .invalid;
+            },
+            else => return .invalid,
+        }
     }
-    fn checkAddrOf(self: *Checker, idx: Index) CheckError!TypeIndex {
-        _ = self;
-        _ = idx;
-        @panic("checkAddrOf not yet ported");
-    }
-    fn checkDeref(self: *Checker, idx: Index) CheckError!TypeIndex {
-        _ = self;
-        _ = idx;
-        @panic("checkDeref not yet ported");
-    }
+
     fn checkTupleLiteral(self: *Checker, idx: Index) CheckError!TypeIndex {
-        _ = self;
-        _ = idx;
-        @panic("checkTupleLiteral not yet ported");
+        const elems = self.tree.extraNodes(self.tree.nodeData(idx).extra_range);
+        const span_start = self.tree.nodeSpan(idx).start;
+        if (elems.len < 2) { self.err.errorWithCode(span_start, .e300, "tuple must have at least 2 elements"); return .invalid; }
+        var elem_types = std.ArrayListUnmanaged(TypeIndex){};
+        defer elem_types.deinit(self.allocator);
+        for (elems) |elem_idx| {
+            const et = try self.checkExpr(elem_idx);
+            elem_types.append(self.allocator, et) catch return .invalid;
+        }
+        return self.types.makeTuple(elem_types.items) catch .invalid;
     }
-    fn checkBuiltinLen(self: *Checker, idx: Index) CheckError!TypeIndex {
-        _ = self;
-        _ = idx;
-        @panic("checkBuiltinLen not yet ported");
+
+    fn checkIfExpr(self: *Checker, idx: Index) CheckError!TypeIndex {
+        const ie = self.tree.ifData(idx);
+        const cond_type = try self.checkExpr(ie.condition);
+        const span_start = self.tree.nodeSpan(idx).start;
+        // Optional unwrap: if expr |val| { ... }
+        if (ie.capture_token.unwrap()) |cap_tok| {
+            const capture_name = self.tree.tokenSlice(cap_tok);
+            const cond_info = self.types.get(cond_type);
+            if (cond_info != .optional) {
+                self.err.errorWithCode(span_start, .e300, "capture requires optional type");
+                return TypeRegistry.VOID;
+            }
+            const elem_type = cond_info.optional.elem;
+            const capture_type = if (ie.capture_is_ptr) self.types.makePointer(elem_type) catch elem_type else elem_type;
+            var capture_scope = Scope.init(self.allocator, self.scope);
+            defer capture_scope.deinit();
+            const old_scope = self.scope;
+            self.scope = &capture_scope;
+            try capture_scope.define(Symbol.init(capture_name, .variable, capture_type, idx, false));
+            const then_type = try self.checkExpr(ie.then_branch);
+            self.scope = old_scope;
+            if (ie.else_branch.unwrap()) |else_node| {
+                const else_type = try self.checkExpr(else_node);
+                if (!self.types.equal(then_type, else_type) and !self.types.isAssignable(else_type, then_type) and !self.types.isAssignable(then_type, else_type))
+                    self.err.errorWithCode(span_start, .e300, "if branches have different types");
+                return then_type;
+            }
+            return TypeRegistry.VOID;
+        }
+        if (!types_mod.isBool(self.types.get(cond_type))) self.err.errorWithCode(span_start, .e300, "condition must be bool");
+        if (self.evalConstExpr(ie.condition)) |cond_val| {
+            if (cond_val != 0) return try self.checkExpr(ie.then_branch);
+            if (ie.else_branch.unwrap()) |else_node| return try self.checkExpr(else_node);
+            return TypeRegistry.VOID;
+        }
+        const then_type = try self.checkExpr(ie.then_branch);
+        if (ie.else_branch.unwrap()) |else_node| {
+            const else_type = try self.checkExpr(else_node);
+            if (!self.types.equal(then_type, else_type) and !self.types.isAssignable(else_type, then_type) and !self.types.isAssignable(then_type, else_type))
+                self.err.errorWithCode(span_start, .e300, "if branches have different types");
+            return then_type;
+        }
+        return TypeRegistry.VOID;
     }
-    fn checkBuiltinAppend(self: *Checker, idx: Index) CheckError!TypeIndex {
-        _ = self;
-        _ = idx;
-        @panic("checkBuiltinAppend not yet ported");
+
+    fn checkSwitchExpr(self: *Checker, idx: Index) CheckError!TypeIndex {
+        const se = self.tree.switchData(idx);
+        var subject_type = try self.checkExpr(se.subject);
+        var subject_info = self.types.get(subject_type);
+        if (self.safe_mode and subject_info == .pointer) {
+            const elem = self.types.get(subject_info.pointer.elem);
+            if (elem == .union_type) { subject_type = subject_info.pointer.elem; subject_info = elem; }
+        }
+        const is_union = subject_info == .union_type;
+        const is_enum = subject_info == .enum_type;
+        const old_switch_enum = self.current_switch_enum_type;
+        if (is_enum) self.current_switch_enum_type = subject_type;
+        defer self.current_switch_enum_type = old_switch_enum;
+        var result_type: TypeIndex = if (self.expected_type != .invalid) self.expected_type else TypeRegistry.VOID;
+        var first = self.expected_type != .invalid;
+        // Iterate switch cases from extra_data
+        const case_raw = self.tree.extraSlice(se.cases);
+        for (case_raw) |case_ei| {
+            const case = self.tree.extraData(@enumFromInt(case_ei), ast.SwitchCaseData);
+            // Check patterns
+            const pattern_nodes = self.tree.extraNodes(case.patterns);
+            for (pattern_nodes) |val_idx| _ = try self.checkExpr(val_idx);
+            if (case.guard.unwrap()) |guard| _ = try self.checkExpr(guard);
+            if (is_union and case.capture_token.unwrap() != null) {
+                const payload_type = self.resolveUnionCaptureType(subject_info.union_type, pattern_nodes);
+                const capture_type = if (case.flags.capture_is_ptr) self.types.makePointer(payload_type) catch payload_type else payload_type;
+                var capture_scope = Scope.init(self.allocator, self.scope);
+                defer capture_scope.deinit();
+                const old_scope = self.scope;
+                self.scope = &capture_scope;
+                if (case.capture_token.unwrap()) |ct| try capture_scope.define(Symbol.init(self.tree.tokenSlice(ct), .variable, capture_type, idx, false));
+                const body_type = try self.checkExpr(case.body);
+                self.scope = old_scope;
+                if (!first) { result_type = self.materializeType(body_type); first = true; }
+            } else {
+                const body_type = try self.checkExpr(case.body);
+                if (!first) { result_type = self.materializeType(body_type); first = true; }
+            }
+        }
+        if (se.else_body.unwrap()) |else_body| _ = try self.checkExpr(else_body);
+        // Enum exhaustiveness check
+        if (is_enum and se.else_body.unwrap() == null) {
+            const et = subject_info.enum_type;
+            var covered = std.StringHashMap(void).init(self.allocator);
+            defer covered.deinit();
+            for (case_raw) |case_ei| {
+                const case = self.tree.extraData(@enumFromInt(case_ei), ast.SwitchCaseData);
+                if (case.guard.unwrap() != null) continue;
+                const pats = self.tree.extraNodes(case.patterns);
+                for (pats) |pat_idx| {
+                    if (self.tree.nodeTag(pat_idx) == .field_access) {
+                        const fa_data = self.tree.nodeData(pat_idx);
+                        const fa_field = self.tree.tokenSlice(fa_data.node_and_token[1]);
+                        covered.put(fa_field, {}) catch {};
+                    }
+                }
+            }
+            if (covered.count() < et.variants.len) {
+                var missing = std.ArrayListUnmanaged(u8){};
+                defer missing.deinit(self.allocator);
+                var missing_count: usize = 0;
+                for (et.variants) |v| {
+                    if (!covered.contains(v.name)) {
+                        if (missing_count > 0) missing.appendSlice(self.allocator, ", ") catch {};
+                        missing.appendSlice(self.allocator, v.name) catch {};
+                        missing_count += 1;
+                    }
+                }
+                const msg = std.fmt.allocPrint(self.allocator, "switch on enum '{s}' must be exhaustive or have else branch; missing: {s}", .{ et.name, missing.items }) catch "non-exhaustive enum switch";
+                self.err.errorWithCode(self.tree.nodeSpan(idx).start, .e300, msg);
+            }
+        }
+        return result_type;
     }
-    fn instantiateGenericFunc(self: *Checker, idx: Index, gen_info: GenericInfo, name: []const u8) CheckError!TypeIndex {
-        _ = self;
-        _ = idx;
-        _ = gen_info;
-        _ = name;
-        @panic("instantiateGenericFunc not yet ported");
+
+    fn resolveUnionCaptureType(self: *Checker, ut: types_mod.UnionType, patterns: []const Index) TypeIndex {
+        if (patterns.len == 0) return TypeRegistry.VOID;
+        if (self.tree.nodeTag(patterns[0]) != .field_access) return TypeRegistry.VOID;
+        const fa_data = self.tree.nodeData(patterns[0]);
+        const field_name = self.tree.tokenSlice(fa_data.node_and_token[1]);
+        for (ut.variants) |v| {
+            if (std.mem.eql(u8, v.name, field_name)) return v.payload_type;
+        }
+        return TypeRegistry.VOID;
     }
+
+    fn checkBlock(self: *Checker, idx: Index) CheckError!TypeIndex {
+        const tag = self.tree.nodeTag(idx);
+        var block_scope = Scope.init(self.allocator, self.scope);
+        defer block_scope.deinit();
+        const old_scope = self.scope;
+        self.scope = &block_scope;
+        // TODO: handle labeled blocks (need to check if block has label)
+        const saved_expected = self.expected_type;
+        self.expected_type = .invalid;
+        switch (tag) {
+            .block_one => {
+                const data = self.tree.nodeData(idx).node_and_node;
+                self.checkStmtsWithReachability(&.{data[0]});
+                self.expected_type = saved_expected;
+                const result = try self.checkExpr(data[1]);
+                if (self.lint_mode) self.checkScopeUnused(&block_scope);
+                self.scope = old_scope;
+                return result;
+            },
+            .block_two => {
+                const data = self.tree.nodeData(idx).node_and_node;
+                self.checkStmtsWithReachability(&.{ data[0], data[1] });
+                self.expected_type = saved_expected;
+                if (self.lint_mode) self.checkScopeUnused(&block_scope);
+                self.scope = old_scope;
+                return TypeRegistry.VOID;
+            },
+            .block => {
+                const data = self.tree.nodeData(idx);
+                const stmts = self.tree.extraNodes(data.extra_range);
+                self.checkStmtsWithReachability(stmts);
+                self.expected_type = saved_expected;
+                if (self.lint_mode) self.checkScopeUnused(&block_scope);
+                self.scope = old_scope;
+                return TypeRegistry.VOID;
+            },
+            else => {
+                self.expected_type = saved_expected;
+                self.scope = old_scope;
+                return TypeRegistry.VOID;
+            },
+        }
+    }
+
+    fn checkBlockExpr(self: *Checker, idx: Index) CheckError!void {
+        const tag = self.tree.nodeTag(idx);
+        switch (tag) {
+            .block_one, .block_two, .block => { _ = try self.checkBlock(idx); return; },
+            .block_stmt => { try self.checkBlockStmt(idx); return; },
+            else => {},
+        }
+    }
+
+    fn checkStringInterp(self: *Checker, idx: Index) CheckError!TypeIndex {
+        // String interpolation segments are stored in extra_data as pairs: (tag, data)
+        // tag 0 = text (data = token index), tag 1 = expr (data = node index)
+        const range = self.tree.nodeData(idx).extra_range;
+        const raw = self.tree.extraSlice(range);
+        var i: usize = 0;
+        while (i + 1 < raw.len) : (i += 2) {
+            const seg_tag = raw[i];
+            if (seg_tag == ast.SEGMENT_EXPR) {
+                const expr_node: Index = @enumFromInt(raw[i + 1]);
+                _ = try self.checkExpr(expr_node);
+            }
+        }
+        return TypeRegistry.STRING;
+    }
+
+    pub fn isSendable(self: *Checker, ty: TypeIndex) bool {
+        const info = self.types.get(ty);
+        return switch (info) {
+            .basic => true,
+            .struct_type => |s| {
+                if (self.unchecked_sendable_types.contains(s.name)) return true;
+                for (s.fields) |f| { if (!self.isSendable(f.type_idx)) return false; }
+                return true;
+            },
+            .enum_type => true,
+            .union_type => |u| { for (u.variants) |v| { if (v.payload_type != .invalid and !self.isSendable(v.payload_type)) return false; } return true; },
+            .optional => |o| self.isSendable(o.elem),
+            .error_union => |eu| self.isSendable(eu.elem),
+            .list => |l| self.isSendable(l.elem),
+            .map => |m| self.isSendable(m.key) and self.isSendable(m.value),
+            .task => true,
+            .tuple => |t| { for (t.element_types) |et| { if (!self.isSendable(et)) return false; } return true; },
+            .distinct => |d| self.isSendable(d.underlying),
+            .existential => |e| std.mem.eql(u8, e.trait_name, "Sendable"),
+            .pointer => false,
+            .func => false,
+            .slice => ty == TypeRegistry.STRING,
+            .array => |a| self.isSendable(a.elem),
+            .error_set => true,
+        };
+    }
+
+    fn sendableTypeName(self: *Checker, ty: TypeIndex) []const u8 {
+        return self.types.get(ty).name();
+    }
+
+    fn checkAddrOf(self: *Checker, idx: Index) CheckError!TypeIndex {
+        const operand_node: Index = self.tree.nodeData(idx).node;
+        const operand_type = try self.checkExpr(operand_node);
+        return try self.types.makePointer(operand_type);
+    }
+
+    fn checkTryExpr(self: *Checker, idx: Index) CheckError!TypeIndex {
+        const operand_node: Index = self.tree.nodeData(idx).node;
+        const operand_type = try self.checkExpr(operand_node);
+        const operand_info = self.types.get(operand_type);
+        if (operand_info != .error_union) {
+            self.err.errorWithCode(self.tree.nodeSpan(idx).start, .e300, "try requires error union type");
+            return .invalid;
+        }
+        const ret_info = self.types.get(self.current_return_type);
+        if (ret_info != .error_union) {
+            self.err.errorWithCode(self.tree.nodeSpan(idx).start, .e300, "try in non-error-returning function");
+        }
+        return operand_info.error_union.elem;
+    }
+
+    fn checkAwaitExpr(self: *Checker, idx: Index) CheckError!TypeIndex {
+        const operand_node: Index = self.tree.nodeData(idx).node;
+        const saved_in_await = self.in_await;
+        self.in_await = true;
+        defer self.in_await = saved_in_await;
+        const operand_type = try self.checkExpr(operand_node);
+        if (self.isCrossActorCallExpr(operand_node) or self.isGlobalActorCallExpr(operand_node)) return operand_type;
+        const operand_info = self.types.get(operand_type);
+        if (operand_info != .task) {
+            self.err.errorWithCode(self.tree.nodeSpan(idx).start, .e300, "cannot await non-task type");
+            return .invalid;
+        }
+        return operand_info.task.result_type;
+    }
+
+    fn checkTaskExpr(self: *Checker, idx: Index) CheckError!TypeIndex {
+        const data = self.tree.nodeData(idx);
+        const te = self.tree.extraData(data.node_and_extra[1], ast.TaskData);
+        var task_scope = Scope.init(self.allocator, self.scope);
+        defer task_scope.deinit();
+        const old_scope = self.scope;
+        const old_return = self.current_return_type;
+        self.scope = &task_scope;
+        self.current_return_type = TypeRegistry.I64;
+        try self.checkBlockExpr(te.body);
+        self.scope = old_scope;
+        self.current_return_type = old_return;
+        return try self.types.makeTask(TypeRegistry.I64);
+    }
+
+    fn isCrossActorCallExpr(self: *Checker, operand_idx: Index) bool {
+        const op_tag = self.tree.nodeTag(operand_idx);
+        if (op_tag != .call_zero and op_tag != .call_one and op_tag != .call) return false;
+        const call_d = self.tree.callData(operand_idx);
+        const receiver_name = self.getCallReceiverActorName(call_d.callee);
+        if (receiver_name) |rn| return self.actor_types.contains(rn);
+        return false;
+    }
+
+    fn isGlobalActorCallExpr(self: *Checker, operand_idx: Index) bool {
+        const op_tag = self.tree.nodeTag(operand_idx);
+        if (op_tag != .call_zero and op_tag != .call_one and op_tag != .call) return false;
+        const call_d = self.tree.callData(operand_idx);
+        if (self.tree.nodeTag(call_d.callee) != .ident) return false;
+        const callee_name = self.tree.tokenSlice(self.tree.nodeMainToken(call_d.callee));
+        return self.global_actor_fns.contains(callee_name);
+    }
+
+    fn getCallReceiverActorName(self: *Checker, callee_idx: Index) ?[]const u8 {
+        if (self.tree.nodeTag(callee_idx) != .field_access) return null;
+        const fa_data = self.tree.nodeData(callee_idx);
+        const base_node: Index = fa_data.node_and_token[0];
+        const base_type_idx = self.expr_types.get(base_node) orelse return null;
+        const base_type = self.types.get(base_type_idx);
+        return switch (base_type) {
+            .struct_type => |st| st.name,
+            .pointer => |ptr| switch (self.types.get(ptr.elem)) {
+                .struct_type => |st| st.name,
+                else => null,
+            },
+            else => null,
+        };
+    }
+
+    fn checkCatchExpr(self: *Checker, idx: Index) CheckError!TypeIndex {
+        const data = self.tree.nodeData(idx);
+        const operand_node: Index = data.node_and_extra[0];
+        const ce = self.tree.extraData(data.node_and_extra[1], ast.CatchData);
+        const operand_type = try self.checkExpr(operand_node);
+        const operand_info = self.types.get(operand_type);
+        if (operand_info != .error_union) {
+            self.err.errorWithCode(self.tree.nodeSpan(idx).start, .e300, "catch requires error union type");
+            return try self.checkExpr(ce.fallback);
+        }
+        const elem_type = operand_info.error_union.elem;
+        var fallback_type: TypeIndex = TypeRegistry.VOID;
+        if (ce.capture_token.unwrap()) |cap_tok| {
+            const err_type = if (operand_info.error_union.error_set != .invalid) operand_info.error_union.error_set else TypeRegistry.I64;
+            const capture_type = if (ce.flags.capture_is_ptr) self.types.makePointer(err_type) catch err_type else err_type;
+            var capture_scope = Scope.init(self.allocator, self.scope);
+            defer capture_scope.deinit();
+            const old_scope = self.scope;
+            self.scope = &capture_scope;
+            try capture_scope.define(Symbol.init(self.tree.tokenSlice(cap_tok), .variable, capture_type, idx, false));
+            fallback_type = try self.checkExpr(ce.fallback);
+            self.scope = old_scope;
+        } else {
+            fallback_type = try self.checkExpr(ce.fallback);
+        }
+        if (elem_type == TypeRegistry.VOID and fallback_type != TypeRegistry.VOID) return fallback_type;
+        return elem_type;
+    }
+
+    fn checkOrElseExpr(self: *Checker, idx: Index) CheckError!TypeIndex {
+        const data = self.tree.nodeData(idx);
+        const operand_node: Index = data.node_and_extra[0];
+        const oe = self.tree.extraData(data.node_and_extra[1], ast.OrElseData);
+        const operand_type = try self.checkExpr(operand_node);
+        const operand_info = self.types.get(operand_type);
+        if (operand_info != .optional) {
+            self.err.errorWithCode(self.tree.nodeSpan(idx).start, .e300, "orelse requires optional type");
+            return operand_type;
+        }
+        const elem_type = operand_info.optional.elem;
+        const fallback_kind: ast.OrElseFallback = @enumFromInt(oe.fallback_kind);
+        switch (fallback_kind) {
+            .expr => { _ = try self.checkExpr(oe.fallback); return elem_type; },
+            .return_val => { _ = try self.checkExpr(oe.fallback); return elem_type; },
+            .return_void, .break_val, .continue_val => return elem_type,
+        }
+    }
+
+    fn checkErrorLiteral(self: *Checker, idx: Index) CheckError!TypeIndex {
+        const error_name_tok = self.tree.nodeData(idx).token;
+        const error_name = self.tree.tokenSlice(error_name_tok);
+        // Check function return type for error set
+        const ret_info = self.types.get(self.current_return_type);
+        if (ret_info == .error_union and ret_info.error_union.error_set != .invalid) {
+            const es_info = self.types.get(ret_info.error_union.error_set);
+            if (es_info == .error_set) {
+                for (es_info.error_set.variants) |v| {
+                    if (std.mem.eql(u8, v, error_name)) return ret_info.error_union.error_set;
+                }
+            }
+        }
+        if (self.expected_type != .invalid) {
+            const exp_info = self.types.get(self.expected_type);
+            if (exp_info == .error_union and exp_info.error_union.error_set != .invalid) {
+                const es_info = self.types.get(exp_info.error_union.error_set);
+                if (es_info == .error_set) {
+                    for (es_info.error_set.variants) |v| {
+                        if (std.mem.eql(u8, v, error_name)) return exp_info.error_union.error_set;
+                    }
+                }
+            }
+            if (exp_info == .error_set) {
+                for (exp_info.error_set.variants) |v| {
+                    if (std.mem.eql(u8, v, error_name)) return self.expected_type;
+                }
+            }
+        }
+        return self.current_return_type;
+    }
+
+    fn checkDeref(self: *Checker, idx: Index) CheckError!TypeIndex {
+        const operand_node: Index = self.tree.nodeData(idx).node;
+        const operand_type = try self.checkExpr(operand_node);
+        if (self.types.isPointer(operand_type)) return self.types.pointerElem(operand_type);
+        self.err.errorWithCode(self.tree.nodeSpan(idx).start, .e300, "cannot dereference non-pointer");
+        return .invalid;
+    }
+
+    // ---------------------------------------------------------------
+    // Statement checking (ported from compiler/ lines 3707-4148)
+    // ---------------------------------------------------------------
+
+    fn checkStmt(self: *Checker, idx: Index) CheckError!void {
+        const tag = self.tree.nodeTag(idx);
+        switch (tag) {
+            .expr_stmt => {
+                const expr_node: Index = self.tree.nodeData(idx).node;
+                _ = try self.checkExpr(expr_node);
+            },
+            .return_expr => {
+                const val_node: Index = self.tree.nodeData(idx).node;
+                try self.checkReturn(val_node, self.tree.nodeSpan(idx).start);
+            },
+            .return_void => {
+                if (self.current_return_type == TypeRegistry.NORETURN) {
+                    self.err.errorWithCode(self.tree.nodeSpan(idx).start, .e300, "noreturn function cannot return");
+                } else if (self.current_return_type != TypeRegistry.VOID) {
+                    self.err.errorWithCode(self.tree.nodeSpan(idx).start, .e300, "non-void function must return a value");
+                }
+            },
+            .var_local, .const_local => try self.checkVarStmt(idx),
+            .assign, .assign_add, .assign_sub, .assign_mul, .assign_div,
+            .assign_mod, .assign_bit_and, .assign_bit_or, .assign_bit_xor,
+            => try self.checkAssign(idx),
+            .if_stmt_simple, .if_stmt => try self.checkIfStmt(idx),
+            .while_stmt => try self.checkWhileStmt(idx),
+            .for_stmt => try self.checkForStmt(idx),
+            .block_stmt => try self.checkBlockStmt(idx),
+            .break_plain => {
+                if (!self.in_loop and self.in_labeled_block == 0)
+                    self.err.errorWithCode(self.tree.nodeSpan(idx).start, .e300, "break outside of loop");
+            },
+            .break_expr => {
+                const data = self.tree.nodeData(idx);
+                const bd = self.tree.extraData(data.node_and_extra[1], ast.BreakData);
+                if (bd.label_token.unwrap() != null) {
+                    if (self.in_labeled_block == 0 and !self.in_loop)
+                        self.err.errorWithCode(self.tree.nodeSpan(idx).start, .e300, "break label does not match any enclosing labeled block or loop");
+                    if (bd.value.unwrap()) |val_node| {
+                        const val_type = try self.checkExpr(val_node);
+                        if (self.labeled_block_result_type == .invalid) self.labeled_block_result_type = val_type;
+                    }
+                } else if (!self.in_loop) self.err.errorWithCode(self.tree.nodeSpan(idx).start, .e300, "break outside of loop");
+            },
+            .continue_plain => {
+                if (!self.in_loop) self.err.errorWithCode(self.tree.nodeSpan(idx).start, .e300, "continue outside of loop");
+            },
+            .continue_labeled => {
+                if (!self.in_loop) self.err.errorWithCode(self.tree.nodeSpan(idx).start, .e300, "continue outside of loop");
+            },
+            .defer_stmt, .errdefer_stmt => {
+                const expr_node: Index = self.tree.nodeData(idx).node;
+                _ = try self.checkExpr(expr_node);
+            },
+            .destructure => try self.checkDestructureStmt(idx),
+            .async_let => {
+                const data = self.tree.nodeData(idx);
+                const name_tok = data.token_and_node[0];
+                const value_node: Index = data.token_and_node[1];
+                const al_name = self.tree.tokenSlice(name_tok);
+                const val_type = try self.checkExpr(value_node);
+                if (!self.scope.isDefined(al_name)) {
+                    try self.scope.define(Symbol.init(al_name, .constant, val_type, idx, false));
+                }
+            },
+            .bad_node => {},
+            else => {},
+        }
+    }
+
+    fn checkReturn(self: *Checker, val_node: Index, span_start: Pos) CheckError!void {
+        if (self.current_return_type == TypeRegistry.NORETURN) {
+            self.err.errorWithCode(span_start, .e300, "noreturn function cannot return");
+            return;
+        }
+        const saved_expected = self.expected_type;
+        self.expected_type = self.current_return_type;
+        defer self.expected_type = saved_expected;
+        const val_type = try self.checkExpr(val_node);
+        if (self.current_return_type == TypeRegistry.VOID) self.err.errorWithCode(span_start, .e300, "void function should not return a value")
+        else if (!self.types.isAssignable(val_type, self.current_return_type)) self.err.errorWithCode(span_start, .e300, "type mismatch");
+    }
+
+    fn checkVarStmt(self: *Checker, idx: Index) CheckError!void {
+        const vs = self.tree.localVarData(idx);
+        const span_start = self.tree.nodeSpan(idx).start;
+        if (self.scope.isDefined(vs.name)) { self.reportRedefined(span_start, vs.name); return; }
+        if (self.lint_mode and self.scope.parent != null) {
+            if (self.scope.parent.?.lookup(vs.name) != null) {
+                self.err.warningWithCode(span_start, .w003, vs.name);
+            }
+        }
+        var var_type: TypeIndex = if (vs.type_expr.unwrap()) |te| try self.resolveTypeExpr(te) else .invalid;
+        if (vs.value.unwrap()) |val_node| {
+            if (!self.isUndefinedLit(val_node) and !self.isZeroInitLit(val_node)) {
+                const saved_expected = self.expected_type;
+                if (var_type != .invalid) self.expected_type = var_type;
+                defer self.expected_type = saved_expected;
+                const val_type = try self.checkExpr(val_node);
+                if (var_type == .invalid) var_type = self.materializeType(val_type)
+                else if (!self.types.isAssignable(val_type, var_type)) {
+                    const vt_info = self.types.get(var_type);
+                    const is_composite_var = vt_info == .struct_type or vt_info == .union_type;
+                    if (self.safe_mode and is_composite_var and self.types.get(val_type) == .pointer and blk: {
+                        const elem = self.types.get(val_type).pointer.elem;
+                        const elem_info = self.types.get(elem);
+                        break :blk (elem_info == .struct_type or elem_info == .union_type) and self.types.isAssignable(elem, var_type);
+                    }) {
+                        var_type = val_type;
+                    } else {
+                        self.err.errorWithCode(span_start, .e300, "type mismatch");
+                    }
+                }
+            }
+        }
+        if (vs.value.unwrap()) |val_node| {
+            if (self.isZeroInitLit(val_node) and var_type == .invalid) {
+                self.err.errorWithCode(span_start, .e300, "zero init requires type annotation");
+            }
+        }
+        if (vs.is_unowned) {
+            if (!self.types.couldBeARC(var_type)) {
+                self.err.errorWithCode(span_start, .e300, "'unowned' can only be used with ARC-managed pointer types");
+            }
+        }
+        if (vs.is_weak) {
+            if (!self.types.couldBeARC(var_type)) {
+                self.err.errorWithCode(span_start, .e300, "'weak' can only be used with ARC-managed pointer types");
+            }
+        }
+        if (vs.is_const) {
+            if (vs.value.unwrap()) |val_node| {
+                if (self.evalConstExpr(val_node)) |cv| {
+                    try self.scope.define(Symbol.initConst(vs.name, var_type, idx, cv));
+                    return;
+                }
+            }
+        }
+        try self.scope.define(Symbol.init(vs.name, if (vs.is_const) .constant else .variable, var_type, idx, !vs.is_const));
+    }
+
+    fn checkDestructureStmt(self: *Checker, idx: Index) CheckError!void {
+        const data = self.tree.nodeData(idx);
+        const ds = self.tree.extraData(data.node_and_extra[1], ast.DestructureData);
+        const span_start = self.tree.nodeSpan(idx).start;
+        // Bindings are stored as alternating (name_token, type_expr OptionalIndex) pairs
+        const binding_raw = self.tree.extraSlice(ds.bindings);
+        const binding_count = binding_raw.len / 2;
+        // Check for redefinitions
+        var bi: usize = 0;
+        while (bi < binding_raw.len) : (bi += 2) {
+            const name_tok: TokenIndex = @enumFromInt(binding_raw[bi]);
+            const bname = self.tree.tokenSlice(name_tok);
+            if (self.scope.isDefined(bname)) { self.reportRedefined(span_start, bname); return; }
+        }
+        const val_type = try self.checkExpr(ds.value);
+        const val_info = self.types.get(val_type);
+        if (val_info != .tuple) {
+            self.err.errorWithCode(span_start, .e300, "destructuring requires a tuple value");
+            return;
+        }
+        if (binding_count != val_info.tuple.element_types.len) {
+            self.err.errorWithCode(span_start, .e300, "destructuring count mismatch");
+            return;
+        }
+        bi = 0;
+        var elem_i: usize = 0;
+        while (bi < binding_raw.len) : ({ bi += 2; elem_i += 1; }) {
+            const name_tok: TokenIndex = @enumFromInt(binding_raw[bi]);
+            const type_expr_oi: OptionalIndex = @enumFromInt(binding_raw[bi + 1]);
+            var elem_type = val_info.tuple.element_types[elem_i];
+            if (type_expr_oi.unwrap()) |te| {
+                const annotated = try self.resolveTypeExpr(te);
+                if (!self.types.isAssignable(elem_type, annotated)) self.err.errorWithCode(span_start, .e300, "type mismatch");
+                elem_type = annotated;
+            } else {
+                elem_type = self.materializeType(elem_type);
+            }
+            const bname = self.tree.tokenSlice(name_tok);
+            try self.scope.define(Symbol.init(bname, if (ds.flags.is_const) .constant else .variable, elem_type, idx, !ds.flags.is_const));
+        }
+    }
+
+    fn checkAssign(self: *Checker, idx: Index) CheckError!void {
+        const data = self.tree.nodeData(idx).node_and_node;
+        const target_idx = data[0];
+        const value_idx = data[1];
+        const span_start = self.tree.nodeSpan(idx).start;
+        // Discard pattern: _ = expr
+        if (self.tree.nodeTag(target_idx) == .ident) {
+            const tname = self.tree.tokenSlice(self.tree.nodeMainToken(target_idx));
+            if (std.mem.eql(u8, tname, "_")) {
+                _ = try self.checkExpr(value_idx);
+                return;
+            }
+        }
+        const target_type = try self.checkExpr(target_idx);
+        const old_expected = self.expected_type;
+        self.expected_type = target_type;
+        const value_type = try self.checkExpr(value_idx);
+        self.expected_type = old_expected;
+        const target_tag = self.tree.nodeTag(target_idx);
+        switch (target_tag) {
+            .ident => {
+                const id_name = self.tree.tokenSlice(self.tree.nodeMainToken(target_idx));
+                if (self.scope.lookup(id_name)) |sym| if (!sym.mutable) { self.err.errorWithCode(span_start, .e300, "cannot assign to constant"); return; };
+            },
+            .index, .field_access, .unary_deref => {},
+            else => { self.err.errorWithCode(span_start, .e300, "invalid assignment target"); return; },
+        }
+        if (!self.types.isAssignable(value_type, target_type)) {
+            const value_info = self.types.get(value_type);
+            if (value_info != .pointer or !self.types.isAssignable(value_info.pointer.elem, target_type)) {
+                self.err.errorWithCode(span_start, .e300, "type mismatch");
+            }
+        }
+    }
+
+    fn checkIfStmt(self: *Checker, idx: Index) CheckError!void {
+        const ie = self.tree.ifData(idx);
+        const cond_type = try self.checkExpr(ie.condition);
+        const span_start = self.tree.nodeSpan(idx).start;
+        if (ie.capture_token.unwrap()) |cap_tok| {
+            const capture_name = self.tree.tokenSlice(cap_tok);
+            const cond_info = self.types.get(cond_type);
+            if (cond_info != .optional) { self.err.errorWithCode(span_start, .e300, "capture requires optional type"); return; }
+            const elem_type = cond_info.optional.elem;
+            const capture_type = if (ie.capture_is_ptr) self.types.makePointer(elem_type) catch elem_type else elem_type;
+            var capture_scope = Scope.init(self.allocator, self.scope);
+            defer capture_scope.deinit();
+            const old_scope = self.scope;
+            self.scope = &capture_scope;
+            try capture_scope.define(Symbol.init(capture_name, .variable, capture_type, idx, false));
+            try self.checkStmt(ie.then_branch);
+            self.scope = old_scope;
+            if (ie.else_branch.unwrap()) |else_node| try self.checkStmt(else_node);
+            return;
+        }
+        if (!types_mod.isBool(self.types.get(cond_type))) self.err.errorWithCode(span_start, .e300, "condition must be bool");
+        if (self.evalConstExpr(ie.condition)) |cond_val| {
+            if (cond_val != 0) { try self.checkStmt(ie.then_branch); return; }
+            if (ie.else_branch.unwrap()) |else_node| { try self.checkStmt(else_node); return; }
+            return;
+        }
+        if (self.lint_mode and self.isEmptyBlock(ie.then_branch)) {
+            self.err.warningWithCode(span_start, .w005, "empty if body");
+        }
+        try self.checkStmt(ie.then_branch);
+        if (ie.else_branch.unwrap()) |else_node| {
+            if (self.lint_mode and self.isEmptyBlock(else_node)) {
+                self.err.warningWithCode(span_start, .w005, "empty else body");
+            }
+            try self.checkStmt(else_node);
+        }
+    }
+
+    fn checkWhileStmt(self: *Checker, idx: Index) CheckError!void {
+        const ws = self.tree.whileData(idx);
+        const cond_type = try self.checkExpr(ws.condition);
+        const span_start = self.tree.nodeSpan(idx).start;
+        if (ws.capture_token.unwrap()) |cap_tok| {
+            const cond_info = self.types.get(cond_type);
+            if (cond_info != .optional) { self.err.errorWithCode(span_start, .e300, "capture requires optional type"); return; }
+            const elem_type = cond_info.optional.elem;
+            const capture_type = if (ws.capture_is_ptr) self.types.makePointer(elem_type) catch elem_type else elem_type;
+            var capture_scope = Scope.init(self.allocator, self.scope);
+            defer capture_scope.deinit();
+            const old_scope = self.scope;
+            self.scope = &capture_scope;
+            try capture_scope.define(Symbol.init(self.tree.tokenSlice(cap_tok), .variable, capture_type, idx, false));
+            const old_in_loop = self.in_loop;
+            self.in_loop = true;
+            if (ws.continue_expr.unwrap()) |ce| try self.checkContinueExpr(ce);
+            try self.checkStmt(ws.body);
+            self.in_loop = old_in_loop;
+            self.scope = old_scope;
+            return;
+        }
+        if (!types_mod.isBool(self.types.get(cond_type))) self.err.errorWithCode(span_start, .e300, "condition must be bool");
+        if (self.lint_mode and self.isEmptyBlock(ws.body)) {
+            self.err.warningWithCode(span_start, .w005, "empty while body");
+        }
+        const old_in_loop = self.in_loop;
+        self.in_loop = true;
+        if (ws.continue_expr.unwrap()) |ce| try self.checkContinueExpr(ce);
+        try self.checkStmt(ws.body);
+        self.in_loop = old_in_loop;
+    }
+
+    fn checkContinueExpr(self: *Checker, node_idx: Index) CheckError!void {
+        const tag = self.tree.nodeTag(node_idx);
+        switch (tag) {
+            .assign, .assign_add, .assign_sub, .assign_mul, .assign_div,
+            .assign_mod, .assign_bit_and, .assign_bit_or, .assign_bit_xor,
+            => try self.checkStmt(node_idx),
+            .expr_stmt => try self.checkStmt(node_idx),
+            else => { _ = try self.checkExpr(node_idx); },
+        }
+    }
+
+    fn checkForStmt(self: *Checker, idx: Index) CheckError!void {
+        const fs = self.tree.forData(idx);
+        const span_start = self.tree.nodeSpan(idx).start;
+        if (fs.is_inline) return self.checkInlineFor(fs);
+        if (fs.is_await) {
+            const iter_node = fs.iterable.unwrap() orelse return;
+            const iter_type = try self.checkExpr(iter_node);
+            const iter_info = self.types.get(iter_type);
+            const type_name: ?[]const u8 = switch (iter_info) {
+                .struct_type => |st| st.name,
+                .pointer => |ptr| switch (self.types.get(ptr.elem)) { .struct_type => |st| st.name, else => null },
+                else => null,
+            };
+            var elem_type: TypeIndex = TypeRegistry.I64;
+            if (type_name) |tn| {
+                if (self.lookupMethod(tn, "next")) |method| {
+                    const method_info = self.types.get(method.func_type);
+                    if (method_info == .func) {
+                        const ret = self.types.get(method_info.func.return_type);
+                        if (ret == .optional) elem_type = ret.optional.elem;
+                    }
+                }
+            }
+            var loop_scope = Scope.init(self.allocator, self.scope);
+            defer loop_scope.deinit();
+            try loop_scope.define(Symbol.init(fs.binding, .variable, elem_type, idx, false));
+            const old_scope = self.scope;
+            const old_in_loop = self.in_loop;
+            self.scope = &loop_scope;
+            self.in_loop = true;
+            try self.checkBlockExpr(fs.body);
+            self.scope = old_scope;
+            self.in_loop = old_in_loop;
+            return;
+        }
+        const is_range = fs.range_start != .none;
+        var elem_type: TypeIndex = .invalid;
+        var idx_type: TypeIndex = TypeRegistry.I64;
+        if (is_range) {
+            const start_type = try self.checkExpr(fs.range_start.unwrap().?);
+            const end_type = try self.checkExpr(fs.range_end.unwrap().?);
+            if (!types_mod.isInteger(self.types.get(start_type)) or !types_mod.isInteger(self.types.get(end_type))) {
+                self.err.errorWithCode(span_start, .e300, "range bounds must be integers");
+            } else { elem_type = start_type; }
+        } else {
+            const iter_node = fs.iterable.unwrap() orelse return;
+            const iter_type = try self.checkExpr(iter_node);
+            const iter = self.types.get(iter_type);
+            switch (iter) {
+                .array => |a| elem_type = a.elem,
+                .slice => |s| elem_type = s.elem,
+                .map => |ma| { elem_type = ma.value; idx_type = ma.key; },
+                .struct_type => |st| {
+                    if (std.mem.startsWith(u8, st.name, "Map(")) {
+                        if (parseMapTypeArgs(st.name)) |margs| { idx_type = margs[0]; elem_type = margs[1]; }
+                        else self.err.errorWithCode(span_start, .e300, "cannot iterate over this type");
+                    } else self.err.errorWithCode(span_start, .e300, "cannot iterate over this type");
+                },
+                else => self.err.errorWithCode(span_start, .e300, "cannot iterate over this type"),
+            }
+        }
+        var loop_scope = Scope.init(self.allocator, self.scope);
+        defer loop_scope.deinit();
+        try loop_scope.define(Symbol.init(fs.binding, .variable, elem_type, idx, false));
+        if (fs.index_binding_token.unwrap()) |ib_tok| {
+            try loop_scope.define(Symbol.init(self.tree.tokenSlice(ib_tok), .variable, idx_type, idx, false));
+        }
+        if (self.lint_mode and self.isEmptyBlock(fs.body)) {
+            self.err.warningWithCode(span_start, .w005, "empty for body");
+        }
+        const old_scope = self.scope;
+        const old_in_loop = self.in_loop;
+        self.scope = &loop_scope;
+        self.in_loop = true;
+        try self.checkStmt(fs.body);
+        self.scope = old_scope;
+        self.in_loop = old_in_loop;
+    }
+
+    fn checkInlineFor(self: *Checker, fs: ast.full.ForFull) CheckError!void {
+        const is_range = fs.range_start != .none;
+        if (is_range) {
+            const start_node = fs.range_start.unwrap() orelse return;
+            const end_node = fs.range_end.unwrap() orelse return;
+            const start_val = self.evalConstExpr(start_node) orelse {
+                self.err.errorWithCode(self.tree.nodeSpan(fs.body).start, .e300, "inline for range start must be comptime-known");
+                return;
+            };
+            const end_val = self.evalConstExpr(end_node) orelse {
+                self.err.errorWithCode(self.tree.nodeSpan(fs.body).start, .e300, "inline for range end must be comptime-known");
+                return;
+            };
+            var i = start_val;
+            while (i < end_val) : (i += 1) {
+                var iter_scope = Scope.init(self.allocator, self.scope);
+                defer iter_scope.deinit();
+                try iter_scope.define(Symbol.initConst(fs.binding, TypeRegistry.I64, @enumFromInt(0), i));
+                const old_scope = self.scope;
+                self.scope = &iter_scope;
+                try self.checkStmt(fs.body);
+                self.scope = old_scope;
+            }
+            return;
+        }
+        const iter_node = fs.iterable.unwrap() orelse return;
+        const iter_val = self.evalComptimeValue(iter_node) orelse {
+            self.err.errorWithCode(self.tree.nodeSpan(fs.body).start, .e300, "inline for requires comptime-known iterable");
+            return;
+        };
+        if (iter_val != .array) {
+            self.err.errorWithCode(self.tree.nodeSpan(fs.body).start, .e300, "inline for iterable must be comptime array or range");
+            return;
+        }
+        for (iter_val.array.elements.items, 0..) |elem, eidx| {
+            var iter_scope = Scope.init(self.allocator, self.scope);
+            defer iter_scope.deinit();
+            var sym = Symbol.init(fs.binding, .constant, TypeRegistry.I64, @enumFromInt(0), false);
+            sym.comptime_val = elem;
+            if (elem == .int) sym.const_value = elem.int;
+            try iter_scope.define(sym);
+            if (fs.index_binding_token.unwrap()) |ib_tok| {
+                try iter_scope.define(Symbol.initConst(self.tree.tokenSlice(ib_tok), TypeRegistry.I64, @enumFromInt(0), @intCast(eidx)));
+            }
+            const old_scope = self.scope;
+            self.scope = &iter_scope;
+            try self.checkStmt(fs.body);
+            self.scope = old_scope;
+        }
+    }
+
+    fn checkBlockStmt(self: *Checker, idx: Index) CheckError!void {
+        var block_scope = Scope.init(self.allocator, self.scope);
+        defer block_scope.deinit();
+        const old_scope = self.scope;
+        self.scope = &block_scope;
+        const stmts = self.tree.extraNodes(self.tree.nodeData(idx).extra_range);
+        self.checkStmtsWithReachability(stmts);
+        if (self.lint_mode) self.checkScopeUnused(&block_scope);
+        self.scope = old_scope;
+    }
+
+    // ---------------------------------------------------------------
+    // Type resolution (ported from compiler/ lines 4149-4354)
+    // ---------------------------------------------------------------
+
+    fn resolveTypeExpr(self: *Checker, idx: Index) CheckError!TypeIndex {
+        const tag = self.tree.nodeTag(idx);
+        return switch (tag) {
+            .ident => {
+                const name = self.tree.tokenSlice(self.tree.nodeMainToken(idx));
+                if (self.type_substitution) |sub| {
+                    if (sub.get(name)) |substituted| return substituted;
+                }
+                if (self.resolveTypeByName(name)) |tidx| return tidx;
+                if (self.types.lookupBitfieldType(name)) |tidx| return tidx;
+                self.errWithSuggestion(self.tree.nodeSpan(idx).start, "undefined type", self.findSimilarType(name));
+                return .invalid;
+            },
+            .type_named => {
+                const name = self.tree.tokenSlice(self.tree.nodeMainToken(idx));
+                if (self.type_substitution) |sub| {
+                    if (sub.get(name)) |substituted| return substituted;
+                }
+                if (self.resolveTypeByName(name)) |tidx| return tidx;
+                if (self.types.lookupBitfieldType(name)) |tidx| return tidx;
+                if (self.scope.lookup(name) != null) return .invalid;
+                self.errWithSuggestion(self.tree.nodeSpan(idx).start, "undefined type", self.findSimilarType(name));
+                return .invalid;
+            },
+            .builtin_call => {
+                const bc = self.tree.builtinCallData(idx);
+                if (bc.kind == .type_of) {
+                    const arg0 = bc.arg0.unwrap() orelse return .invalid;
+                    return try self.checkExpr(arg0);
+                }
+                return .invalid;
+            },
+            .type_pointer => {
+                const elem = try self.resolveTypeExpr(self.tree.nodeData(idx).node);
+                return self.types.makePointer(elem);
+            },
+            .type_optional => {
+                const elem = try self.resolveTypeExpr(self.tree.nodeData(idx).node);
+                return self.types.makeOptional(elem);
+            },
+            .type_error_union => {
+                const elem = try self.resolveTypeExpr(self.tree.nodeData(idx).node);
+                return self.types.makeErrorUnion(elem);
+            },
+            .type_error_union_set => {
+                const data = self.tree.nodeData(idx).node_and_node;
+                const es_node = data[0];
+                const elem_node = data[1];
+                const elem = try self.resolveTypeExpr(elem_node);
+                const es_type = try self.resolveTypeExpr(es_node);
+                return self.types.makeErrorUnionWithSet(elem, es_type);
+            },
+            .type_slice => {
+                const elem = try self.resolveTypeExpr(self.tree.nodeData(idx).node);
+                return self.types.makeSlice(elem);
+            },
+            .type_array => {
+                const data = self.tree.nodeData(idx).node_and_node;
+                const size_node = data[0];
+                const elem_node = data[1];
+                const elem = try self.resolveTypeExpr(elem_node);
+                const size: u64 = blk: {
+                    const size_tag = self.tree.nodeTag(size_node);
+                    if (size_tag == .literal_int) {
+                        break :blk std.fmt.parseInt(u64, self.tree.tokenSlice(self.tree.nodeMainToken(size_node)), 0) catch 0;
+                    }
+                    if (self.evalConstExpr(size_node)) |v| {
+                        if (v > 0) break :blk @as(u64, @intCast(v));
+                    }
+                    break :blk 0;
+                };
+                return try self.types.makeArray(elem, size);
+            },
+            .type_map => {
+                const data = self.tree.nodeData(idx).node_and_node;
+                return self.types.makeMap(try self.resolveTypeExpr(data[0]), try self.resolveTypeExpr(data[1]));
+            },
+            .type_list => {
+                return self.types.makeList(try self.resolveTypeExpr(self.tree.nodeData(idx).node));
+            },
+            .type_function => {
+                const data = self.tree.nodeData(idx);
+                const ft = self.tree.extraData(data.node_and_extra[1], ast.FnType);
+                var func_params = std.ArrayListUnmanaged(types_mod.FuncParam){};
+                defer func_params.deinit(self.allocator);
+                const param_raw = self.tree.extraSlice(ft.params);
+                for (param_raw) |pt_raw| {
+                    const pt_idx: Index = @enumFromInt(pt_raw);
+                    var pt_type = try self.resolveTypeExpr(pt_idx);
+                    pt_type = try self.safeWrapType(pt_type);
+                    try func_params.append(self.allocator, .{ .name = "", .type_idx = pt_type });
+                }
+                const ret_type = if (ft.ret.unwrap()) |r| try self.resolveTypeExpr(r) else TypeRegistry.VOID;
+                return try self.types.makeFunc(func_params.items, ret_type);
+            },
+            .type_tuple => {
+                const elems_raw = self.tree.extraSlice(self.tree.nodeData(idx).extra_range);
+                var elem_types = std.ArrayListUnmanaged(TypeIndex){};
+                defer elem_types.deinit(self.allocator);
+                for (elems_raw) |e_raw| try elem_types.append(self.allocator, try self.resolveTypeExpr(@enumFromInt(e_raw)));
+                return try self.types.makeTuple(elem_types.items);
+            },
+            .type_generic => {
+                const data = self.tree.nodeData(idx);
+                const gi = self.tree.extraData(data.node_and_extra[1], ast.GenericInstance);
+                const gi_name = self.tree.tokenSlice(gi.name_token);
+                return try self.resolveGenericInstance_byName(gi_name, gi.type_args, self.tree.nodeSpan(idx));
+            },
+            .type_existential => {
+                const trait_node: Index = self.tree.nodeData(idx).node;
+                const trait_tag = self.tree.nodeTag(trait_node);
+                const trait_name = if (trait_tag == .ident or trait_tag == .type_named)
+                    self.tree.tokenSlice(self.tree.nodeMainToken(trait_node))
+                else
+                    return .invalid;
+                const trait_def = self.generics.trait_defs.get(trait_name) orelse {
+                    self.err.errorWithCode(self.tree.nodeSpan(idx).start, .e301, try std.fmt.allocPrint(self.allocator, "undefined trait '{s}'", .{trait_name}));
+                    return .invalid;
+                };
+                var conforming = std.ArrayListUnmanaged([]const u8){};
+                var impl_it = self.generics.trait_impls.iterator();
+                while (impl_it.next()) |impl_entry| {
+                    if (std.mem.eql(u8, impl_entry.value_ptr.*, trait_name)) {
+                        const key = impl_entry.key_ptr.*;
+                        if (std.mem.indexOf(u8, key, ":")) |colon| {
+                            try conforming.append(self.allocator, key[colon + 1 ..]);
+                        }
+                    }
+                }
+                const exist_idx = try self.types.makeExistential(trait_name, trait_def.method_names);
+                var exist_type = &self.types.types.items[@intCast(exist_idx)];
+                exist_type.existential.conforming_types = try self.allocator.dupe([]const u8, conforming.items);
+                return exist_idx;
+            },
+            else => .invalid,
+        };
+    }
+
+    fn resolveGenericInstance(self: *Checker, name: []const u8, type_arg_nodes: []const Index, span: Span) CheckError!TypeIndex {
+        const gen_info = self.generics.generic_structs.get(name) orelse {
+            if (std.mem.eql(u8, name, "List") and type_arg_nodes.len == 1) return try self.types.makeList(try self.resolveTypeExpr(type_arg_nodes[0]));
+            if (std.mem.eql(u8, name, "Map") and type_arg_nodes.len == 2) return try self.types.makeMap(try self.resolveTypeExpr(type_arg_nodes[0]), try self.resolveTypeExpr(type_arg_nodes[1]));
+            self.errWithSuggestion(span.start, "undefined generic type", self.findSimilarType(name));
+            return .invalid;
+        };
+        if (type_arg_nodes.len != gen_info.type_params.len) { self.err.errorWithCode(span.start, .e300, "wrong number of type arguments"); return .invalid; }
+        var resolved_args = std.ArrayListUnmanaged(TypeIndex){};
+        defer resolved_args.deinit(self.allocator);
+        for (type_arg_nodes) |arg_node| try resolved_args.append(self.allocator, try self.resolveTypeExpr(arg_node));
+        const cache_key = try self.buildGenericCacheKey(name, resolved_args.items);
+        if (self.generics.instantiation_cache.get(cache_key)) |cached| return cached;
+        var sub_map = std.StringHashMap(TypeIndex).init(self.allocator);
+        defer sub_map.deinit();
+        for (gen_info.type_params, 0..) |param_name, i| try sub_map.put(param_name, resolved_args.items[i]);
+        const saved_tree = self.tree;
+        const saved_safe_mode = self.safe_mode;
+        const saved_scope = self.scope;
+        self.tree = gen_info.tree;
+        if (gen_info.tree.file) |file| self.safe_mode = file.safe_mode;
+        if (gen_info.scope) |s| self.scope = s;
+        defer { self.tree = saved_tree; self.safe_mode = saved_safe_mode; self.scope = saved_scope; }
+        const struct_decl = self.tree.structDeclData(gen_info.node_idx);
+        const old_sub = self.type_substitution;
+        self.type_substitution = sub_map;
+        const concrete_type = try self.buildStructTypeWithLayout(cache_key, struct_decl.fields, struct_decl.layout);
+        self.type_substitution = old_sub;
+        try self.types.registerNamed(cache_key, concrete_type);
+        try self.generics.instantiation_cache.put(cache_key, concrete_type);
+        try self.instantiateGenericImplMethods(name, cache_key, resolved_args.items);
+        return concrete_type;
+    }
+
+    // ---------------------------------------------------------------
+    // Type building (ported from compiler/ lines 4355-4855)
+    // ---------------------------------------------------------------
+
+    fn instantiateGenericImplMethods(
+        self: *Checker,
+        base_name: []const u8,
+        concrete_name: []const u8,
+        resolved_args: []const TypeIndex,
+    ) CheckError!void {
+        const impl_list = self.generics.generic_impl_blocks.get(base_name) orelse return;
+        for (impl_list.items) |impl_info| {
+            if (impl_info.type_params.len != resolved_args.len) continue;
+            const saved_tree = self.tree;
+            const saved_safe_mode = self.safe_mode;
+            const saved_scope = self.scope;
+            self.tree = impl_info.tree;
+            if (impl_info.tree.file) |file| self.safe_mode = file.safe_mode;
+            if (impl_info.scope) |s| self.scope = s;
+            defer { self.tree = saved_tree; self.safe_mode = saved_safe_mode; self.scope = saved_scope; }
+            var sub_map = std.StringHashMap(TypeIndex).init(self.allocator);
+            defer sub_map.deinit();
+            for (impl_info.type_params, 0..) |param_name, i| try sub_map.put(param_name, resolved_args[i]);
+            const old_sub = self.type_substitution;
+            self.type_substitution = sub_map;
+            defer self.type_substitution = old_sub;
+            const safe_self_type: ?TypeIndex = if (self.safe_mode) blk: {
+                const concrete_type = self.generics.instantiation_cache.get(concrete_name) orelse break :blk null;
+                break :blk self.types.makePointer(concrete_type) catch null;
+            } else null;
+            // Pass 1: Register all method signatures
+            for (impl_info.methods) |method_idx| {
+                const m_tag = self.tree.nodeTag(method_idx);
+                if (m_tag != .fn_decl and m_tag != .fn_decl_extern) continue;
+                const f = self.tree.fnDeclData(method_idx);
+                const synth_name = try std.fmt.allocPrint(self.allocator, "{s}_{s}", .{ concrete_name, f.name });
+                const func_type = if (safe_self_type != null and !f.flags.is_static) blk: {
+                    const base_type = try self.buildFuncType(f.params, f.return_type);
+                    const base_info = self.types.get(base_type);
+                    if (base_info != .func) break :blk base_type;
+                    var new_params = std.ArrayListUnmanaged(types_mod.FuncParam){};
+                    defer new_params.deinit(self.allocator);
+                    try new_params.append(self.allocator, .{ .name = "self", .type_idx = safe_self_type.? });
+                    for (base_info.func.params) |p| try new_params.append(self.allocator, p);
+                    break :blk try self.types.makeFunc(new_params.items, base_info.func.return_type);
+                } else try self.buildFuncType(f.params, f.return_type);
+                if (!self.global_scope.isDefined(synth_name)) {
+                    try self.global_scope.define(Symbol.init(synth_name, .function, func_type, method_idx, false));
+                }
+                const param_raw = self.tree.extraSlice(f.params);
+                const has_self_p = if (param_raw.len > 0) blk: {
+                    const ff = self.tree.extraData(@enumFromInt(param_raw[0]), ast.Field);
+                    break :blk std.mem.eql(u8, self.tree.tokenSlice(ff.name_token), "self");
+                } else false;
+                const effective_static_g = f.flags.is_static or (!self.safe_mode and (param_raw.len == 0 or !has_self_p));
+                try self.types.registerMethod(concrete_name, types_mod.MethodInfo{
+                    .name = f.name,
+                    .func_name = synth_name,
+                    .func_type = func_type,
+                    .receiver_is_ptr = !effective_static_g,
+                    .is_static = effective_static_g,
+                    .source_tree = self.tree,
+                });
+                const indirect_result = self.isTypeParamNameInList(f.return_type, impl_info.type_params);
+                const inst = GenericInstInfo{
+                    .concrete_name = synth_name,
+                    .generic_node = method_idx,
+                    .type_args = try self.allocator.dupe(TypeIndex, resolved_args),
+                    .type_param_names = impl_info.type_params,
+                    .tree = impl_info.tree,
+                    .scope = impl_info.scope,
+                    .has_indirect_result = indirect_result,
+                };
+                try self.generics.generic_inst_by_name.put(synth_name, inst);
+            }
+            // Pass 2: Check method bodies
+            for (impl_info.methods) |method_idx| {
+                const m_tag = self.tree.nodeTag(method_idx);
+                if (m_tag != .fn_decl and m_tag != .fn_decl_extern) continue;
+                const f = self.tree.fnDeclData(method_idx);
+                const synth_name = try std.fmt.allocPrint(self.allocator, "{s}_{s}", .{ concrete_name, f.name });
+                var inst_expr_types = std.AutoHashMap(Index, TypeIndex).init(self.allocator);
+                {
+                    const saved_et = self.expr_types;
+                    self.expr_types = inst_expr_types;
+                    defer { inst_expr_types = self.expr_types; self.expr_types = saved_et; }
+                    if (safe_self_type != null and !f.flags.is_static) {
+                        var self_scope = Scope.init(self.allocator, self.scope);
+                        defer self_scope.deinit();
+                        try self_scope.define(Symbol.init("self", .parameter, safe_self_type.?, method_idx, true));
+                        const old_scope_2 = self.scope;
+                        self.scope = &self_scope;
+                        defer self.scope = old_scope_2;
+                        try self.checkFnDeclWithName(f, method_idx, synth_name);
+                    } else {
+                        try self.checkFnDeclWithName(f, method_idx, synth_name);
+                    }
+                }
+                if (self.generics.generic_inst_by_name.getPtr(synth_name)) |ptr| {
+                    ptr.expr_types = inst_expr_types;
+                }
+            }
+        }
+    }
+
+    /// Check if a return type expression is a type parameter name.
+    fn isTypeParamNameInList(self: *Checker, return_type: OptionalIndex, type_params: []const []const u8) bool {
+        const rt_node = return_type.unwrap() orelse return false;
+        const rt_tag = self.tree.nodeTag(rt_node);
+        if (rt_tag == .type_named or rt_tag == .ident) {
+            const rt_name = self.tree.tokenSlice(self.tree.nodeMainToken(rt_node));
+            for (type_params) |tp| {
+                if (std.mem.eql(u8, tp, rt_name)) return true;
+            }
+        }
+        return false;
+    }
+
+    fn instantiateGenericFunc(self: *Checker, call_idx: Index, gen_info: GenericInfo, name: []const u8) CheckError!TypeIndex {
+        const args = self.getCallArgNodes(call_idx);
+        const span_start = self.tree.nodeSpan(call_idx).start;
+        if (args.len != gen_info.type_params.len) {
+            self.err.errorWithCode(span_start, .e300, "wrong number of type arguments");
+            return .invalid;
+        }
+        var resolved_args = std.ArrayListUnmanaged(TypeIndex){};
+        defer resolved_args.deinit(self.allocator);
+        for (args) |arg_node| {
+            const arg_type = try self.resolveTypeExpr(arg_node);
+            if (arg_type == .invalid) {
+                if (self.tree.nodeTag(arg_node) == .ident) {
+                    if (self.resolveTypeByName(self.tree.tokenSlice(self.tree.nodeMainToken(arg_node)))) |tidx| {
+                        try resolved_args.append(self.allocator, tidx);
+                        continue;
+                    }
+                }
+                self.err.errorWithCode(span_start, .e300, "expected type argument");
+                return .invalid;
+            }
+            try resolved_args.append(self.allocator, arg_type);
+        }
+        // Validate trait bounds
+        if (gen_info.type_param_bounds.len > 0) {
+            for (gen_info.type_param_bounds, 0..) |bound, i| {
+                if (bound) |trait_name| {
+                    const tname = self.types.typeName(resolved_args.items[i]);
+                    const impl_key = try std.fmt.allocPrint(self.allocator, "{s}:{s}", .{ trait_name, tname });
+                    defer self.allocator.free(impl_key);
+                    if (self.generics.trait_impls.get(impl_key) == null) {
+                        self.err.errorWithCode(span_start, .e300, "type does not satisfy trait bound");
+                        return .invalid;
+                    }
+                }
+            }
+        }
+        const cache_key = try self.buildGenericCacheKey(name, resolved_args.items);
+        const saved_tree = self.tree;
+        const saved_safe_mode = self.safe_mode;
+        const saved_scope = self.scope;
+        self.tree = gen_info.tree;
+        if (gen_info.tree.file) |file| self.safe_mode = file.safe_mode;
+        if (gen_info.scope) |s| self.scope = s;
+        defer { self.tree = saved_tree; self.safe_mode = saved_safe_mode; self.scope = saved_scope; }
+        const fn_decl = self.tree.fnDeclData(gen_info.node_idx);
+        var sub_map = std.StringHashMap(TypeIndex).init(self.allocator);
+        defer sub_map.deinit();
+        for (gen_info.type_params, 0..) |param_name, i| try sub_map.put(param_name, resolved_args.items[i]);
+        const old_sub = self.type_substitution;
+        self.type_substitution = sub_map;
+        const func_type = try self.buildFuncType(fn_decl.params, fn_decl.return_type);
+        if (!self.global_scope.isDefined(cache_key)) {
+            try self.global_scope.define(Symbol.init(cache_key, .function, func_type, gen_info.node_idx, false));
+        }
+        var inst_expr_types = std.AutoHashMap(Index, TypeIndex).init(self.allocator);
+        {
+            const saved_et = self.expr_types;
+            self.expr_types = inst_expr_types;
+            defer { inst_expr_types = self.expr_types; self.expr_types = saved_et; }
+            try self.checkFnDeclWithName(fn_decl, gen_info.node_idx, cache_key);
+        }
+        self.type_substitution = old_sub;
+        const inst = GenericInstInfo{
+            .concrete_name = cache_key,
+            .generic_node = gen_info.node_idx,
+            .type_args = try self.allocator.dupe(TypeIndex, resolved_args.items),
+            .tree = gen_info.tree,
+            .scope = gen_info.scope,
+            .expr_types = inst_expr_types,
+            .has_indirect_result = self.isTypeParamNameInList(fn_decl.return_type, gen_info.type_params),
+        };
+        const callee_idx = self.tree.callData(call_idx).callee;
+        try self.generic_instantiations.put(callee_idx, inst);
+        try self.generics.generic_inst_by_name.put(cache_key, inst);
+        return func_type;
+    }
+
+    fn buildGenericCacheKey(self: *Checker, name: []const u8, type_args: []const TypeIndex) CheckError![]const u8 {
+        var buf = std.ArrayListUnmanaged(u8){};
+        defer buf.deinit(self.allocator);
+        const writer = buf.writer(self.allocator);
+        writer.writeAll(name) catch return error.OutOfMemory;
+        writer.writeByte('(') catch return error.OutOfMemory;
+        for (type_args, 0..) |arg, i| {
+            if (i > 0) writer.writeByte(';') catch return error.OutOfMemory;
+            std.fmt.format(writer, "{d}", .{arg}) catch return error.OutOfMemory;
+        }
+        writer.writeByte(')') catch return error.OutOfMemory;
+        return try self.allocator.dupe(u8, buf.items);
+    }
+
+    pub fn safeWrapType(self: *Checker, type_idx: TypeIndex) !TypeIndex {
+        const t_pre = self.types.get(type_idx);
+        if (t_pre == .existential) return try self.types.makePointer(type_idx);
+        if (t_pre == .struct_type and self.actor_types.contains(t_pre.struct_type.name))
+            return try self.types.makePointer(type_idx);
+        if (!self.safe_mode) return type_idx;
+        const t = t_pre;
+        if (t == .struct_type or t == .union_type) return try self.types.makePointer(type_idx);
+        if (t == .error_union) {
+            const elem = self.types.get(t.error_union.elem);
+            if (elem == .struct_type or elem == .union_type) {
+                const wrapped = try self.types.makePointer(t.error_union.elem);
+                return try self.types.makeErrorUnionWithSet(wrapped, t.error_union.error_set);
+            }
+        }
+        return type_idx;
+    }
+
+    fn buildFuncType(self: *Checker, params: SubRange, return_type_oi: OptionalIndex) CheckError!TypeIndex {
+        var func_params = std.ArrayListUnmanaged(types_mod.FuncParam){};
+        defer func_params.deinit(self.allocator);
+        const param_raw = self.tree.extraSlice(params);
+        for (param_raw) |raw_ei| {
+            const field = self.tree.extraData(@enumFromInt(raw_ei), ast.Field);
+            const param_name = self.tree.tokenSlice(field.name_token);
+            var type_idx = try self.resolveTypeExpr(field.type_expr);
+            const is_substituted = if (self.type_substitution) |sub| blk: {
+                const te_tag = self.tree.nodeTag(field.type_expr);
+                if (te_tag == .ident or te_tag == .type_named) {
+                    break :blk sub.contains(self.tree.tokenSlice(self.tree.nodeMainToken(field.type_expr)));
+                }
+                break :blk false;
+            } else false;
+            if (!is_substituted) type_idx = try self.safeWrapType(type_idx);
+            try func_params.append(self.allocator, .{ .name = param_name, .type_idx = type_idx, .is_sending = field.flags.is_sending });
+        }
+        const ret_type = if (return_type_oi.unwrap()) |rt| try self.resolveTypeExpr(rt) else TypeRegistry.VOID;
+        return try self.types.add(.{ .func = .{ .params = try self.allocator.dupe(types_mod.FuncParam, func_params.items), .return_type = ret_type } });
+    }
+
+    fn buildStructType(self: *Checker, name: []const u8, fields: SubRange) CheckError!TypeIndex {
+        return self.buildStructTypeWithLayout(name, fields, .auto);
+    }
+
+    fn buildStructTypeWithLayout(self: *Checker, name: []const u8, fields_range: SubRange, layout: ast.StructLayout) CheckError!TypeIndex {
+        var struct_fields = std.ArrayListUnmanaged(types_mod.StructField){};
+        defer struct_fields.deinit(self.allocator);
+        var offset: u32 = 0;
+        var max_align: u32 = 1;
+        const field_raw = self.tree.extraSlice(fields_range);
+        for (field_raw) |raw_ei| {
+            const field = self.tree.extraData(@enumFromInt(raw_ei), ast.Field);
+            const field_name = self.tree.tokenSlice(field.name_token);
+            const field_type = try self.resolveTypeExpr(field.type_expr);
+            switch (layout) {
+                .@"packed" => {
+                    var bit_width: u8 = 0;
+                    const te_tag = self.tree.nodeTag(field.type_expr);
+                    if (te_tag == .type_named) {
+                        const te_name = self.tree.tokenSlice(self.tree.nodeMainToken(field.type_expr));
+                        if (types_mod.TypeRegistry.parseBitWidth(te_name)) |bw| {
+                            if (bw != 8 and bw != 16 and bw != 32 and bw != 64) bit_width = bw;
+                        }
+                    }
+                    try struct_fields.append(self.allocator, .{
+                        .name = field_name,
+                        .type_idx = field_type,
+                        .offset = offset,
+                        .bit_offset = 0,
+                        .bit_width = bit_width,
+                        .default_value = field.default_value,
+                    });
+                    if (bit_width == 0) offset += self.types.sizeOf(field_type);
+                },
+                .@"extern" => {
+                    const field_align = self.types.alignmentOf(field_type);
+                    if (field_align > max_align) max_align = field_align;
+                    if (field_align > 0) offset = (offset + field_align - 1) & ~(field_align - 1);
+                    try struct_fields.append(self.allocator, .{ .name = field_name, .type_idx = field_type, .offset = offset, .default_value = field.default_value });
+                    offset += self.types.sizeOf(field_type);
+                },
+                .auto => {
+                    const field_align = self.types.alignmentOf(field_type);
+                    if (field_align > 0) offset = (offset + field_align - 1) & ~(field_align - 1);
+                    try struct_fields.append(self.allocator, .{ .name = field_name, .type_idx = field_type, .offset = offset, .default_value = field.default_value });
+                    offset += self.types.sizeOf(field_type);
+                },
+            }
+        }
+        var has_bitfields = false;
+        for (struct_fields.items) |f| { if (f.bit_width > 0) { has_bitfields = true; break; } }
+        var backing_int: TypeIndex = @enumFromInt(0);
+        if (has_bitfields and layout == .@"packed") {
+            var bit_pos: u32 = 0;
+            for (struct_fields.items) |*f| {
+                f.bit_offset = @intCast(bit_pos);
+                if (f.bit_width > 0) { bit_pos += f.bit_width; } else {
+                    f.bit_width = @intCast(self.types.sizeOf(f.type_idx) * 8);
+                    bit_pos += f.bit_width;
+                }
+                f.offset = 0;
+            }
+            if (bit_pos <= 8) { offset = 1; backing_int = TypeRegistry.U8; }
+            else if (bit_pos <= 16) { offset = 2; backing_int = TypeRegistry.U16; }
+            else if (bit_pos <= 32) { offset = 4; backing_int = TypeRegistry.U32; }
+            else if (bit_pos <= 64) { offset = 8; backing_int = TypeRegistry.U64; }
+            else {
+                if (field_raw.len > 0) {
+                    const first_field = self.tree.extraData(@enumFromInt(field_raw[0]), ast.Field);
+                    _ = first_field;
+                }
+                self.err.errorWithCode(self.tree.nodeSpan(@enumFromInt(0)).start, .e302, "packed struct total bit width exceeds 64");
+                offset = 8; backing_int = TypeRegistry.U64;
+            }
+        }
+        const alignment: u8 = switch (layout) {
+            .@"packed" => if (has_bitfields) @intCast(offset) else 1,
+            .@"extern" => @intCast(max_align),
+            .auto => 8,
+        };
+        if (layout != .@"packed" and alignment > 1) {
+            const a = @as(u32, alignment);
+            offset = (offset + a - 1) & ~(a - 1);
+        }
+        return try self.types.add(.{ .struct_type = .{
+            .name = name,
+            .fields = try self.allocator.dupe(types_mod.StructField, struct_fields.items),
+            .size = offset,
+            .alignment = alignment,
+            .layout = layout,
+            .backing_int = backing_int,
+        } });
+    }
+
+    fn buildEnumType(self: *Checker, idx: Index) CheckError!TypeIndex {
+        const e = self.tree.enumDeclData(idx);
+        var backing_type: TypeIndex = TypeRegistry.I32;
+        if (e.backing_type.unwrap()) |bt| backing_type = try self.resolveTypeExpr(bt);
+        var enum_variants = std.ArrayListUnmanaged(types_mod.EnumVariant){};
+        defer enum_variants.deinit(self.allocator);
+        var next_value: i64 = 0;
+        const variant_raw = self.tree.extraSlice(e.variants);
+        for (variant_raw) |raw_ei| {
+            const ev = self.tree.extraData(@enumFromInt(raw_ei), ast.EnumVariant);
+            const vname = self.tree.tokenSlice(ev.name_token);
+            var value = next_value;
+            if (ev.value.unwrap()) |val_node| {
+                if (self.tree.nodeTag(val_node) == .literal_int)
+                    value = std.fmt.parseInt(i64, self.tree.tokenSlice(self.tree.nodeMainToken(val_node)), 0) catch 0;
+            }
+            try enum_variants.append(self.allocator, .{ .name = vname, .value = value });
+            next_value = value + 1;
+        }
+        return try self.types.add(.{ .enum_type = .{ .name = e.name, .backing_type = backing_type, .variants = try self.allocator.dupe(types_mod.EnumVariant, enum_variants.items) } });
+    }
+
+    fn buildUnionType(self: *Checker, idx: Index) CheckError!TypeIndex {
+        const u = self.tree.unionDeclData(idx);
+        var union_variants = std.ArrayListUnmanaged(types_mod.UnionVariant){};
+        defer union_variants.deinit(self.allocator);
+        const variant_raw = self.tree.extraSlice(u.variants);
+        for (variant_raw) |raw_ei| {
+            const uv = self.tree.extraData(@enumFromInt(raw_ei), ast.UnionVariant);
+            const vname = self.tree.tokenSlice(uv.name_token);
+            const payload_type = if (self.tree.nodeTag(uv.type_expr) != .bad_node) try self.resolveTypeExpr(uv.type_expr) else .invalid;
+            try union_variants.append(self.allocator, .{ .name = vname, .payload_type = payload_type });
+        }
+        const tag_type: TypeIndex = if (variant_raw.len <= 256) TypeRegistry.U8 else TypeRegistry.U16;
+        return try self.types.add(.{ .union_type = .{ .name = u.name, .variants = try self.allocator.dupe(types_mod.UnionVariant, union_variants.items), .tag_type = tag_type } });
+    }
+
+    fn materializeType(self: *Checker, idx: TypeIndex) TypeIndex {
+        const t = self.types.get(idx);
+        return switch (t) {
+            .basic => |k| switch (k) { .untyped_int => TypeRegistry.INT, .untyped_float => TypeRegistry.FLOAT, .untyped_bool => TypeRegistry.BOOL, else => idx },
+            .array => |arr| blk: { const me = self.materializeType(arr.elem); if (me == arr.elem) break :blk idx; break :blk self.types.makeArray(me, arr.length) catch idx; },
+            .slice => |sl| blk: { const me = self.materializeType(sl.elem); if (me == sl.elem) break :blk idx; break :blk self.types.makeSlice(me) catch idx; },
+            else => idx,
+        };
+    }
+
+    fn isUnionVariantRef(self: *Checker, expr_idx: Index, ut: types_mod.UnionType) bool {
+        if (self.tree.nodeTag(expr_idx) != .field_access) return false;
+        const fa_data = self.tree.nodeData(expr_idx);
+        const fa_field = self.tree.tokenSlice(fa_data.node_and_token[1]);
+        for (ut.variants) |v| {
+            if (std.mem.eql(u8, v.name, fa_field)) return true;
+        }
+        return false;
+    }
+
     fn isComparable(self: *Checker, a: TypeIndex, b: TypeIndex) bool {
-        _ = self;
-        _ = a;
-        _ = b;
-        @panic("isComparable not yet ported");
+        if (self.types.equal(a, b)) return true;
+        const ta = self.types.get(a);
+        const tb = self.types.get(b);
+        if (types_mod.isNumeric(ta) and types_mod.isNumeric(tb)) return true;
+        if (types_mod.isBool(ta) and types_mod.isBool(tb)) return true;
+        if (ta == .slice and tb == .slice and ta.slice.elem == TypeRegistry.U8 and tb.slice.elem == TypeRegistry.U8) return true;
+        if (ta == .optional and tb == .basic and tb.basic == .untyped_null) return true;
+        if (tb == .optional and ta == .basic and ta.basic == .untyped_null) return true;
+        if (ta == .pointer and tb == .basic and tb.basic == .untyped_null) return true;
+        if (tb == .pointer and ta == .basic and ta.basic == .untyped_null) return true;
+        if (ta == .enum_type and types_mod.isInteger(tb)) return true;
+        if (tb == .enum_type and types_mod.isInteger(ta)) return true;
+        if (ta == .optional and self.isComparable(ta.optional.elem, b)) return true;
+        if (tb == .optional and self.isComparable(a, tb.optional.elem)) return true;
+        return false;
     }
-    fn isUnionVariantRef(self: *Checker, node: Index, ut: types_mod.UnionType) bool {
-        _ = self;
-        _ = node;
-        _ = ut;
-        @panic("isUnionVariantRef not yet ported");
+
+    // ---------------------------------------------------------------
+    // Diagnostics (ported from compiler/ lines 4856-5162)
+    // ---------------------------------------------------------------
+
+    const MAX_EDIT_LEN = 64;
+
+    fn editDistance(a: []const u8, b: []const u8) usize {
+        if (a.len > MAX_EDIT_LEN or b.len > MAX_EDIT_LEN) return std.math.maxInt(usize);
+        if (a.len == 0) return b.len;
+        if (b.len == 0) return a.len;
+        if (std.mem.eql(u8, a, b)) return 0;
+        const s1 = if (a.len <= b.len) a else b;
+        const s2 = if (a.len <= b.len) b else a;
+        var prev: [MAX_EDIT_LEN + 1]usize = undefined;
+        var curr: [MAX_EDIT_LEN + 1]usize = undefined;
+        for (0..s1.len + 1) |i| prev[i] = i;
+        for (s2, 0..) |c2, j| {
+            curr[0] = j + 1;
+            for (s1, 0..) |c1, i| {
+                const cost: usize = if (c1 == c2) 0 else 1;
+                curr[i + 1] = @min(@min(curr[i] + 1, prev[i + 1] + 1), prev[i] + cost);
+            }
+            @memcpy(prev[0 .. s1.len + 1], curr[0 .. s1.len + 1]);
+        }
+        return prev[s1.len];
     }
-    fn getCallReceiverActorName(self: *Checker, callee: Index) ?[]const u8 {
-        _ = self;
-        _ = callee;
-        @panic("getCallReceiverActorName not yet ported");
+
+    fn isUserVisibleName(name: []const u8) bool {
+        if (name.len == 0) return false;
+        if (std.mem.indexOfScalar(u8, name, '(') != null) return false;
+        if (name.len >= 2 and name[0] == '_' and name[1] == '_') return false;
+        return true;
+    }
+
+    fn findSimilarName(self: *Checker, name: []const u8) ?[]const u8 {
+        var best: ?[]const u8 = null;
+        var best_dist: usize = std.math.maxInt(usize);
+        var scope_ptr: ?*const Scope = self.scope;
+        while (scope_ptr) |s| {
+            var it = s.symbols.iterator();
+            while (it.next()) |entry| {
+                const candidate = entry.key_ptr.*;
+                if (std.mem.eql(u8, candidate, name)) continue;
+                if (!isUserVisibleName(candidate)) continue;
+                const d = editDistance(name, candidate);
+                if (d < best_dist and d <= 2 and d * 2 <= name.len) { best_dist = d; best = candidate; }
+            }
+            scope_ptr = s.parent;
+        }
+        {
+            var it = self.global_scope.symbols.iterator();
+            while (it.next()) |entry| {
+                const candidate = entry.key_ptr.*;
+                if (std.mem.eql(u8, candidate, name)) continue;
+                if (!isUserVisibleName(candidate)) continue;
+                const d = editDistance(name, candidate);
+                if (d < best_dist and d <= 2 and d * 2 <= name.len) { best_dist = d; best = candidate; }
+            }
+        }
+        const builtins = [_][]const u8{ "print", "println", "eprint", "eprintln", "len", "append" };
+        for (builtins) |candidate| {
+            if (std.mem.eql(u8, candidate, name)) continue;
+            const d = editDistance(name, candidate);
+            if (d < best_dist and d <= 2 and d * 2 <= name.len) { best_dist = d; best = candidate; }
+        }
+        return best;
+    }
+
+    fn findSimilarField(name: []const u8, fields: []const types_mod.StructField) ?[]const u8 {
+        var best: ?[]const u8 = null;
+        var best_dist: usize = std.math.maxInt(usize);
+        for (fields) |fld| {
+            if (std.mem.eql(u8, fld.name, name)) continue;
+            const d = editDistance(name, fld.name);
+            if (d < best_dist and d <= 2 and d * 2 <= name.len) { best_dist = d; best = fld.name; }
+        }
+        return best;
+    }
+
+    fn findSimilarVariant(name: []const u8, variants: anytype) ?[]const u8 {
+        var best: ?[]const u8 = null;
+        var best_dist: usize = std.math.maxInt(usize);
+        for (variants) |v| {
+            if (std.mem.eql(u8, v.name, name)) continue;
+            const d = editDistance(name, v.name);
+            if (d < best_dist and d <= 2 and d * 2 <= name.len) { best_dist = d; best = v.name; }
+        }
+        return best;
+    }
+
+    fn findSimilarType(self: *Checker, name: []const u8) ?[]const u8 {
+        var best: ?[]const u8 = null;
+        var best_dist: usize = std.math.maxInt(usize);
+        var it = self.types.name_map.iterator();
+        while (it.next()) |entry| {
+            const candidate = entry.key_ptr.*;
+            if (std.mem.eql(u8, candidate, name)) continue;
+            if (!isUserVisibleName(candidate)) continue;
+            const d = editDistance(name, candidate);
+            if (d < best_dist and d <= 2 and d * 2 <= name.len) { best_dist = d; best = candidate; }
+        }
+        var git = self.generics.generic_structs.iterator();
+        while (git.next()) |entry| {
+            const candidate = entry.key_ptr.*;
+            if (std.mem.eql(u8, candidate, name)) continue;
+            const d = editDistance(name, candidate);
+            if (d < best_dist and d <= 2 and d * 2 <= name.len) { best_dist = d; best = candidate; }
+        }
+        return best;
+    }
+
+    fn findSimilarTrait(self: *Checker, name: []const u8) ?[]const u8 {
+        var best: ?[]const u8 = null;
+        var best_dist: usize = std.math.maxInt(usize);
+        var it = self.generics.trait_defs.iterator();
+        while (it.next()) |entry| {
+            const candidate = entry.key_ptr.*;
+            if (std.mem.eql(u8, candidate, name)) continue;
+            const d = editDistance(name, candidate);
+            if (d < best_dist and d <= 2 and d * 2 <= name.len) { best_dist = d; best = candidate; }
+        }
+        return best;
+    }
+
+    fn editDistSuggest(name: []const u8, candidates: []const []const u8) ?[]const u8 {
+        var best: ?[]const u8 = null;
+        var best_dist: usize = std.math.maxInt(usize);
+        for (candidates) |c| {
+            if (std.mem.eql(u8, c, name)) continue;
+            const d = editDistance(name, c);
+            if (d < best_dist and d <= 2 and d * 2 <= name.len) { best_dist = d; best = c; }
+        }
+        return best;
+    }
+
+    fn errWithSuggestion(self: *Checker, pos: Pos, msg: []const u8, suggestion: ?[]const u8) void {
+        if (suggestion) |s| {
+            const full_msg = std.fmt.allocPrint(self.allocator, "{s}; did you mean '{s}'?", .{ msg, s }) catch {
+                self.err.errorWithCode(pos, .e301, msg);
+                return;
+            };
+            self.err.errorWithCode(pos, .e301, full_msg);
+        } else {
+            self.err.errorWithCode(pos, .e301, msg);
+        }
     }
 };
 
