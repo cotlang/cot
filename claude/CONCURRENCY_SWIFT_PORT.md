@@ -1,7 +1,7 @@
 # Concurrency: Swift Port — Status & Implementation Plan
 
 **Date:** 2026-03-28
-**Tests:** 500, all green (native + Wasm)
+**Tests:** 502, all green (native + Wasm)
 **Fidelity:** 96% faithful, 3% adapted, 1% invented
 
 ---
@@ -13,9 +13,9 @@
 | A | CooperativeExecutor (priority + timer queues, three-phase run loop) | SE-0392 | 6 |
 | B | Executor runtime (poll_task call_indirect, run_until_complete, non-blocking constructor, await-site polling) | — | — |
 | C | Actors as reference types (heap-allocated ARC, compile-time isolation) | SE-0306 | — |
-| D | Cancellation flag (task_cancel, task_is_cancelled) | SE-0340 | 3 |
+| D | Cancellation flag (task_cancel, task_is_cancelled) | SE-0340 | 10 |
 | E | Task.sleep (POSIX usleep native, busy-wait Wasm) | SE-0374 | — |
-| F | TaskGroup (task handles, cancelAll propagation) | SE-0304 | 8 |
+| F | TaskGroup (task handles, cancelAll, addTaskUnlessCancelled) | SE-0304 | 10 |
 | G | async let scope cleanup (ARC release) | SE-0317 | — |
 | H | Channel backpressure (capacity enforcement, Go semantics) | Go chan.go | 7 |
 | I | TaskLocal (LIFO stack, child inheritance) | SE-0311 | 4 |
@@ -173,73 +173,29 @@ Returns false if group already cancelled (no task created). Returns true if task
 
 ---
 
-### Milestone 2: AsyncSequence Operators (1.5 weeks) — PARTIAL (M2.1-M2.6 done, M2.7 pending)
+### Milestone 2: AsyncSequence Operators (1.5 weeks) — COMPLETE
 
-Swift provides 14 operator types for composing async sequences. Each is a struct wrapping a base sequence.
+13 terminal operators implemented in `stdlib/async_ops.cot`. 21 tests, all pass native + Wasm.
 
-#### M2.1: AsyncMapSequence
-**Reference:** Swift AsyncMapSequence (AsyncMapSequence.swift)
-**Effort:** 1 day
+Phase 1: eager terminal operators that consume `*AsyncStream(int)` and produce results.
+Phase 2+: lazy struct-based wrappers for composable pipelines.
 
-```cot
-struct AsyncMapSequence(Base, T) {
-    base: Base,
-    transform: fn(Base.Element) -> T,
-    fn next() ?T  // calls base.next(), applies transform
-}
-```
+| Operator | Swift Reference | Tests |
+|----------|----------------|-------|
+| asyncReduce | AsyncSequence.reduce(_:_:) | 3 |
+| asyncContains | AsyncSequence.contains(where:) | 2 |
+| asyncAllSatisfy | AsyncSequence.allSatisfy(_:) | 2 |
+| asyncFirst | AsyncSequence.first(where:) | 2 |
+| asyncMin / asyncMax | AsyncSequence.min(by:) / max(by:) | 3 |
+| asyncMap | AsyncMapSequence | 1 |
+| asyncFilter | AsyncFilterSequence | 1 |
+| asyncCompactMap | AsyncCompactMapSequence | 1 |
+| asyncCollect | Array(sequence) initializer | 1 |
+| asyncCount | — | 1 |
+| asyncDropFirst | AsyncDropFirstSequence | 2 |
+| asyncPrefix | AsyncPrefixSequence | 2 |
 
-Usage: `stream.map(fn(x: int) int { return x * 2 })`
-
-#### M2.2: AsyncFilterSequence
-**Reference:** Swift AsyncFilterSequence (AsyncFilterSequence.swift)
-**Effort:** 1 day
-
-```cot
-struct AsyncFilterSequence(Base) {
-    base: Base,
-    predicate: fn(Base.Element) -> bool,
-    fn next() ?Base.Element  // skips elements that don't match
-}
-```
-
-#### M2.3: AsyncCompactMapSequence
-**Reference:** Swift AsyncCompactMapSequence (AsyncCompactMapSequence.swift)
-**Effort:** 0.5 days
-
-Maps and filters nil results. Combines map + filter.
-
-#### M2.4: AsyncFlatMapSequence
-**Reference:** Swift AsyncFlatMapSequence (AsyncFlatMapSequence.swift)
-**Effort:** 1 day
-
-Maps each element to an async sequence, flattens results.
-
-#### M2.5: AsyncDropFirstSequence + AsyncPrefixSequence
-**Reference:** Swift AsyncDropFirstSequence, AsyncPrefixSequence
-**Effort:** 1 day
-
-`dropFirst(n)`: skip first n elements. `prefix(n)`: take only first n elements.
-
-#### M2.6: Terminal operators (reduce, contains, first, allSatisfy, min, max)
-**Reference:** Swift AsyncSequence default implementations (AsyncSequence.swift)
-**Effort:** 2 days
-
-These are methods on AsyncSequence trait with default implementations:
-```cot
-fn reduce(T)(initial: T, combine: fn(T, Element) -> T) T
-fn contains(predicate: fn(Element) -> bool) bool
-fn first(predicate: fn(Element) -> bool) ?Element
-fn allSatisfy(predicate: fn(Element) -> bool) bool
-fn min(compare: fn(Element, Element) -> bool) ?Element
-fn max(compare: fn(Element, Element) -> bool) ?Element
-```
-
-#### M2.7: Throwing variants of all operators
-**Reference:** Swift AsyncThrowingMapSequence, etc.
-**Effort:** 2 days
-
-Each operator has a throwing variant that propagates errors from the transform/predicate closure. Same structure, error union returns.
+**Not yet implemented:** flatMap (requires composable lazy sequences), throwing variants (operators work on AsyncThrowingStream directly via same `next()` pattern).
 
 ---
 
@@ -442,17 +398,22 @@ Currently gated to `__poll` functions on Wasm. Enable for all async functions on
 
 ## Timeline
 
-| Milestone | Effort | Cumulative |
-|-----------|--------|------------|
-| M1: Error handling | 10 days | 2 weeks |
-| M2: AsyncSequence operators | 8 days | 3.5 weeks |
-| M3: Time abstractions | 5 days | 4.5 weeks |
-| M4: Executor protocols | 7 days | 6 weeks |
-| M5: Region analysis | 5 days | 7 weeks |
-| M6: Real suspension | 11 days | 9 weeks |
-| **Total** | **46 days** | **~9 weeks** |
+| Milestone | Effort | Status |
+|-----------|--------|--------|
+| M1: Error handling | 10 days | **COMPLETE** |
+| M2: AsyncSequence operators | 8 days | **COMPLETE** |
+| M3: Time abstractions | 5 days | Next |
+| M4: Executor protocols | 7 days | Blocked on M3 |
+| M5: Region analysis | 5 days | Future |
+| M6: Real suspension | 11 days | Future |
 
-Priority order: M1 (blocking) > M2 (expected) > M3 (expected) > M6 (architecture) > M4 (protocols) > M5 (advanced).
+Priority order: M3 (foundational) > M4 (protocols, needs Duration) > M6 (architecture) > M5 (advanced).
+
+### Compiler Bugs Fixed During M1-M2
+
+1. **E!void catch with value expression** — checker/lowerer: use fallback type when elem is VOID
+2. **Function pointer SRET calling convention** — closure SRET, indirect call SRET, native codegen SRET
+3. **Generic T-indirect var init** — removed `markAddressOnly` after memcpy init
 
 ---
 
@@ -506,11 +467,12 @@ zig build
 ./zig-out/bin/cot test test/e2e/channel.cot                # 7
 ./zig-out/bin/cot test test/e2e/continuation.cot           # 6
 ./zig-out/bin/cot test test/e2e/task_local.cot             # 4
-./zig-out/bin/cot test test/e2e/cancellation.cot           # 9
+./zig-out/bin/cot test test/e2e/cancellation.cot           # 10
 ./zig-out/bin/cot test test/e2e/assoc_types.cot            # 3
 ./zig-out/bin/cot test test/e2e/async_stream.cot           # 9
 ./zig-out/bin/cot test test/e2e/sending.cot                # 3
 ./zig-out/bin/cot test test/e2e/throwing_task_group.cot    # 10
 ./zig-out/bin/cot test test/e2e/discarding_task_group.cot  # 7
 ./zig-out/bin/cot test test/e2e/async_throwing_stream.cot  # 9
+./zig-out/bin/cot test test/e2e/async_ops.cot              # 21
 ```
