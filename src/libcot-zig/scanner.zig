@@ -394,7 +394,7 @@ pub const Scanner = struct {
             ';' => .semicolon,
             ':' => .colon,
             '~' => .not,
-            '@' => if (self.ch == '"') blk: {
+            '@' => if (self.ch == '"') {
                 // Quoted identifier: @"keyword" allows using reserved words as names
                 self.advance();
                 const text_start = self.pos.offset;
