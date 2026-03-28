@@ -7,6 +7,61 @@
 
 ---
 
+## Step 0: Fix Comptime Array Literal Init (prerequisite)
+
+**Problem:** Comptime blocks only accept `var arr: [3]i64 = undefined` for array creation. The literal syntax `var arr = [0, 0, 0]` fails with "unable to evaluate comptime expression". Both should work — Zig accepts all of these in comptime:
+
+```zig
+// Zig — all valid in comptime:
+var s: [3]i64 = undefined;           // typed + undefined  (works in Cot ✓)
+var s = [_]i64{ 0, 0, 0 };          // inferred literal    (fails in Cot ✗)
+var s: [3]i64 = .{ 0, 0, 0 };       // typed + init list   (fails in Cot ✗)
+```
+
+**Fix:** In `checker.zig`, `evalComptimeBlock`'s var_decl handling, when the initializer is an array literal:
+
+1. Evaluate each element as a comptime value
+2. Construct a `ComptimeArray` from the results
+3. Store in `comptime_vars`
+
+```zig
+// In evalComptimeBlock, var_decl with array literal init:
+if (init_expr == .array_literal) {
+    var elements = std.ArrayListUnmanaged(ComptimeValue){};
+    for (init_expr.array_literal.items) |elem_idx| {
+        const elem_val = self.evalComptimeValue(elem_idx) orelse return null;
+        elements.append(self.allocator, elem_val) catch return null;
+    }
+    const arr = ComptimeValue{ .array = .{
+        .elements = elements,
+        .elem_type_name = "",  // inferred from elements
+    }};
+    comptime_vars.put(var_name, arr);
+}
+```
+
+**Location:** `compiler/frontend/checker.zig`, inside `evalComptimeBlock` near the existing `undefined` array init handling.
+
+**Lines:** ~20-30
+
+**Test:**
+```cot
+test "comptime array literal init" {
+    const s = comptime {
+        var arr = [10, 20, 12]
+        arr[0] = 99
+        arr
+    }
+    @assertEq(s[0], 99)
+    @assertEq(s[1], 20)
+    @assertEq(s[2], 12)
+}
+```
+
+This must be done BEFORE the map work — the comptime evaluator's value handling should be complete for arrays before extending to maps.
+
+---
+
 ## Context
 
 Cot needs compile-time map support for patterns like keyword lookup tables:
