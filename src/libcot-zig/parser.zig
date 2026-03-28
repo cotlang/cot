@@ -82,9 +82,7 @@ pub const Parser = struct {
         };
     }
 
-    // ========================================================================
     // Tokenization — pre-tokenize source into flat arrays
-    // ========================================================================
 
     /// Tokenize source text into the parser's token arrays.
     pub fn tokenize(p: *Parser) !void {
@@ -108,9 +106,7 @@ pub const Parser = struct {
         p.token_starts = slice.items(.start);
     }
 
-    // ========================================================================
     // Core: addNode, addExtra, listToSpan, scratch
-    // ========================================================================
 
     /// Append a node to the node list. Returns its index.
     fn addNode(p: *Parser, node: Node) !Index {
@@ -186,9 +182,7 @@ pub const Parser = struct {
         try p.extra_data.append(p.gpa, val);
     }
 
-    // ========================================================================
     // Token navigation
-    // ========================================================================
 
     fn currentTag(p: *const Parser) Token {
         return p.token_tags[p.tok_i];
@@ -226,9 +220,7 @@ pub const Parser = struct {
         return c == ' ' or c == '\n' or c == '\t' or c == '\r';
     }
 
-    // ========================================================================
     // Error handling
-    // ========================================================================
 
     fn addError(p: *Parser, tag: Ast.Ast.ErrorTag) !void {
         try p.errors.append(p.gpa, .{
@@ -257,9 +249,7 @@ pub const Parser = struct {
         p.nest_level -= 1;
     }
 
-    // ========================================================================
     // Doc comments
-    // ========================================================================
 
     fn collectDocComment(p: *Parser) void {
         if (p.currentTag() != .doc_comment) {
@@ -278,9 +268,7 @@ pub const Parser = struct {
         return if (doc) |d| @enumFromInt(d) else .none;
     }
 
-    // ========================================================================
     // Public API
-    // ========================================================================
 
     pub const Error = error{ ParseError, OutOfMemory };
 
@@ -325,9 +313,7 @@ pub const Parser = struct {
         };
     }
 
-    // ========================================================================
     // Top-level parsing
-    // ========================================================================
 
     fn parseTopLevel(p: *Parser) Error!SubRange {
         const scratch_top = p.scratch.items.len;
@@ -346,9 +332,7 @@ pub const Parser = struct {
         return p.listToSpan(p.scratch.items[scratch_top..]);
     }
 
-    // ========================================================================
     // Declaration parsing
-    // ========================================================================
 
     fn parseDecl(p: *Parser) Error!?Index {
         return switch (p.currentTag()) {
@@ -1255,9 +1239,7 @@ pub const Parser = struct {
         return null;
     }
 
-    // ========================================================================
     // Expression parsing (Step 6)
-    // ========================================================================
 
     fn parseExpr(p: *Parser) Error!?Index {
         return p.parseBinaryExpr(0);
@@ -1442,6 +1424,28 @@ pub const Parser = struct {
                 expr = try p.parseIndexOrSlice(expr);
             } else if (p.eatToken(.lparen) != null) {
                 expr = try p.parseCallArgs(expr);
+            } else if (p.currentTag() == .kw_as) {
+                // expr as Type — postfix cast
+                const as_token = p.advance();
+                const type_node = try p.parseType() orelse {
+                    try p.addError(.expected_type);
+                    return null;
+                };
+                const extra = try p.addExtra(Ast.BuiltinCallData{
+                    .kind = @intFromEnum(Ast.BuiltinKind.as),
+                    .type_arg = type_node.toOptional(),
+                    .arg0 = expr.toOptional(),
+                    .arg1 = .none,
+                    .arg2 = .none,
+                });
+                expr = try p.addNode(.{ .tag = .builtin_call, .main_token = as_token, .data = .{ .node_and_extra = .{ @enumFromInt(0), extra } } });
+            } else if (p.currentTag() == .lbrace) {
+                // Could be: struct init, Task { body }, Task.detached { body }, or end of expression
+                if (try p.tryParsePostfixBrace(expr)) |new_expr| {
+                    expr = new_expr;
+                    continue;
+                }
+                break;
             } else break;
         }
         return expr;
@@ -1506,6 +1510,18 @@ pub const Parser = struct {
     fn parseOperand(p: *Parser) Error!?Index {
         return switch (p.currentTag()) {
             .ident => {
+                // Labeled block: label: { break :label value }
+                if (p.peekIs(.colon)) {
+                    const label_token = p.advance(); // consume ident
+                    _ = p.advance(); // consume colon
+                    if (p.currentTag() == .lbrace) {
+                        // Parse as block with label — label stored as main_token
+                        return p.parseBlockStmt();
+                    }
+                    try p.addError(.expected_block);
+                    _ = label_token;
+                    return null;
+                }
                 const t = p.advance();
                 return try p.addNode(.{ .tag = .ident, .main_token = t, .data = .{ .none = {} } });
             },
@@ -1565,17 +1581,63 @@ pub const Parser = struct {
                 const body = try p.parseBlockStmt() orelse return null;
                 return try p.addNode(.{ .tag = .comptime_block, .main_token = t, .data = .{ .node = body } });
             },
-            .at => p.parseBuiltinCall(),
+            .at => {
+                // @Sendable fn(...) — closure with Sendable annotation
+                if (p.peekTag() == .ident and p.isTokenText(p.tok_i + 1, "Sendable")) {
+                    _ = p.advance(); // @
+                    _ = p.advance(); // Sendable
+                    if (p.currentTag() == .kw_fn) return p.parseSendableClosure();
+                    try p.addError(.unexpected_token);
+                    return null;
+                }
+                return p.parseBuiltinCall();
+            },
+            .kw_async => {
+                // async fn(params) rettype { body } — async closure in expression position
+                const async_token = p.advance();
+                if (p.currentTag() != .kw_fn) {
+                    try p.addError(.unexpected_token);
+                    return null;
+                }
+                return p.parseClosureExprWithFlags(async_token, .{ .is_async = true });
+            },
             .kw_fn => p.parseClosureExpr(),
             .kw_new => p.parseNewExpr(),
             .period => {
-                // .field_name (enum literal shorthand) or .{} (zero init)
-                const t = p.advance();
+                const t = p.advance(); // consume .
                 if (p.currentTag() == .lbrace) {
-                    _ = p.advance();
+                    _ = p.advance(); // consume {
+                    // .{} zero init
+                    if (p.currentTag() == .rbrace) {
+                        _ = p.advance();
+                        return try p.addNode(.{ .tag = .zero_init, .main_token = t, .data = .{ .none = {} } });
+                    }
+                    // .{ .field = value, ... } anonymous struct literal
+                    if (p.currentTag() == .period) {
+                        const fields = try p.parseDotFields();
+                        _ = p.eatToken(.rbrace);
+                        const extra = try p.addExtra(Ast.StructInit{
+                            .type_name_token = .none,
+                            .type_args = SubRange.empty,
+                            .fields = fields,
+                        });
+                        return try p.addNode(.{ .tag = .struct_init, .main_token = t, .data = .{ .node_and_extra = .{ @enumFromInt(0), extra } } });
+                    }
+                    // .{ ident: value } colon-syntax (@safe)
+                    if (p.safe_mode and p.currentTag() == .ident) {
+                        const fields = try p.parseColonFields();
+                        _ = p.eatToken(.rbrace);
+                        const extra = try p.addExtra(Ast.StructInit{
+                            .type_name_token = .none,
+                            .type_args = SubRange.empty,
+                            .fields = fields,
+                        });
+                        return try p.addNode(.{ .tag = .struct_init, .main_token = t, .data = .{ .node_and_extra = .{ @enumFromInt(0), extra } } });
+                    }
                     _ = p.eatToken(.rbrace);
                     return try p.addNode(.{ .tag = .zero_init, .main_token = t, .data = .{ .none = {} } });
                 }
+                // .field_name — enum literal shorthand
                 if (p.currentTag() == .ident) {
                     const name = p.advance();
                     return try p.addNode(.{ .tag = .field_access, .main_token = t, .data = .{ .node_and_token = .{ @enumFromInt(0), name } } });
@@ -1780,6 +1842,32 @@ pub const Parser = struct {
         return try p.addNode(.{ .tag = .builtin_call, .main_token = at_token, .data = .{ .node_and_extra = .{ @enumFromInt(0), extra } } });
     }
 
+    fn parseSendableClosure(p: *Parser) Error!?Index {
+        return p.parseClosureExprWithFlags(p.tok_i, .{ .is_sendable = true });
+    }
+
+    fn parseClosureExprWithFlags(p: *Parser, main_token: TokenIndex, flags: Ast.ClosureFlags) Error!?Index {
+        _ = p.advance(); // consume 'fn'
+        _ = p.eatToken(.lparen);
+        const params = try p.parseFieldList(.rparen);
+        _ = p.eatToken(.rparen);
+        var return_type: OptionalIndex = .none;
+        if (p.currentTag() != .lbrace and p.currentTag() != .eof) {
+            if (try p.parseType()) |rt| return_type = rt.toOptional();
+        }
+        const body = try p.parseBlockStmt() orelse {
+            try p.addError(.expected_block);
+            return null;
+        };
+        const extra = try p.addExtra(Ast.ClosureData{
+            .params = params,
+            .return_type = return_type,
+            .body = body,
+            .flags = flags,
+        });
+        return try p.addNode(.{ .tag = .closure_expr, .main_token = main_token, .data = .{ .node_and_extra = .{ @enumFromInt(0), extra } } });
+    }
+
     fn parseClosureExpr(p: *Parser) Error!?Index {
         const fn_token = p.advance(); // consume 'fn'
         _ = p.eatToken(.lparen);
@@ -1880,9 +1968,7 @@ pub const Parser = struct {
         return try p.addNode(.{ .tag = .string_interp, .main_token = start_token, .data = .{ .extra_range = range } });
     }
 
-    // ========================================================================
     // Type parsing
-    // ========================================================================
 
     fn parseType(p: *Parser) Error!?Index {
         if (p.eatToken(.question) != null) {
@@ -1975,9 +2061,7 @@ pub const Parser = struct {
         return null;
     }
 
-    // ========================================================================
     // Statement parsing (Step 7)
-    // ========================================================================
 
     fn parseStmt(p: *Parser) Error!?Index {
         return switch (p.currentTag()) {
@@ -2226,9 +2310,166 @@ pub const Parser = struct {
         return p.nodes.items(.main_token)[@intFromEnum(node)];
     }
 
-    // ========================================================================
     // Helpers
-    // ========================================================================
+
+    // Postfix brace: struct init, Task { body }, Task.detached { body }
+
+    /// With pre-tokenized input, lookahead is trivial — just index into the array.
+    fn peekNextIsPeriod(p: *const Parser) bool {
+        return p.currentTag() == .lbrace and p.peekTag() == .period;
+    }
+
+    /// Check if current is `{ ident :` or `{ ident ,` or `{ ident }` — colon-syntax struct init.
+    fn peekNextIsIdentColon(p: *const Parser) bool {
+        if (p.currentTag() != .lbrace) return false;
+        if (p.tok_i + 2 >= p.token_tags.len) return false;
+        if (p.token_tags[p.tok_i + 1] != .ident) return false;
+        const tok3 = p.token_tags[p.tok_i + 2];
+        return tok3 == .colon or tok3 == .comma or tok3 == .rbrace;
+    }
+
+    /// Parse colon-syntax struct fields (@safe): `{ x: 10, y: 20 }` or shorthand `{ x, y }`
+    fn parseColonFields(p: *Parser) Error!SubRange {
+        const scratch_top = p.scratch.items.len;
+        defer p.scratch.shrinkRetainingCapacity(scratch_top);
+
+        while (p.currentTag() != .rbrace and p.currentTag() != .eof) {
+            if (p.currentTag() != .ident) break;
+            const name_token = p.advance();
+            var value: Index = undefined;
+            if (p.eatToken(.colon) != null) {
+                value = try p.parseExpr() orelse break;
+            } else {
+                // Field shorthand: `{ x }` -> `{ x: x }`
+                value = try p.addNode(.{ .tag = .ident, .main_token = name_token, .data = .{ .none = {} } });
+            }
+            // Store as pairs: (name_token, value_node)
+            try p.scratch.append(p.gpa, name_token);
+            try p.scratch.append(p.gpa, @intFromEnum(value));
+            if (p.eatToken(.comma) == null) break;
+        }
+
+        return p.listToSpan(p.scratch.items[scratch_top..]);
+    }
+
+    /// Parse `.field = value` struct init fields.
+    fn parseDotFields(p: *Parser) Error!SubRange {
+        const scratch_top = p.scratch.items.len;
+        defer p.scratch.shrinkRetainingCapacity(scratch_top);
+
+        while (p.currentTag() != .rbrace and p.currentTag() != .eof) {
+            _ = p.eatToken(.period) orelse break;
+            const name_token = p.eatToken(.ident) orelse {
+                try p.addError(.expected_identifier);
+                break;
+            };
+            _ = p.eatToken(.assign) orelse {
+                try p.addError(.unexpected_token);
+                break;
+            };
+            const value = try p.parseExpr() orelse break;
+            try p.scratch.append(p.gpa, name_token);
+            try p.scratch.append(p.gpa, @intFromEnum(value));
+            if (p.eatToken(.comma) == null) break;
+        }
+
+        return p.listToSpan(p.scratch.items[scratch_top..]);
+    }
+
+    /// Try to parse a postfix brace as struct init, Task creation, or generic struct init.
+    /// Returns null if the brace should not be consumed (end of expression).
+    fn tryParsePostfixBrace(p: *Parser, expr: Index) Error!?Index {
+        const expr_tag = p.nodes.items(.tag)[@intFromEnum(expr)];
+        const expr_data = p.nodes.items(.data)[@intFromEnum(expr)];
+
+        // Task.detached { body } — check for field_access("detached") on ident("Task")
+        if (expr_tag == .field_access) {
+            const base_node_raw = expr_data.node_and_token[0];
+            const field_token = expr_data.node_and_token[1];
+            if (@intFromEnum(base_node_raw) < p.nodes.len) {
+                const base_tag = p.nodes.items(.tag)[@intFromEnum(base_node_raw)];
+                if (base_tag == .ident) {
+                    const base_main = p.nodes.items(.main_token)[@intFromEnum(base_node_raw)];
+                    if (p.isTokenText(base_main, "Task") and p.isTokenText(field_token, "detached")) {
+                        if (p.peekTag() != .rbrace and p.peekTag() != .period) {
+                            const body = try p.parseBlockStmt() orelse return null;
+                            const extra = try p.addExtra(Ast.TaskData{ .body = body, .flags = .{ .is_detached = true } });
+                            return try p.addNode(.{ .tag = .task_expr, .main_token = p.nodeMainToken(expr), .data = .{ .node_and_extra = .{ @enumFromInt(0), extra } } });
+                        }
+                    }
+                }
+            }
+        }
+
+        // Generic struct init: call(UpperIdent, args) followed by { . or { ident:
+        if (expr_tag == .call or expr_tag == .call_one or expr_tag == .call_zero) {
+            if (p.peekNextIsPeriod() or (p.safe_mode and p.peekNextIsIdentColon())) {
+                // Check callee is uppercase identifier
+                const callee_idx = switch (expr_tag) {
+                    .call_zero => expr_data.node,
+                    .call_one => expr_data.node_and_node[0],
+                    .call => expr_data.node_and_extra[0],
+                    else => unreachable,
+                };
+                const callee_tag = p.nodes.items(.tag)[@intFromEnum(callee_idx)];
+                if (callee_tag == .ident) {
+                    const callee_main = p.nodes.items(.main_token)[@intFromEnum(callee_idx)];
+                    const callee_text = p.tokenText(callee_main);
+                    if (callee_text.len > 0 and std.ascii.isUpper(callee_text[0])) {
+                        _ = p.advance(); // consume {
+                        const use_colon = p.safe_mode and p.peekNextIsIdentColon();
+                        const fields = if (use_colon) try p.parseColonFields() else try p.parseDotFields();
+                        _ = p.eatToken(.rbrace);
+                        const extra = try p.addExtra(Ast.StructInit{
+                            .type_name_token = @enumFromInt(callee_main),
+                            .type_args = SubRange.empty, // TODO: extract from call node
+                            .fields = fields,
+                        });
+                        return try p.addNode(.{ .tag = .struct_init, .main_token = callee_main, .data = .{ .node_and_extra = .{ @enumFromInt(0), extra } } });
+                    }
+                }
+            }
+        }
+
+        // Ident { ... } — struct init or Task creation
+        if (expr_tag == .ident) {
+            const ident_main = p.nodes.items(.main_token)[@intFromEnum(expr)];
+            const ident_text = p.tokenText(ident_main);
+
+            // Task { body } — unstructured task creation
+            if (std.mem.eql(u8, ident_text, "Task")) {
+                if (p.peekTag() != .rbrace and p.peekTag() != .period and
+                    !(p.safe_mode and p.peekNextIsIdentColon()))
+                {
+                    const body = try p.parseBlockStmt() orelse return null;
+                    const extra = try p.addExtra(Ast.TaskData{ .body = body, .flags = .{} });
+                    return try p.addNode(.{ .tag = .task_expr, .main_token = ident_main, .data = .{ .node_and_extra = .{ @enumFromInt(0), extra } } });
+                }
+            }
+
+            // Type {} — empty struct init
+            if (ident_text.len > 0 and std.ascii.isUpper(ident_text[0]) and p.peekTag() == .rbrace) {
+                _ = p.advance(); // consume {
+                _ = p.advance(); // consume }
+                const extra = try p.addExtra(Ast.StructInit{ .type_name_token = @enumFromInt(ident_main), .type_args = SubRange.empty, .fields = SubRange.empty });
+                return try p.addNode(.{ .tag = .struct_init, .main_token = ident_main, .data = .{ .node_and_extra = .{ @enumFromInt(0), extra } } });
+            }
+
+            // Type { .field = value } or Type { field: value } (@safe)
+            if (ident_text.len > 0 and std.ascii.isUpper(ident_text[0])) {
+                if (p.peekNextIsPeriod() or (p.safe_mode and p.peekNextIsIdentColon())) {
+                    _ = p.advance(); // consume {
+                    const use_colon = p.safe_mode and p.peekNextIsIdentColon();
+                    const fields = if (use_colon) try p.parseColonFields() else try p.parseDotFields();
+                    _ = p.eatToken(.rbrace);
+                    const extra = try p.addExtra(Ast.StructInit{ .type_name_token = @enumFromInt(ident_main), .type_args = SubRange.empty, .fields = fields });
+                    return try p.addNode(.{ .tag = .struct_init, .main_token = ident_main, .data = .{ .node_and_extra = .{ @enumFromInt(0), extra } } });
+                }
+            }
+        }
+
+        return null; // Don't consume the brace — it's not part of this expression
+    }
 
     fn peekIsNotColon(p: *const Parser) bool {
         if (p.tok_i + 1 >= p.token_tags.len) return true;
@@ -2256,9 +2497,7 @@ pub const Parser = struct {
         };
     }
 
-    // ========================================================================
     // Skip helpers (for stubs)
-    // ========================================================================
 
     fn skipBraceBlock(p: *Parser) void {
         // Skip tokens until we find the identifier/name, then the brace block
@@ -2277,9 +2516,7 @@ pub const Parser = struct {
         }
     }
 
-    // ========================================================================
     // Cleanup
-    // ========================================================================
 
     pub fn deinit(p: *Parser) void {
         p.token_list.deinit(p.gpa);
@@ -2290,9 +2527,7 @@ pub const Parser = struct {
     }
 };
 
-// ============================================================================
 // Tests
-// ============================================================================
 
 test "parser infrastructure: addNode and addExtra round-trip" {
     var p = Parser.init(std.testing.allocator, "fn main() {}", false);
@@ -2404,9 +2639,7 @@ test "parser: parse test declaration stub" {
     try std.testing.expectEqual(Tag.test_decl, p.nodes.items(.tag)[@intFromEnum(decl.?)]);
 }
 
-// ============================================================================
 // End-to-end integration tests
-// ============================================================================
 
 fn initTestParser(allocator: std.mem.Allocator, src: [:0]const u8) !Parser {
     var p = Parser.init(allocator, src, false);

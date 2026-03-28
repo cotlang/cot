@@ -1046,9 +1046,7 @@ pub const Ast = struct {
         return false;
     }
 
-    // ----------------------------------------------------------------
     // full.* accessor functions — unpack compact nodes into rich structs
-    // ----------------------------------------------------------------
 
     pub fn fnDeclData(self: *const Ast, node: Index) full.FnDeclFull {
         const tag = self.nodeTag(node);
