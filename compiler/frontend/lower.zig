@@ -1869,9 +1869,23 @@ pub const Lowerer = struct {
                                         _ = try fb.emitStoreField(sret_ptr, 0, 0, lowered, ret.span);
                                     }
                                 } else {
-                                    // Pure scalar — store directly
-                                    _ = try fb.emitStoreField(sret_ptr, 0, 0, lowered, ret.span);
-                                    debug.log(.lower, "Phase 8.5: T-indirect SRET return via scalar store", .{});
+                                    // Check if the return value is an address-only local.
+                                    // Address-only locals return their stack address from convertLoadLocal
+                                    // (ssa_builder.zig:771-773), so we must memcpy from the address
+                                    // rather than storing the address value itself.
+                                    const is_addr_only_ret = if (ret_ident_name) |name|
+                                        (if (fb.lookupLocal(name)) |li| fb.locals.items[li].is_address_only else false)
+                                    else
+                                        false;
+                                    if (is_addr_only_ret) {
+                                        var mc_args = [_]ir.NodeIndex{ sret_ptr, lowered, runtime_size };
+                                        _ = try fb.emitCall("memcpy", &mc_args, false, TypeRegistry.VOID, ret.span);
+                                        debug.log(.lower, "Phase 8.5: T-indirect SRET return via memcpy (address-only local)", .{});
+                                    } else {
+                                        // Pure scalar — store directly
+                                        _ = try fb.emitStoreField(sret_ptr, 0, 0, lowered, ret.span);
+                                        debug.log(.lower, "Phase 8.5: T-indirect SRET return via scalar store", .{});
+                                    }
                                 }
                             }
                         }
@@ -2467,10 +2481,14 @@ pub const Lowerer = struct {
                     const rt_size = try self.emitRuntimeSizeOf(fb, tp_name, var_stmt.span);
                     var mc_args = [_]ir.NodeIndex{ dst_addr, src_ptr, rt_size };
                     _ = try fb.emitCall("memcpy", &mc_args, false, TypeRegistry.VOID, var_stmt.span);
-                    // Swift GenOpaque.cpp — mark as address-only so SSA builder
-                    // won't decompose this local (no ptr+len for strings, etc.)
-                    fb.markAddressOnly(local_idx);
-                    debug.log(.lower, "Phase 8.5: var '{s}' init from T-indirect '{s}' via memcpy (early, address-only)", .{ var_stmt.name, init_ident });
+                    // Do NOT mark as address_only — the local holds a concrete scalar value
+                    // that must be readable via normal load. The memcpy correctly populates
+                    // the local's memory; marking address_only would make all subsequent
+                    // reads return the stack address instead of the value.
+                    // Swift GenOpaque.cpp uses address-only for truly opaque types, but
+                    // in Cot shared bodies, T resolves to a concrete type (int, etc.)
+                    // and reads must work normally.
+                    debug.log(.lower, "Phase 8.5: var '{s}' init from T-indirect '{s}' via memcpy", .{ var_stmt.name, init_ident });
                     return;
                 }
             }
