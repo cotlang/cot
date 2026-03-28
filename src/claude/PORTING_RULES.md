@@ -2,6 +2,13 @@
 
 **These rules apply to ALL code moved from `compiler/` to `src/`.**
 
+**Academic documentation:** Every ported file gets a companion `.md` file in `~/cotlang/ac/` that mirrors the source path exactly. The markdown explains the code section by section with matching line numbers. This becomes the educational content for `cot.ac`.
+
+```
+Source:  ~/cotlang/cot/src/libcot-zig/scanner.zig
+Docs:    ~/cotlang/ac/src/libcot-zig/scanner.md
+```
+
 ---
 
 ## 1. Remove Reference Comments
@@ -94,7 +101,33 @@ The concurrency code is being rewritten from Go-style to Swift-style. Don't port
 
 Wait for the Swift concurrency port to land in `compiler/`, then port the new code.
 
-## 9. Git Discipline
+## 9. Slow and Methodical — Educational Porting
+
+This is not a bulk copy. Each file is ported in small chunks (~200-300 lines) with a summary explaining what the code does. The goal is for John to understand every line of the compiler by reading the port.
+
+**Process for each chunk:**
+
+1. Read ~200-300 lines from `compiler/`
+2. Explain what the code does in plain English — what problem it solves, why it's shaped this way
+3. Port it to `src/` with cleanup applied (remove reference comments, simplify, rename)
+4. Show the before/after so the changes are visible
+5. Wait for confirmation before continuing to the next chunk
+
+**The pace is the point.** This is a learning exercise, not a speed exercise. A file that took Claude 30 seconds to write originally should take an hour to port properly with explanations.
+
+**Order for each chunk:**
+1. Write the cleaned code to `src/` FIRST
+2. Then write the companion documentation to `ac/`
+3. Line numbers in the docs must match the source file exactly
+
+**What the documentation should cover:**
+- What this section of code does (high-level purpose)
+- How it fits into the compilation pipeline
+- Any non-obvious design decisions and why they were made
+- What was cleaned up from the original and why
+- A "changes from original" table at the end of each file
+
+## 10. Git Discipline
 
 - One commit per logical unit (one file or one closely-related group)
 - Commit message: `port: <file> from compiler/ to src/libX-zig/`
