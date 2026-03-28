@@ -1,7 +1,11 @@
 // Executor tests — Swift CooperativeExecutor faithful port.
 // Tests the cooperative event loop: priority queue, timer queue, run loop.
+// M4: Executor protocol conformance (SerialExecutor, SchedulingExecutor).
 
 import "std/executor"
+import "std/executor_traits"
+import "std/duration"
+import "std/instant"
 import "std/sys"
 
 test "executor init and empty run" {
@@ -62,4 +66,60 @@ test "executor drain timer queue" {
     @assertEq(exec.timer_queue.len(), 0)
     @assertEq(exec.run_queue.len(), 1)
     @assertEq(exec.run_queue.get(0).context, 42)
+}
+
+// --- M4: SchedulingExecutor with Duration ---
+
+test "executor enqueueAfter with Duration" {
+    var exec = CooperativeExecutor_init()
+    var delay = Duration.seconds(10)
+    CooperativeExecutor_enqueueAfter(&exec, 0, 77, PRIORITY_HIGH, delay)
+    @assertEq(exec.timer_queue.len(), 1)
+    @assertEq(exec.timer_queue.get(0).context, 77)
+    @assertEq(exec.timer_queue.get(0).priority, PRIORITY_HIGH)
+    @assert(exec.timer_queue.get(0).deadline > 0)
+}
+
+test "executor enqueueAt with Instant" {
+    var exec = CooperativeExecutor_init()
+    // Deadline 10 seconds in the future
+    var now = Instant.now()
+    var delay = Duration.seconds(10)
+    var deadline = now.advanced(delay)
+    CooperativeExecutor_enqueueAt(&exec, 0, 88, PRIORITY_LOW, deadline)
+    @assertEq(exec.timer_queue.len(), 1)
+    @assertEq(exec.timer_queue.get(0).context, 88)
+}
+
+test "executor enqueueAt past deadline goes to run queue" {
+    var exec = CooperativeExecutor_init()
+    // Deadline in the past
+    var deadline = Instant.fromNanoseconds(1)
+    CooperativeExecutor_enqueueAt(&exec, 0, 99, PRIORITY_DEFAULT, deadline)
+    @assertEq(exec.run_queue.len(), 1)
+    @assertEq(exec.run_queue.get(0).context, 99)
+    @assertEq(exec.timer_queue.len(), 0)
+}
+
+// --- M4: SerialExecutor ---
+
+test "executor isSameExclusiveExecutionContext" {
+    var exec = CooperativeExecutor_init()
+    // Phase 1: single-threaded, always same context
+    @assert(CooperativeExecutor_isSameExclusiveExecutionContext(&exec, 0))
+}
+
+test "executor checkIsolated no crash" {
+    var exec = CooperativeExecutor_init()
+    CooperativeExecutor_checkIsolated(&exec)
+}
+
+test "executor isIsolatingCurrentContext" {
+    var exec = CooperativeExecutor_init()
+    @assert(CooperativeExecutor_isIsolatingCurrentContext(&exec))
+}
+
+test "executor isMainExecutor" {
+    var exec = CooperativeExecutor_init()
+    @assert(CooperativeExecutor_isMainExecutor(&exec))
 }
