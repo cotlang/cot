@@ -968,7 +968,9 @@ pub const Parser = struct {
         };
 
         var is_distinct = false;
-        if (p.currentTag() == .ident and p.isTokenText(p.tok_i, "distinct")) {
+        if (p.currentTag() == .kw_distinct or
+            (p.currentTag() == .ident and p.isTokenText(p.tok_i, "distinct")))
+        {
             is_distinct = true;
             _ = p.advance();
         }
@@ -2400,4 +2402,131 @@ test "parser: parse test declaration stub" {
     const decl = try p.parseDecl();
     try std.testing.expect(decl != null);
     try std.testing.expectEqual(Tag.test_decl, p.nodes.items(.tag)[@intFromEnum(decl.?)]);
+}
+
+// ============================================================================
+// End-to-end integration tests
+// ============================================================================
+
+fn initTestParser(allocator: std.mem.Allocator, src: [:0]const u8) !Parser {
+    var p = Parser.init(allocator, src, false);
+    try p.tokenize();
+    try p.nodes.append(p.gpa, .{ .tag = .root, .main_token = 0, .data = .{ .none = {} } });
+    return p;
+}
+
+fn testAst(p: *const Parser) Ast.Ast {
+    return .{
+        .source = p.source,
+        .tokens = p.token_list.slice(),
+        .nodes = p.nodes.slice(),
+        .extra_data = p.extra_data.items,
+        .errors = &.{},
+        .safe_mode = false,
+    };
+}
+
+test "e2e: fn with params and return type" {
+    var p = try initTestParser(std.testing.allocator, "fn add(a: i64, b: i64) i64 { return a; }");
+    defer p.deinit();
+    const decl = (try p.parseDecl()).?;
+    try std.testing.expectEqual(Tag.fn_decl, p.nodes.items(.tag)[@intFromEnum(decl)]);
+    const a = testAst(&p);
+    const f = a.fnDeclData(decl);
+    try std.testing.expectEqualStrings("add", f.name);
+    try std.testing.expect(!f.is_extern);
+    try std.testing.expect(f.params.len() > 0);
+    try std.testing.expect(f.return_type != .none);
+    try std.testing.expect(f.body != .none);
+}
+
+test "e2e: extern fn" {
+    var p = try initTestParser(std.testing.allocator, "extern fn exit(code: i32)");
+    defer p.deinit();
+    const decl = (try p.parseDecl()).?;
+    try std.testing.expectEqual(Tag.fn_decl_extern, p.nodes.items(.tag)[@intFromEnum(decl)]);
+}
+
+test "e2e: struct with fields" {
+    var p = try initTestParser(std.testing.allocator, "struct Point { x: i64, y: i64 }");
+    defer p.deinit();
+    const decl = (try p.parseDecl()).?;
+    try std.testing.expectEqual(Tag.struct_decl, p.nodes.items(.tag)[@intFromEnum(decl)]);
+    const a = testAst(&p);
+    const s = a.structDeclData(decl);
+    try std.testing.expectEqualStrings("Point", s.name);
+    try std.testing.expect(s.fields.len() > 0);
+    try std.testing.expect(!s.is_actor);
+}
+
+test "e2e: var with type and value" {
+    var p = try initTestParser(std.testing.allocator, "var x: i64 = 42");
+    defer p.deinit();
+    const decl = (try p.parseDecl()).?;
+    const a = testAst(&p);
+    const v = a.varDeclData(decl);
+    try std.testing.expectEqualStrings("x", v.name);
+    try std.testing.expect(!v.is_const);
+    try std.testing.expect(v.type_expr != .none);
+    try std.testing.expect(v.value != .none);
+}
+
+test "e2e: type alias distinct" {
+    var p = try initTestParser(std.testing.allocator, "type RawPtr = distinct i64");
+    defer p.deinit();
+    const decl = (try p.parseDecl()).?;
+    try std.testing.expectEqual(Tag.type_alias_distinct, p.nodes.items(.tag)[@intFromEnum(decl)]);
+}
+
+test "e2e: trait declaration" {
+    var p = try initTestParser(std.testing.allocator, "trait Hashable { fn hash() i64 }");
+    defer p.deinit();
+    const decl = (try p.parseDecl()).?;
+    const a = testAst(&p);
+    const t = a.traitDeclData(decl);
+    try std.testing.expectEqualStrings("Hashable", t.name);
+    try std.testing.expect(t.methods.len() > 0);
+}
+
+test "e2e: union declaration" {
+    var p = try initTestParser(std.testing.allocator, "union Result { ok: i64, err: string }");
+    defer p.deinit();
+    const decl = (try p.parseDecl()).?;
+    const a = testAst(&p);
+    const u = a.unionDeclData(decl);
+    try std.testing.expectEqualStrings("Result", u.name);
+    try std.testing.expect(u.variants.len() > 0);
+}
+
+test "e2e: binary expression in fn body" {
+    var p = try initTestParser(std.testing.allocator, "fn f() { 1 + 2; }");
+    defer p.deinit();
+    _ = try p.parseDecl();
+    var found = false;
+    for (p.nodes.items(.tag)) |tag| {
+        if (tag == .binary_add) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "e2e: call expression" {
+    var p = try initTestParser(std.testing.allocator, "fn f() { print(42); }");
+    defer p.deinit();
+    _ = try p.parseDecl();
+    var found = false;
+    for (p.nodes.items(.tag)) |tag| {
+        if (tag == .call_one) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "e2e: multiple top-level declarations" {
+    var p = try initTestParser(std.testing.allocator,
+        \\import "std/io"
+        \\fn main() { return 0; }
+        \\const PI = 3
+    );
+    defer p.deinit();
+    const top = try p.parseTopLevel();
+    try std.testing.expectEqual(@as(u32, 3), top.len());
 }
