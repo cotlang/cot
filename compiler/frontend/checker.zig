@@ -918,6 +918,9 @@ pub const Checker = struct {
         self.current_return_type = body_return_type;
         // Swift SE-0316: set global actor context for isolation checking
         if (f.global_actor) |ga| self.current_global_actor = ga;
+        // Swift SE-0430: clear sent_variables at function boundary.
+        // Each function has its own sending scope — sent state doesn't leak across functions.
+        self.sent_variables.clearRetainingCapacity();
         if (f.body != null_node) try self.checkBlockExpr(f.body);
         // Lint: check for unused vars/params before scope exits
         if (self.lint_mode) self.checkScopeUnused(&func_scope);
@@ -1786,6 +1789,14 @@ pub const Checker = struct {
     }
 
     fn checkIdentifier(self: *Checker, id: ast.Ident) TypeIndex {
+        // Swift SE-0430: use-after-send detection.
+        // Swift reference: RegionAnalysis.cpp PartitionOpKind::Require
+        //   A Require on a sent element produces LocalUseAfterSendError.
+        // Cot Phase 1: checker-level tracking via sent_variables map.
+        if (self.sent_variables.contains(id.name)) {
+            self.err.errorWithCode(id.span.start, .e300,
+                "use of variable after it has been sent; sending transfers ownership");
+        }
         if (self.resolveTypeByName(id.name)) |type_idx| {
             const t = self.types.get(type_idx);
             // Allow enum, union, and error_set types to be used as expressions
@@ -2225,6 +2236,26 @@ pub const Checker = struct {
                     self.types.isAssignable(at.pointer.elem, param_tidx);
                 if (!is_safe_struct and !is_safe_deref) {
                     self.err.errorWithCode(c.span.start, .e300, "type mismatch");
+                }
+            }
+        }
+
+        // Swift SE-0430: mark sending parameter arguments as "sent".
+        // Swift reference: RegionAnalysis.cpp PartitionOpKind::Send
+        //   When a non-Sendable value is passed to a sending parameter,
+        //   the value's region is marked as sent. Any subsequent use is
+        //   a use-after-send error (PartitionOpKind::Require → LocalUseAfterSendError).
+        // Cot Phase 1: track sent variable names in sent_variables map.
+        for (c.args, 0..) |arg_idx, i| {
+            const param_idx = i + param_offset;
+            if (param_idx < ft.params.len and ft.params[param_idx].is_sending) {
+                // Extract the argument's variable name (if it's a simple identifier)
+                if (self.tree.getNode(arg_idx)) |arg_node| {
+                    if (arg_node.asExpr()) |arg_expr| {
+                        if (arg_expr == .ident) {
+                            self.sent_variables.put(arg_expr.ident.name, {}) catch {};
+                        }
+                    }
                 }
             }
         }
@@ -4632,7 +4663,9 @@ pub const Checker = struct {
             } else false;
 
             if (!is_substituted) type_idx = try self.safeWrapType(type_idx);
-            try func_params.append(self.allocator, .{ .name = param.name, .type_idx = type_idx });
+            // Swift SE-0430: propagate is_sending from AST to type system.
+            // This enables use-after-send detection in checkCall().
+            try func_params.append(self.allocator, .{ .name = param.name, .type_idx = type_idx, .is_sending = param.is_sending });
         }
         const ret_type = if (return_type_idx != null_node) try self.resolveTypeExpr(return_type_idx) else TypeRegistry.VOID;
         return try self.types.add(.{ .func = .{ .params = try self.allocator.dupe(types.FuncParam, func_params.items), .return_type = ret_type } });

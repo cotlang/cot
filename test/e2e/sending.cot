@@ -1,12 +1,15 @@
 // sending parameter tests — Swift SE-0430.
 // Syntax: `param: sending Type` — transfers ownership to callee.
-// Phase 1: parsing + type system. Phase 2+: use-after-send enforcement.
+// Swift reference: RegionAnalysis.cpp — Send op marks region as sent,
+//   Require op on sent region produces LocalUseAfterSendError.
+//
+// Phase 1: checker-level tracking via sent_variables map.
+// Phase 2+: full SSA region dataflow (region_isolation.zig).
 
 import "std/sys"
 
 // Function with sending parameter.
 // Swift reference: func processItem(sending item: NonSendable)
-// Cot syntax: `value: sending int` (sending before type, after colon)
 fn consume(value: sending int) int {
     return value * 2
 }
@@ -30,4 +33,24 @@ test "sending with multiple params" {
         return a + b
     }
     @assertEq(transfer(10, 20), 30)
+}
+
+test "sending literal is fine" {
+    // Sending a literal (not a variable) — no use-after-send
+    var r1 = consume(42)
+    var r2 = consume(99)
+    @assertEq(r1, 84)
+    @assertEq(r2, 198)
+}
+
+test "non-sending param still usable after call" {
+    fn transfer(a: sending int, b: int) int {
+        return a + b
+    }
+    var a = 10
+    var b = 20
+    var result = transfer(a, b)
+    // b was NOT a sending param — still usable
+    @assertEq(b, 20)
+    @assertEq(result, 30)
 }
