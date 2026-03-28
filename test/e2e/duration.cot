@@ -1,0 +1,150 @@
+// Duration + Instant + Clock tests — Swift Duration.swift, ContinuousClock.swift
+// Swift reference: Duration (core/Duration.swift), Instant (ContinuousClock.swift:19),
+//   Clock (Concurrency/Clock.swift), ContinuousClock, SuspendingClock
+
+import "std/duration"
+import "std/instant"
+import "std/clock"
+import "std/time"
+
+// --- Duration factory methods ---
+
+test "Duration.seconds" {
+    var d = Duration.seconds(3)
+    @assertEq(d.toNanoseconds(), 3000000000)
+    @assertEq(d.toSeconds(), 3)
+}
+
+test "Duration.milliseconds" {
+    var d = Duration.milliseconds(500)
+    @assertEq(d.toNanoseconds(), 500000000)
+    @assertEq(d.toMilliseconds(), 500)
+}
+
+test "Duration.microseconds" {
+    var d = Duration.microseconds(1000)
+    @assertEq(d.toNanoseconds(), 1000000)
+    @assertEq(d.toMicroseconds(), 1000)
+}
+
+test "Duration.nanoseconds" {
+    var d = Duration.nanoseconds(42)
+    @assertEq(d.toNanoseconds(), 42)
+}
+
+test "Duration.zero" {
+    var d = Duration.zero()
+    @assert(d.isZero())
+    @assertEq(d.toNanoseconds(), 0)
+}
+
+// --- Duration arithmetic ---
+
+test "Duration add" {
+    var a = Duration.seconds(1)
+    var b = Duration.milliseconds(500)
+    var c = a.add(b)
+    @assertEq(c.toNanoseconds(), 1500000000)
+}
+
+test "Duration sub" {
+    var a = Duration.seconds(2)
+    var b = Duration.milliseconds(500)
+    var c = a.sub(b)
+    @assertEq(c.toNanoseconds(), 1500000000)
+}
+
+test "Duration mul" {
+    var d = Duration.milliseconds(100)
+    var doubled = d.mul(2)
+    @assertEq(doubled.toMilliseconds(), 200)
+}
+
+test "Duration div" {
+    var d = Duration.seconds(10)
+    var half = d.div(2)
+    @assertEq(half.toSeconds(), 5)
+}
+
+// --- Duration comparison ---
+
+test "Duration comparison" {
+    var a = Duration.seconds(1)
+    var b = Duration.seconds(2)
+    @assert(a.lessThan(b))
+    @assert(b.greaterThan(a))
+    @assert(!a.equals(b))
+}
+
+test "Duration equals" {
+    var a = Duration.milliseconds(1000)
+    var b = Duration.seconds(1)
+    @assert(a.equals(b))
+}
+
+// --- Instant ---
+
+test "Instant.now is positive" {
+    var now = Instant.now()
+    @assert(now.toNanoseconds() > 0)
+}
+
+test "Instant ordering" {
+    var a = Instant.now()
+    var b = Instant.now()
+    @assert(!b.isBefore(a))
+}
+
+test "Instant advanced" {
+    var base = Instant.fromNanoseconds(1000000000)
+    var dur = Duration.seconds(5)
+    var advanced = base.advanced(dur)
+    @assertEq(advanced.toNanoseconds(), 6000000000)
+}
+
+test "Instant duration" {
+    var a = Instant.fromNanoseconds(1000000000)
+    var b = Instant.fromNanoseconds(3000000000)
+    var d = a.duration(b)
+    @assertEq(d.toSeconds(), 2)
+}
+
+// --- Clock ---
+
+test "ContinuousClock.now returns positive" {
+    var now = ContinuousClock.now()
+    @assert(now.toNanoseconds() > 0)
+}
+
+test "ContinuousClock.minimumResolution" {
+    var res = ContinuousClock.minimumResolution()
+    @assertEq(res.toNanoseconds(), 1)
+}
+
+test "ContinuousClock.measure" {
+    var elapsed = ContinuousClock.measure(fn() void { var x = 0 })
+    @assert(elapsed.toNanoseconds() >= 0)
+}
+
+test "SuspendingClock.now returns positive" {
+    var now = SuspendingClock.now()
+    @assert(now.toNanoseconds() > 0)
+}
+
+// --- Task.sleep / Task.yield / Task.currentPriority ---
+
+test "Task_sleep_for zero" {
+    Task_sleep_for(Duration.zero())
+}
+
+test "Task_sleep_until past deadline" {
+    Task_sleep_until(Instant.fromNanoseconds(0))
+}
+
+test "Task_yield is no-op" {
+    Task_yield()
+}
+
+test "Task_currentPriority returns DEFAULT" {
+    @assertEq(Task_currentPriority(), PRIORITY_DEFAULT)
+}
