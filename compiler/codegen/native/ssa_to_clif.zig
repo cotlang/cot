@@ -1654,11 +1654,54 @@ const SsaToClifTranslator = struct {
             break :blk 2;
         } else 1;
 
+        // Check if return type needs SRET (struct return pointer as hidden first arg).
+        // The callee was compiled with needsSret() in the lowerer, which adds a hidden
+        // __sret first parameter. We must match this convention for indirect calls.
+        // Reference: lower.zig:100-114 needsSret()
+        const ret_info = if (v.type_idx != TypeRegistry.VOID and v.type_idx != TypeRegistry.SSA_MEM)
+            self.type_reg.get(v.type_idx)
+        else
+            self.type_reg.get(TypeRegistry.VOID);
+        const needs_sret = blk: {
+            if (v.type_idx == TypeRegistry.VOID or v.type_idx == TypeRegistry.SSA_MEM)
+                break :blk false;
+            const ri = ret_info;
+            if ((ri == .struct_type or ri == .tuple or ri == .union_type) and self.type_reg.sizeOf(v.type_idx) > 8)
+                break :blk true;
+            if (ri == .optional) {
+                // Pointer-like optionals (?*T managed) don't use SRET
+                const ei = self.type_reg.get(ri.optional.elem);
+                if (ei == .pointer and ei.pointer.managed) break :blk false;
+                break :blk true;
+            }
+            break :blk false;
+        };
+
+        // If SRET needed: allocate stack slot and get its address
+        var sret_slot: ?clif.StackSlot = null;
+        var sret_addr: ?clif.Value = null;
+        if (needs_sret) {
+            const ret_size = self.type_reg.sizeOf(v.type_idx);
+            const slot_size: u32 = @max(8, @as(u32, @intCast(ret_size)));
+            sret_slot = try self.clif_func.createStackSlot(self.allocator, .{
+                .kind = .explicit_slot,
+                .size = slot_size,
+                .align_shift = 0,
+            });
+            sret_addr = try self.builder.ins().stackAddr(clif.Type.I64, sret_slot.?, 0);
+        }
+
         // Skip last arg (memory state) by position, not value identity
         const indirect_has_mem = v.memoryArg() != null;
         const indirect_end = if (indirect_has_mem and v.args.len > 0) v.args.len - 1 else v.args.len;
         var call_args = std.ArrayListUnmanaged(clif.Value){};
         defer call_args.deinit(self.allocator);
+
+        // SRET: prepend hidden __sret pointer as first argument
+        if (sret_addr) |addr| {
+            try call_args.append(self.allocator, addr);
+        }
+
         if (actual_args_start < indirect_end) {
             for (v.args[actual_args_start..indirect_end]) |arg| {
                 const clif_arg = self.getClif(arg);
@@ -1666,18 +1709,41 @@ const SsaToClifTranslator = struct {
             }
         }
 
-        // Build signature for indirect call
+        // Build signature for indirect call — must match callee's actual ABI.
         var sig = clif.Signature.init(.system_v);
         for (call_args.items) |_| {
             try sig.addParam(self.allocator, clif.AbiParam.init(clif.Type.I64));
         }
-        if (v.type_idx != TypeRegistry.VOID and v.type_idx != TypeRegistry.SSA_MEM) {
-            try sig.addReturn(self.allocator, clif.AbiParam.init(clif.Type.I64));
+        if (!needs_sret and v.type_idx != TypeRegistry.VOID and v.type_idx != TypeRegistry.SSA_MEM) {
+            // Non-SRET return: callee returns value in registers
+            const is_string_or_slice_ret = v.type_idx == TypeRegistry.STRING or ret_info == .slice;
+            const is_opt_ptr_ret = ret_info == .optional and blk: {
+                const ei = self.type_reg.get(ret_info.optional.elem);
+                break :blk ei == .pointer and ei.pointer.managed;
+            };
+            if (is_string_or_slice_ret or is_opt_ptr_ret) {
+                try sig.addReturn(self.allocator, clif.AbiParam.init(clif.Type.I64));
+                try sig.addReturn(self.allocator, clif.AbiParam.init(clif.Type.I64));
+            } else {
+                try sig.addReturn(self.allocator, clif.AbiParam.init(self.ssaTypeToClifType(v.type_idx)));
+            }
         }
+        // SRET functions return void at ABI level — no return in signature.
 
         const sig_ref = try self.builder.importSignature(sig);
         const call_result = try self.builder.ins().callIndirect(sig_ref, callee, call_args.items);
-        if (call_result.results.len > 0) {
+
+        if (needs_sret) {
+            // SRET: load result from the stack slot. The callee wrote to __sret pointer.
+            // For optionals: value at [sret+0], null flag at [sret+8].
+            // Store value to value_map, tag to compound_extra_map.
+            const result_val = try self.builder.ins().stackLoad(clif.Type.I64, sret_slot.?, 0);
+            try self.putValue(v.id, result_val);
+            if (ret_info == .optional) {
+                const tag_val = try self.builder.ins().stackLoad(clif.Type.I64, sret_slot.?, 8);
+                try self.compound_extra_map.put(self.allocator, v.id, tag_val);
+            }
+        } else if (call_result.results.len > 0) {
             try self.putValue(v.id, call_result.results[0]);
         }
     }

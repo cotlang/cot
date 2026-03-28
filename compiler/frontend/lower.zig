@@ -7784,10 +7784,22 @@ pub const Lowerer = struct {
 
         // Create the closure body function
         const return_type = if (ce.return_type != null_node) self.resolveTypeNode(ce.return_type) else TypeRegistry.VOID;
-        self.builder.startFunc(closure_name, TypeRegistry.VOID, return_type, ce.span);
+        // SRET: closure functions must use the same SRET convention as regular functions.
+        // Without this, indirect callers pass an __sret pointer but the closure body
+        // returns directly — mismatched calling convention causes corruption.
+        // Reference: lower.zig:737-758 (regular function SRET handling)
+        const closure_uses_sret = self.needsSret(return_type);
+        const closure_wasm_return_type = if (closure_uses_sret) TypeRegistry.VOID else return_type;
+        self.builder.startFunc(closure_name, TypeRegistry.VOID, closure_wasm_return_type, ce.span);
         if (self.builder.func()) |closure_fb| {
             self.current_func = closure_fb;
             self.cleanup_stack.clear();
+            if (closure_uses_sret) closure_fb.sret_return_type = return_type;
+
+            // SRET: add hidden first parameter (must come before declared params)
+            if (closure_uses_sret) {
+                _ = try closure_fb.addParam("__sret", TypeRegistry.I64, 8);
+            }
 
             // Add declared params
             for (ce.params) |param| {
@@ -9600,6 +9612,25 @@ pub const Lowerer = struct {
             // Closure struct decomposition: load table_idx from offset 0
             const closure_ptr = try self.lowerExprNode(call.callee);
             const table_idx = try fb.emitPtrLoadValue(closure_ptr, TypeRegistry.I64, call.span);
+
+            // SRET: if callee returns a compound type (struct/tuple/optional > 8 bytes),
+            // it was compiled with a hidden __sret first parameter. We must match this
+            // convention for indirect calls (closure_call / inter_call).
+            // Reference: lower.zig:100-114 needsSret(), line 756-758 addParam("__sret")
+            if (self.needsSret(return_type)) {
+                const ret_size = self.type_reg.sizeOf(return_type);
+                // Use a dedicated temporary local (not shared SRET) to avoid conflicts
+                // when the caller also uses SRET for its own return.
+                const tmp_local = try fb.addLocalWithSize("__indirect_sret", return_type, false, ret_size);
+                const tmp_addr = try fb.emitAddrLocal(tmp_local, TypeRegistry.I64, call.span);
+                var sret_args = std.ArrayListUnmanaged(ir.NodeIndex){};
+                defer sret_args.deinit(self.allocator);
+                try sret_args.append(self.allocator, tmp_addr);
+                try sret_args.appendSlice(self.allocator, args.items);
+                _ = try fb.emitClosureCall(table_idx, closure_ptr, sret_args.items, TypeRegistry.VOID, call.span);
+                return try fb.emitLoadLocal(tmp_local, return_type, call.span);
+            }
+
             // Use closure_call: callee=table_idx, context=closure_ptr, args
             return try fb.emitClosureCall(table_idx, closure_ptr, args.items, return_type, call.span);
         }

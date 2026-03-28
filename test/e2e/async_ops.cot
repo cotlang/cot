@@ -176,6 +176,17 @@ test "asyncPrefix more than available" {
 }
 
 // --- compactMap ---
-// NOTE: asyncCompactMap with fn(int) -> ?int closure crashes on native (SIGSEGV).
-// Pre-existing compiler bug: closures returning optionals through function pointers.
-// Skipped for now — will work once the compiler fixes optional closure returns.
+
+test "asyncCompactMap" {
+    var s = makeStream(5)
+    // Keep only even numbers, doubled
+    var result = asyncCompactMap(&s,
+        fn(x: int) ?int {
+            if (x % 2 == 0) { return x * 2 }
+            return null
+        }
+    )
+    @assertEq(result.len(), 2)
+    @assertEq(result.get(0), 4)
+    @assertEq(result.get(1), 8)
+}
