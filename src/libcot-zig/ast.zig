@@ -22,9 +22,6 @@ const Span = source.Span;
 const Pos = source.Pos;
 const Token = tok.Token;
 
-// ============================================================================
-// Index types — type-safe wrappers around u32
-// ============================================================================
 
 /// Index into the node array.
 pub const Index = enum(u32) {
@@ -86,9 +83,6 @@ pub const SubRange = struct {
     };
 };
 
-// ============================================================================
-// Node — the core fixed-size unit
-// ============================================================================
 
 pub const Node = struct {
     tag: Tag,
@@ -417,9 +411,6 @@ pub const Node = struct {
     };
 };
 
-// ============================================================================
-// Extra data structs — packed into extra_data: []u32
-// ============================================================================
 
 pub const FnDecl = struct {
     name_token: TokenIndex,
@@ -740,9 +731,6 @@ pub const DestructureFlags = packed struct(u32) {
 pub const SEGMENT_TEXT: u32 = 0;
 pub const SEGMENT_EXPR: u32 = 1;
 
-// ============================================================================
-// BuiltinKind — compiler intrinsics
-// ============================================================================
 
 /// Compiler builtin functions (@sizeOf, @intCast, @panic, etc.).
 ///
@@ -871,9 +859,6 @@ fn comptimeCamelLen(comptime input: []const u8) usize {
     return len;
 }
 
-// ============================================================================
-// Ast — the complete parse result
-// ============================================================================
 
 pub const Ast = struct {
     /// Reference to externally-owned source text.
@@ -919,7 +904,6 @@ pub const Ast = struct {
         self.* = undefined;
     }
 
-    // --- Token accessors ---
 
     pub fn tokenTag(self: *const Ast, ti: TokenIndex) Token {
         return self.tokens.items(.tag)[ti];
@@ -950,7 +934,6 @@ pub const Ast = struct {
         return self.source[start..];
     }
 
-    // --- Node accessors ---
 
     pub fn nodeTag(self: *const Ast, node: Index) Node.Tag {
         return self.nodes.items(.tag)[@intFromEnum(node)];
@@ -964,7 +947,6 @@ pub const Ast = struct {
         return self.nodes.items(.data)[@intFromEnum(node)];
     }
 
-    // --- Extra data unpacker ---
 
     /// Read a struct from extra_data starting at `index`.
     /// Uses comptime reflection to read consecutive u32 fields.
@@ -1011,13 +993,10 @@ pub const Ast = struct {
         return @ptrCast(raw);
     }
 
-    /// Compute the source span for any node.
+    /// Compute the source span for a node from its main_token position.
     pub fn nodeSpan(self: *const Ast, node: Index) Span {
         const main = self.nodeMainToken(node);
         const start_offset = self.tokenStart(main);
-        // For a simple implementation, use main_token position.
-        // Full firstToken/lastToken traversal would be more precise
-        // but requires per-tag logic (TODO: implement like Zig).
         return Span.init(
             Pos{ .offset = start_offset },
             Pos{ .offset = start_offset + @as(u32, @intCast(self.tokenSlice(main).len)) },
@@ -1039,14 +1018,17 @@ pub const Ast = struct {
                     const fn_data = self.extraData(extra_idx, FnDecl);
                     if (fn_data.flags.is_async) return true;
                 },
-                .unary_await, .closure_expr, .async_let => return true,
+                .unary_await, .async_let => return true,
+                .closure_expr => {
+                    const c = self.extraData(data.node_and_extra[1], ClosureData);
+                    if (c.flags.is_async) return true;
+                },
                 else => {},
             }
         }
         return false;
     }
 
-    // full.* accessor functions — unpack compact nodes into rich structs
 
     pub fn fnDeclData(self: *const Ast, node: Index) full.FnDeclFull {
         const tag = self.nodeTag(node);
@@ -1351,9 +1333,6 @@ pub const Ast = struct {
     }
 };
 
-// ============================================================================
-// full.* — rich accessor structs for consumers
-// ============================================================================
 
 pub const full = struct {
     pub const FnDeclFull = struct {
@@ -1527,9 +1506,6 @@ pub const full = struct {
     };
 };
 
-// ============================================================================
-// Tests
-// ============================================================================
 
 test "index type safety" {
     const idx: Index = @enumFromInt(42);
