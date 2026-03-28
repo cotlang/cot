@@ -30,19 +30,17 @@ All other ready files have been completed (source, errors, target, debug, ast).
 
 ---
 
-## Blocked (waiting for concurrency work to freeze)
+## Ready to port (concurrency complete — 618 tests, 46/50 Swift parity)
 
-These files are actively being modified by the Swift concurrency port. Do NOT port until concurrency is complete.
+These files are now stable. See `src/claude/CONCURRENCY.md` for full status.
 
-| # | File | Original Lines | Concurrency Commits | What's changing |
-|---|------|---------------|--------------------|----|
-| 9 | `parser.zig` | ~2,400 | 7 | Parsing actor, nonisolated, sending, Task {} |
-| 10 | `types.zig` | ~2,500 | 4 | Actor type, TaskType, Sendable checking |
-| 11 | `checker.zig` | ~5,000 | 8 | Actor isolation, Sendable enforcement, async checking |
-| 12 | `lower.zig` | ~13,000 | 18 | State machine transform, actor enqueue, Task creation |
-| 13 | `formatter.zig` | ~600 | 3 | Formatting new keywords |
-
-**Concurrency status:** M1-M6 complete (565 tests). Remaining work: ThrowingTaskGroup, AsyncThrowingStream, Clock/Duration, Executor protocols, region analysis. See `claude/CONCURRENCY_SWIFT_PORT.md`.
+| # | File | Original Lines | Deps | Notes |
+|---|------|---------------|------|-------|
+| 9 | `parser.zig` | ~2,400 | token, scanner, ast, source, errors | Core parser |
+| 10 | `types.zig` | ~2,500 | ast | Type system definitions |
+| 11 | `checker.zig` | ~5,000 | ast, types, errors | Type checking + method resolution |
+| 12 | `lower.zig` | ~13,000 | ast, types, ssa | IR lowering (will need splitting) |
+| 13 | `formatter.zig` | ~600 | ast, token | Code formatter |
 
 ---
 
