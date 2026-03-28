@@ -1,7 +1,7 @@
 # Concurrency: Swift Port — Status & Implementation Plan
 
 **Date:** 2026-03-28
-**Tests:** 532, all green (native + Wasm)
+**Tests:** 535, all green (native + Wasm)
 **Fidelity:** 96% faithful, 3% adapted, 1% invented
 
 ---
@@ -404,7 +404,7 @@ Currently gated to `__poll` functions on Wasm. Enable for all async functions on
 | M2: AsyncSequence operators | 8 days | **COMPLETE** |
 | M3: Time abstractions | 5 days | **COMPLETE** |
 | M4: Executor protocols | 7 days | **COMPLETE** (Phase 1) |
-| M5: Region analysis | 5 days | Future |
+| M5: Region analysis | 5 days | **COMPLETE** (Phase 1) |
 | M6: Real suspension | 11 days | Future |
 
 Priority order: M3 (foundational) > M4 (protocols, needs Duration) > M6 (architecture) > M5 (advanced).
@@ -470,7 +470,7 @@ zig build
 ./zig-out/bin/cot test test/e2e/cancellation.cot           # 10
 ./zig-out/bin/cot test test/e2e/assoc_types.cot            # 3
 ./zig-out/bin/cot test test/e2e/async_stream.cot           # 9
-./zig-out/bin/cot test test/e2e/sending.cot                # 3
+./zig-out/bin/cot test test/e2e/sending.cot                # 5
 ./zig-out/bin/cot test test/e2e/throwing_task_group.cot    # 10
 ./zig-out/bin/cot test test/e2e/discarding_task_group.cot  # 7
 ./zig-out/bin/cot test test/e2e/async_throwing_stream.cot  # 9
