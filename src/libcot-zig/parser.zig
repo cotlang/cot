@@ -27,6 +27,9 @@ const OptionalTokenIndex = Ast.OptionalTokenIndex;
 const ExtraIndex = Ast.ExtraIndex;
 const SubRange = Ast.SubRange;
 
+/// Recursive descent parser producing a compact, data-oriented AST.
+/// Operates on a pre-tokenized token array. Variable-length data is
+/// collected via a shared scratch buffer into a flat extra_data sidecar.
 pub const Parser = struct {
     gpa: std.mem.Allocator,
     source: [:0]const u8,
@@ -42,7 +45,6 @@ pub const Parser = struct {
     // Temporary scratch buffer for collecting variable-length lists
     scratch: std.ArrayListUnmanaged(u32),
 
-    // Parser state
     tok_i: TokenIndex,
     safe_mode: bool,
 
@@ -51,7 +53,6 @@ pub const Parser = struct {
     current_impl_is_generic: bool,
     current_impl_is_actor: bool,
 
-    // Pending attributes
     pending_global_actor: ?TokenIndex,
     pending_doc_comment: ?TokenIndex,
 
@@ -82,7 +83,6 @@ pub const Parser = struct {
         };
     }
 
-    // Tokenization — pre-tokenize source into flat arrays
 
     /// Tokenize source text into the parser's token arrays.
     pub fn tokenize(p: *Parser) !void {
@@ -106,7 +106,6 @@ pub const Parser = struct {
         p.token_starts = slice.items(.start);
     }
 
-    // Core: addNode, addExtra, listToSpan, scratch
 
     /// Append a node to the node list. Returns its index.
     fn addNode(p: *Parser, node: Node) !Index {
@@ -177,9 +176,7 @@ pub const Parser = struct {
         };
     }
 
-    /// Append a single u32 to extra_data.
 
-    // Token navigation
 
     fn currentTag(p: *const Parser) Token {
         return p.token_tags[p.tok_i];
@@ -217,7 +214,6 @@ pub const Parser = struct {
         return c == ' ' or c == '\n' or c == '\t' or c == '\r';
     }
 
-    // Error handling
 
     fn addError(p: *Parser, tag: Ast.Ast.ErrorTag) !void {
         try p.errors.append(p.gpa, .{
@@ -239,7 +235,6 @@ pub const Parser = struct {
         p.nest_level -= 1;
     }
 
-    // Doc comments
 
     fn collectDocComment(p: *Parser) void {
         if (p.currentTag() != .doc_comment) {
@@ -258,7 +253,6 @@ pub const Parser = struct {
         return if (doc) |d| @enumFromInt(d) else .none;
     }
 
-    // Public API
 
     pub const Error = error{ ParseError, OutOfMemory };
 
@@ -303,7 +297,6 @@ pub const Parser = struct {
         };
     }
 
-    // Top-level parsing
 
     fn parseTopLevel(p: *Parser) Error!SubRange {
         const scratch_top = p.scratch.items.len;
@@ -322,7 +315,6 @@ pub const Parser = struct {
         return p.listToSpan(p.scratch.items[scratch_top..]);
     }
 
-    // Declaration parsing
 
     fn parseDecl(p: *Parser) Error!?Index {
         return switch (p.currentTag()) {
@@ -2014,7 +2006,6 @@ pub const Parser = struct {
         return try p.addNode(.{ .tag = .string_interp, .main_token = start_token, .data = .{ .extra_range = range } });
     }
 
-    // Type parsing
 
     fn parseType(p: *Parser) Error!?Index {
         if (p.eatToken(.question) != null) {
@@ -2592,9 +2583,7 @@ pub const Parser = struct {
         return p.nodes.items(.main_token)[@intFromEnum(node)];
     }
 
-    // Helpers
 
-    // Postfix brace: struct init, Task { body }, Task.detached { body }
 
     /// With pre-tokenized input, lookahead is trivial — just index into the array.
     fn peekNextIsPeriod(p: *const Parser) bool {
@@ -2903,7 +2892,6 @@ test "parser: parse test declaration stub" {
     try std.testing.expectEqual(Tag.test_decl, p.nodes.items(.tag)[@intFromEnum(decl.?)]);
 }
 
-// End-to-end integration tests
 
 fn initTestParser(allocator: std.mem.Allocator, src: [:0]const u8) !Parser {
     var p = Parser.init(allocator, src, false);

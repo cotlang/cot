@@ -84,6 +84,9 @@ pub const SubRange = struct {
 };
 
 
+/// Fixed-size AST node. Every node is 13 bytes (padded to 16 in MultiArrayList).
+/// The tag identifies the syntax form, main_token is the primary token for
+/// span derivation, and data holds at most two u32 payload values.
 pub const Node = struct {
     tag: Tag,
     main_token: TokenIndex,
@@ -96,17 +99,13 @@ pub const Node = struct {
         }
     }
 
-    // ========================================================================
     // Tag — every Cot syntax form
-    // ========================================================================
 
     pub const Tag = enum(u8) {
-        // ----- Root -----
 
         /// Root node (always at index 0). data: extra_range of top-level decl indices.
         root,
 
-        // ----- Declarations -----
 
         /// `fn name(params) RetType { body }` — data: extra(FnDecl) + body Index
         fn_decl,
@@ -141,7 +140,6 @@ pub const Node = struct {
         /// `bench "name" { body }` — data: name token + body node
         bench_decl,
 
-        // ----- Literals -----
 
         /// Identifier — data: unused (name derived from main_token)
         ident,
@@ -166,7 +164,6 @@ pub const Node = struct {
         /// `error.Name` — data: name token (the identifier after `error.`)
         error_literal,
 
-        // ----- Binary operators -----
         // All: data = left node + right node
 
         binary_add,
@@ -190,7 +187,6 @@ pub const Node = struct {
         binary_concat,
         binary_pipe,
 
-        // ----- Unary operators -----
         // All: data = operand node
 
         unary_neg,
@@ -202,7 +198,6 @@ pub const Node = struct {
         unary_await,
         unary_unwrap, // .?
 
-        // ----- Calls -----
 
         /// `f()` — data: callee node (no args)
         call_zero,
@@ -211,7 +206,6 @@ pub const Node = struct {
         /// `f(a, b, ...)` — data: callee node + extra(SubRange) for args
         call,
 
-        // ----- Access -----
 
         /// `a[i]` — data: base node + index node
         index,
@@ -220,7 +214,6 @@ pub const Node = struct {
         /// `a.field` — data: base node + field name token
         field_access,
 
-        // ----- Array/Tuple literals -----
 
         /// `[]` or `.{}` — data: unused
         array_literal_empty,
@@ -231,24 +224,20 @@ pub const Node = struct {
         /// `(a, b, ...)` tuple literal — data: extra_range of element nodes
         tuple_literal,
 
-        // ----- Grouping -----
 
         /// `(expr)` — data: inner node
         paren,
 
-        // ----- If -----
 
         /// `if cond then_branch` (no else) — data: condition node + then node
         if_simple,
         /// `if cond then_branch else else_branch` — data: condition node + extra(IfData)
         if_full,
 
-        // ----- Switch -----
 
         /// `switch subject { cases }` — data: subject node + extra(SwitchData)
         switch_expr,
 
-        // ----- Blocks -----
 
         /// Single-statement block — data: stmt node + result node
         block_one,
@@ -257,7 +246,6 @@ pub const Node = struct {
         /// Block with 3+ stmts — data: extra_range of stmt nodes + extra result OptionalIndex
         block,
 
-        // ----- Struct/new init -----
 
         /// `Type { field: value }` (1 field) — data: extra(StructInitOne)
         struct_init_one,
@@ -266,17 +254,14 @@ pub const Node = struct {
         /// `new Type { fields }` or `new Type(args)` — data: extra(NewExpr)
         new_expr,
 
-        // ----- Builtins -----
 
         /// `@builtin(args)` — data: extra(BuiltinCallData)
         builtin_call,
 
-        // ----- String interpolation -----
 
         /// `"text ${expr} text"` — data: extra_range of segment data
         string_interp,
 
-        // ----- Type expressions -----
 
         /// Named type: `int`, `MyStruct` — data: unused (name from main_token)
         type_named,
@@ -305,19 +290,16 @@ pub const Node = struct {
         /// `any Trait` existential — data: trait node
         type_existential,
 
-        // ----- Error handling expressions -----
 
         /// `x catch |e| fallback` — data: operand node + extra(CatchData)
         catch_expr,
         /// `x orelse fallback` — data: operand node + extra(OrElseData)
         orelse_expr,
 
-        // ----- Closures -----
 
         /// `fn(params) -> T { body }` closure — data: extra(ClosureData)
         closure_expr,
 
-        // ----- Misc expressions -----
 
         /// `comptime { body }` — data: body node
         comptime_block,
@@ -326,7 +308,6 @@ pub const Node = struct {
         /// `.{}` zero-init — data: unused
         zero_init,
 
-        // ----- Statements -----
 
         /// Expression statement `expr;` — data: expr node
         expr_stmt,
@@ -390,9 +371,7 @@ pub const Node = struct {
         bad_node,
     };
 
-    // ========================================================================
     // Data — two u32 payload
-    // ========================================================================
 
     pub const Data = union {
         none: void,
@@ -860,18 +839,26 @@ fn comptimeCamelLen(comptime input: []const u8) usize {
 }
 
 
+/// Complete parse result. Owns the node array, extra data, and errors.
+/// Source text and tokens are references to externally-owned data.
 pub const Ast = struct {
     /// Reference to externally-owned source text.
     source: [:0]const u8,
+    /// Pre-tokenized token array (struct-of-arrays layout).
     tokens: TokenList.Slice,
+    /// Compact node array (struct-of-arrays layout).
     nodes: NodeList.Slice,
+    /// Sidecar for variable-length node data (params, fields, etc.).
     extra_data: []const u32,
+    /// Parse errors collected during parsing.
     errors: []const Error,
+    /// Whether @safe mode is enabled for this file.
     safe_mode: bool,
 
+    /// Token storage: parallel arrays of tag and byte offset.
     pub const TokenList = std.MultiArrayList(struct {
         tag: Token,
-        start: u32, // byte offset into source
+        start: u32,
     });
 
     pub const NodeList = std.MultiArrayList(Node);
@@ -1149,6 +1136,7 @@ pub const Ast = struct {
             .target_type_token = it.target_type_token,
             .type_params = it.type_params,
             .methods = it.methods,
+            .assoc_types = it.assoc_types,
             .doc_comment = it.doc_comment,
             .main_token = self.nodeMainToken(node),
         };
@@ -1334,7 +1322,11 @@ pub const Ast = struct {
 };
 
 
+/// Rich accessor structs for consumers. Each struct unpacks a compact node
+/// into named fields with resolved token text. Returned on the stack by
+/// the corresponding Ast accessor method (e.g., `ast.fnDeclData(node)`).
 pub const full = struct {
+    /// Unpacked function declaration.
     pub const FnDeclFull = struct {
         name: []const u8,
         name_token: TokenIndex,
@@ -1407,6 +1399,7 @@ pub const full = struct {
         target_type_token: TokenIndex,
         type_params: SubRange,
         methods: SubRange,
+        assoc_types: SubRange,
         doc_comment: OptionalTokenIndex,
         main_token: TokenIndex,
     };
