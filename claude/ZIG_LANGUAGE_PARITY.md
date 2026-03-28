@@ -207,3 +207,246 @@ These must be closed before libcot-zig can be mechanically translated to libcot 
 5. **Everything else** — as needed during the port
 
 **Total effort to unblock self-hosting: ~5-7 days of comptime work.**
+
+---
+
+## Implementation Plan: Comptime Gaps
+
+### Current Comptime Infrastructure (already working)
+
+- `ComptimeValue` union in `compiler/frontend/comptime.zig` (64 lines)
+- `ComptimeArray` with `elements: ArrayListUnmanaged(ComptimeValue)`
+- Mutable comptime variables via `checker.comptime_vars: StringHashMap(ComptimeValue)`
+- Array element mutation: `arr[i] = val` in comptime blocks
+- Inline for over comptime arrays
+- Comptime block evaluation returning last expression
+- Lowering comptime arrays to runtime via `emitComptimeArray()` in `lower.zig`
+
+**Note:** Comptime arrays work but ONLY with typed syntax: `var arr: [3]i64 = undefined` then indexed assignment. The literal syntax `var arr = [0, 0, 0]` does NOT work in comptime blocks yet.
+
+**Files that need changes:**
+1. `compiler/frontend/comptime.zig` — add ComptimeMap type
+2. `compiler/frontend/checker.zig` — evaluate map/array operations in comptime blocks
+3. `compiler/frontend/lower.zig` — materialize comptime maps to runtime
+4. `test/e2e/features.cot` — add tests
+
+---
+
+### Step 0: Fix Comptime Array Literal Init (~20-30 lines, 1 day)
+
+**Problem:** Comptime blocks only accept `var arr: [3]i64 = undefined` for array creation. The literal syntax `var arr = [0, 0, 0]` fails. Both should work — Zig accepts all of these in comptime:
+
+```zig
+// Zig — all valid in comptime:
+var s: [3]i64 = undefined;           // typed + undefined  (works in Cot)
+var s = [_]i64{ 0, 0, 0 };          // inferred literal    (fails in Cot)
+var s: [3]i64 = .{ 0, 0, 0 };       // typed + init list   (fails in Cot)
+```
+
+**Fix:** In `checker.zig`, `evalComptimeBlock`'s var_decl handling, when the initializer is an array literal:
+
+1. Evaluate each element as a comptime value
+2. Construct a `ComptimeArray` from the results
+3. Store in `comptime_vars`
+
+```zig
+// In evalComptimeBlock, var_decl with array literal init:
+if (init_expr == .array_literal) {
+    var elements = std.ArrayListUnmanaged(ComptimeValue){};
+    for (init_expr.array_literal.items) |elem_idx| {
+        const elem_val = self.evalComptimeValue(elem_idx) orelse return null;
+        elements.append(self.allocator, elem_val) catch return null;
+    }
+    const arr = ComptimeValue{ .array = .{
+        .elements = elements,
+        .elem_type_name = "",
+    }};
+    comptime_vars.put(var_name, arr);
+}
+```
+
+**Location:** `compiler/frontend/checker.zig`, inside `evalComptimeBlock` near the existing `undefined` array init handling.
+
+**Test:**
+```cot
+test "comptime array literal init" {
+    const s = comptime {
+        var arr = [10, 20, 12]
+        arr[0] = 99
+        arr
+    }
+    @assertEq(s[0], 99)
+    @assertEq(s[1], 20)
+    @assertEq(s[2], 12)
+}
+```
+
+---
+
+### Step 1: Extend ComptimeValue with Map (~50 lines, half day)
+
+Add `map` variant to the `ComptimeValue` union in `comptime.zig`:
+
+```zig
+pub const ComptimeMap = struct {
+    keys: std.ArrayListUnmanaged(ComptimeValue),
+    values: std.ArrayListUnmanaged(ComptimeValue),
+    key_type_name: []const u8,
+    value_type_name: []const u8,
+
+    pub fn get(self: *const ComptimeMap, key: ComptimeValue) ?ComptimeValue {
+        for (self.keys.items, 0..) |k, i| {
+            if (comptimeEqual(k, key)) return self.values.items[i];
+        }
+        return null;
+    }
+
+    pub fn set(self: *ComptimeMap, allocator: Allocator, key: ComptimeValue, value: ComptimeValue) void {
+        for (self.keys.items, 0..) |k, i| {
+            if (comptimeEqual(k, key)) {
+                self.values.items[i] = value;
+                return;
+            }
+        }
+        self.keys.append(allocator, key) catch {};
+        self.values.append(allocator, value) catch {};
+    }
+};
+
+fn comptimeEqual(a: ComptimeValue, b: ComptimeValue) bool {
+    if (@as(std.meta.Tag(ComptimeValue), a) != @as(std.meta.Tag(ComptimeValue), b)) return false;
+    return switch (a) {
+        .int => |v| v == b.int,
+        .string => |v| std.mem.eql(u8, v, b.string),
+        .boolean => |v| v == b.boolean,
+        else => false,
+    };
+}
+```
+
+Two parallel arrays (keys + values) — simpler than a hash map, correct, and fast enough for comptime where N < 100.
+
+---
+
+### Step 2: Checker — Evaluate Map Operations (~120 lines, 1-2 days)
+
+**2a: Empty map init.** When the checker evaluates `var m: Map(K, V) = .{}` inside a comptime block, create an empty `ComptimeMap`:
+
+```zig
+if (type is Map(K, V) and init is .zero_init) {
+    const map = ComptimeValue{ .map = .{
+        .keys = .{}, .values = .{},
+        .key_type_name = K_name, .value_type_name = V_name,
+    }};
+    comptime_vars.put(var_name, map);
+}
+```
+
+**2b: Method calls.** When evaluating `m.set(key, value)` or `m.get(key)` inside a comptime block:
+
+```zig
+if (expr is method_call and receiver is comptime_var) {
+    const map_ptr = comptime_vars.getPtr(receiver_name);
+    if (map_ptr.* == .map) {
+        if (method_name == "set") {
+            const key = evalComptimeValue(args[0]);
+            const val = evalComptimeValue(args[1]);
+            map_ptr.map.set(allocator, key, val);
+        } else if (method_name == "get") {
+            const key = evalComptimeValue(args[0]);
+            return map_ptr.map.get(key);
+        }
+    }
+}
+```
+
+**2c: Return value.** When the comptime block's last expression is a map variable, return the `ComptimeValue.map`. Same pattern as arrays.
+
+**2d: For iteration.** In `evalComptimeInlineFor`, add map iteration:
+
+```zig
+if (iterable == .map) {
+    for (iterable.map.keys.items, iterable.map.values.items) |k, v| {
+        // Bind loop variables, re-evaluate body
+    }
+}
+```
+
+---
+
+### Step 3: Lowerer — Materialize Comptime Maps (~80 lines, half day)
+
+**Strategy A (implement first):** Lower to two parallel arrays with linear scan lookup. For < 100 entries this is fast enough.
+
+```zig
+fn emitComptimeMap(self: *Lowerer, map: ComptimeMap, span: Span) !ir.NodeIndex {
+    // Allocate buffer: [keys...][values...]
+    // Store keys then values sequentially
+    // Return pointer to buffer
+}
+```
+
+**Strategy B (optimization, later):** For `string → enum` maps, generate a switch on first character + length. This is what Go does for keyword tables.
+
+---
+
+### Step 4: Tests (~40 lines)
+
+```cot
+test "comptime map basic" {
+    const m = comptime {
+        var map: Map(string, i64) = .{}
+        map.set("a", 1)
+        map.set("b", 2)
+        map.set("c", 3)
+        map
+    }
+    @assertEq(m.get("a"), 1)
+    @assertEq(m.get("b"), 2)
+    @assertEq(m.get("c"), 3)
+}
+
+test "comptime map iteration" {
+    const total = comptime {
+        var map: Map(string, i64) = .{}
+        map.set("x", 10)
+        map.set("y", 20)
+        var sum: i64 = 0
+        inline for (key, value) in map {
+            sum += value
+        }
+        sum
+    }
+    @assertEq(total, 30)
+}
+
+test "comptime map overwrite" {
+    const m = comptime {
+        var map: Map(string, i64) = .{}
+        map.set("a", 1)
+        map.set("a", 99)
+        map
+    }
+    @assertEq(m.get("a"), 99)
+}
+```
+
+---
+
+### Step 5: Port to selfcot (~80 lines)
+
+Mirror changes in `self/check/checker.cot`. The `ComptimeValue` in selfcot already has the array variant — add map alongside it.
+
+---
+
+### Implementation Summary
+
+| Step | File | Lines | Effort |
+|------|------|-------|--------|
+| 0. Array literal init | `checker.zig` | ~25 | 1 day |
+| 1. ComptimeMap type | `comptime.zig` | ~50 | Half day |
+| 2. Checker evaluation | `checker.zig` | ~120 | 1-2 days |
+| 3. Lowerer materialization | `lower.zig` | ~80 | Half day |
+| 4. Tests | `features.cot` | ~40 | Half day |
+| 5. Selfcot port | `self/check/checker.cot` | ~80 | Half day |
+| **Total** | | **~395** | **~5 days** |
