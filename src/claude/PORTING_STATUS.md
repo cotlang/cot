@@ -9,23 +9,24 @@
 | # | File | Lines | Docs | Notes |
 |---|------|-------|------|-------|
 | 1 | `token.zig` | 581 | `ac/src/libcot-zig/token.md` (210 lines) | Token enum, keyword table, precedence. Zero deps. |
-| 2 | `scanner.zig` | 665 | `ac/src/libcot-zig/scanner.md` (429 lines) | Lexer. Depends on token, source, errors. |
+| 2 | `source.zig` | 264 | `ac/src/libcot-zig/source.md` | Position tracking, lazy line offset computation. |
+| 3 | `errors.zig` | 352 | `ac/src/libcot-zig/errors.md` | Error/warning reporting with codes and source context. |
+| 4 | `target.zig` | 143 | `ac/src/libcot-zig/target.md` | Platform config: Arch, Os, CLI target parsing. |
+| 5 | `debug.zig` | 157 | `ac/src/libcot-zig/debug.md` | Pipeline debug logging. `@typeInfo` reflection transform. |
+| 6 | `scanner.zig` | 665 | `ac/src/libcot-zig/scanner.md` (429 lines) | Lexer. Depends on token, source, errors. |
+| 7 | `ast.zig` | 830 | `ac/src/libcot-zig/ast.md` | AST nodes. Comptime `snakeToCamel` + `@typeInfo` map for BuiltinKind. |
 
 ---
 
 ## Next (safe to port now — no concurrency changes)
 
-Port in this order — each file only depends on files above it:
+All leaf files are ported. Next candidates depend on blocked files:
 
 | # | File | Original Lines | Deps | Status |
 |---|------|---------------|------|--------|
-| 3 | `source.zig` | ~300 | none | **Ready** — untouched by concurrency |
-| 4 | `errors.zig` | ~200 | source | **Ready** — untouched by concurrency |
-| 5 | `target.zig` | ~100 | none | **Ready** — untouched by concurrency |
-| 6 | `pipeline_debug.zig` | ~150 | none | **Ready** — debug logging utility |
-| 7 | `vwt_gen.zig` | ~1,500 | types, lower | **Ready** — untouched, but depends on blocked files |
+| 8 | `vwt_gen.zig` | ~1,500 | types, lower | **Blocked** — depends on types.zig and lower.zig |
 
-After source + errors are ported, scanner.zig can actually compile in the new structure.
+All other ready files have been completed (source, errors, target, debug, ast).
 
 ---
 
@@ -35,7 +36,6 @@ These files are actively being modified by the Swift concurrency port. Do NOT po
 
 | # | File | Original Lines | Concurrency Commits | What's changing |
 |---|------|---------------|--------------------|----|
-| 8 | `ast.zig` | ~800 | 6 | New AST nodes for actor, async let, Task {} |
 | 9 | `parser.zig` | ~2,400 | 7 | Parsing actor, nonisolated, sending, Task {} |
 | 10 | `types.zig` | ~2,500 | 4 | Actor type, TaskType, Sendable checking |
 | 11 | `checker.zig` | ~5,000 | 8 | Actor isolation, Sendable enforcement, async checking |
