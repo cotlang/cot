@@ -1254,11 +1254,254 @@ pub const Parser = struct {
     }
 
     // ========================================================================
-    // Expression & statement stubs (to be implemented in Steps 6-7)
+    // Expression parsing (Step 6)
     // ========================================================================
 
     fn parseExpr(p: *Parser) Error!?Index {
-        // Minimal stub: parse a single token as a literal or ident
+        return p.parseBinaryExpr(0);
+    }
+
+    fn parseBinaryExpr(p: *Parser, min_prec: u8) Error!?Index {
+        try p.incNest();
+        defer p.decNest();
+
+        var left = try p.parseUnaryExpr() orelse return null;
+
+        while (true) {
+            // catch as low-precedence postfix (prec 1)
+            if (p.currentTag() == .kw_catch and min_prec <= 1) {
+                left = try p.parseCatchExpr(left);
+                continue;
+            }
+            // orelse as low-precedence postfix (prec 1)
+            if (p.currentTag() == .kw_orelse and min_prec <= 1) {
+                left = try p.parseOrElseExpr(left);
+                continue;
+            }
+
+            const op_tag = p.currentTag();
+            const prec = op_tag.precedence();
+            if (prec < min_prec or prec == 0) break;
+
+            const op_token = p.advance();
+            const right = try p.parseBinaryExpr(prec + 1) orelse {
+                try p.addError(.expected_expression);
+                return null;
+            };
+
+            const bin_tag: Tag = switch (op_tag) {
+                .add => .binary_add,
+                .sub => .binary_sub,
+                .mul => .binary_mul,
+                .quo => .binary_div,
+                .rem => .binary_mod,
+                .eql => .binary_eq,
+                .neq => .binary_neq,
+                .lss => .binary_lt,
+                .gtr => .binary_gt,
+                .leq => .binary_lte,
+                .geq => .binary_gte,
+                .kw_and => .binary_and,
+                .kw_or => .binary_or,
+                .@"and" => .binary_bit_and,
+                .@"or" => .binary_bit_or,
+                .xor => .binary_bit_xor,
+                .shl => .binary_shl,
+                .shr => .binary_shr,
+                .concat => .binary_concat,
+                else => break,
+            };
+
+            left = try p.addNode(.{
+                .tag = bin_tag,
+                .main_token = op_token,
+                .data = .{ .node_and_node = .{ left, right } },
+            });
+        }
+        return left;
+    }
+
+    fn parseCatchExpr(p: *Parser, operand: Index) Error!Index {
+        const catch_token = p.advance(); // consume 'catch'
+        var capture_token: OptionalTokenIndex = .none;
+        var capture_is_ptr = false;
+        if (p.eatToken(.@"or") != null) {
+            if (p.eatToken(.mul) != null) capture_is_ptr = true;
+            if (p.currentTag() == .ident) {
+                capture_token = @enumFromInt(p.advance());
+            }
+            _ = p.eatToken(.@"or");
+        }
+        const fallback = try p.parseBinaryExpr(2) orelse {
+            try p.addError(.expected_expression);
+            return @enumFromInt(0);
+        };
+        const extra = try p.addExtra(Ast.CatchData{
+            .capture_token = capture_token,
+            .fallback = fallback,
+            .flags = .{ .capture_is_ptr = capture_is_ptr },
+        });
+        return try p.addNode(.{
+            .tag = .catch_expr,
+            .main_token = catch_token,
+            .data = .{ .node_and_extra = .{ operand, extra } },
+        });
+    }
+
+    fn parseOrElseExpr(p: *Parser, operand: Index) Error!Index {
+        const orelse_token = p.advance(); // consume 'orelse'
+
+        var fallback_kind: Ast.OrElseFallback = .expr;
+        var fallback: Index = @enumFromInt(0);
+
+        if (p.eatToken(.kw_return) != null) {
+            if (try p.parseBinaryExpr(2)) |v| {
+                fallback = v;
+                fallback_kind = .return_val;
+            } else {
+                fallback_kind = .return_void;
+            }
+        } else if (p.eatToken(.kw_break) != null) {
+            fallback_kind = .break_val;
+        } else if (p.eatToken(.kw_continue) != null) {
+            fallback_kind = .continue_val;
+        } else {
+            fallback = try p.parseBinaryExpr(2) orelse {
+                try p.addError(.expected_expression);
+                return @enumFromInt(0);
+            };
+        }
+
+        const extra = try p.addExtra(Ast.OrElseData{
+            .fallback = fallback,
+            .fallback_kind = @intFromEnum(fallback_kind),
+        });
+        return try p.addNode(.{
+            .tag = .orelse_expr,
+            .main_token = orelse_token,
+            .data = .{ .node_and_extra = .{ operand, extra } },
+        });
+    }
+
+    fn parseUnaryExpr(p: *Parser) Error!?Index {
+        return switch (p.currentTag()) {
+            .@"and" => {
+                const t = p.advance();
+                const operand = try p.parseUnaryExpr() orelse return null;
+                return try p.addNode(.{ .tag = .unary_addr_of, .main_token = t, .data = .{ .node = operand } });
+            },
+            .kw_try => {
+                const t = p.advance();
+                const operand = try p.parseUnaryExpr() orelse return null;
+                return try p.addNode(.{ .tag = .unary_try, .main_token = t, .data = .{ .node = operand } });
+            },
+            .kw_await => {
+                const t = p.advance();
+                const operand = try p.parseUnaryExpr() orelse return null;
+                return try p.addNode(.{ .tag = .unary_await, .main_token = t, .data = .{ .node = operand } });
+            },
+            .sub => {
+                const t = p.advance();
+                const operand = try p.parseUnaryExpr() orelse return null;
+                return try p.addNode(.{ .tag = .unary_neg, .main_token = t, .data = .{ .node = operand } });
+            },
+            .lnot => {
+                const t = p.advance();
+                const operand = try p.parseUnaryExpr() orelse return null;
+                return try p.addNode(.{ .tag = .unary_not, .main_token = t, .data = .{ .node = operand } });
+            },
+            .not, .kw_not => {
+                const t = p.advance();
+                const operand = try p.parseUnaryExpr() orelse return null;
+                return try p.addNode(.{ .tag = .unary_bit_not, .main_token = t, .data = .{ .node = operand } });
+            },
+            else => p.parsePrimaryExpr(),
+        };
+    }
+
+    fn parsePrimaryExpr(p: *Parser) Error!?Index {
+        var expr = try p.parseOperand() orelse return null;
+
+        // Postfix: .field, [idx], (args), .*, .?
+        while (true) {
+            if (p.eatToken(.period_star) != null) {
+                expr = try p.addNode(.{ .tag = .unary_deref, .main_token = p.tok_i - 1, .data = .{ .node = expr } });
+            } else if (p.eatToken(.period_question) != null) {
+                expr = try p.addNode(.{ .tag = .unary_unwrap, .main_token = p.tok_i - 1, .data = .{ .node = expr } });
+            } else if (p.eatToken(.period) != null) {
+                if (p.currentTag() == .ident or p.currentTag() == .int_lit) {
+                    const field_token = p.advance();
+                    expr = try p.addNode(.{ .tag = .field_access, .main_token = field_token, .data = .{ .node_and_token = .{ expr, field_token } } });
+                } else {
+                    try p.addError(.expected_identifier);
+                    return null;
+                }
+            } else if (p.eatToken(.lbrack) != null) {
+                expr = try p.parseIndexOrSlice(expr);
+            } else if (p.eatToken(.lparen) != null) {
+                expr = try p.parseCallArgs(expr);
+            } else break;
+        }
+        return expr;
+    }
+
+    fn parseIndexOrSlice(p: *Parser, base: Index) Error!Index {
+        const bracket_token = p.tok_i - 1;
+        // [:end]
+        if (p.eatToken(.colon) != null) {
+            var end_node: OptionalIndex = .none;
+            if (p.currentTag() != .rbrack) {
+                if (try p.parseExpr()) |e| end_node = e.toOptional();
+            }
+            _ = p.eatToken(.rbrack);
+            const extra = try p.addExtra(Ast.SliceData{ .start = .none, .end = end_node });
+            return try p.addNode(.{ .tag = .slice, .main_token = bracket_token, .data = .{ .node_and_extra = .{ base, extra } } });
+        }
+        const idx = try p.parseExpr() orelse {
+            try p.addError(.expected_expression);
+            _ = p.eatToken(.rbrack);
+            return @enumFromInt(0);
+        };
+        // [start:end]
+        if (p.eatToken(.colon) != null) {
+            var end_node: OptionalIndex = .none;
+            if (p.currentTag() != .rbrack) {
+                if (try p.parseExpr()) |e| end_node = e.toOptional();
+            }
+            _ = p.eatToken(.rbrack);
+            const extra = try p.addExtra(Ast.SliceData{ .start = idx.toOptional(), .end = end_node });
+            return try p.addNode(.{ .tag = .slice, .main_token = bracket_token, .data = .{ .node_and_extra = .{ base, extra } } });
+        }
+        // [index]
+        _ = p.eatToken(.rbrack);
+        return try p.addNode(.{ .tag = .index, .main_token = bracket_token, .data = .{ .node_and_node = .{ base, idx } } });
+    }
+
+    fn parseCallArgs(p: *Parser, callee: Index) Error!Index {
+        const lparen_token = p.tok_i - 1;
+        const scratch_top = p.scratch.items.len;
+        defer p.scratch.shrinkRetainingCapacity(scratch_top);
+
+        while (p.currentTag() != .rparen and p.currentTag() != .eof) {
+            if (try p.parseExpr()) |arg| {
+                try p.scratch.append(p.gpa, @intFromEnum(arg));
+            } else break;
+            if (p.eatToken(.comma) == null) break;
+        }
+        _ = p.eatToken(.rparen);
+
+        const args = p.scratch.items[scratch_top..];
+        if (args.len == 0) {
+            return try p.addNode(.{ .tag = .call_zero, .main_token = lparen_token, .data = .{ .node = callee } });
+        }
+        if (args.len == 1) {
+            return try p.addNode(.{ .tag = .call_one, .main_token = lparen_token, .data = .{ .node_and_node = .{ callee, @enumFromInt(args[0]) } } });
+        }
+        const range = try p.listToSpan(args);
+        return try p.addNode(.{ .tag = .call, .main_token = lparen_token, .data = .{ .node_and_extra = .{ callee, @enumFromInt(@intFromEnum(range.start)) } } });
+    }
+
+    fn parseOperand(p: *Parser) Error!?Index {
         return switch (p.currentTag()) {
             .ident => {
                 const t = p.advance();
@@ -1276,6 +1519,10 @@ pub const Parser = struct {
                 const t = p.advance();
                 return try p.addNode(.{ .tag = .literal_string, .main_token = t, .data = .{ .none = {} } });
             },
+            .char_lit => {
+                const t = p.advance();
+                return try p.addNode(.{ .tag = .literal_char, .main_token = t, .data = .{ .none = {} } });
+            },
             .kw_true => {
                 const t = p.advance();
                 return try p.addNode(.{ .tag = .literal_true, .main_token = t, .data = .{ .none = {} } });
@@ -1288,7 +1535,53 @@ pub const Parser = struct {
                 const t = p.advance();
                 return try p.addNode(.{ .tag = .literal_null, .main_token = t, .data = .{ .none = {} } });
             },
-            .lbrace => p.parseBlockStmt(),
+            .kw_undefined => {
+                const t = p.advance();
+                return try p.addNode(.{ .tag = .literal_undefined, .main_token = t, .data = .{ .none = {} } });
+            },
+            .kw_unreachable => {
+                const t = p.advance();
+                return try p.addNode(.{ .tag = .literal_unreachable, .main_token = t, .data = .{ .none = {} } });
+            },
+            .kw_error => {
+                // error.Name
+                const t = p.advance();
+                _ = p.eatToken(.period);
+                const name = p.eatToken(.ident) orelse {
+                    try p.addError(.expected_identifier);
+                    return null;
+                };
+                return try p.addNode(.{ .tag = .error_literal, .main_token = t, .data = .{ .token = name } });
+            },
+            .lparen => p.parseParenOrTuple(),
+            .lbrack => p.parseArrayLiteral(),
+            .lbrace => p.parseBlockExpr(),
+            .kw_if => p.parseIfExpr(),
+            .kw_switch => p.parseSwitchExpr(),
+            .kw_comptime => {
+                const t = p.advance();
+                const body = try p.parseBlockStmt() orelse return null;
+                return try p.addNode(.{ .tag = .comptime_block, .main_token = t, .data = .{ .node = body } });
+            },
+            .at => p.parseBuiltinCall(),
+            .kw_fn => p.parseClosureExpr(),
+            .kw_new => p.parseNewExpr(),
+            .period => {
+                // .field_name (enum literal shorthand) or .{} (zero init)
+                const t = p.advance();
+                if (p.currentTag() == .lbrace) {
+                    _ = p.advance();
+                    _ = p.eatToken(.rbrace);
+                    return try p.addNode(.{ .tag = .zero_init, .main_token = t, .data = .{ .none = {} } });
+                }
+                if (p.currentTag() == .ident) {
+                    const name = p.advance();
+                    return try p.addNode(.{ .tag = .field_access, .main_token = t, .data = .{ .node_and_token = .{ @enumFromInt(0), name } } });
+                }
+                try p.addError(.expected_expression);
+                return null;
+            },
+            .string_interp_start => p.parseStringInterp(),
             else => {
                 try p.addError(.expected_expression);
                 return null;
@@ -1296,8 +1589,300 @@ pub const Parser = struct {
         };
     }
 
+    fn parseParenOrTuple(p: *Parser) Error!?Index {
+        const lparen = p.advance(); // consume '('
+        const first = try p.parseExpr() orelse {
+            _ = p.eatToken(.rparen);
+            return try p.addNode(.{ .tag = .paren, .main_token = lparen, .data = .{ .node = @enumFromInt(0) } });
+        };
+        if (p.eatToken(.rparen) != null) {
+            // Single expr in parens
+            return try p.addNode(.{ .tag = .paren, .main_token = lparen, .data = .{ .node = first } });
+        }
+        // Tuple: (a, b, ...)
+        const scratch_top = p.scratch.items.len;
+        defer p.scratch.shrinkRetainingCapacity(scratch_top);
+        try p.scratch.append(p.gpa, @intFromEnum(first));
+        while (p.eatToken(.comma) != null) {
+            if (try p.parseExpr()) |elem| {
+                try p.scratch.append(p.gpa, @intFromEnum(elem));
+            } else break;
+        }
+        _ = p.eatToken(.rparen);
+        const range = try p.listToSpan(p.scratch.items[scratch_top..]);
+        return try p.addNode(.{ .tag = .tuple_literal, .main_token = lparen, .data = .{ .extra_range = range } });
+    }
+
+    fn parseArrayLiteral(p: *Parser) Error!?Index {
+        const lbrack = p.advance(); // consume '['
+        if (p.eatToken(.rbrack) != null) {
+            return try p.addNode(.{ .tag = .array_literal_empty, .main_token = lbrack, .data = .{ .none = {} } });
+        }
+        const first = try p.parseExpr() orelse {
+            _ = p.eatToken(.rbrack);
+            return try p.addNode(.{ .tag = .array_literal_empty, .main_token = lbrack, .data = .{ .none = {} } });
+        };
+        if (p.eatToken(.rbrack) != null) {
+            return try p.addNode(.{ .tag = .array_literal_one, .main_token = lbrack, .data = .{ .node = first } });
+        }
+        const scratch_top = p.scratch.items.len;
+        defer p.scratch.shrinkRetainingCapacity(scratch_top);
+        try p.scratch.append(p.gpa, @intFromEnum(first));
+        while (p.eatToken(.comma) != null) {
+            if (p.currentTag() == .rbrack) break;
+            if (try p.parseExpr()) |elem| {
+                try p.scratch.append(p.gpa, @intFromEnum(elem));
+            } else break;
+        }
+        _ = p.eatToken(.rbrack);
+        const range = try p.listToSpan(p.scratch.items[scratch_top..]);
+        return try p.addNode(.{ .tag = .array_literal, .main_token = lbrack, .data = .{ .extra_range = range } });
+    }
+
+    fn parseBlockExpr(p: *Parser) Error!?Index {
+        return p.parseBlockStmt();
+    }
+
+    fn parseIfExpr(p: *Parser) Error!?Index {
+        const if_token = p.advance(); // consume 'if'
+        const cond = try p.parseExpr() orelse {
+            try p.addError(.expected_expression);
+            return null;
+        };
+        const then_branch = try p.parseBlockStmt() orelse try p.parseExpr() orelse {
+            try p.addError(.expected_block);
+            return null;
+        };
+        if (p.eatToken(.kw_else) == null) {
+            return try p.addNode(.{ .tag = .if_simple, .main_token = if_token, .data = .{ .node_and_node = .{ cond, then_branch } } });
+        }
+        const else_branch = try p.parseBlockStmt() orelse try p.parseIfExpr() orelse try p.parseExpr() orelse {
+            try p.addError(.expected_block);
+            return null;
+        };
+        const extra = try p.addExtra(Ast.IfData{
+            .then_node = then_branch,
+            .else_node = else_branch.toOptional(),
+            .capture_token = .none,
+            .flags = .{},
+        });
+        return try p.addNode(.{ .tag = .if_full, .main_token = if_token, .data = .{ .node_and_extra = .{ cond, extra } } });
+    }
+
+    fn parseSwitchExpr(p: *Parser) Error!?Index {
+        const switch_token = p.advance(); // consume 'switch'
+        const subject = try p.parseExpr() orelse {
+            try p.addError(.expected_expression);
+            return null;
+        };
+        _ = p.eatToken(.lbrace);
+
+        const scratch_top = p.scratch.items.len;
+        defer p.scratch.shrinkRetainingCapacity(scratch_top);
+
+        var else_body: OptionalIndex = .none;
+        while (p.currentTag() != .rbrace and p.currentTag() != .eof) {
+            // else => body
+            if (p.eatToken(.kw_else) != null) {
+                _ = p.eatToken(.fat_arrow);
+                if (try p.parseExpr()) |eb| else_body = eb.toOptional();
+                _ = p.eatToken(.comma);
+                continue;
+            }
+            // pattern => body
+            if (try p.parseSwitchCase()) |case_extra| {
+                try p.scratch.append(p.gpa, @intFromEnum(case_extra));
+            } else break;
+        }
+        _ = p.eatToken(.rbrace);
+
+        const cases = try p.listToSpan(p.scratch.items[scratch_top..]);
+        const extra = try p.addExtra(Ast.SwitchData{
+            .cases = cases,
+            .else_body = else_body,
+        });
+        return try p.addNode(.{ .tag = .switch_expr, .main_token = switch_token, .data = .{ .node_and_extra = .{ subject, extra } } });
+    }
+
+    fn parseSwitchCase(p: *Parser) Error!?ExtraIndex {
+        const patterns_top = p.scratch.items.len;
+
+        // Parse patterns
+        while (p.currentTag() != .fat_arrow and p.currentTag() != .eof) {
+            if (try p.parseExpr()) |pat| {
+                try p.scratch.append(p.gpa, @intFromEnum(pat));
+            } else break;
+            if (p.eatToken(.comma) == null) break;
+        }
+        if (p.scratch.items.len == patterns_top) return null;
+
+        const patterns = try p.listToSpan(p.scratch.items[patterns_top..]);
+        p.scratch.shrinkRetainingCapacity(patterns_top);
+
+        _ = p.eatToken(.fat_arrow);
+        const body = try p.parseExpr() orelse {
+            try p.addError(.expected_expression);
+            return null;
+        };
+        _ = p.eatToken(.comma);
+
+        return try p.addExtra(Ast.SwitchCaseData{
+            .patterns = patterns,
+            .guard = .none,
+            .capture_token = .none,
+            .body = body,
+            .flags = .{},
+        });
+    }
+
+    fn parseBuiltinCall(p: *Parser) Error!?Index {
+        const at_token = p.advance(); // consume '@'
+        if (p.currentTag() != .ident) {
+            try p.addError(.expected_identifier);
+            return null;
+        }
+        const name_text = p.tokenText(p.tok_i);
+        const kind = Ast.BuiltinKind.fromString(name_text) orelse {
+            try p.addError(.unexpected_token);
+            return null;
+        };
+        _ = p.advance(); // consume builtin name
+
+        _ = p.eatToken(.lparen);
+        const type_arg: OptionalIndex = .none;
+        var args: [3]OptionalIndex = .{ .none, .none, .none };
+        var arg_count: usize = 0;
+
+        while (p.currentTag() != .rparen and p.currentTag() != .eof and arg_count < 4) {
+            if (try p.parseExpr()) |arg| {
+                if (arg_count == 0 and p.currentTag() == .rparen and type_arg == .none) {
+                    // Could be type arg or regular arg — treat as type_arg if single capitalized ident
+                    args[0] = arg.toOptional();
+                    arg_count = 1;
+                } else if (arg_count < 3) {
+                    args[arg_count] = arg.toOptional();
+                    arg_count += 1;
+                }
+            } else break;
+            if (p.eatToken(.comma) == null) break;
+        }
+        _ = p.eatToken(.rparen);
+
+        const extra = try p.addExtra(Ast.BuiltinCallData{
+            .kind = @intFromEnum(kind),
+            .type_arg = type_arg,
+            .arg0 = args[0],
+            .arg1 = args[1],
+            .arg2 = args[2],
+        });
+        return try p.addNode(.{ .tag = .builtin_call, .main_token = at_token, .data = .{ .node_and_extra = .{ @enumFromInt(0), extra } } });
+    }
+
+    fn parseClosureExpr(p: *Parser) Error!?Index {
+        const fn_token = p.advance(); // consume 'fn'
+        _ = p.eatToken(.lparen);
+        const params = try p.parseFieldList(.rparen);
+        _ = p.eatToken(.rparen);
+
+        var return_type: OptionalIndex = .none;
+        if (p.currentTag() != .lbrace and p.currentTag() != .eof) {
+            if (try p.parseType()) |rt| return_type = rt.toOptional();
+        }
+        const body = try p.parseBlockStmt() orelse {
+            try p.addError(.expected_block);
+            return null;
+        };
+        const extra = try p.addExtra(Ast.ClosureData{
+            .params = params,
+            .return_type = return_type,
+            .body = body,
+            .flags = .{},
+        });
+        return try p.addNode(.{ .tag = .closure_expr, .main_token = fn_token, .data = .{ .node_and_extra = .{ @enumFromInt(0), extra } } });
+    }
+
+    fn parseNewExpr(p: *Parser) Error!?Index {
+        const new_token = p.advance(); // consume 'new'
+        const type_name = p.eatToken(.ident) orelse {
+            try p.addError(.expected_identifier);
+            return null;
+        };
+
+        // Skip type args and fields/constructor args for now
+        var type_args = SubRange.empty;
+        if (p.eatToken(.lparen) != null) {
+            // Could be type args or constructor args
+            const scratch_top = p.scratch.items.len;
+            defer p.scratch.shrinkRetainingCapacity(scratch_top);
+            while (p.currentTag() != .rparen and p.currentTag() != .eof) {
+                if (try p.parseExpr()) |arg| {
+                    try p.scratch.append(p.gpa, @intFromEnum(arg));
+                } else break;
+                if (p.eatToken(.comma) == null) break;
+            }
+            _ = p.eatToken(.rparen);
+            type_args = try p.listToSpan(p.scratch.items[scratch_top..]);
+        }
+
+        // Fields in braces
+        var fields = SubRange.empty;
+        if (p.eatToken(.lbrace) != null) {
+            fields = try p.parseFieldList(.rbrace);
+            _ = p.eatToken(.rbrace);
+        }
+
+        const extra = try p.addExtra(Ast.NewExprData{
+            .type_name_token = type_name,
+            .type_args = type_args,
+            .fields = fields,
+            .constructor_args = SubRange.empty,
+            .flags = .{},
+        });
+        return try p.addNode(.{ .tag = .new_expr, .main_token = new_token, .data = .{ .node_and_extra = .{ @enumFromInt(0), extra } } });
+    }
+
+    fn parseStringInterp(p: *Parser) Error!?Index {
+        const start_token = p.advance(); // consume string_interp_start
+        const scratch_top = p.scratch.items.len;
+        defer p.scratch.shrinkRetainingCapacity(scratch_top);
+
+        // Text segment from start token
+        try p.scratch.append(p.gpa, Ast.SEGMENT_TEXT);
+        try p.scratch.append(p.gpa, start_token);
+
+        // Expression between ${ }
+        if (try p.parseExpr()) |expr| {
+            try p.scratch.append(p.gpa, Ast.SEGMENT_EXPR);
+            try p.scratch.append(p.gpa, @intFromEnum(expr));
+        }
+
+        // Mid/end segments
+        while (p.currentTag() != .eof) {
+            if (p.currentTag() == .string_interp_mid) {
+                const mid = p.advance();
+                try p.scratch.append(p.gpa, Ast.SEGMENT_TEXT);
+                try p.scratch.append(p.gpa, mid);
+                if (try p.parseExpr()) |expr| {
+                    try p.scratch.append(p.gpa, Ast.SEGMENT_EXPR);
+                    try p.scratch.append(p.gpa, @intFromEnum(expr));
+                }
+            } else if (p.currentTag() == .string_interp_end) {
+                const end = p.advance();
+                try p.scratch.append(p.gpa, Ast.SEGMENT_TEXT);
+                try p.scratch.append(p.gpa, end);
+                break;
+            } else break;
+        }
+
+        const range = try p.listToSpan(p.scratch.items[scratch_top..]);
+        return try p.addNode(.{ .tag = .string_interp, .main_token = start_token, .data = .{ .extra_range = range } });
+    }
+
+    // ========================================================================
+    // Type parsing
+    // ========================================================================
+
     fn parseType(p: *Parser) Error!?Index {
-        // Minimal stub: parse named types and pointer/optional prefixes
         if (p.eatToken(.question) != null) {
             const inner = try p.parseType() orelse return null;
             return try p.addNode(.{ .tag = .type_optional, .main_token = p.tok_i - 1, .data = .{ .node = inner } });
@@ -1307,19 +1892,302 @@ pub const Parser = struct {
             return try p.addNode(.{ .tag = .type_pointer, .main_token = p.tok_i - 1, .data = .{ .node = inner } });
         }
         if (p.eatToken(.lnot) != null) {
+            if (p.currentTag() == .ident or p.currentTag().isTypeKeyword()) {
+                // Could be ErrorSet!T
+                const maybe_error_set = p.tok_i;
+                if (p.peekIs(.lnot)) {
+                    // ErrorSet!T
+                    const error_set = try p.addNode(.{ .tag = .type_named, .main_token = p.advance(), .data = .{ .none = {} } });
+                    _ = p.advance(); // consume second !
+                    const inner = try p.parseType() orelse return null;
+                    return try p.addNode(.{ .tag = .type_error_union_set, .main_token = maybe_error_set, .data = .{ .node_and_node = .{ error_set, inner } } });
+                }
+            }
             const inner = try p.parseType() orelse return null;
             return try p.addNode(.{ .tag = .type_error_union, .main_token = p.tok_i - 1, .data = .{ .node = inner } });
         }
-        if (p.currentTag() == .ident or p.currentTag().isTypeKeyword()) {
+        // []T slice
+        if (p.currentTag() == .lbrack) {
             const t = p.advance();
-            return try p.addNode(.{ .tag = .type_named, .main_token = t, .data = .{ .none = {} } });
+            if (p.eatToken(.rbrack) != null) {
+                const elem = try p.parseType() orelse return null;
+                return try p.addNode(.{ .tag = .type_slice, .main_token = t, .data = .{ .node = elem } });
+            }
+            // [N]T array
+            const size = try p.parseExpr() orelse return null;
+            _ = p.eatToken(.rbrack);
+            const elem = try p.parseType() orelse return null;
+            return try p.addNode(.{ .tag = .type_array, .main_token = t, .data = .{ .node_and_node = .{ size, elem } } });
         }
+        // any Trait (existential)
+        if (p.currentTag() == .ident and p.isTokenText(p.tok_i, "any")) {
+            const t = p.advance();
+            const trait = try p.parseType() orelse return null;
+            return try p.addNode(.{ .tag = .type_existential, .main_token = t, .data = .{ .node = trait } });
+        }
+        // Named type, possibly generic: Type(T, U)
+        if (p.currentTag() == .ident or p.currentTag().isTypeKeyword()) {
+            const name_token = p.advance();
+            // Check for generic args: Type(T, U)
+            if (p.eatToken(.lparen) != null) {
+                const scratch_top = p.scratch.items.len;
+                defer p.scratch.shrinkRetainingCapacity(scratch_top);
+                while (p.currentTag() != .rparen and p.currentTag() != .eof) {
+                    if (try p.parseType()) |arg| {
+                        try p.scratch.append(p.gpa, @intFromEnum(arg));
+                    } else break;
+                    if (p.eatToken(.comma) == null) break;
+                }
+                _ = p.eatToken(.rparen);
+                const type_args = try p.listToSpan(p.scratch.items[scratch_top..]);
+                const extra = try p.addExtra(Ast.GenericInstance{
+                    .name_token = name_token,
+                    .type_args = type_args,
+                });
+                return try p.addNode(.{ .tag = .type_generic, .main_token = name_token, .data = .{ .node_and_extra = .{ @enumFromInt(0), extra } } });
+            }
+            return try p.addNode(.{ .tag = .type_named, .main_token = name_token, .data = .{ .none = {} } });
+        }
+        // fn(A, B) -> R
         if (p.currentTag() == .kw_fn) {
-            // fn type — skip for now
-            return null;
+            const fn_token = p.advance();
+            _ = p.eatToken(.lparen);
+            const scratch_top = p.scratch.items.len;
+            defer p.scratch.shrinkRetainingCapacity(scratch_top);
+            while (p.currentTag() != .rparen and p.currentTag() != .eof) {
+                if (try p.parseType()) |param| {
+                    try p.scratch.append(p.gpa, @intFromEnum(param));
+                } else break;
+                if (p.eatToken(.comma) == null) break;
+            }
+            _ = p.eatToken(.rparen);
+            var ret: OptionalIndex = .none;
+            if (p.currentTag() != .lbrace and p.currentTag() != .eof and p.currentTag() != .rparen and p.currentTag() != .comma) {
+                if (try p.parseType()) |r| ret = r.toOptional();
+            }
+            const fn_params = try p.listToSpan(p.scratch.items[scratch_top..]);
+            const extra = try p.addExtra(Ast.FnType{ .params = fn_params, .ret = ret });
+            return try p.addNode(.{ .tag = .type_function, .main_token = fn_token, .data = .{ .node_and_extra = .{ @enumFromInt(0), extra } } });
         }
         try p.addError(.expected_type);
         return null;
+    }
+
+    // ========================================================================
+    // Statement parsing (Step 7)
+    // ========================================================================
+
+    fn parseStmt(p: *Parser) Error!?Index {
+        return switch (p.currentTag()) {
+            .kw_return => p.parseReturnStmt(),
+            .kw_var => p.parseLocalVar(false),
+            .kw_const, .kw_let => p.parseLocalVar(true),
+            .kw_if => p.parseIfStmt(),
+            .kw_while => p.parseWhileStmt(),
+            .kw_for => p.parseForStmt(),
+            .kw_break => p.parseBreakStmt(),
+            .kw_continue => p.parseContinueStmt(),
+            .kw_defer => {
+                const t = p.advance();
+                const expr = try p.parseExpr() orelse return null;
+                _ = p.eatToken(.semicolon);
+                return try p.addNode(.{ .tag = .defer_stmt, .main_token = t, .data = .{ .node = expr } });
+            },
+            .kw_errdefer => {
+                const t = p.advance();
+                const expr = try p.parseExpr() orelse return null;
+                _ = p.eatToken(.semicolon);
+                return try p.addNode(.{ .tag = .errdefer_stmt, .main_token = t, .data = .{ .node = expr } });
+            },
+            else => p.parseExprOrAssign(),
+        };
+    }
+
+    fn parseReturnStmt(p: *Parser) Error!?Index {
+        const ret_token = p.advance(); // consume 'return'
+        if (p.currentTag() == .semicolon or p.currentTag() == .rbrace or p.currentTag() == .eof) {
+            _ = p.eatToken(.semicolon);
+            return try p.addNode(.{ .tag = .return_void, .main_token = ret_token, .data = .{ .none = {} } });
+        }
+        const value = try p.parseExpr() orelse {
+            _ = p.eatToken(.semicolon);
+            return try p.addNode(.{ .tag = .return_void, .main_token = ret_token, .data = .{ .none = {} } });
+        };
+        _ = p.eatToken(.semicolon);
+        return try p.addNode(.{ .tag = .return_expr, .main_token = ret_token, .data = .{ .node = value } });
+    }
+
+    fn parseLocalVar(p: *Parser, is_const: bool) Error!?Index {
+        const var_token = p.advance();
+        const name_token = p.eatToken(.ident) orelse {
+            try p.addError(.expected_identifier);
+            return null;
+        };
+        var type_expr: OptionalIndex = .none;
+        if (p.eatToken(.colon) != null) {
+            if (try p.parseType()) |te| type_expr = te.toOptional();
+        }
+        var value: OptionalIndex = .none;
+        if (p.eatToken(.assign) != null) {
+            if (try p.parseExpr()) |v| value = v.toOptional();
+        }
+        _ = p.eatToken(.semicolon);
+        const extra = try p.addExtra(Ast.LocalVarData{
+            .name_token = name_token,
+            .type_expr = type_expr,
+            .value = value,
+            .flags = .{},
+        });
+        return try p.addNode(.{
+            .tag = if (is_const) .const_local else .var_local,
+            .main_token = var_token,
+            .data = .{ .node_and_extra = .{ @enumFromInt(0), extra } },
+        });
+    }
+
+    fn parseIfStmt(p: *Parser) Error!?Index {
+        const if_token = p.advance();
+        const cond = try p.parseExpr() orelse {
+            try p.addError(.expected_expression);
+            return null;
+        };
+        const then_branch = try p.parseBlockStmt() orelse {
+            try p.addError(.expected_block);
+            return null;
+        };
+        if (p.eatToken(.kw_else) == null) {
+            return try p.addNode(.{ .tag = .if_stmt_simple, .main_token = if_token, .data = .{ .node_and_node = .{ cond, then_branch } } });
+        }
+        const else_branch = try p.parseBlockStmt() orelse try p.parseIfStmt() orelse {
+            try p.addError(.expected_block);
+            return null;
+        };
+        const extra = try p.addExtra(Ast.IfData{
+            .then_node = then_branch,
+            .else_node = else_branch.toOptional(),
+            .capture_token = .none,
+            .flags = .{},
+        });
+        return try p.addNode(.{ .tag = .if_stmt, .main_token = if_token, .data = .{ .node_and_extra = .{ cond, extra } } });
+    }
+
+    fn parseWhileStmt(p: *Parser) Error!?Index {
+        const while_token = p.advance();
+        const cond = try p.parseExpr() orelse {
+            try p.addError(.expected_expression);
+            return null;
+        };
+        const body = try p.parseBlockStmt() orelse {
+            try p.addError(.expected_block);
+            return null;
+        };
+        const extra = try p.addExtra(Ast.WhileData{
+            .body = body,
+            .label_token = .none,
+            .capture_token = .none,
+            .continue_expr = .none,
+            .flags = .{},
+        });
+        return try p.addNode(.{ .tag = .while_stmt, .main_token = while_token, .data = .{ .node_and_extra = .{ cond, extra } } });
+    }
+
+    fn parseForStmt(p: *Parser) Error!?Index {
+        const for_token = p.advance();
+        const binding_token = p.eatToken(.ident) orelse {
+            try p.addError(.expected_identifier);
+            return null;
+        };
+
+        var index_binding: OptionalTokenIndex = .none;
+        if (p.eatToken(.comma) != null) {
+            if (p.currentTag() == .ident) {
+                // Two bindings: for i, item in collection
+                // But wait — Cot uses "for item in" with optional "for i, item in"
+                // The first ident is the index, second is the value
+                index_binding = @enumFromInt(binding_token);
+            }
+        }
+
+        _ = p.eatToken(.kw_in);
+        const iterable = try p.parseExpr() orelse {
+            try p.addError(.expected_expression);
+            return null;
+        };
+
+        const body = try p.parseBlockStmt() orelse {
+            try p.addError(.expected_block);
+            return null;
+        };
+
+        const extra = try p.addExtra(Ast.ForData{
+            .binding_token = binding_token,
+            .index_binding_token = index_binding,
+            .iterable = iterable.toOptional(),
+            .range_start = .none,
+            .range_end = .none,
+            .body = body,
+            .label_token = .none,
+            .flags = .{},
+        });
+        return try p.addNode(.{ .tag = .for_stmt, .main_token = for_token, .data = .{ .node_and_extra = .{ @enumFromInt(0), extra } } });
+    }
+
+    fn parseBreakStmt(p: *Parser) Error!?Index {
+        const break_token = p.advance();
+        if (p.currentTag() == .semicolon or p.currentTag() == .rbrace or p.currentTag() == .eof) {
+            _ = p.eatToken(.semicolon);
+            return try p.addNode(.{ .tag = .break_plain, .main_token = break_token, .data = .{ .none = {} } });
+        }
+        var label: OptionalTokenIndex = .none;
+        if (p.eatToken(.colon) != null) {
+            if (p.currentTag() == .ident) label = @enumFromInt(p.advance());
+        }
+        var value: OptionalIndex = .none;
+        if (p.currentTag() != .semicolon and p.currentTag() != .rbrace and p.currentTag() != .eof) {
+            if (try p.parseExpr()) |v| value = v.toOptional();
+        }
+        _ = p.eatToken(.semicolon);
+        const extra = try p.addExtra(Ast.BreakData{ .label_token = label, .value = value });
+        return try p.addNode(.{ .tag = .break_expr, .main_token = break_token, .data = .{ .node_and_extra = .{ @enumFromInt(0), extra } } });
+    }
+
+    fn parseContinueStmt(p: *Parser) Error!?Index {
+        const cont_token = p.advance();
+        if (p.eatToken(.colon) != null and p.currentTag() == .ident) {
+            const label = p.advance();
+            _ = p.eatToken(.semicolon);
+            return try p.addNode(.{ .tag = .continue_labeled, .main_token = cont_token, .data = .{ .token = label } });
+        }
+        _ = p.eatToken(.semicolon);
+        return try p.addNode(.{ .tag = .continue_plain, .main_token = cont_token, .data = .{ .none = {} } });
+    }
+
+    fn parseExprOrAssign(p: *Parser) Error!?Index {
+        const expr = try p.parseExpr() orelse return null;
+        // Check for assignment operators
+        const assign_tag: ?Tag = switch (p.currentTag()) {
+            .assign => .assign,
+            .add_assign => .assign_add,
+            .sub_assign => .assign_sub,
+            .mul_assign => .assign_mul,
+            .quo_assign => .assign_div,
+            .rem_assign => .assign_mod,
+            .and_assign => .assign_bit_and,
+            .or_assign => .assign_bit_or,
+            .xor_assign => .assign_bit_xor,
+            else => null,
+        };
+        if (assign_tag) |tag| {
+            const op_token = p.advance();
+            const value = try p.parseExpr() orelse {
+                try p.addError(.expected_expression);
+                return null;
+            };
+            _ = p.eatToken(.semicolon);
+            return try p.addNode(.{ .tag = tag, .main_token = op_token, .data = .{ .node_and_node = .{ expr, value } } });
+        }
+        _ = p.eatToken(.semicolon);
+        return try p.addNode(.{ .tag = .expr_stmt, .main_token = p.nodeMainToken(expr), .data = .{ .node = expr } });
     }
 
     fn parseBlockStmt(p: *Parser) Error!?Index {
@@ -1330,17 +2198,10 @@ pub const Parser = struct {
         defer p.scratch.shrinkRetainingCapacity(scratch_top);
 
         while (p.currentTag() != .rbrace and p.currentTag() != .eof) {
-            // Minimal: treat each token as an expression statement
-            if (try p.parseExpr()) |expr| {
-                _ = p.eatToken(.semicolon);
-                const stmt = try p.addNode(.{
-                    .tag = .expr_stmt,
-                    .main_token = p.nodeMainToken(expr),
-                    .data = .{ .node = expr },
-                });
+            if (try p.parseStmt()) |stmt| {
                 try p.scratch.append(p.gpa, @intFromEnum(stmt));
             } else {
-                _ = p.advance(); // skip bad token
+                _ = p.advance(); // skip bad token for error recovery
             }
         }
         _ = p.eatToken(.rbrace);
