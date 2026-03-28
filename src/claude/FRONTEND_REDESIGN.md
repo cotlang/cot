@@ -678,8 +678,11 @@ This is purely a representation change. The tree structure is identical — only
 - `ast.zig` — Node, Tag, Data, extra structs, full accessors, BuiltinKind
 - `parser.zig` — Recursive descent parser producing compact AST
 
+**Modified (src/libcot-zig/):**
+- `scanner.zig` → renamed to `Tokenizer.zig` (Zig convention: types are PascalCase filenames). Add `tokenize()` entry point that pre-tokenizes into `Ast.TokenList`.
+
 **Unchanged:**
-- `token.zig`, `source.zig`, `errors.zig`, `scanner.zig`, `debug.zig`, `target.zig`
+- `token.zig`, `source.zig`, `errors.zig`, `debug.zig`, `target.zig`
 
 **Later (when porting to src/):**
 - `checker.zig` — use `tree.fnDecl()` accessors
@@ -689,23 +692,135 @@ This is purely a representation change. The tree structure is identical — only
 
 ---
 
-## Open Questions
+## Decisions (resolved)
 
-1. **Token storage:** Should we store tokens in a `MultiArrayList` like Zig, or keep the current `Scanner` interface? Zig pre-tokenizes everything into an array; Cot's scanner is streaming. Pre-tokenizing would allow the parser to use token indices directly (no `peek_tok` state), which is cleaner.
+### 1. Pre-tokenize into MultiArrayList — YES
 
-2. **Span storage:** Zig derives spans from `main_token` + grammar knowledge. We store `span_start` in each node. Should we also store `span_end` (4 more bytes per node) or compute it on demand? Storing it is simpler; computing saves memory.
+Zig pre-tokenizes the entire source into a flat array before parsing. We adopt this.
 
-3. **Doc comments:** Zig handles doc comments at the token level. Cot accumulates `///` lines into a string during parsing. With the compact model, doc comments could be stored as token ranges in extra_data rather than allocated strings.
+**Rationale:** Token indices become the universal reference currency throughout the AST. The parser uses `tok_i` (a single integer) instead of carrying `TokenInfo` structs. This enables:
+- `main_token` per node (like Zig) — the primary token for each node is a u32 index
+- `firstToken()` / `lastToken()` methods that walk token indices to derive spans
+- Token-level operations for the formatter (comment interleaving, whitespace preservation)
+- `MultiArrayList(struct { tag: Token, start: u32 })` — tags in one array, byte offsets in another
 
-4. **How far to push the "two" optimization?** Zig has `call_one` vs `call`, `block_two` vs `block`, etc. — saving extra_data for common 0-1 element cases. Worth it for calls (most have 0-3 args) and blocks (many have 1-2 stmts). Diminishing returns beyond that.
+**Impact on scanner.zig:** The scanner stays as-is. We add a thin `tokenize()` function that calls `scanner.next()` in a loop and packs results into the `TokenList`. The scanner remains useful standalone (LSP incremental tokenization, syntax highlighting).
+
+### 2. Derive spans from token positions — YES, with `main_token`
+
+Replace `span_start: u32` with `main_token: TokenIndex` in the Node struct (same 4 bytes). Spans are derived:
+- `firstToken(node)` — walks backwards from `main_token` to find the node's true start
+- `lastToken(node)` — walks forwards from the last child to find the node's end
+- `nodeSpan(node)` — returns `Span { tokenStart(firstToken), tokenStart(lastToken) + tokenLen }`
+
+**Rationale:** Zig proved this works at scale (4,144-line AST with 56 accessor functions). It eliminates 4 bytes of redundant span_end storage per node and makes spans always correct (they can't drift from the tokens). For error reporting, `nodeSpan()` computes the same span on demand.
+
+**The cost:** Each `full.*` accessor must know how to find firstToken/lastToken for its node type. This is mechanical but must be written per tag. It's the right trade-off — write it once, benefit forever.
+
+### 3. Doc comments as token indices — YES
+
+Store doc comments as `OptionalTokenIndex` pointing to the first `///` token. Consecutive `///` tokens form the comment naturally (they're adjacent in the token array). To extract the comment text, walk consecutive `doc_comment` tokens from that index.
+
+**Rationale:** Zero string allocation during parsing. The source text already contains the comment — we just need to know where it starts. The formatter and doc generator can extract the text on demand from the token array + source text.
+
+### 4. "Two" optimization — YES, for hot paths
+
+Apply the zero/one/many split to:
+- **Calls:** `call_zero` (0 args), `call_one` (1 arg), `call` (2+ args) — most calls have 0-2 args
+- **Blocks:** `block_one` (1 stmt), `block_two` (2 stmts), `block` (3+ stmts) — most blocks are small
+- **Array literals:** `array_literal_empty`, `array_literal_one`, `array_literal`
+- **Struct init:** `struct_init_one`, `struct_init`
+
+Not worth it for: fn params (usually 1-5, not worth triple tags), switch cases, enum variants.
+
+**Rationale:** These are the highest-frequency node types. In a typical Cot program, calls and blocks dominate. The optimization saves extra_data entries for the common case — which means less memory, fewer cache misses, and faster `deinit`. The cost is ~12 extra tag variants and paired accessor logic, which is a one-time investment.
+
+### 5. Scanner redesign — YES, split into Tokenizer + TokenList
+
+Rename `scanner.zig` → `Tokenizer.zig` (Zig convention). Add a `tokenize()` entry point:
+
+```zig
+pub fn tokenize(gpa: Allocator, source: [:0]const u8) !Ast.TokenList {
+    var tokens = Ast.TokenList{};
+    // Empirically, source_len / 6 is a good estimate for Cot
+    try tokens.ensureTotalCapacity(gpa, source.len / 6);
+    var tokenizer = Tokenizer.init(source);
+    while (true) {
+        const tok = tokenizer.next();
+        try tokens.append(gpa, .{ .tag = tok.tag, .start = tok.start });
+        if (tok.tag == .eof) break;
+    }
+    return tokens;
+}
+```
+
+The existing `Scanner` struct and its streaming `next()` method stay — they're renamed to `Tokenizer` and work identically. The new `tokenize()` is a convenience wrapper.
+
+### 6. Source text ownership — reference, don't copy
+
+The AST stores `source: [:0]const u8` — a reference to externally-owned source text, not a copy. The caller (driver) owns the source and must keep it alive for the AST's lifetime. This matches Zig exactly and eliminates a full source copy.
+
+**Impact:** Source text must be null-terminated (`[:0]const u8`) for the tokenizer. The driver reads files with a null sentinel.
 
 ---
 
 ## Implementation Order
 
-1. Write `ast.zig` — Tag enum, Data union, extra structs, Index types, full accessors, BuiltinKind
-2. Write tests for `ast.zig` — verify accessor round-trips
-3. Write `parser.zig` — recursive descent producing compact AST
-4. Write parser tests — verify parse of all Cot syntax forms
-5. Write companion docs (`ac/src/libcot-zig/ast.md`, `parser.md`)
-6. Verify: `zig test src/libcot-zig/ast.zig` and `zig test src/libcot-zig/parser.zig`
+### Step 1: ast.zig — Type Definitions Only (~400 lines)
+
+All types, no logic beyond comptime assertions and trivial helpers:
+- Index types (Index, OptionalIndex, TokenIndex, etc.)
+- Node struct
+- Tag enum (~130 variants)
+- Data union
+- Extra data structs (FnDecl, VarStmt, StructDecl, etc.)
+- Packed flag structs (FnFlags, StructFlags, etc.)
+- SubRange
+- BuiltinKind enum with comptime snakeToCamel
+- `full` namespace with rich accessor structs
+
+### Step 2: ast.zig — Accessor Functions (~300 lines)
+
+Methods on Ast that unpack compact nodes:
+- `nodeTag()`, `nodeData()`, `nodeMainToken()`
+- `extraData()` — comptime generic unpacker
+- `extraDataSlice()` — SubRange to slice
+- `tokenSlice()` — get source text for a token
+- `tokenTag()`, `tokenStart()`
+- Per-tag `full.*` accessors: `fnDecl()`, `structDecl()`, `ifExpr()`, `forStmt()`, etc.
+- `firstToken()`, `lastToken()`, `nodeSpan()` — span derivation
+
+### Step 3: ast.zig — Tests (~150 lines)
+
+- Round-trip: pack extra data, unpack with accessor, verify fields match
+- Span derivation: verify firstToken/lastToken produce correct byte ranges
+- BuiltinKind: comptime snakeToCamel + reverse lookup
+- Index type safety: OptionalIndex.unwrap(), none sentinel
+
+### Step 4: parser.zig — Core Infrastructure (~200 lines)
+
+Parser struct, addNode, addExtra, listToSpan, scratch buffer, error handling, token advancement.
+
+### Step 5: parser.zig — Declaration Parsing (~500 lines)
+
+parseFnDecl, parseStructDecl, parseEnumDecl, parseUnionDecl, parseTraitDecl, parseImplBlock, parseVarDecl, parseImportDecl, parseTestDecl.
+
+### Step 6: parser.zig — Expression Parsing (~500 lines)
+
+parsePrimaryExpr, parseBinaryExpr (precedence climbing), parseUnaryExpr, parseCallExpr, parseFieldAccess, parseIndexExpr, parseIfExpr, parseSwitchExpr, parseBlockExpr, parseBuiltinCall, parseStringInterp, parseClosureExpr, parseTypeExpr.
+
+### Step 7: parser.zig — Statement Parsing (~300 lines)
+
+parseStmt, parseVarStmt, parseAssign, parseIfStmt, parseWhileStmt, parseForStmt, parseReturnStmt, parseDeferStmt, parseDestructure.
+
+### Step 8: parser.zig — Tests (~300 lines)
+
+Parse real Cot source snippets, verify node tags, verify accessor output matches expected values. Cover every Tag variant.
+
+### Step 9: Documentation
+
+`ac/src/libcot-zig/ast.md` and `ac/src/libcot-zig/parser.md` — section-by-section with line numbers.
+
+### Step 10: Integration
+
+Wire into build.zig. Verify `zig test` passes for all files. Verify the full libcot-zig test suite (token + source + errors + scanner + debug + target + ast + parser).
