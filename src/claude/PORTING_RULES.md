@@ -11,7 +11,24 @@ Docs:    ~/cotlang/ac/src/libcot-zig/scanner.md
 
 ---
 
-## 1. Remove Reference Comments
+## 1. Transform, Don't Copy
+
+**This is NOT a bulk copy with cleanup. Every file must be actively improved during the port.**
+
+Before writing a single line, read the entire original file and ask:
+- Can any repeated patterns be replaced with comptime reflection or data-driven design?
+- Are there if-chains or switches that could be a lookup table or enum method?
+- Are there functions doing too many things that should be split?
+- Can types be made more expressive (named fields vs positional args, enums vs bools)?
+- Are there better Zig idioms for what the code is doing (see `references/zig/lib/std/`)?
+
+The `debug.zig` port is the standard to meet — it replaced 13 explicit bool fields + 13 if-statements + a 13-way switch with one `[N]bool` array + `inline for` over `@typeInfo`. That's the level of improvement expected on EVERY file. If the ported file looks the same as the original with just comments removed, it hasn't been ported properly.
+
+**Spend time studying the Zig standard library before porting complex files.** Read how `std.hash_map.zig`, `std.mem.zig`, `std.fmt.zig` solve similar problems. Use their patterns.
+
+---
+
+## 2. Remove Reference Comments
 
 The code in `compiler/` is littered with comments like:
 ```
