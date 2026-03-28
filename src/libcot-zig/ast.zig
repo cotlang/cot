@@ -1027,18 +1027,506 @@ pub const Ast = struct {
     /// Check if the file uses async features.
     pub fn hasAsyncFunctions(self: *const Ast) bool {
         const tags = self.nodes.items(.tag);
-        for (tags) |tag| {
+        const datas = self.nodes.items(.data);
+        for (tags, datas) |tag, data| {
             switch (tag) {
-                .fn_decl => {
-                    // Check FnFlags in extra data
-                    // TODO: implement when parser wires this up
+                .fn_decl, .fn_decl_extern => {
+                    const extra_idx = switch (tag) {
+                        .fn_decl => data.extra_and_node[0],
+                        .fn_decl_extern => data.node_and_extra[1],
+                        else => unreachable,
+                    };
+                    const fn_data = self.extraData(extra_idx, FnDecl);
+                    if (fn_data.flags.is_async) return true;
                 },
-                .unary_await, .closure_expr => return true,
+                .unary_await, .closure_expr, .async_let => return true,
                 else => {},
             }
         }
         return false;
     }
+
+    // ----------------------------------------------------------------
+    // full.* accessor functions — unpack compact nodes into rich structs
+    // ----------------------------------------------------------------
+
+    pub fn fnDeclData(self: *const Ast, node: Index) full.FnDeclFull {
+        const tag = self.nodeTag(node);
+        std.debug.assert(tag == .fn_decl or tag == .fn_decl_extern);
+        const data = self.nodeData(node);
+        const extra_idx = switch (tag) {
+            .fn_decl => data.extra_and_node[0],
+            .fn_decl_extern => data.node_and_extra[1],
+            else => unreachable,
+        };
+        const body_node = if (tag == .fn_decl) data.extra_and_node[1].toOptional() else OptionalIndex.none;
+        const fn_extra = self.extraData(extra_idx, FnDecl);
+        return .{
+            .name = self.tokenSlice(fn_extra.name_token),
+            .name_token = fn_extra.name_token,
+            .type_params = fn_extra.type_params,
+            .param_bounds = fn_extra.param_bounds,
+            .params = fn_extra.params,
+            .return_type = fn_extra.return_type,
+            .body = body_node,
+            .flags = fn_extra.flags,
+            .is_extern = (tag == .fn_decl_extern),
+            .doc_comment = fn_extra.doc_comment,
+            .global_actor = fn_extra.global_actor,
+            .main_token = self.nodeMainToken(node),
+        };
+    }
+
+    pub fn varDeclData(self: *const Ast, node: Index) full.VarDeclFull {
+        std.debug.assert(self.nodeTag(node) == .var_decl);
+        const data = self.nodeData(node);
+        const extra_idx = data.node_and_extra[1];
+        const var_extra = self.extraData(extra_idx, VarDecl);
+        return .{
+            .name = self.tokenSlice(var_extra.name_token),
+            .name_token = var_extra.name_token,
+            .type_expr = var_extra.type_expr,
+            .value = var_extra.value,
+            .is_const = var_extra.flags.is_const,
+            .doc_comment = var_extra.doc_comment,
+            .main_token = self.nodeMainToken(node),
+        };
+    }
+
+    pub fn structDeclData(self: *const Ast, node: Index) full.StructDeclFull {
+        std.debug.assert(self.nodeTag(node) == .struct_decl);
+        const data = self.nodeData(node);
+        const extra_idx = data.node_and_extra[1];
+        const s = self.extraData(extra_idx, StructDecl);
+        return .{
+            .name = self.tokenSlice(s.name_token),
+            .name_token = s.name_token,
+            .type_params = s.type_params,
+            .fields = s.fields,
+            .nested_decls = s.nested_decls,
+            .layout = @enumFromInt(s.layout),
+            .is_actor = s.flags.is_actor,
+            .doc_comment = s.doc_comment,
+            .main_token = self.nodeMainToken(node),
+        };
+    }
+
+    pub fn enumDeclData(self: *const Ast, node: Index) full.EnumDeclFull {
+        std.debug.assert(self.nodeTag(node) == .enum_decl);
+        const data = self.nodeData(node);
+        const extra_idx = data.node_and_extra[1];
+        const e = self.extraData(extra_idx, EnumDecl);
+        return .{
+            .name = self.tokenSlice(e.name_token),
+            .name_token = e.name_token,
+            .backing_type = e.backing_type,
+            .variants = e.variants,
+            .nested_decls = e.nested_decls,
+            .doc_comment = e.doc_comment,
+            .main_token = self.nodeMainToken(node),
+        };
+    }
+
+    pub fn unionDeclData(self: *const Ast, node: Index) full.UnionDeclFull {
+        std.debug.assert(self.nodeTag(node) == .union_decl);
+        const data = self.nodeData(node);
+        const extra_idx = data.node_and_extra[1];
+        const u = self.extraData(extra_idx, UnionDecl);
+        return .{
+            .name = self.tokenSlice(u.name_token),
+            .name_token = u.name_token,
+            .variants = u.variants,
+            .doc_comment = u.doc_comment,
+            .main_token = self.nodeMainToken(node),
+        };
+    }
+
+    pub fn implBlockData(self: *const Ast, node: Index) full.ImplBlockFull {
+        std.debug.assert(self.nodeTag(node) == .impl_block);
+        const data = self.nodeData(node);
+        const extra_idx = data.node_and_extra[1];
+        const ib = self.extraData(extra_idx, ImplBlock);
+        return .{
+            .type_name = self.tokenSlice(ib.type_name_token),
+            .type_name_token = ib.type_name_token,
+            .type_params = ib.type_params,
+            .methods = ib.methods,
+            .consts = ib.consts,
+            .doc_comment = ib.doc_comment,
+            .main_token = self.nodeMainToken(node),
+        };
+    }
+
+    pub fn implTraitData(self: *const Ast, node: Index) full.ImplTraitFull {
+        std.debug.assert(self.nodeTag(node) == .impl_trait);
+        const data = self.nodeData(node);
+        const extra_idx = data.node_and_extra[1];
+        const it = self.extraData(extra_idx, ImplTrait);
+        return .{
+            .trait_name = self.tokenSlice(it.trait_name_token),
+            .target_type = self.tokenSlice(it.target_type_token),
+            .trait_name_token = it.trait_name_token,
+            .target_type_token = it.target_type_token,
+            .type_params = it.type_params,
+            .methods = it.methods,
+            .doc_comment = it.doc_comment,
+            .main_token = self.nodeMainToken(node),
+        };
+    }
+
+    pub fn traitDeclData(self: *const Ast, node: Index) full.TraitDeclFull {
+        std.debug.assert(self.nodeTag(node) == .trait_decl);
+        const data = self.nodeData(node);
+        const extra_idx = data.node_and_extra[1];
+        const t = self.extraData(extra_idx, TraitDecl);
+        return .{
+            .name = self.tokenSlice(t.name_token),
+            .name_token = t.name_token,
+            .type_params = t.type_params,
+            .methods = t.methods,
+            .assoc_types = t.assoc_types,
+            .doc_comment = t.doc_comment,
+            .main_token = self.nodeMainToken(node),
+        };
+    }
+
+    pub fn errorSetData(self: *const Ast, node: Index) full.ErrorSetFull {
+        std.debug.assert(self.nodeTag(node) == .error_set_decl);
+        const data = self.nodeData(node);
+        const extra_idx = data.node_and_extra[1];
+        const e = self.extraData(extra_idx, ErrorSetDecl);
+        return .{
+            .name = self.tokenSlice(e.name_token),
+            .name_token = e.name_token,
+            .variants = e.variants,
+            .doc_comment = e.doc_comment,
+            .main_token = self.nodeMainToken(node),
+        };
+    }
+
+    pub fn ifData(self: *const Ast, node: Index) full.IfFull {
+        const tag = self.nodeTag(node);
+        const data = self.nodeData(node);
+        switch (tag) {
+            .if_simple, .if_stmt_simple => {
+                const pair = data.node_and_node;
+                return .{
+                    .condition = pair[0],
+                    .then_branch = pair[1],
+                    .else_branch = .none,
+                    .capture_token = .none,
+                    .capture_is_ptr = false,
+                    .main_token = self.nodeMainToken(node),
+                };
+            },
+            .if_full, .if_stmt => {
+                const cond = data.node_and_extra[0];
+                const extra = self.extraData(data.node_and_extra[1], IfData);
+                return .{
+                    .condition = cond,
+                    .then_branch = extra.then_node,
+                    .else_branch = extra.else_node,
+                    .capture_token = extra.capture_token,
+                    .capture_is_ptr = extra.flags.capture_is_ptr,
+                    .main_token = self.nodeMainToken(node),
+                };
+            },
+            else => unreachable,
+        }
+    }
+
+    pub fn whileData(self: *const Ast, node: Index) full.WhileFull {
+        std.debug.assert(self.nodeTag(node) == .while_stmt);
+        const data = self.nodeData(node);
+        const cond = data.node_and_extra[0];
+        const w = self.extraData(data.node_and_extra[1], WhileData);
+        return .{
+            .condition = cond,
+            .body = w.body,
+            .label_token = w.label_token,
+            .capture_token = w.capture_token,
+            .continue_expr = w.continue_expr,
+            .capture_is_ptr = w.flags.capture_is_ptr,
+            .main_token = self.nodeMainToken(node),
+        };
+    }
+
+    pub fn forData(self: *const Ast, node: Index) full.ForFull {
+        std.debug.assert(self.nodeTag(node) == .for_stmt);
+        const data = self.nodeData(node);
+        const f = self.extraData(data.node_and_extra[1], ForData);
+        return .{
+            .binding = self.tokenSlice(f.binding_token),
+            .binding_token = f.binding_token,
+            .index_binding_token = f.index_binding_token,
+            .iterable = f.iterable,
+            .range_start = f.range_start,
+            .range_end = f.range_end,
+            .body = f.body,
+            .label_token = f.label_token,
+            .is_inline = f.flags.is_inline,
+            .is_await = f.flags.is_await,
+            .main_token = self.nodeMainToken(node),
+        };
+    }
+
+    pub fn switchData(self: *const Ast, node: Index) full.SwitchFull {
+        std.debug.assert(self.nodeTag(node) == .switch_expr);
+        const data = self.nodeData(node);
+        const subject = data.node_and_extra[0];
+        const s = self.extraData(data.node_and_extra[1], SwitchData);
+        return .{
+            .subject = subject,
+            .cases = s.cases,
+            .else_body = s.else_body,
+            .main_token = self.nodeMainToken(node),
+        };
+    }
+
+    pub fn callData(self: *const Ast, node: Index) full.CallFull {
+        const tag = self.nodeTag(node);
+        const data = self.nodeData(node);
+        return switch (tag) {
+            .call_zero => .{
+                .callee = data.node,
+                .args = SubRange.empty,
+                .main_token = self.nodeMainToken(node),
+            },
+            .call_one => .{
+                .callee = data.node_and_node[0],
+                .args = SubRange.empty, // single arg in data[1], not a range
+                .single_arg = data.node_and_node[1],
+                .main_token = self.nodeMainToken(node),
+            },
+            .call => .{
+                .callee = data.node_and_extra[0],
+                .args = .{ .start = data.node_and_extra[1], .end = @enumFromInt(@intFromEnum(data.node_and_extra[1]) + self.extra_data[@intFromEnum(data.node_and_extra[1])]) },
+                .main_token = self.nodeMainToken(node),
+            },
+            else => unreachable,
+        };
+    }
+
+    pub fn closureData(self: *const Ast, node: Index) full.ClosureFull {
+        std.debug.assert(self.nodeTag(node) == .closure_expr);
+        const data = self.nodeData(node);
+        const c = self.extraData(data.node_and_extra[1], ClosureData);
+        return .{
+            .params = c.params,
+            .return_type = c.return_type,
+            .body = c.body,
+            .is_sendable = c.flags.is_sendable,
+            .is_async = c.flags.is_async,
+            .main_token = self.nodeMainToken(node),
+        };
+    }
+
+    pub fn builtinCallData(self: *const Ast, node: Index) full.BuiltinCallFull {
+        std.debug.assert(self.nodeTag(node) == .builtin_call);
+        const data = self.nodeData(node);
+        const b = self.extraData(data.node_and_extra[1], BuiltinCallData);
+        return .{
+            .kind = @enumFromInt(b.kind),
+            .type_arg = b.type_arg,
+            .arg0 = b.arg0,
+            .arg1 = b.arg1,
+            .arg2 = b.arg2,
+            .main_token = self.nodeMainToken(node),
+        };
+    }
+
+    pub fn localVarData(self: *const Ast, node: Index) full.LocalVarFull {
+        const tag = self.nodeTag(node);
+        std.debug.assert(tag == .var_local or tag == .const_local);
+        const data = self.nodeData(node);
+        const v = self.extraData(data.node_and_extra[1], LocalVarData);
+        return .{
+            .name = self.tokenSlice(v.name_token),
+            .name_token = v.name_token,
+            .type_expr = v.type_expr,
+            .value = v.value,
+            .is_const = (tag == .const_local),
+            .is_weak = v.flags.is_weak,
+            .is_unowned = v.flags.is_unowned,
+            .main_token = self.nodeMainToken(node),
+        };
+    }
+};
+
+// ============================================================================
+// full.* — rich accessor structs for consumers
+// ============================================================================
+
+pub const full = struct {
+    pub const FnDeclFull = struct {
+        name: []const u8,
+        name_token: TokenIndex,
+        type_params: SubRange,
+        param_bounds: SubRange,
+        params: SubRange,
+        return_type: OptionalIndex,
+        body: OptionalIndex,
+        flags: FnFlags,
+        is_extern: bool,
+        doc_comment: OptionalTokenIndex,
+        global_actor: OptionalTokenIndex,
+        main_token: TokenIndex,
+    };
+
+    pub const VarDeclFull = struct {
+        name: []const u8,
+        name_token: TokenIndex,
+        type_expr: OptionalIndex,
+        value: OptionalIndex,
+        is_const: bool,
+        doc_comment: OptionalTokenIndex,
+        main_token: TokenIndex,
+    };
+
+    pub const StructDeclFull = struct {
+        name: []const u8,
+        name_token: TokenIndex,
+        type_params: SubRange,
+        fields: SubRange,
+        nested_decls: SubRange,
+        layout: StructLayout,
+        is_actor: bool,
+        doc_comment: OptionalTokenIndex,
+        main_token: TokenIndex,
+    };
+
+    pub const EnumDeclFull = struct {
+        name: []const u8,
+        name_token: TokenIndex,
+        backing_type: OptionalIndex,
+        variants: SubRange,
+        nested_decls: SubRange,
+        doc_comment: OptionalTokenIndex,
+        main_token: TokenIndex,
+    };
+
+    pub const UnionDeclFull = struct {
+        name: []const u8,
+        name_token: TokenIndex,
+        variants: SubRange,
+        doc_comment: OptionalTokenIndex,
+        main_token: TokenIndex,
+    };
+
+    pub const ImplBlockFull = struct {
+        type_name: []const u8,
+        type_name_token: TokenIndex,
+        type_params: SubRange,
+        methods: SubRange,
+        consts: SubRange,
+        doc_comment: OptionalTokenIndex,
+        main_token: TokenIndex,
+    };
+
+    pub const ImplTraitFull = struct {
+        trait_name: []const u8,
+        target_type: []const u8,
+        trait_name_token: TokenIndex,
+        target_type_token: TokenIndex,
+        type_params: SubRange,
+        methods: SubRange,
+        doc_comment: OptionalTokenIndex,
+        main_token: TokenIndex,
+    };
+
+    pub const TraitDeclFull = struct {
+        name: []const u8,
+        name_token: TokenIndex,
+        type_params: SubRange,
+        methods: SubRange,
+        assoc_types: SubRange,
+        doc_comment: OptionalTokenIndex,
+        main_token: TokenIndex,
+    };
+
+    pub const ErrorSetFull = struct {
+        name: []const u8,
+        name_token: TokenIndex,
+        variants: SubRange,
+        doc_comment: OptionalTokenIndex,
+        main_token: TokenIndex,
+    };
+
+    pub const IfFull = struct {
+        condition: Index,
+        then_branch: Index,
+        else_branch: OptionalIndex,
+        capture_token: OptionalTokenIndex,
+        capture_is_ptr: bool,
+        main_token: TokenIndex,
+    };
+
+    pub const WhileFull = struct {
+        condition: Index,
+        body: Index,
+        label_token: OptionalTokenIndex,
+        capture_token: OptionalTokenIndex,
+        continue_expr: OptionalIndex,
+        capture_is_ptr: bool,
+        main_token: TokenIndex,
+    };
+
+    pub const ForFull = struct {
+        binding: []const u8,
+        binding_token: TokenIndex,
+        index_binding_token: OptionalTokenIndex,
+        iterable: OptionalIndex,
+        range_start: OptionalIndex,
+        range_end: OptionalIndex,
+        body: Index,
+        label_token: OptionalTokenIndex,
+        is_inline: bool,
+        is_await: bool,
+        main_token: TokenIndex,
+    };
+
+    pub const SwitchFull = struct {
+        subject: Index,
+        cases: SubRange,
+        else_body: OptionalIndex,
+        main_token: TokenIndex,
+    };
+
+    pub const CallFull = struct {
+        callee: Index,
+        args: SubRange,
+        single_arg: OptionalIndex = .none,
+        main_token: TokenIndex,
+    };
+
+    pub const ClosureFull = struct {
+        params: SubRange,
+        return_type: OptionalIndex,
+        body: Index,
+        is_sendable: bool,
+        is_async: bool,
+        main_token: TokenIndex,
+    };
+
+    pub const BuiltinCallFull = struct {
+        kind: BuiltinKind,
+        type_arg: OptionalIndex,
+        arg0: OptionalIndex,
+        arg1: OptionalIndex,
+        arg2: OptionalIndex,
+        main_token: TokenIndex,
+    };
+
+    pub const LocalVarFull = struct {
+        name: []const u8,
+        name_token: TokenIndex,
+        type_expr: OptionalIndex,
+        value: OptionalIndex,
+        is_const: bool,
+        is_weak: bool,
+        is_unowned: bool,
+        main_token: TokenIndex,
+    };
 };
 
 // ============================================================================
