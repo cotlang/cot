@@ -16,6 +16,9 @@ pub const checker = @import("checker.zig");
 pub const lower = @import("lower.zig");
 pub const formatter = @import("formatter.zig");
 pub const scanner = @import("scanner.zig");
+pub const token = @import("token.zig");
+pub const errors = @import("errors.zig");
+pub const comptime_val = @import("comptime.zig");
 
 test {
     _ = foundation;
@@ -26,4 +29,7 @@ test {
     _ = lower;
     _ = formatter;
     _ = scanner;
+    _ = token;
+    _ = errors;
+    _ = comptime_val;
 }

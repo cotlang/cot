@@ -10,7 +10,7 @@
 
 const std = @import("std");
 const Ast = @import("ast.zig");
-const tok = @import("foundation").token;
+const tok = @import("token.zig");
 const src_mod = @import("foundation").source;
 const scanner_mod = @import("scanner.zig");
 

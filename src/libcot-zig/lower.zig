@@ -15,11 +15,11 @@ const ast_mod = @import("ast.zig");
 const ir = @import("cir").ir;
 const types_mod = @import("foundation").types;
 const source_mod = @import("foundation").source;
-const errors_mod = @import("foundation").errors;
+const errors_mod = @import("errors.zig");
 const checker_mod = @import("checker.zig");
-const comptime_mod = @import("foundation").comptime_val;
+const comptime_mod = @import("comptime.zig");
 const target_mod = @import("foundation").target;
-const token_mod = @import("foundation").token;
+const token_mod = @import("token.zig");
 
 const Token = token_mod.Token;
 

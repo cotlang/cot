@@ -16,7 +16,7 @@
 
 const std = @import("std");
 const source = @import("foundation").source;
-const tok = @import("foundation").token;
+const tok = @import("token.zig");
 
 const Span = source.Span;
 const Pos = source.Pos;

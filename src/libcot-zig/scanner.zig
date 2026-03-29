@@ -14,9 +14,9 @@
 //! string resumes.
 
 const std = @import("std");
-const token = @import("foundation").token;
+const token = @import("token.zig");
 const source = @import("foundation").source;
-const errors = @import("foundation").errors;
+const errors = @import("errors.zig");
 
 const Token = token.Token;
 const Pos = source.Pos;

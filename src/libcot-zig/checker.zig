@@ -14,10 +14,10 @@
 const std = @import("std");
 const ast = @import("ast.zig");
 const types_mod = @import("foundation").types;
-const errors = @import("foundation").errors;
+const errors = @import("errors.zig");
 const source = @import("foundation").source;
-const tok = @import("foundation").token;
-const comptime_mod = @import("foundation").comptime_val;
+const tok = @import("token.zig");
+const comptime_mod = @import("comptime.zig");
 const target_mod = @import("foundation").target;
 const debug = @import("foundation").debug;
 

@@ -14,7 +14,7 @@
 //!                     ^~~~~~
 
 const std = @import("std");
-const source = @import("source.zig");
+const source = @import("foundation").source;
 
 const Pos = source.Pos;
 const Span = source.Span;

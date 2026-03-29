@@ -7,7 +7,7 @@
 const std = @import("std");
 const ast_mod = @import("ast.zig");
 const source_mod = @import("foundation").source;
-const tok = @import("foundation").token;
+const tok = @import("token.zig");
 
 const Ast = ast_mod.Ast;
 const Index = ast_mod.Index;
