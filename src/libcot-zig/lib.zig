@@ -32,4 +32,5 @@ test {
     _ = token;
     _ = errors;
     _ = comptime_val;
+    _ = @import("integration_test.zig");
 }

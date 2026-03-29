@@ -3563,7 +3563,7 @@ pub const Checker = struct {
         // Check field pairs (name_token, value_node alternating)
         var fi: usize = 0;
         while (fi + 1 < field_pairs.len) : (fi += 2) {
-            const fname_tok: TokenIndex = @enumFromInt(field_pairs[fi]);
+            const fname_tok: TokenIndex = field_pairs[fi];
             const fval_node: Index = @enumFromInt(field_pairs[fi + 1]);
             const fi_name = self.tree.tokenSlice(fname_tok);
             var found = false;
@@ -3592,7 +3592,7 @@ pub const Checker = struct {
             var provided = false;
             var fi2: usize = 0;
             while (fi2 + 1 < field_pairs.len) : (fi2 += 2) {
-                const ftok: TokenIndex = @enumFromInt(field_pairs[fi2]);
+                const ftok: TokenIndex = field_pairs[fi2];
                 if (std.mem.eql(u8, sf.name, self.tree.tokenSlice(ftok))) { provided = true; break; }
             }
             if (!provided) self.err.errorWithCode(span_start, .e300, "missing field in struct init");
@@ -3639,7 +3639,7 @@ pub const Checker = struct {
         const saved_safe_mode = self.safe_mode;
         const saved_scope = self.scope;
         self.tree = gen_info.tree;
-        if (gen_info.tree.file) |file| self.safe_mode = file.safe_mode;
+        self.safe_mode = gen_info.tree.safe_mode;
         if (gen_info.scope) |s| self.scope = s;
         defer { self.tree = saved_tree; self.safe_mode = saved_safe_mode; self.scope = saved_scope; }
         const struct_decl = self.tree.structDeclData(gen_info.node_idx);
@@ -3703,7 +3703,7 @@ pub const Checker = struct {
         const field_pair_raw = self.tree.extraSlice(ne.fields);
         var fpi: usize = 0;
         while (fpi + 1 < field_pair_raw.len) : (fpi += 2) {
-            const fname_tok: TokenIndex = @enumFromInt(field_pair_raw[fpi]);
+            const fname_tok: TokenIndex = field_pair_raw[fpi];
             const fval_node: Index = @enumFromInt(field_pair_raw[fpi + 1]);
             const fi_name = self.tree.tokenSlice(fname_tok);
             var found = false;
@@ -3731,7 +3731,7 @@ pub const Checker = struct {
             var provided = false;
             var fpi2: usize = 0;
             while (fpi2 + 1 < field_pair_raw.len) : (fpi2 += 2) {
-                const ftok: TokenIndex = @enumFromInt(field_pair_raw[fpi2]);
+                const ftok: TokenIndex = field_pair_raw[fpi2];
                 if (std.mem.eql(u8, sf.name, self.tree.tokenSlice(ftok))) { provided = true; break; }
             }
             if (!provided) self.err.errorWithCode(span_start, .e300, "missing field in struct init");
@@ -4339,7 +4339,7 @@ pub const Checker = struct {
         // Check for redefinitions
         var bi: usize = 0;
         while (bi < binding_raw.len) : (bi += 2) {
-            const name_tok: TokenIndex = @enumFromInt(binding_raw[bi]);
+            const name_tok: TokenIndex = binding_raw[bi];
             const bname = self.tree.tokenSlice(name_tok);
             if (self.scope.isDefined(bname)) { self.reportRedefined(span_start, bname); return; }
         }
@@ -4356,7 +4356,7 @@ pub const Checker = struct {
         bi = 0;
         var elem_i: usize = 0;
         while (bi < binding_raw.len) : ({ bi += 2; elem_i += 1; }) {
-            const name_tok: TokenIndex = @enumFromInt(binding_raw[bi]);
+            const name_tok: TokenIndex = binding_raw[bi];
             const type_expr_oi: OptionalIndex = @enumFromInt(binding_raw[bi + 1]);
             var elem_type = val_info.tuple.element_types[elem_i];
             if (type_expr_oi.unwrap()) |te| {
@@ -4763,7 +4763,7 @@ pub const Checker = struct {
                     }
                 }
                 const exist_idx = try self.types.makeExistential(trait_name, trait_def.method_names);
-                var exist_type = &self.types.types.items[@intCast(exist_idx)];
+                var exist_type = &self.types.types.items[@intFromEnum(exist_idx)];
                 exist_type.existential.conforming_types = try self.allocator.dupe([]const u8, conforming.items);
                 return exist_idx;
             },
@@ -4791,7 +4791,7 @@ pub const Checker = struct {
         const saved_safe_mode = self.safe_mode;
         const saved_scope = self.scope;
         self.tree = gen_info.tree;
-        if (gen_info.tree.file) |file| self.safe_mode = file.safe_mode;
+        self.safe_mode = gen_info.tree.safe_mode;
         if (gen_info.scope) |s| self.scope = s;
         defer { self.tree = saved_tree; self.safe_mode = saved_safe_mode; self.scope = saved_scope; }
         const struct_decl = self.tree.structDeclData(gen_info.node_idx);
@@ -4822,7 +4822,7 @@ pub const Checker = struct {
             const saved_safe_mode = self.safe_mode;
             const saved_scope = self.scope;
             self.tree = impl_info.tree;
-            if (impl_info.tree.file) |file| self.safe_mode = file.safe_mode;
+            self.safe_mode = impl_info.tree.safe_mode;
             if (impl_info.scope) |s| self.scope = s;
             defer { self.tree = saved_tree; self.safe_mode = saved_safe_mode; self.scope = saved_scope; }
             var sub_map = std.StringHashMap(TypeIndex).init(self.allocator);
@@ -4965,7 +4965,7 @@ pub const Checker = struct {
         const saved_safe_mode = self.safe_mode;
         const saved_scope = self.scope;
         self.tree = gen_info.tree;
-        if (gen_info.tree.file) |file| self.safe_mode = file.safe_mode;
+        self.safe_mode = gen_info.tree.safe_mode;
         if (gen_info.scope) |s| self.scope = s;
         defer { self.tree = saved_tree; self.safe_mode = saved_safe_mode; self.scope = saved_scope; }
         const fn_decl = self.tree.fnDeclData(gen_info.node_idx);
@@ -5085,7 +5085,7 @@ pub const Checker = struct {
                         .offset = offset,
                         .bit_offset = 0,
                         .bit_width = bit_width,
-                        .default_value = field.default_value,
+                        .default_value = @enumFromInt(@intFromEnum(field.default_value)),
                     });
                     if (bit_width == 0) offset += self.types.sizeOf(field_type);
                 },
@@ -5093,13 +5093,13 @@ pub const Checker = struct {
                     const field_align = self.types.alignmentOf(field_type);
                     if (field_align > max_align) max_align = field_align;
                     if (field_align > 0) offset = (offset + field_align - 1) & ~(field_align - 1);
-                    try struct_fields.append(self.allocator, .{ .name = field_name, .type_idx = field_type, .offset = offset, .default_value = field.default_value });
+                    try struct_fields.append(self.allocator, .{ .name = field_name, .type_idx = field_type, .offset = offset, .default_value = @enumFromInt(@intFromEnum(field.default_value)) });
                     offset += self.types.sizeOf(field_type);
                 },
                 .auto => {
                     const field_align = self.types.alignmentOf(field_type);
                     if (field_align > 0) offset = (offset + field_align - 1) & ~(field_align - 1);
-                    try struct_fields.append(self.allocator, .{ .name = field_name, .type_idx = field_type, .offset = offset, .default_value = field.default_value });
+                    try struct_fields.append(self.allocator, .{ .name = field_name, .type_idx = field_type, .offset = offset, .default_value = @enumFromInt(@intFromEnum(field.default_value)) });
                     offset += self.types.sizeOf(field_type);
                 },
             }

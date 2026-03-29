@@ -1263,7 +1263,7 @@ pub const Ast = struct {
             .call_one => .{
                 .callee = data.node_and_node[0],
                 .args = SubRange.empty, // single arg in data[1], not a range
-                .single_arg = data.node_and_node[1],
+                .single_arg = data.node_and_node[1].toOptional(),
                 .main_token = self.nodeMainToken(node),
             },
             .call => .{

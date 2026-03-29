@@ -298,7 +298,7 @@ pub const Parser = struct {
     }
 
 
-    fn parseTopLevel(p: *Parser) Error!SubRange {
+    pub fn parseTopLevel(p: *Parser) Error!SubRange {
         const scratch_top = p.scratch.items.len;
         defer p.scratch.shrinkRetainingCapacity(scratch_top);
 
