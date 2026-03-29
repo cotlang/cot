@@ -974,7 +974,7 @@ pub const Lowerer = struct {
                 return false;
             },
             .destructure => {
-                // TODO: destructure lowering
+                try self.lowerDestructureStmt(idx);
                 return false;
             },
             else => return false,
@@ -1464,10 +1464,10 @@ pub const Lowerer = struct {
                 }
             },
             .field_access => {
-                // TODO: full field assign — for now just evaluate target+value for side effects
+                try self.lowerFieldAssign(target_idx, value_node, value_idx_raw, span);
             },
             .index => {
-                // TODO: full index assign — for now just evaluate target+value for side effects
+                try self.lowerIndexAssign(target_idx, value_node, span);
             },
             .unary_deref => {
                 const operand_idx = self.tree.nodeData(target_idx).node;
@@ -1482,6 +1482,9 @@ pub const Lowerer = struct {
         const fb = self.current_func orelse return false;
         const if_data = self.tree.ifData(idx);
         const span = self.getSpan(idx);
+
+        // Optional unwrap: if expr |val| { ... }
+        if (if_data.capture_token.unwrap() != null) return try self.lowerIfOptional(idx);
 
         // Comptime const-fold
         if (self.chk.evalConstExpr(if_data.condition)) |cond_val| {
@@ -1520,6 +1523,9 @@ pub const Lowerer = struct {
         const fb = self.current_func orelse return;
         const wd = self.tree.whileData(idx);
         const span = self.getSpan(idx);
+
+        // Optional capture: while (expr) |val| { ... }
+        if (wd.capture_token.unwrap() != null) return try self.lowerWhileOptional(idx);
 
         const cond_block = try fb.newBlock("while.cond");
         const body_block = try fb.newBlock("while.body");
@@ -1560,15 +1566,64 @@ pub const Lowerer = struct {
 
         // Handle numeric range: for i in start..end
         if (fd.range_start.unwrap() != null and fd.range_end.unwrap() != null) {
-            const start_val = try self.lowerExprNode(fd.range_start.unwrap().?);
-            const end_val = try self.lowerExprNode(fd.range_end.unwrap().?);
+            try self.lowerForRange(idx);
+            return;
+        }
 
-            const idx_local = try fb.addLocalWithSize(fd.binding, TypeRegistry.I64, true, 8);
-            _ = try fb.emitStoreLocal(idx_local, start_val, span);
+        // Array/slice/map iteration
+        if (fd.iterable.unwrap()) |iterable_idx| {
+            const iter_type = self.inferExprType(iterable_idx);
+            const iter_info = self.type_reg.get(iter_type);
 
-            const end_name = try self.tempName("__for_end");
-            const end_local = try fb.addLocalWithSize(end_name, TypeRegistry.I64, false, 8);
-            _ = try fb.emitStoreLocal(end_local, end_val, span);
+            // Map iteration
+            if (iter_info == .map) {
+                try self.lowerForMap(idx, iter_info.map);
+                return;
+            }
+            if (iter_info == .struct_type and std.mem.startsWith(u8, iter_info.struct_type.name, "Map(")) {
+                if (checker_mod.parseMapTypeArgs(iter_info.struct_type.name)) |args| {
+                    try self.lowerForMap(idx, .{ .key = args[0], .value = args[1] });
+                    return;
+                }
+            }
+
+            const elem_type: TypeIndex = switch (iter_info) {
+                .array => |a| a.elem,
+                .slice => |s| s.elem,
+                else => {
+                    _ = try self.lowerBlockNode(fd.body);
+                    return;
+                },
+            };
+            const elem_size = self.type_reg.sizeOf(elem_type);
+
+            // Index variable
+            const idx_name = try self.tempName("__for_idx");
+            const idx_local = try fb.addLocalWithSize(idx_name, TypeRegistry.I64, true, 8);
+            const zero = try fb.emitConstInt(0, TypeRegistry.I64, span);
+            _ = try fb.emitStoreLocal(idx_local, zero, span);
+
+            // Length
+            const len_name = try self.tempName("__for_len");
+            const len_local = try fb.addLocalWithSize(len_name, TypeRegistry.I64, false, 8);
+            switch (iter_info) {
+                .array => |a| {
+                    const len_val = try fb.emitConstInt(@intCast(a.length), TypeRegistry.I64, span);
+                    _ = try fb.emitStoreLocal(len_local, len_val, span);
+                },
+                .slice => {
+                    const iter_tag = self.tree.nodeTag(iterable_idx);
+                    if (iter_tag == .ident) {
+                        const iname = self.tree.tokenSlice(self.tree.nodeMainToken(iterable_idx));
+                        if (fb.lookupLocal(iname)) |slice_local| {
+                            const slice_val = try fb.emitLoadLocal(slice_local, iter_type, span);
+                            const len_val = try fb.emitSliceLen(slice_val, span);
+                            _ = try fb.emitStoreLocal(len_local, len_val, span);
+                        }
+                    }
+                },
+                else => return,
+            }
 
             const cond_block = try fb.newBlock("for.cond");
             const body_block = try fb.newBlock("for.body");
@@ -1578,8 +1633,8 @@ pub const Lowerer = struct {
             _ = try fb.emitJump(cond_block, span);
             fb.setBlock(cond_block);
             const idx_val = try fb.emitLoadLocal(idx_local, TypeRegistry.I64, span);
-            const end_val_cond = try fb.emitLoadLocal(end_local, TypeRegistry.I64, span);
-            const cond = try fb.emitBinary(.lt, idx_val, end_val_cond, TypeRegistry.BOOL, span);
+            const len_val_cond = try fb.emitLoadLocal(len_local, TypeRegistry.I64, span);
+            const cond = try fb.emitBinary(.lt, idx_val, len_val_cond, TypeRegistry.BOOL, span);
             _ = try fb.emitBranch(cond, body_block, exit_block, span);
 
             const label: ?[]const u8 = if (fd.label_token.unwrap()) |lt| self.tree.tokenSlice(lt) else null;
@@ -1591,6 +1646,43 @@ pub const Lowerer = struct {
             });
 
             fb.setBlock(body_block);
+            const binding_local = try fb.addLocalWithSize(fd.binding, elem_type, false, elem_size);
+            const cur_idx = try fb.emitLoadLocal(idx_local, TypeRegistry.I64, span);
+
+            // Bind index variable if present
+            if (fd.index_binding_token.unwrap()) |ibt| {
+                const idx_binding = self.tree.tokenSlice(ibt);
+                const idx_binding_local = try fb.addLocalWithSize(idx_binding, TypeRegistry.I64, false, 8);
+                _ = try fb.emitStoreLocal(idx_binding_local, cur_idx, span);
+            }
+
+            switch (iter_info) {
+                .array => {
+                    const iter_tag2 = self.tree.nodeTag(iterable_idx);
+                    if (iter_tag2 == .ident) {
+                        const iname2 = self.tree.tokenSlice(self.tree.nodeMainToken(iterable_idx));
+                        if (fb.lookupLocal(iname2)) |arr_local| {
+                            const elem_val = try fb.emitIndexLocal(arr_local, cur_idx, elem_size, elem_type, span);
+                            _ = try fb.emitStoreLocal(binding_local, elem_val, span);
+                        }
+                    }
+                },
+                .slice => {
+                    const iter_tag2 = self.tree.nodeTag(iterable_idx);
+                    if (iter_tag2 == .ident) {
+                        const iname2 = self.tree.tokenSlice(self.tree.nodeMainToken(iterable_idx));
+                        if (fb.lookupLocal(iname2)) |slice_local| {
+                            const slice_val = try fb.emitLoadLocal(slice_local, iter_type, span);
+                            const ptr_type = self.type_reg.makePointer(elem_type) catch TypeRegistry.I64;
+                            const ptr_val = try fb.emitSlicePtr(slice_val, ptr_type, span);
+                            const elem_val = try fb.emitIndexValue(ptr_val, cur_idx, elem_size, elem_type, span);
+                            _ = try fb.emitStoreLocal(binding_local, elem_val, span);
+                        }
+                    }
+                },
+                else => {},
+            }
+
             if (!try self.lowerBlockNode(fd.body)) _ = try fb.emitJump(incr_block, span);
 
             fb.setBlock(incr_block);
@@ -1602,13 +1694,6 @@ pub const Lowerer = struct {
 
             _ = self.loop_stack.pop();
             fb.setBlock(exit_block);
-            return;
-        }
-
-        // Array/slice iteration — TODO: full implementation
-        if (fd.iterable.unwrap()) |_| {
-            // Stub: just lower the body once for now
-            _ = try self.lowerBlockNode(fd.body);
         }
     }
 
@@ -4054,18 +4139,6 @@ pub const Lowerer = struct {
     }
 
     // ========================================================================
-    // Helper: global error index
-    // ========================================================================
-
-    fn getGlobalErrorIndex(self: *Lowerer, error_name: []const u8) i64 {
-        if (self.global_error_table.get(error_name)) |idx2| return idx2;
-        const new_idx = self.next_error_idx + 1;
-        self.next_error_idx = new_idx;
-        self.global_error_table.put(error_name, new_idx) catch {};
-        return new_idx;
-    }
-
-    // ========================================================================
     // Type resolution helpers — stubs, will be ported in subsequent steps
     // ========================================================================
 
@@ -4471,12 +4544,6 @@ pub const Lowerer = struct {
     // Generic function helpers
     // ========================================================================
 
-    /// Queue a generic function instantiation for deferred lowering.
-    fn ensureGenericFnQueued(self: *Lowerer, inst_info: checker_mod.GenericInstInfo) !void {
-        if (self.lowered_generics.contains(inst_info.concrete_name)) return;
-        try self.lowered_generics.put(inst_info.concrete_name, {});
-    }
-
     /// VWT base-name sharing: strip type args to get shared body name.
     /// "myFunc(i64)" → "myFunc", "Type_method(i64;string)" → "Type_method"
     fn computeGenericBaseName(self: *Lowerer, concrete_name: []const u8) ![]const u8 {
@@ -4531,6 +4598,1697 @@ pub const Lowerer = struct {
                 _ = try fb.emitGlobalStore(gi.global_idx, gi.name, value, gi.span);
             }
             _ = try fb.emitRet(null, span);
+            self.current_func = null;
+        }
+        try self.builder.endFunc();
+    }
+
+    // ========================================================================
+    // Group 4: Compound optional helpers
+    // Ported from compiler/frontend/lower.zig lines 248-469
+    // ========================================================================
+
+    /// Lower compound orelse: left orelse right, where left is a compound optional.
+    fn lowerCompoundOrelse(self: *Lowerer, fb: *ir.FuncBuilder, left: ir.NodeIndex, right_idx: Index, left_type_idx: TypeIndex, result_type: TypeIndex, span: Span) Error!ir.NodeIndex {
+        const opt_size = self.type_reg.sizeOf(left_type_idx);
+        const opt_local = try fb.addLocalWithSize("__orelse_opt", left_type_idx, false, opt_size);
+        _ = try fb.emitStoreLocal(opt_local, left, span);
+        const tag = try fb.emitFieldLocal(opt_local, 0, 0, TypeRegistry.I64, span);
+        const zero_tag = try fb.emitConstInt(0, TypeRegistry.I64, span);
+        const is_non_null = try fb.emitBinary(.ne, tag, zero_tag, TypeRegistry.BOOL, span);
+
+        const result_size = self.type_reg.sizeOf(result_type);
+        const result_local = try fb.addLocalWithSize("__orelse_result", result_type, false, result_size);
+        const then_block = try fb.newBlock("orelse.nonnull");
+        const else_block = try fb.newBlock("orelse.null");
+        const merge_block = try fb.newBlock("orelse.end");
+        _ = try fb.emitBranch(is_non_null, then_block, else_block, span);
+
+        // Non-null path: extract payload from compound optional
+        fb.setBlock(then_block);
+        const left_info = self.type_reg.get(left_type_idx);
+        const elem_type = if (left_info == .optional) left_info.optional.elem else result_type;
+        const payload = try fb.emitFieldLocal(opt_local, 1, 8, elem_type, span);
+        _ = try fb.emitStoreLocal(result_local, payload, span);
+        _ = try fb.emitJump(merge_block, span);
+
+        // Null path: lower fallback expression HERE (in else_block, not before the branch)
+        fb.setBlock(else_block);
+        const fallback = try self.lowerExprNode(right_idx);
+        if (fallback != ir.null_node) {
+            _ = try fb.emitStoreLocal(result_local, fallback, span);
+        }
+        _ = try fb.emitJump(merge_block, span);
+
+        // Merge: load result
+        fb.setBlock(merge_block);
+        return try fb.emitLoadLocal(result_local, result_type, span);
+    }
+
+    /// Short-circuit and/or at IR level: defer right-side lowering until inside the branch.
+    fn lowerShortCircuit(self: *Lowerer, fb: *ir.FuncBuilder, left: ir.NodeIndex, right_idx: Index, is_and: bool, span: Span) Error!ir.NodeIndex {
+        const result_local = try fb.addLocalWithSize("__sc_result", TypeRegistry.BOOL, false, 8);
+        const eval_right_block = try fb.newBlock("sc.eval_right");
+        const short_circuit_block = try fb.newBlock("sc.short");
+        const merge_block = try fb.newBlock("sc.merge");
+
+        if (is_and) {
+            _ = try fb.emitBranch(left, eval_right_block, short_circuit_block, span);
+        } else {
+            _ = try fb.emitBranch(left, short_circuit_block, eval_right_block, span);
+        }
+
+        // Short circuit block: result = false (for and) or true (for or)
+        fb.setBlock(short_circuit_block);
+        const short_val = try fb.emitConstBool(!is_and, span);
+        _ = try fb.emitStoreLocal(result_local, short_val, span);
+        _ = try fb.emitJump(merge_block, span);
+
+        // Eval right block: lower right operand HERE (deferred, after branch)
+        fb.setBlock(eval_right_block);
+        const right = try self.lowerExprNode(right_idx);
+        if (right != ir.null_node) {
+            _ = try fb.emitStoreLocal(result_local, right, span);
+        }
+        _ = try fb.emitJump(merge_block, span);
+
+        // Merge: load result
+        fb.setBlock(merge_block);
+        return try fb.emitLoadLocal(result_local, TypeRegistry.BOOL, span);
+    }
+
+    /// Store a value into a compound optional result local, wrapping T -> ?T as needed.
+    fn storeCompoundOptArm(self: *Lowerer, fb: *ir.FuncBuilder, result_local: ir.LocalIdx, val: ir.NodeIndex, body_idx: Index, span: Span) !void {
+        // Check if arm value is a null literal
+        const body_tag = self.tree.nodeTag(body_idx);
+        const is_null = (body_tag == .literal_null);
+        if (is_null) {
+            const tag_zero = try fb.emitConstInt(0, TypeRegistry.I64, span);
+            _ = try fb.emitStoreLocalField(result_local, 0, 0, tag_zero, span);
+        } else {
+            const arm_type = self.inferExprType(body_idx);
+            const arm_info = self.type_reg.get(arm_type);
+            if (arm_info == .optional and !self.isPtrLikeOptional(arm_type)) {
+                _ = try fb.emitStoreLocal(result_local, val, span);
+            } else {
+                const tag_one = try fb.emitConstInt(1, TypeRegistry.I64, span);
+                _ = try fb.emitStoreLocalField(result_local, 0, 0, tag_one, span);
+                const arm_size = self.type_reg.sizeOf(arm_type);
+                if (arm_size > 8) {
+                    const val_tmp = try fb.addLocalWithSize("__opt_arm_tmp", arm_type, false, arm_size);
+                    _ = try fb.emitStoreLocal(val_tmp, val, span);
+                    const num_words: u32 = @intCast((arm_size + 7) / 8);
+                    for (0..num_words) |i| {
+                        const off: i64 = @intCast(i * 8);
+                        const word = try fb.emitFieldLocal(val_tmp, @intCast(i), off, TypeRegistry.I64, span);
+                        _ = try fb.emitStoreLocalField(result_local, @as(u32, @intCast(1 + i)), @as(i64, 8) + off, word, span);
+                    }
+                } else {
+                    _ = try fb.emitStoreLocalField(result_local, 1, 8, val, span);
+                }
+            }
+        }
+    }
+
+    /// Store compound optional via pointer base (for struct field assign through pointer).
+    fn storeCompoundOptFieldPtr(self: *Lowerer, fb: *ir.FuncBuilder, ptr: ir.NodeIndex, field_idx: u32, field_offset: i64, val: ir.NodeIndex, ast_idx: Index, span: Span) !void {
+        const is_null = (self.tree.nodeTag(ast_idx) == .literal_null);
+        if (is_null) {
+            const tag_zero = try fb.emitConstInt(0, TypeRegistry.I64, span);
+            _ = try fb.emitStoreFieldValue(ptr, field_idx, field_offset, tag_zero, span);
+        } else {
+            const arm_type = self.inferExprType(ast_idx);
+            const arm_info = self.type_reg.get(arm_type);
+            if (arm_info == .optional and !self.isPtrLikeOptional(arm_type)) {
+                const arm_size = self.type_reg.sizeOf(arm_type);
+                const num_words: u32 = arm_size / 8;
+                const tmp = try fb.addLocalWithSize("__opt_fap_tmp", arm_type, false, arm_size);
+                _ = try fb.emitStoreLocal(tmp, val, span);
+                for (0..num_words) |i| {
+                    const offset: i64 = @intCast(i * 8);
+                    const field = try fb.emitFieldLocal(tmp, @intCast(i), offset, TypeRegistry.I64, span);
+                    _ = try fb.emitStoreFieldValue(ptr, field_idx + @as(u32, @intCast(i)), field_offset + offset, field, span);
+                }
+            } else {
+                const tag_one = try fb.emitConstInt(1, TypeRegistry.I64, span);
+                _ = try fb.emitStoreFieldValue(ptr, field_idx, field_offset, tag_one, span);
+                const arm_size = self.type_reg.sizeOf(arm_type);
+                if (arm_size > 8) {
+                    const val_tmp = try fb.addLocalWithSize("__opt_fap_val", arm_type, false, arm_size);
+                    _ = try fb.emitStoreLocal(val_tmp, val, span);
+                    const num_words: u32 = @intCast((arm_size + 7) / 8);
+                    for (0..num_words) |i| {
+                        const off: i64 = @intCast(i * 8);
+                        const word = try fb.emitFieldLocal(val_tmp, @intCast(i), off, TypeRegistry.I64, span);
+                        _ = try fb.emitStoreFieldValue(ptr, field_idx + @as(u32, @intCast(1 + i)), field_offset + @as(i64, 8) + off, word, span);
+                    }
+                } else {
+                    _ = try fb.emitStoreFieldValue(ptr, field_idx + 1, field_offset + 8, val, span);
+                }
+            }
+        }
+    }
+
+    /// Store a value into a compound optional struct field, wrapping T -> ?T as needed.
+    fn storeCompoundOptField(self: *Lowerer, fb: *ir.FuncBuilder, local_idx: ir.LocalIdx, field_idx: u32, field_offset: i64, val: ir.NodeIndex, ast_idx: Index, span: Span) !void {
+        const is_null = (self.tree.nodeTag(ast_idx) == .literal_null);
+        if (is_null) {
+            const tag_zero = try fb.emitConstInt(0, TypeRegistry.I64, span);
+            _ = try fb.emitStoreLocalField(local_idx, field_idx, field_offset, tag_zero, span);
+        } else {
+            const arm_type = self.inferExprType(ast_idx);
+            const arm_info = self.type_reg.get(arm_type);
+            if (arm_info == .optional and !self.isPtrLikeOptional(arm_type)) {
+                const arm_size = self.type_reg.sizeOf(arm_type);
+                const num_words: u32 = arm_size / 8;
+                const tmp = try fb.addLocalWithSize("__opt_field_tmp", arm_type, false, arm_size);
+                _ = try fb.emitStoreLocal(tmp, val, span);
+                for (0..num_words) |i| {
+                    const offset: i64 = @intCast(i * 8);
+                    const field = try fb.emitFieldLocal(tmp, @intCast(i), offset, TypeRegistry.I64, span);
+                    _ = try fb.emitStoreLocalField(local_idx, field_idx + @as(u32, @intCast(i)), field_offset + offset, field, span);
+                }
+            } else {
+                const tag_one = try fb.emitConstInt(1, TypeRegistry.I64, span);
+                _ = try fb.emitStoreLocalField(local_idx, field_idx, field_offset, tag_one, span);
+                const arm_size = self.type_reg.sizeOf(arm_type);
+                if (arm_size > 8) {
+                    const val_tmp = try fb.addLocalWithSize("__opt_fld_val", arm_type, false, arm_size);
+                    _ = try fb.emitStoreLocal(val_tmp, val, span);
+                    const num_words: u32 = @intCast((arm_size + 7) / 8);
+                    for (0..num_words) |i| {
+                        const off: i64 = @intCast(i * 8);
+                        const word = try fb.emitFieldLocal(val_tmp, @intCast(i), off, TypeRegistry.I64, span);
+                        _ = try fb.emitStoreLocalField(local_idx, field_idx + @as(u32, @intCast(1 + i)), field_offset + @as(i64, 8) + off, word, span);
+                    }
+                } else {
+                    _ = try fb.emitStoreLocalField(local_idx, field_idx + 1, field_offset + 8, val, span);
+                }
+            }
+        }
+    }
+
+    // ========================================================================
+    // Group 6: Assignment helpers
+    // Ported from compiler/frontend/lower.zig lines 3535-3966
+    // ========================================================================
+
+    /// Lower field assignment: `obj.field = value`.
+    fn lowerFieldAssign(self: *Lowerer, target_idx: Index, value_node: ir.NodeIndex, rhs_ast: Index, span: Span) !void {
+        const fb = self.current_func orelse return;
+        const data = self.tree.nodeData(target_idx);
+        const base_idx = data.node_and_token[0];
+        const field_token = data.node_and_token[1];
+        const field_name = self.tree.tokenSlice(field_token);
+
+        const base_type_idx = self.inferExprType(base_idx);
+        const base_type = self.type_reg.get(base_type_idx);
+
+        const struct_type = switch (base_type) {
+            .struct_type => |st| st,
+            .pointer => |ptr| blk: {
+                const elem_type = self.type_reg.get(ptr.elem);
+                if (elem_type == .struct_type) break :blk elem_type.struct_type;
+                return;
+            },
+            else => return,
+        };
+
+        for (struct_type.fields, 0..) |field, i| {
+            if (std.mem.eql(u8, field.name, field_name)) {
+                const fld_idx: u32 = @intCast(i);
+                const fld_offset: i64 = @intCast(field.offset);
+
+                if (base_type == .pointer) {
+                    const ptr_val = try self.lowerExprNode(base_idx);
+                    const fld_info = self.type_reg.get(field.type_idx);
+                    if (fld_info == .optional and !self.isPtrLikeOptional(field.type_idx)) {
+                        try self.storeCompoundOptFieldPtr(fb, ptr_val, fld_idx, fld_offset, value_node, rhs_ast, span);
+                    } else if ((fld_info == .struct_type or fld_info == .tuple or fld_info == .union_type) and self.type_reg.sizeOf(field.type_idx) > 8) {
+                        const fld_size = self.type_reg.sizeOf(field.type_idx);
+                        const num_words = fld_size / 8;
+                        const tmp_local = try fb.addLocalWithSize("__fld_assign_src", field.type_idx, false, fld_size);
+                        _ = try fb.emitStoreLocal(tmp_local, value_node, span);
+                        for (0..num_words) |w| {
+                            const w_offset: i64 = @intCast(w * 8);
+                            const word = try fb.emitFieldLocal(tmp_local, @intCast(w), w_offset, TypeRegistry.I64, span);
+                            _ = try fb.emitStoreField(ptr_val, fld_idx, fld_offset + w_offset, word, span);
+                        }
+                    } else {
+                        // ARC: retain/release for managed pointer fields
+                        if (self.type_reg.get(field.type_idx) == .pointer and self.type_reg.get(field.type_idx).pointer.managed and !self.target.isWasm()) {
+                            const old_val = try fb.emitFieldValue(ptr_val, fld_idx, fld_offset, field.type_idx, span);
+                            _ = try self.emitCopyValue(fb, value_node, field.type_idx, span);
+                            _ = try fb.emitStoreFieldValue(ptr_val, fld_idx, fld_offset, value_node, span);
+                            try self.emitDestroyValue(fb, old_val, field.type_idx, span);
+                        } else {
+                            _ = try fb.emitStoreFieldValue(ptr_val, fld_idx, fld_offset, value_node, span);
+                        }
+                    }
+                } else {
+                    // Base is an ident local
+                    const base_tag = self.tree.nodeTag(base_idx);
+                    if (base_tag == .ident) {
+                        const base_name = self.tree.tokenSlice(self.tree.nodeMainToken(base_idx));
+                        if (fb.lookupLocal(base_name)) |local_idx| {
+                            const fld_info = self.type_reg.get(field.type_idx);
+                            if (fld_info == .optional and !self.isPtrLikeOptional(field.type_idx)) {
+                                try self.storeCompoundOptField(fb, local_idx, fld_idx, fld_offset, value_node, rhs_ast, span);
+                            } else if (self.type_reg.get(field.type_idx) == .pointer and self.type_reg.get(field.type_idx).pointer.managed and !self.target.isWasm()) {
+                                const old_val = try fb.emitFieldLocal(local_idx, fld_idx, fld_offset, field.type_idx, span);
+                                _ = try self.emitCopyValue(fb, value_node, field.type_idx, span);
+                                _ = try fb.emitStoreLocalField(local_idx, fld_idx, fld_offset, value_node, span);
+                                try self.emitDestroyValue(fb, old_val, field.type_idx, span);
+                            } else {
+                                _ = try fb.emitStoreLocalField(local_idx, fld_idx, fld_offset, value_node, span);
+                            }
+                        } else if (self.builder.lookupGlobal(base_name)) |g| {
+                            const ptr_type = self.type_reg.makePointer(base_type_idx) catch TypeRegistry.VOID;
+                            const global_addr = try fb.emitAddrGlobal(g.idx, base_name, ptr_type, span);
+                            _ = try fb.emitStoreFieldValue(global_addr, fld_idx, fld_offset, value_node, span);
+                        }
+                    } else if (base_tag == .field_access) {
+                        // Nested struct field assign: o.inner.val = 42
+                        const base_addr = try self.resolveStructFieldAddr(base_idx);
+                        if (base_addr != ir.null_node) {
+                            _ = try fb.emitStoreFieldValue(base_addr, fld_idx, fld_offset, value_node, span);
+                        }
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    /// Resolve a struct field access expression to its memory address.
+    fn resolveStructFieldAddr(self: *Lowerer, node_idx: Index) !ir.NodeIndex {
+        const fb = self.current_func orelse return ir.null_node;
+        const tag = self.tree.nodeTag(node_idx);
+
+        if (tag == .ident) {
+            const name = self.tree.tokenSlice(self.tree.nodeMainToken(node_idx));
+            if (fb.lookupLocal(name)) |local_idx| {
+                const local_type = fb.locals.items[local_idx].type_idx;
+                const ptr_type = self.type_reg.makePointer(local_type) catch TypeRegistry.VOID;
+                return try fb.emitAddrLocal(local_idx, ptr_type, self.getSpan(node_idx));
+            }
+            if (self.builder.lookupGlobal(name)) |g| {
+                const ptr_type = self.type_reg.makePointer(g.global.type_idx) catch TypeRegistry.VOID;
+                return try fb.emitAddrGlobal(g.idx, name, ptr_type, self.getSpan(node_idx));
+            }
+            return ir.null_node;
+        }
+
+        if (tag == .field_access) {
+            const data = self.tree.nodeData(node_idx);
+            const base_idx = data.node_and_token[0];
+            const field_token = data.node_and_token[1];
+            const field_name = self.tree.tokenSlice(field_token);
+
+            const base_type_idx = self.inferExprType(base_idx);
+            const base_type_info = self.type_reg.get(base_type_idx);
+
+            const struct_type = switch (base_type_info) {
+                .struct_type => |st| st,
+                .pointer => |ptr| blk: {
+                    const elem = self.type_reg.get(ptr.elem);
+                    if (elem == .struct_type) break :blk elem.struct_type;
+                    return ir.null_node;
+                },
+                else => return ir.null_node,
+            };
+
+            const base_addr = if (base_type_info == .pointer)
+                try self.lowerExprNode(base_idx)
+            else
+                try self.resolveStructFieldAddr(base_idx);
+
+            if (base_addr == ir.null_node) return ir.null_node;
+
+            for (struct_type.fields) |field| {
+                if (std.mem.eql(u8, field.name, field_name)) {
+                    const field_offset: i64 = @intCast(field.offset);
+                    if (field_offset == 0) return base_addr;
+                    const field_ptr_type = self.type_reg.makePointer(field.type_idx) catch TypeRegistry.VOID;
+                    return try fb.emitAddrOffset(base_addr, field_offset, field_ptr_type, self.getSpan(node_idx));
+                }
+            }
+            return ir.null_node;
+        }
+
+        return ir.null_node;
+    }
+
+    /// @safe auto-ref: take address of a struct value to produce *Struct.
+    fn autoRefValue(self: *Lowerer, fb: *ir.FuncBuilder, value_ir: ir.NodeIndex, ast_idx: Index, span: Span) !ir.NodeIndex {
+        const value_type_idx = fb.nodes.items[value_ir].type_idx;
+        const ptr_type = self.type_reg.makePointer(value_type_idx) catch TypeRegistry.I64;
+        // Try lvalue path
+        const tag = self.tree.nodeTag(ast_idx);
+        if (tag == .ident) {
+            const name = self.tree.tokenSlice(self.tree.nodeMainToken(ast_idx));
+            if (fb.lookupLocal(name)) |local_idx| {
+                return fb.emitAddrLocal(local_idx, ptr_type, span);
+            } else if (self.builder.lookupGlobal(name)) |g| {
+                return fb.emitAddrGlobal(g.idx, name, ptr_type, span);
+            }
+        } else if (tag == .field_access) {
+            const addr = try self.resolveStructFieldAddr(ast_idx);
+            if (addr != ir.null_node) return addr;
+        }
+        // Fallback: temp copy
+        const tmp_local = try fb.addLocalWithSize("__safe_ref", value_type_idx, true, self.type_reg.sizeOf(value_type_idx));
+        _ = try fb.emitStoreLocal(tmp_local, value_ir, span);
+        return fb.emitAddrLocal(tmp_local, ptr_type, span);
+    }
+
+    /// Lower index assignment: `arr[idx] = value`.
+    fn lowerIndexAssign(self: *Lowerer, target_idx: Index, value_node: ir.NodeIndex, span: Span) !void {
+        const fb = self.current_func orelse return;
+        // Index expression: data = [base_node, index_node]
+        const data = self.tree.nodeData(target_idx);
+        const base_idx = data.node_and_node[0];
+        const index_idx = data.node_and_node[1];
+
+        const base_type_idx = self.inferExprType(base_idx);
+        const base_type = self.type_reg.get(base_type_idx);
+        const elem_type: TypeIndex = switch (base_type) {
+            .array => |a| a.elem,
+            .slice => |s| s.elem,
+            .pointer => |p| blk: {
+                const pointee = self.type_reg.get(p.elem);
+                break :blk if (pointee == .array) pointee.array.elem else return;
+            },
+            else => return,
+        };
+        const elem_size = self.type_reg.sizeOf(elem_type);
+        const index_node = try self.lowerExprNode(index_idx);
+        const base_tag = self.tree.nodeTag(base_idx);
+
+        if (base_tag == .ident) {
+            const name = self.tree.tokenSlice(self.tree.nodeMainToken(base_idx));
+            if (fb.lookupLocal(name)) |local_idx| {
+                const local = fb.locals.items[local_idx];
+                if (self.type_reg.get(local.type_idx) == .slice) {
+                    const slice_val = try fb.emitLoadLocal(local_idx, local.type_idx, span);
+                    const ptr_type = self.type_reg.makePointer(elem_type) catch TypeRegistry.I64;
+                    const ptr_val = try fb.emitSlicePtr(slice_val, ptr_type, span);
+                    _ = try fb.emitStoreIndexValue(ptr_val, index_node, value_node, elem_size, span);
+                    return;
+                }
+                if (local.is_param and self.type_reg.isArray(local.type_idx)) {
+                    const ptr_val = try fb.emitLoadLocal(local_idx, local.type_idx, span);
+                    _ = try fb.emitStoreIndexValue(ptr_val, index_node, value_node, elem_size, span);
+                    return;
+                }
+                const local_info = self.type_reg.get(local.type_idx);
+                if (local_info == .pointer and self.type_reg.get(local_info.pointer.elem) == .array) {
+                    const ptr_val = try fb.emitLoadLocal(local_idx, TypeRegistry.I64, span);
+                    _ = try fb.emitStoreIndexValue(ptr_val, index_node, value_node, elem_size, span);
+                    return;
+                }
+                _ = try fb.emitStoreIndexLocal(local_idx, index_node, value_node, elem_size, span);
+                return;
+            }
+            if (self.builder.lookupGlobal(name)) |g| {
+                const ptr_type = self.type_reg.makePointer(g.global.type_idx) catch TypeRegistry.VOID;
+                const global_addr = try fb.emitAddrGlobal(g.idx, name, ptr_type, span);
+                _ = try fb.emitStoreIndexValue(global_addr, index_node, value_node, elem_size, span);
+                return;
+            }
+        }
+
+        switch (base_type) {
+            .slice => {
+                const base_val = try self.lowerExprNode(base_idx);
+                const ptr_type = self.type_reg.makePointer(elem_type) catch TypeRegistry.I64;
+                const ptr_val = try fb.emitSlicePtr(base_val, ptr_type, span);
+                _ = try fb.emitStoreIndexValue(ptr_val, index_node, value_node, elem_size, span);
+            },
+            .pointer => {
+                const base_val = try self.lowerExprNode(base_idx);
+                _ = try fb.emitStoreIndexValue(base_val, index_node, value_node, elem_size, span);
+            },
+            .array => {
+                if (base_tag == .field_access) {
+                    const array_addr = try self.lowerExprNode(base_idx);
+                    _ = try fb.emitStoreIndexValue(array_addr, index_node, value_node, elem_size, span);
+                }
+            },
+            else => {},
+        }
+    }
+
+    // ========================================================================
+    // Group 3: Control flow with optional unwrapping
+    // Ported from compiler/frontend/lower.zig lines 3967-4708
+    // ========================================================================
+
+    /// Lower if-optional statement: if expr |val| { ... } else { ... }
+    fn lowerIfOptional(self: *Lowerer, idx: Index) !bool {
+        const fb = self.current_func orelse return false;
+        const if_data = self.tree.ifData(idx);
+        const span = self.getSpan(idx);
+
+        const opt_type_idx = self.inferExprType(if_data.condition);
+        const opt_info = self.type_reg.get(opt_type_idx);
+        const elem_type = if (opt_info == .optional) opt_info.optional.elem else opt_type_idx;
+        const is_compound_opt = opt_info == .optional and !self.isPtrLikeOptional(opt_type_idx);
+
+        // Value capture
+        const opt_val = try self.lowerExprNode(if_data.condition);
+        if (opt_val == ir.null_node) return false;
+
+        const is_non_null = if (is_compound_opt) blk: {
+            const opt_local = try fb.addLocalWithSize("__opt_if", opt_type_idx, false, self.type_reg.sizeOf(opt_type_idx));
+            _ = try fb.emitStoreLocal(opt_local, opt_val, span);
+            const tag_val = try fb.emitFieldLocal(opt_local, 0, 0, TypeRegistry.I64, span);
+            const zero = try fb.emitConstInt(0, TypeRegistry.I64, span);
+            break :blk try fb.emitBinary(.ne, tag_val, zero, TypeRegistry.BOOL, span);
+        } else blk: {
+            const null_val = try fb.emit(ir.Node.init(.const_null, TypeRegistry.UNTYPED_NULL, span));
+            break :blk try fb.emitBinary(.ne, opt_val, null_val, TypeRegistry.BOOL, span);
+        };
+
+        const then_block = try fb.newBlock("if.opt.then");
+        const else_block = if (if_data.else_branch.unwrap() != null) try fb.newBlock("if.opt.else") else null;
+        const merge_block = try fb.newBlock("if.opt.end");
+        _ = try fb.emitBranch(is_non_null, then_block, else_block orelse merge_block, span);
+
+        fb.beginOverlapGroup();
+        fb.nextOverlapArm();
+        fb.setBlock(then_block);
+        const scope_depth = fb.markScopeEntry();
+        const unwrapped = if (is_compound_opt) blk: {
+            const opt_local = fb.lookupLocal("__opt_if").?;
+            break :blk try fb.emitFieldLocal(opt_local, 1, 8, elem_type, span);
+        } else blk: {
+            break :blk try fb.emitUnary(.optional_unwrap, opt_val, elem_type, span);
+        };
+        // Bind capture variable
+        if (if_data.capture_token.unwrap()) |ct| {
+            const capture_name = self.tree.tokenSlice(ct);
+            const capture_local = try fb.addLocalWithSize(capture_name, elem_type, false, self.type_reg.sizeOf(elem_type));
+            _ = try fb.emitStoreLocal(capture_local, unwrapped, span);
+        }
+        if (!try self.lowerBlockNode(if_data.then_branch)) _ = try fb.emitJump(merge_block, span);
+        fb.restoreScope(scope_depth);
+
+        if (else_block) |eb| {
+            fb.nextOverlapArm();
+            fb.setBlock(eb);
+            if (if_data.else_branch.unwrap()) |else_idx| {
+                if (!try self.lowerBlockNode(else_idx)) _ = try fb.emitJump(merge_block, span);
+            }
+        }
+        fb.endOverlapGroup();
+        fb.setBlock(merge_block);
+        return false;
+    }
+
+    /// Lower while-optional: while (expr) |val| { ... }
+    fn lowerWhileOptional(self: *Lowerer, idx: Index) !void {
+        const fb = self.current_func orelse return;
+        const wd = self.tree.whileData(idx);
+        const span = self.getSpan(idx);
+
+        const cond_block = try fb.newBlock("while.opt.cond");
+        const body_block = try fb.newBlock("while.opt.body");
+        const exit_block = try fb.newBlock("while.opt.end");
+        const cont_block = if (wd.continue_expr.unwrap() != null) try fb.newBlock("while.opt.cont") else cond_block;
+
+        const opt_type_idx = self.inferExprType(wd.condition);
+        const opt_info = self.type_reg.get(opt_type_idx);
+        const elem_type = if (opt_info == .optional) opt_info.optional.elem else opt_type_idx;
+        const is_compound_opt = opt_info == .optional and !self.isPtrLikeOptional(opt_type_idx);
+
+        const opt_local = try fb.addLocalWithSize("__while_opt", opt_type_idx, true, self.type_reg.sizeOf(opt_type_idx));
+
+        _ = try fb.emitJump(cond_block, span);
+        fb.setBlock(cond_block);
+
+        const opt_val = try self.lowerExprNode(wd.condition);
+        if (opt_val == ir.null_node) return;
+        _ = try fb.emitStoreLocal(opt_local, opt_val, span);
+
+        const is_non_null = if (is_compound_opt) blk: {
+            const tag_val = try fb.emitFieldLocal(opt_local, 0, 0, TypeRegistry.I64, span);
+            const zero = try fb.emitConstInt(0, TypeRegistry.I64, span);
+            break :blk try fb.emitBinary(.ne, tag_val, zero, TypeRegistry.BOOL, span);
+        } else blk: {
+            const null_val = try fb.emit(ir.Node.init(.const_null, TypeRegistry.UNTYPED_NULL, span));
+            break :blk try fb.emitBinary(.ne, opt_val, null_val, TypeRegistry.BOOL, span);
+        };
+        _ = try fb.emitBranch(is_non_null, body_block, exit_block, span);
+
+        const label: ?[]const u8 = if (wd.label_token.unwrap()) |lt| self.tree.tokenSlice(lt) else null;
+        try self.loop_stack.append(self.allocator, .{ .cond_block = cont_block, .exit_block = exit_block, .cleanup_depth = self.cleanup_stack.getScopeDepth(), .label = label });
+        fb.setBlock(body_block);
+        const scope_depth2 = fb.markScopeEntry();
+        const unwrapped2 = if (is_compound_opt) blk: {
+            break :blk try fb.emitFieldLocal(opt_local, 1, 8, elem_type, span);
+        } else blk: {
+            const opt_reload = try fb.emitLoadLocal(opt_local, opt_type_idx, span);
+            break :blk try fb.emitUnary(.optional_unwrap, opt_reload, elem_type, span);
+        };
+        if (wd.capture_token.unwrap()) |ct| {
+            const capture_name = self.tree.tokenSlice(ct);
+            const capture_local = try fb.addLocalWithSize(capture_name, elem_type, false, self.type_reg.sizeOf(elem_type));
+            _ = try fb.emitStoreLocal(capture_local, unwrapped2, span);
+        }
+        if (!try self.lowerBlockNode(wd.body)) _ = try fb.emitJump(cont_block, span);
+        fb.restoreScope(scope_depth2);
+
+        if (wd.continue_expr.unwrap()) |cont_expr| {
+            fb.setBlock(cont_block);
+            _ = try self.lowerExprNode(cont_expr);
+            _ = try fb.emitJump(cond_block, span);
+        }
+
+        _ = self.loop_stack.pop();
+        fb.setBlock(exit_block);
+    }
+
+    /// Lower for-range: for i in start..end { body }
+    fn lowerForRange(self: *Lowerer, idx: Index) !void {
+        const fb = self.current_func orelse return;
+        const fd = self.tree.forData(idx);
+        const span = self.getSpan(idx);
+
+        const start_val = try self.lowerExprNode(fd.range_start.unwrap().?);
+        const end_val = try self.lowerExprNode(fd.range_end.unwrap().?);
+
+        const idx_local = try fb.addLocalWithSize(fd.binding, TypeRegistry.I64, true, 8);
+        _ = try fb.emitStoreLocal(idx_local, start_val, span);
+
+        const end_name = try self.tempName("__for_end");
+        const end_local = try fb.addLocalWithSize(end_name, TypeRegistry.I64, false, 8);
+        _ = try fb.emitStoreLocal(end_local, end_val, span);
+
+        const cond_block = try fb.newBlock("for.cond");
+        const body_block = try fb.newBlock("for.body");
+        const incr_block = try fb.newBlock("for.incr");
+        const exit_block = try fb.newBlock("for.end");
+
+        _ = try fb.emitJump(cond_block, span);
+        fb.setBlock(cond_block);
+        const idx_val = try fb.emitLoadLocal(idx_local, TypeRegistry.I64, span);
+        const end_val_cond = try fb.emitLoadLocal(end_local, TypeRegistry.I64, span);
+        const cond = try fb.emitBinary(.lt, idx_val, end_val_cond, TypeRegistry.BOOL, span);
+        _ = try fb.emitBranch(cond, body_block, exit_block, span);
+
+        const label: ?[]const u8 = if (fd.label_token.unwrap()) |lt| self.tree.tokenSlice(lt) else null;
+        try self.loop_stack.append(self.allocator, .{
+            .cond_block = incr_block,
+            .exit_block = exit_block,
+            .cleanup_depth = self.cleanup_stack.getScopeDepth(),
+            .label = label,
+        });
+
+        fb.setBlock(body_block);
+        if (!try self.lowerBlockNode(fd.body)) _ = try fb.emitJump(incr_block, span);
+
+        fb.setBlock(incr_block);
+        const idx_before = try fb.emitLoadLocal(idx_local, TypeRegistry.I64, span);
+        const one = try fb.emitConstInt(1, TypeRegistry.I64, span);
+        const idx_after = try fb.emitBinary(.add, idx_before, one, TypeRegistry.I64, span);
+        _ = try fb.emitStoreLocal(idx_local, idx_after, span);
+        _ = try fb.emitJump(cond_block, span);
+
+        _ = self.loop_stack.pop();
+        fb.setBlock(exit_block);
+    }
+
+    /// Lower `for k, v in map { }` — iterates occupied slots in hash table.
+    fn lowerForMap(self: *Lowerer, idx: Index, map_info: types_mod.MapType) !void {
+        const fb = self.current_func orelse return;
+        const fd = self.tree.forData(idx);
+        const span = self.getSpan(idx);
+
+        const key_type = map_info.key;
+        const val_type = map_info.value;
+        const key_size: u32 = self.type_reg.sizeOf(key_type);
+        const val_size: u32 = self.type_reg.sizeOf(val_type);
+
+        // Get the map local
+        const iterable_idx = fd.iterable.unwrap() orelse return;
+        const iter_tag = self.tree.nodeTag(iterable_idx);
+        if (iter_tag != .ident) return;
+        const iter_name = self.tree.tokenSlice(self.tree.nodeMainToken(iterable_idx));
+        const map_local = fb.lookupLocal(iter_name) orelse return;
+
+        // Loop index
+        const idx_name = try self.tempName("__map_idx");
+        const idx_local = try fb.addLocalWithSize(idx_name, TypeRegistry.I64, true, 8);
+        const zero = try fb.emitConstInt(0, TypeRegistry.I64, span);
+        _ = try fb.emitStoreLocal(idx_local, zero, span);
+
+        // Load buf pointer from Map struct
+        const buf_val = try fb.emitFieldLocal(map_local, 0, 0, TypeRegistry.I64, span);
+
+        // Capacity local
+        const cap_name = try self.tempName("__map_cap");
+        const cap_local = try fb.addLocalWithSize(cap_name, TypeRegistry.I64, true, 8);
+        _ = try fb.emitStoreLocal(cap_local, zero, span);
+        const buf_is_null = try fb.emitBinary(.eq, buf_val, zero, TypeRegistry.BOOL, span);
+        const buf_ok_block = try fb.newBlock("map.buf_ok");
+        const buf_loaded_block = try fb.newBlock("map.buf_loaded");
+        _ = try fb.emitBranch(buf_is_null, buf_loaded_block, buf_ok_block, span);
+
+        fb.setBlock(buf_ok_block);
+        const eight = try fb.emitConstInt(8, TypeRegistry.I64, span);
+        const cap_addr = try fb.emitBinary(.add, buf_val, eight, TypeRegistry.I64, span);
+        const cap_field = try fb.emitPtrLoadValue(cap_addr, TypeRegistry.I64, span);
+        _ = try fb.emitStoreLocal(cap_local, cap_field, span);
+
+        const states_name = try self.tempName("__map_states");
+        const states_local = try fb.addLocalWithSize(states_name, TypeRegistry.I64, true, 8);
+        const keys_name = try self.tempName("__map_keys");
+        const keys_local = try fb.addLocalWithSize(keys_name, TypeRegistry.I64, true, 8);
+        const vals_name = try self.tempName("__map_vals");
+        const vals_local = try fb.addLocalWithSize(vals_name, TypeRegistry.I64, true, 8);
+
+        const sixteen = try fb.emitConstInt(16, TypeRegistry.I64, span);
+        const states_base = try fb.emitBinary(.add, buf_val, sixteen, TypeRegistry.I64, span);
+        _ = try fb.emitStoreLocal(states_local, states_base, span);
+
+        const cap_for_keys = try fb.emitLoadLocal(cap_local, TypeRegistry.I64, span);
+        const states_size = try fb.emitBinary(.mul, cap_for_keys, eight, TypeRegistry.I64, span);
+        const keys_base = try fb.emitBinary(.add, states_base, states_size, TypeRegistry.I64, span);
+        _ = try fb.emitStoreLocal(keys_local, keys_base, span);
+
+        const key_size_val = try fb.emitConstInt(@intCast(key_size), TypeRegistry.I64, span);
+        const keys_total = try fb.emitBinary(.mul, cap_for_keys, key_size_val, TypeRegistry.I64, span);
+        const vals_base = try fb.emitBinary(.add, keys_base, keys_total, TypeRegistry.I64, span);
+        _ = try fb.emitStoreLocal(vals_local, vals_base, span);
+
+        _ = try fb.emitJump(buf_loaded_block, span);
+        fb.setBlock(buf_loaded_block);
+
+        const cond_block = try fb.newBlock("map.cond");
+        const body_block = try fb.newBlock("map.body");
+        const incr_block = try fb.newBlock("map.incr");
+        const exit_block = try fb.newBlock("map.end");
+
+        _ = try fb.emitJump(cond_block, span);
+
+        fb.setBlock(cond_block);
+        const idx_cond = try fb.emitLoadLocal(idx_local, TypeRegistry.I64, span);
+        const cap_cond = try fb.emitLoadLocal(cap_local, TypeRegistry.I64, span);
+        const cond = try fb.emitBinary(.lt, idx_cond, cap_cond, TypeRegistry.BOOL, span);
+        _ = try fb.emitBranch(cond, body_block, exit_block, span);
+
+        const label: ?[]const u8 = if (fd.label_token.unwrap()) |lt| self.tree.tokenSlice(lt) else null;
+        try self.loop_stack.append(self.allocator, .{
+            .cond_block = incr_block,
+            .exit_block = exit_block,
+            .cleanup_depth = self.cleanup_stack.getScopeDepth(),
+            .label = label,
+        });
+
+        fb.setBlock(body_block);
+        const cur_idx = try fb.emitLoadLocal(idx_local, TypeRegistry.I64, span);
+
+        const states_base2 = try fb.emitLoadLocal(states_local, TypeRegistry.I64, span);
+        const state_val = try fb.emitIndexValue(states_base2, cur_idx, 8, TypeRegistry.I64, span);
+        const one = try fb.emitConstInt(1, TypeRegistry.I64, span);
+        const is_occupied = try fb.emitBinary(.eq, state_val, one, TypeRegistry.BOOL, span);
+
+        const occupied_block = try fb.newBlock("map.occupied");
+        _ = try fb.emitBranch(is_occupied, occupied_block, incr_block, span);
+
+        fb.setBlock(occupied_block);
+        const idx_load = try fb.emitLoadLocal(idx_local, TypeRegistry.I64, span);
+
+        const keys_base2 = try fb.emitLoadLocal(keys_local, TypeRegistry.I64, span);
+        const key_val = try fb.emitIndexValue(keys_base2, idx_load, @intCast(key_size), key_type, span);
+        const vals_base2 = try fb.emitLoadLocal(vals_local, TypeRegistry.I64, span);
+        const val_val = try fb.emitIndexValue(vals_base2, idx_load, @intCast(val_size), val_type, span);
+
+        // Bind value (binding = value)
+        const val_local = try fb.addLocalWithSize(fd.binding, val_type, false, val_size);
+        _ = try fb.emitStoreLocal(val_local, val_val, span);
+
+        // Bind key (index_binding = key)
+        if (fd.index_binding_token.unwrap()) |ibt| {
+            const key_binding = self.tree.tokenSlice(ibt);
+            const key_local = try fb.addLocalWithSize(key_binding, key_type, false, key_size);
+            _ = try fb.emitStoreLocal(key_local, key_val, span);
+        }
+
+        if (!try self.lowerBlockNode(fd.body)) _ = try fb.emitJump(incr_block, span);
+
+        fb.setBlock(incr_block);
+        const idx_before = try fb.emitLoadLocal(idx_local, TypeRegistry.I64, span);
+        const inc = try fb.emitConstInt(1, TypeRegistry.I64, span);
+        const idx_after = try fb.emitBinary(.add, idx_before, inc, TypeRegistry.I64, span);
+        _ = try fb.emitStoreLocal(idx_local, idx_after, span);
+        _ = try fb.emitJump(cond_block, span);
+
+        _ = self.loop_stack.pop();
+        fb.setBlock(exit_block);
+    }
+
+    /// Labeled block expression: label: { ... break :label value ... }
+    fn lowerLabeledBlockExpr(self: *Lowerer, idx: Index) Error!ir.NodeIndex {
+        const fb = self.current_func orelse return ir.null_node;
+        const span = self.getSpan(idx);
+
+        // Extract block data — labeled blocks use block_expr tag
+        const data = self.tree.nodeData(idx);
+        const stmt_range = data.extra_range;
+        const stmt_indices = self.tree.extraNodes(stmt_range);
+
+        // Get label from the main token
+        const label_token = self.tree.nodeMainToken(idx);
+        const label = self.tree.tokenSlice(label_token);
+
+        const result_type: TypeIndex = TypeRegistry.I64;
+        const result_size = self.type_reg.sizeOf(result_type);
+
+        const result_local = try fb.addLocalWithSize("__block_result", result_type, false, result_size);
+        const exit_block = try fb.newBlock("block.exit");
+
+        try self.labeled_block_stack.append(self.allocator, .{
+            .label = label,
+            .exit_block = exit_block,
+            .result_local = result_local,
+            .result_type = result_type,
+            .cleanup_depth = self.cleanup_stack.getScopeDepth(),
+        });
+
+        const scope_depth3 = fb.markScopeEntry();
+        for (stmt_indices) |stmt_idx| {
+            if (try self.lowerStmt(stmt_idx)) break;
+        }
+
+        if (fb.needsTerminator()) _ = try fb.emitJump(exit_block, span);
+
+        fb.restoreScope(scope_depth3);
+        _ = self.labeled_block_stack.pop();
+
+        fb.setBlock(exit_block);
+        return try fb.emitLoadLocal(result_local, result_type, span);
+    }
+
+    // ========================================================================
+    // Group 5: Variable init helpers (destructure)
+    // Ported from compiler/frontend/lower.zig lines 2643-2716
+    // ========================================================================
+
+    /// Lower destructuring statement: let (a, b) = tuple_expr
+    fn lowerDestructureStmt(self: *Lowerer, idx: Index) !void {
+        const fb = self.current_func orelse return;
+        const data = self.tree.nodeData(idx);
+        const ds = self.tree.extraData(data.node_and_extra[1], ast_mod.DestructureData);
+        const span = self.getSpan(idx);
+
+        // value is the RHS expression
+        const tuple_type_idx = self.inferExprType(ds.value);
+        const tuple_info = self.type_reg.get(tuple_type_idx);
+        if (tuple_info != .tuple) return;
+        const tup = tuple_info.tuple;
+
+        // Parse bindings from extra data (pairs of name_token, type_expr)
+        const binding_extra = self.tree.extraSlice(ds.bindings);
+        const is_const = ds.flags.is_const;
+
+        // Lower RHS to a temp tuple local, then extract each element
+        const tuple_size = self.type_reg.sizeOf(tuple_type_idx);
+        const temp_idx = try fb.addLocalWithSize("__destruct_tmp", tuple_type_idx, true, tuple_size);
+        const rhs_val = try self.lowerExprNode(ds.value);
+        if (rhs_val == ir.null_node) return;
+        _ = try fb.emitStoreLocal(temp_idx, rhs_val, span);
+
+        // Each binding is a pair (name_token, type_opt) in extra_data
+        var bi: usize = 0;
+        var elem_i: usize = 0;
+        while (bi < binding_extra.len and elem_i < tup.element_types.len) : ({
+            bi += 2;
+            elem_i += 1;
+        }) {
+            const name_token: ast_mod.TokenIndex = @enumFromInt(binding_extra[bi]);
+            // binding_extra[bi+1] is the optional type expr (unused here)
+            const binding_name = self.tree.tokenSlice(name_token);
+            const elem_type = tup.element_types[elem_i];
+            const elem_size = self.type_reg.sizeOf(elem_type);
+            const local_idx = try fb.addLocalWithSize(binding_name, elem_type, !is_const, elem_size);
+            const offset: i64 = @intCast(self.type_reg.tupleElementOffset(tuple_type_idx, @intCast(elem_i)));
+
+            if (elem_type == TypeRegistry.STRING) {
+                const ptr_val = try fb.emitFieldLocal(temp_idx, @intCast(elem_i * 2), offset, TypeRegistry.I64, span);
+                const len_val = try fb.emitFieldLocal(temp_idx, @intCast(elem_i * 2 + 1), offset + 8, TypeRegistry.I64, span);
+                _ = try fb.emitStoreLocalField(local_idx, 0, 0, ptr_val, span);
+                _ = try fb.emitStoreLocalField(local_idx, 1, 8, len_val, span);
+            } else {
+                const elem_val = try fb.emitFieldLocal(temp_idx, @intCast(elem_i), offset, elem_type, span);
+                _ = try fb.emitStoreLocal(local_idx, elem_val, span);
+            }
+        }
+    }
+
+    // ========================================================================
+    // Group 1: Switch lowering
+    // Ported from compiler/frontend/lower.zig lines 8368-9127
+    // ========================================================================
+
+    /// Check if any switch case has a capture.
+    fn hasCapture(self: *Lowerer, sw: ast_mod.full.SwitchFull) bool {
+        const case_extra_indices = self.tree.extraSlice(sw.cases);
+        for (case_extra_indices) |case_extra_raw| {
+            const case_extra: ast_mod.ExtraIndex = @enumFromInt(case_extra_raw);
+            const case_data = self.tree.extraData(case_extra, ast_mod.SwitchCaseData);
+            if (case_data.capture_token.unwrap() != null) return true;
+        }
+        return false;
+    }
+
+    /// Check if any switch arm body contains a function call (side effects).
+    fn switchArmsHaveCalls(self: *Lowerer, sw: ast_mod.full.SwitchFull) bool {
+        const case_extra_indices = self.tree.extraSlice(sw.cases);
+        for (case_extra_indices) |case_extra_raw| {
+            const case_extra: ast_mod.ExtraIndex = @enumFromInt(case_extra_raw);
+            const case_data = self.tree.extraData(case_extra, ast_mod.SwitchCaseData);
+            if (self.exprMayHaveSideEffects(case_data.body)) return true;
+        }
+        if (sw.else_body.unwrap()) |eb| {
+            if (self.exprMayHaveSideEffects(eb)) return true;
+        }
+        return false;
+    }
+
+    /// Conservative check: does this expression potentially have side effects?
+    fn exprMayHaveSideEffects(self: *Lowerer, idx: Index) bool {
+        const tag = self.tree.nodeTag(idx);
+        return switch (tag) {
+            .call, .call_one, .builtin_call, .new_expr => true,
+            .literal_unreachable => true,
+            .literal_int, .literal_float, .literal_true, .literal_false,
+            .literal_null, .literal_string, .literal_char,
+            .ident, .field_access,
+            => false,
+            // Conservative: unknown expression types assumed side-effectful
+            else => true,
+        };
+    }
+
+    /// Resolve an error literal pattern to its globally unique variant index, or lower normally.
+    fn resolveErrorPatternOrLower(self: *Lowerer, pattern_idx: Index, span: Span) Error!ir.NodeIndex {
+        const fb = self.current_func orelse return ir.null_node;
+        const ptag = self.tree.nodeTag(pattern_idx);
+        if (ptag == .error_literal) {
+            const name = self.tree.tokenSlice(self.tree.nodeMainToken(pattern_idx));
+            const error_idx = self.getGlobalErrorIndex(name);
+            return try fb.emitConstInt(error_idx, TypeRegistry.I64, span);
+        }
+        return try self.lowerExprNode(pattern_idx);
+    }
+
+    /// Get globally unique index for an error variant name.
+    fn getGlobalErrorIndex(self: *Lowerer, name: []const u8) i64 {
+        if (self.global_error_table.get(name)) |idx2| return idx2;
+        const idx2 = self.next_error_idx;
+        self.next_error_idx += 1;
+        self.global_error_table.put(name, idx2) catch {};
+        return idx2;
+    }
+
+    /// Resolve a switch case pattern expression to a union variant index.
+    fn resolveUnionVariantIndex(self: *Lowerer, pattern_idx: Index, ut: types_mod.UnionType) ?usize {
+        const ptag = self.tree.nodeTag(pattern_idx);
+        if (ptag != .field_access) return null;
+        const d = self.tree.nodeData(pattern_idx);
+        const field_token = d.node_and_token[1];
+        const field_name = self.tree.tokenSlice(field_token);
+        for (ut.variants, 0..) |v, i| {
+            if (std.mem.eql(u8, v.name, field_name)) return i;
+        }
+        return null;
+    }
+
+    /// Resolve the payload type from a pattern's first variant.
+    fn resolveUnionPayloadType(self: *Lowerer, patterns: []const u32, ut: types_mod.UnionType) TypeIndex {
+        if (patterns.len == 0) return TypeRegistry.VOID;
+        const pat_idx: Index = @enumFromInt(patterns[0]);
+        if (self.resolveUnionVariantIndex(pat_idx, ut)) |vidx| {
+            return ut.variants[vidx].payload_type;
+        }
+        return TypeRegistry.VOID;
+    }
+
+    /// Lower switch statement (non-expression form, no result value).
+    fn lowerSwitchStatement(self: *Lowerer, idx: Index) Error!ir.NodeIndex {
+        const fb = self.current_func orelse return ir.null_node;
+        const sw = self.tree.switchData(idx);
+        const span = self.getSpan(idx);
+
+        var subject_type = self.inferExprType(sw.subject);
+        var subject_info = self.type_reg.get(subject_type);
+        // @safe auto-deref
+        if (self.chk.safe_mode and subject_info == .pointer and self.type_reg.get(subject_info.pointer.elem) == .union_type) {
+            subject_type = subject_info.pointer.elem;
+            subject_info = self.type_reg.get(subject_type);
+        }
+        const is_union = subject_info == .union_type;
+        const old_switch_enum = self.current_switch_enum_type;
+        if (subject_info == .enum_type) self.current_switch_enum_type = subject_type;
+        defer self.current_switch_enum_type = old_switch_enum;
+
+        if (is_union) return try self.lowerUnionSwitch(sw, subject_type, subject_info.union_type, TypeRegistry.VOID, span);
+
+        const subject = try self.lowerExprNode(sw.subject);
+        const merge_block = try fb.newBlock("switch.end");
+
+        // String switch: pre-extract ptr/len
+        const is_string_switch = subject_type == TypeRegistry.STRING;
+        var subject_ptr: ir.NodeIndex = ir.null_node;
+        var subject_len: ir.NodeIndex = ir.null_node;
+        if (is_string_switch) {
+            const ptr_type = try self.type_reg.makePointer(TypeRegistry.U8);
+            subject_ptr = try fb.emitSlicePtr(subject, ptr_type, span);
+            subject_len = try fb.emitSliceLen(subject, span);
+        }
+
+        fb.beginOverlapGroup();
+
+        const case_extra_indices = self.tree.extraSlice(sw.cases);
+        var i: usize = 0;
+        while (i < case_extra_indices.len) : (i += 1) {
+            fb.nextOverlapArm();
+            const case_extra: ast_mod.ExtraIndex = @enumFromInt(case_extra_indices[i]);
+            const case_data = self.tree.extraData(case_extra, ast_mod.SwitchCaseData);
+            const patterns = self.tree.extraSlice(case_data.patterns);
+            var case_cond: ir.NodeIndex = ir.null_node;
+
+            if (case_data.flags.is_range and patterns.len >= 2) {
+                const range_start = try self.lowerExprNode(@enumFromInt(patterns[0]));
+                const range_end = try self.lowerExprNode(@enumFromInt(patterns[1]));
+                const ge_cond = try fb.emitBinary(.ge, subject, range_start, TypeRegistry.BOOL, span);
+                const le_cond = try fb.emitBinary(.le, subject, range_end, TypeRegistry.BOOL, span);
+                case_cond = try fb.emitBinary(.@"and", ge_cond, le_cond, TypeRegistry.BOOL, span);
+            } else {
+                for (patterns) |pat_raw| {
+                    const pat_idx2: Index = @enumFromInt(pat_raw);
+                    const pattern_val = try self.resolveErrorPatternOrLower(pat_idx2, span);
+                    const pattern_cond = if (is_string_switch) blk: {
+                        const ptr_type = try self.type_reg.makePointer(TypeRegistry.U8);
+                        const p_ptr = try fb.emitSlicePtr(pattern_val, ptr_type, span);
+                        const p_len = try fb.emitSliceLen(pattern_val, span);
+                        var eq_args = [_]ir.NodeIndex{ subject_ptr, subject_len, p_ptr, p_len };
+                        const eq_result = try fb.emitCall("string_eq", &eq_args, false, TypeRegistry.I64, span);
+                        const zero2 = try fb.emitConstInt(0, TypeRegistry.I64, span);
+                        break :blk try fb.emitBinary(.ne, eq_result, zero2, TypeRegistry.BOOL, span);
+                    } else try fb.emitBinary(.eq, subject, pattern_val, TypeRegistry.BOOL, span);
+                    case_cond = if (case_cond == ir.null_node) pattern_cond else try fb.emitBinary(.@"or", case_cond, pattern_cond, TypeRegistry.BOOL, span);
+                }
+            }
+
+            // Guard
+            if (case_data.guard.unwrap()) |guard_idx| {
+                if (case_cond != ir.null_node) {
+                    const guard_cond = try self.lowerExprNode(guard_idx);
+                    case_cond = try fb.emitBinary(.@"and", case_cond, guard_cond, TypeRegistry.BOOL, span);
+                }
+            }
+
+            const case_block = try fb.newBlock("switch.case");
+            const next_block = if (i + 1 < case_extra_indices.len) try fb.newBlock("switch.next") else if (sw.else_body.unwrap() != null) try fb.newBlock("switch.else") else merge_block;
+            if (case_cond != ir.null_node) _ = try fb.emitBranch(case_cond, case_block, next_block, span);
+            fb.setBlock(case_block);
+            if (!try self.lowerBlockNode(case_data.body)) _ = try fb.emitJump(merge_block, span);
+            fb.setBlock(next_block);
+        }
+
+        if (sw.else_body.unwrap()) |eb| {
+            fb.nextOverlapArm();
+            if (!try self.lowerBlockNode(eb)) _ = try fb.emitJump(merge_block, span);
+        }
+        fb.endOverlapGroup();
+        fb.setBlock(merge_block);
+        return ir.null_node;
+    }
+
+    /// Lower union switch: dispatch on tag, extract payload via capture.
+    fn lowerUnionSwitch(self: *Lowerer, sw: ast_mod.full.SwitchFull, subject_type: TypeIndex, ut: types_mod.UnionType, result_type: TypeIndex, span: Span) Error!ir.NodeIndex {
+        const fb = self.current_func orelse return ir.null_node;
+        const is_expr = result_type != TypeRegistry.VOID;
+        const result_info = self.type_reg.get(result_type);
+        const is_compound_opt = result_info == .optional and !self.isPtrLikeOptional(result_type);
+
+        var result_local: ir.LocalIdx = 0;
+        if (is_expr) {
+            const result_size = self.type_reg.sizeOf(result_type);
+            result_local = try fb.addLocalWithSize("__switch_result", result_type, true, result_size);
+        }
+
+        // Store subject into a local so we can extract tag/payload
+        const subject_local = blk: {
+            const subj_tag = self.tree.nodeTag(sw.subject);
+            if (subj_tag == .ident) {
+                const subj_name = self.tree.tokenSlice(self.tree.nodeMainToken(sw.subject));
+                if (fb.lookupLocal(subj_name)) |li| break :blk li;
+            }
+            break :blk null;
+        } orelse blk: {
+            const size = self.type_reg.sizeOf(subject_type);
+            const tmp_local = try fb.addLocalWithSize("__switch_subj", subject_type, false, size);
+            const subj_val = try self.lowerExprNode(sw.subject);
+            _ = try fb.emitStoreLocal(tmp_local, subj_val, span);
+            break :blk tmp_local;
+        };
+
+        // @safe auto-deref
+        var effective_local = subject_local;
+        if (self.chk.safe_mode) {
+            const local_type = fb.locals.items[subject_local].type_idx;
+            const lt_info = self.type_reg.get(local_type);
+            if (lt_info == .pointer and self.type_reg.get(lt_info.pointer.elem) == .union_type) {
+                const union_type_idx = lt_info.pointer.elem;
+                const size2 = self.type_reg.sizeOf(union_type_idx);
+                const deref_local = try fb.addLocalWithSize("__union_deref", union_type_idx, false, size2);
+                const ptr_val = try fb.emitLoadLocal(subject_local, local_type, span);
+                const val = try fb.emitPtrLoadValue(ptr_val, union_type_idx, span);
+                _ = try fb.emitStoreLocal(deref_local, val, span);
+                effective_local = deref_local;
+            }
+        }
+
+        const tag_val = try fb.emitFieldLocal(effective_local, 0, 0, TypeRegistry.I64, span);
+        const merge_block = try fb.newBlock("switch.end");
+        fb.beginOverlapGroup();
+
+        const case_extra_indices = self.tree.extraSlice(sw.cases);
+        var i: usize = 0;
+        while (i < case_extra_indices.len) : (i += 1) {
+            fb.nextOverlapArm();
+            const case_extra: ast_mod.ExtraIndex = @enumFromInt(case_extra_indices[i]);
+            const case_data = self.tree.extraData(case_extra, ast_mod.SwitchCaseData);
+            const patterns = self.tree.extraSlice(case_data.patterns);
+            var case_cond: ir.NodeIndex = ir.null_node;
+
+            for (patterns) |pat_raw| {
+                const pat_idx2: Index = @enumFromInt(pat_raw);
+                const variant_idx = self.resolveUnionVariantIndex(pat_idx2, ut);
+                if (variant_idx) |vidx| {
+                    const idx_val = try fb.emitConstInt(@intCast(vidx), TypeRegistry.I64, span);
+                    const pattern_cond = try fb.emitBinary(.eq, tag_val, idx_val, TypeRegistry.BOOL, span);
+                    case_cond = if (case_cond == ir.null_node) pattern_cond else try fb.emitBinary(.@"or", case_cond, pattern_cond, TypeRegistry.BOOL, span);
+                }
+            }
+
+            const case_block = try fb.newBlock("switch.case");
+            const next_block = if (i + 1 < case_extra_indices.len) try fb.newBlock("switch.next") else if (sw.else_body.unwrap() != null) try fb.newBlock("switch.else") else merge_block;
+            if (case_cond != ir.null_node) _ = try fb.emitBranch(case_cond, case_block, next_block, span);
+            fb.setBlock(case_block);
+
+            // Capture handling
+            if (case_data.capture_token.unwrap()) |ct| {
+                const scope_depth4 = fb.markScopeEntry();
+                const payload_type = self.resolveUnionPayloadType(patterns, ut);
+                const payload_size = self.type_reg.sizeOf(payload_type);
+                const capture_name = self.tree.tokenSlice(ct);
+
+                if (case_data.flags.capture_is_ptr) {
+                    const ptr_type = self.type_reg.makePointer(payload_type) catch TypeRegistry.VOID;
+                    const subj_ptr_type = self.type_reg.makePointer(subject_type) catch TypeRegistry.VOID;
+                    const subj_addr = try fb.emitAddrLocal(effective_local, subj_ptr_type, span);
+                    const payload_addr = try fb.emitAddrOffset(subj_addr, 8, ptr_type, span);
+                    const capture_local = try fb.addLocalWithSize(capture_name, ptr_type, false, 8);
+                    _ = try fb.emitStoreLocal(capture_local, payload_addr, span);
+                } else {
+                    const capture_local = try fb.addLocalWithSize(capture_name, payload_type, false, payload_size);
+                    const num_chunks = (payload_size + 7) / 8;
+                    for (0..num_chunks) |ci| {
+                        const union_offset: i64 = 8 + @as(i64, @intCast(ci * 8));
+                        const cap_offset: i64 = @intCast(ci * 8);
+                        const chunk_val = try fb.emitFieldLocal(effective_local, @intCast(1 + ci), union_offset, TypeRegistry.I64, span);
+                        _ = try fb.emitStoreLocalField(capture_local, @intCast(ci), cap_offset, chunk_val, span);
+                    }
+                }
+
+                if (is_expr) {
+                    const case_val = try self.lowerExprNode(case_data.body);
+                    const arm_type = self.inferExprType(case_data.body);
+                    if (case_val != ir.null_node and arm_type != TypeRegistry.VOID) {
+                        if (is_compound_opt) {
+                            try self.storeCompoundOptArm(fb, result_local, case_val, case_data.body, span);
+                        } else {
+                            _ = try fb.emitStoreLocal(result_local, case_val, span);
+                        }
+                    }
+                    if (fb.needsTerminator()) _ = try fb.emitJump(merge_block, span);
+                } else {
+                    if (!try self.lowerBlockNode(case_data.body)) _ = try fb.emitJump(merge_block, span);
+                }
+                fb.restoreScope(scope_depth4);
+            } else {
+                if (is_expr) {
+                    const case_val = try self.lowerExprNode(case_data.body);
+                    const arm_type = self.inferExprType(case_data.body);
+                    if (case_val != ir.null_node and arm_type != TypeRegistry.VOID) {
+                        if (is_compound_opt) {
+                            try self.storeCompoundOptArm(fb, result_local, case_val, case_data.body, span);
+                        } else {
+                            _ = try fb.emitStoreLocal(result_local, case_val, span);
+                        }
+                    }
+                    if (fb.needsTerminator()) _ = try fb.emitJump(merge_block, span);
+                } else {
+                    if (!try self.lowerBlockNode(case_data.body)) _ = try fb.emitJump(merge_block, span);
+                }
+            }
+            fb.setBlock(next_block);
+        }
+
+        if (sw.else_body.unwrap()) |eb| {
+            fb.nextOverlapArm();
+            if (is_expr) {
+                const else_val = try self.lowerExprNode(eb);
+                const else_type = self.inferExprType(eb);
+                if (else_val != ir.null_node and else_type != TypeRegistry.VOID) {
+                    if (is_compound_opt) {
+                        try self.storeCompoundOptArm(fb, result_local, else_val, eb, span);
+                    } else {
+                        _ = try fb.emitStoreLocal(result_local, else_val, span);
+                    }
+                }
+                if (fb.needsTerminator()) _ = try fb.emitJump(merge_block, span);
+            } else {
+                if (!try self.lowerBlockNode(eb)) _ = try fb.emitJump(merge_block, span);
+            }
+        }
+        fb.endOverlapGroup();
+        fb.setBlock(merge_block);
+        if (is_expr) return try fb.emitLoadLocal(result_local, result_type, span);
+        return ir.null_node;
+    }
+
+    /// Block-based switch expression lowering: each arm in its own block, result stored in local.
+    fn lowerSwitchValueBlocks(self: *Lowerer, sw: ast_mod.full.SwitchFull, result_type: TypeIndex) Error!ir.NodeIndex {
+        const fb = self.current_func orelse return ir.null_node;
+        const span = self.getSpan(sw.subject);
+        const old_switch_enum = self.current_switch_enum_type;
+        const subject_type = self.inferExprType(sw.subject);
+        const subject_info = self.type_reg.get(subject_type);
+        if (subject_info == .enum_type) self.current_switch_enum_type = subject_type;
+        defer self.current_switch_enum_type = old_switch_enum;
+
+        const subject = try self.lowerExprNode(sw.subject);
+        const merge_block = try fb.newBlock("switch.end");
+        const result_size = self.type_reg.sizeOf(result_type);
+        const result_local = try fb.addLocalWithSize("__switch_result", result_type, true, result_size);
+        const result_type_info = self.type_reg.get(result_type);
+        const is_compound_opt = result_type_info == .optional and !self.isPtrLikeOptional(result_type);
+
+        const is_string_switch = subject_type == TypeRegistry.STRING;
+        var subject_ptr: ir.NodeIndex = ir.null_node;
+        var subject_len: ir.NodeIndex = ir.null_node;
+        if (is_string_switch) {
+            const ptr_type = try self.type_reg.makePointer(TypeRegistry.U8);
+            subject_ptr = try fb.emitSlicePtr(subject, ptr_type, span);
+            subject_len = try fb.emitSliceLen(subject, span);
+        }
+
+        fb.beginOverlapGroup();
+        const case_extra_indices = self.tree.extraSlice(sw.cases);
+        var i: usize = 0;
+        while (i < case_extra_indices.len) : (i += 1) {
+            fb.nextOverlapArm();
+            const case_extra: ast_mod.ExtraIndex = @enumFromInt(case_extra_indices[i]);
+            const case_data = self.tree.extraData(case_extra, ast_mod.SwitchCaseData);
+            const patterns = self.tree.extraSlice(case_data.patterns);
+            var case_cond: ir.NodeIndex = ir.null_node;
+
+            if (case_data.flags.is_range and patterns.len >= 2) {
+                const range_start = try self.lowerExprNode(@enumFromInt(patterns[0]));
+                const range_end = try self.lowerExprNode(@enumFromInt(patterns[1]));
+                const ge_cond = try fb.emitBinary(.ge, subject, range_start, TypeRegistry.BOOL, span);
+                const le_cond = try fb.emitBinary(.le, subject, range_end, TypeRegistry.BOOL, span);
+                case_cond = try fb.emitBinary(.@"and", ge_cond, le_cond, TypeRegistry.BOOL, span);
+            } else {
+                for (patterns) |pat_raw| {
+                    const pat_idx2: Index = @enumFromInt(pat_raw);
+                    const pattern_val = try self.resolveErrorPatternOrLower(pat_idx2, span);
+                    const pattern_cond = if (is_string_switch) blk: {
+                        const ptr_type = try self.type_reg.makePointer(TypeRegistry.U8);
+                        const p_ptr = try fb.emitSlicePtr(pattern_val, ptr_type, span);
+                        const p_len = try fb.emitSliceLen(pattern_val, span);
+                        var eq_args = [_]ir.NodeIndex{ subject_ptr, subject_len, p_ptr, p_len };
+                        const eq_result = try fb.emitCall("string_eq", &eq_args, false, TypeRegistry.I64, span);
+                        const zero2 = try fb.emitConstInt(0, TypeRegistry.I64, span);
+                        break :blk try fb.emitBinary(.ne, eq_result, zero2, TypeRegistry.BOOL, span);
+                    } else try fb.emitBinary(.eq, subject, pattern_val, TypeRegistry.BOOL, span);
+                    case_cond = if (case_cond == ir.null_node) pattern_cond else try fb.emitBinary(.@"or", case_cond, pattern_cond, TypeRegistry.BOOL, span);
+                }
+            }
+
+            if (case_data.guard.unwrap()) |guard_idx| {
+                if (case_cond != ir.null_node) {
+                    const guard_cond = try self.lowerExprNode(guard_idx);
+                    case_cond = try fb.emitBinary(.@"and", case_cond, guard_cond, TypeRegistry.BOOL, span);
+                }
+            }
+
+            const case_block = try fb.newBlock("switch.case");
+            const next_block = if (i + 1 < case_extra_indices.len) try fb.newBlock("switch.next") else if (sw.else_body.unwrap() != null) try fb.newBlock("switch.else") else merge_block;
+            if (case_cond != ir.null_node) _ = try fb.emitBranch(case_cond, case_block, next_block, span);
+            fb.setBlock(case_block);
+            const case_val = try self.lowerExprNode(case_data.body);
+            if (case_val != ir.null_node and fb.nodes.items[case_val].type_idx != TypeRegistry.VOID) {
+                if (is_compound_opt) {
+                    try self.storeCompoundOptArm(fb, result_local, case_val, case_data.body, span);
+                } else {
+                    _ = try fb.emitStoreLocal(result_local, case_val, span);
+                }
+            }
+            if (fb.needsTerminator()) _ = try fb.emitJump(merge_block, span);
+            fb.setBlock(next_block);
+        }
+
+        if (sw.else_body.unwrap()) |eb| {
+            fb.nextOverlapArm();
+            const else_val = try self.lowerExprNode(eb);
+            if (else_val != ir.null_node and fb.nodes.items[else_val].type_idx != TypeRegistry.VOID) {
+                if (is_compound_opt) {
+                    try self.storeCompoundOptArm(fb, result_local, else_val, eb, span);
+                } else {
+                    _ = try fb.emitStoreLocal(result_local, else_val, span);
+                }
+            }
+            if (fb.needsTerminator()) _ = try fb.emitJump(merge_block, span);
+        }
+        fb.endOverlapGroup();
+        fb.setBlock(merge_block);
+        return try fb.emitLoadLocal(result_local, result_type, span);
+    }
+
+    /// Switch as select: pure expressions (no side effects), nest selects bottom-up.
+    fn lowerSwitchAsSelect(self: *Lowerer, sw: ast_mod.full.SwitchFull, result_type: TypeIndex) Error!ir.NodeIndex {
+        const fb = self.current_func orelse return ir.null_node;
+        const span = self.getSpan(sw.subject);
+        const old_switch_enum = self.current_switch_enum_type;
+        const sel_subject_type = self.inferExprType(sw.subject);
+        if (self.type_reg.get(sel_subject_type) == .enum_type) self.current_switch_enum_type = sel_subject_type;
+        defer self.current_switch_enum_type = old_switch_enum;
+        const subject = try self.lowerExprNode(sw.subject);
+
+        const is_string_switch = sel_subject_type == TypeRegistry.STRING;
+        var subject_ptr: ir.NodeIndex = ir.null_node;
+        var subject_len: ir.NodeIndex = ir.null_node;
+        if (is_string_switch) {
+            const ptr_type = try self.type_reg.makePointer(TypeRegistry.U8);
+            subject_ptr = try fb.emitSlicePtr(subject, ptr_type, span);
+            subject_len = try fb.emitSliceLen(subject, span);
+        }
+
+        var result = if (sw.else_body.unwrap()) |eb| try self.lowerExprNode(eb) else try fb.emitConstNull(result_type, span);
+        if (result == ir.null_node) result = try fb.emitConstInt(0, result_type, span);
+
+        const case_extra_indices = self.tree.extraSlice(sw.cases);
+        var i: usize = case_extra_indices.len;
+        while (i > 0) {
+            i -= 1;
+            const case_extra: ast_mod.ExtraIndex = @enumFromInt(case_extra_indices[i]);
+            const case_data = self.tree.extraData(case_extra, ast_mod.SwitchCaseData);
+            const patterns = self.tree.extraSlice(case_data.patterns);
+            var case_cond: ir.NodeIndex = ir.null_node;
+
+            if (case_data.flags.is_range and patterns.len >= 2) {
+                const range_start = try self.lowerExprNode(@enumFromInt(patterns[0]));
+                const range_end = try self.lowerExprNode(@enumFromInt(patterns[1]));
+                const ge_cond = try fb.emitBinary(.ge, subject, range_start, TypeRegistry.BOOL, span);
+                const le_cond = try fb.emitBinary(.le, subject, range_end, TypeRegistry.BOOL, span);
+                case_cond = try fb.emitBinary(.@"and", ge_cond, le_cond, TypeRegistry.BOOL, span);
+            } else {
+                for (patterns) |pat_raw| {
+                    const pat_idx2: Index = @enumFromInt(pat_raw);
+                    const pattern_val = try self.resolveErrorPatternOrLower(pat_idx2, span);
+                    const pattern_cond = if (is_string_switch) blk: {
+                        const ptr_type = try self.type_reg.makePointer(TypeRegistry.U8);
+                        const p_ptr = try fb.emitSlicePtr(pattern_val, ptr_type, span);
+                        const p_len = try fb.emitSliceLen(pattern_val, span);
+                        var eq_args = [_]ir.NodeIndex{ subject_ptr, subject_len, p_ptr, p_len };
+                        const eq_result = try fb.emitCall("string_eq", &eq_args, false, TypeRegistry.I64, span);
+                        const zero2 = try fb.emitConstInt(0, TypeRegistry.I64, span);
+                        break :blk try fb.emitBinary(.ne, eq_result, zero2, TypeRegistry.BOOL, span);
+                    } else try fb.emitBinary(.eq, subject, pattern_val, TypeRegistry.BOOL, span);
+                    case_cond = if (case_cond == ir.null_node) pattern_cond else try fb.emitBinary(.@"or", case_cond, pattern_cond, TypeRegistry.BOOL, span);
+                }
+            }
+
+            if (case_data.guard.unwrap()) |guard_idx| {
+                if (case_cond != ir.null_node) {
+                    const guard_cond = try self.lowerExprNode(guard_idx);
+                    case_cond = try fb.emitBinary(.@"and", case_cond, guard_cond, TypeRegistry.BOOL, span);
+                }
+            }
+
+            const case_val = try self.lowerExprNode(case_data.body);
+            if (case_val == ir.null_node) continue;
+            result = try fb.emitSelect(case_cond, case_val, result, result_type, span);
+        }
+        return result;
+    }
+
+    // ========================================================================
+    // Group 2: Generic/VWT lowering
+    // Ported from compiler/frontend/lower.zig lines 9804-10520
+    // ========================================================================
+
+    fn ensureGenericFnQueued(self: *Lowerer, inst_info_name: []const u8) !void {
+        if (self.lowered_generics.contains(inst_info_name)) return;
+        try self.lowered_generics.put(inst_info_name, {});
+    }
+
+    /// Pre-declare all @inlinable generic function names so hasFunc() returns true during lowering.
+    fn predeclareInlinableGenerics(self: *Lowerer) !void {
+        // Iterate generic instantiations, declare those marked @inlinable
+        var it = self.chk.generics.generic_inst_by_name.valueIterator();
+        while (it.next()) |inst_info| {
+            if (!self.lowered_generics.contains(inst_info.concrete_name)) continue;
+            if (self.builder.hasFunc(inst_info.concrete_name)) continue;
+            const saved = self.tree;
+            self.tree = inst_info.tree;
+            defer self.tree = saved;
+            const fn_node_tag = self.tree.nodeTag(inst_info.generic_node);
+            _ = fn_node_tag;
+            // Check @inlinable annotation from the fn_decl
+            // For compact AST we check the fn decl flags
+            try self.builder.declareFunc(inst_info.concrete_name);
+        }
+    }
+
+    /// Process all queued generic instantiations as top-level functions.
+    fn lowerQueuedGenericFunctions(self: *Lowerer) !void {
+        var pending = std.ArrayListUnmanaged(checker_mod.GenericInstInfo){};
+        defer pending.deinit(self.allocator);
+        var made_progress = true;
+        while (made_progress) {
+            made_progress = false;
+            pending.clearRetainingCapacity();
+            var it = self.chk.generics.generic_inst_by_name.valueIterator();
+            while (it.next()) |inst_info| {
+                if (!self.lowered_generics.contains(inst_info.concrete_name)) continue;
+                const bn = self.computeGenericBaseName(inst_info.concrete_name) catch continue;
+                if (self.builder.hasFunc(bn)) continue;
+                try pending.append(self.allocator, inst_info.*);
+            }
+            for (pending.items) |inst_info| {
+                const bn = self.computeGenericBaseName(inst_info.concrete_name) catch continue;
+                if (self.builder.hasFunc(bn)) continue;
+                try self.lowerGenericFnInstance(inst_info, false);
+                made_progress = true;
+            }
+        }
+    }
+
+    /// Lower one generic function instance (shared body or monomorphized).
+    fn lowerGenericFnInstance(self: *Lowerer, inst_info: checker_mod.GenericInstInfo, is_inlinable: bool) !void {
+        const func_name = if (is_inlinable)
+            inst_info.concrete_name
+        else
+            try self.computeGenericBaseName(inst_info.concrete_name);
+
+        if (self.builder.hasFunc(func_name)) return;
+
+        // Swap to defining file's AST
+        const saved_tree = self.tree;
+        const saved_chk_tree = self.chk.tree;
+        const saved_safe_mode = self.chk.safe_mode;
+        self.tree = inst_info.tree;
+        self.chk.tree = inst_info.tree;
+        if (inst_info.tree.safe_mode) self.chk.safe_mode = true;
+        defer {
+            self.tree = saved_tree;
+            self.chk.tree = saved_chk_tree;
+            self.chk.safe_mode = saved_safe_mode;
+        }
+
+        // For the compact AST, we use the generic_node to get the fn decl
+        const fn_tag = self.tree.nodeTag(inst_info.generic_node);
+        if (fn_tag != .fn_decl) return;
+
+        // Build type substitution map
+        var sub_map = std.StringHashMap(TypeIndex).init(self.allocator);
+        defer sub_map.deinit();
+        for (inst_info.type_param_names, 0..) |param_name, i| {
+            if (i < inst_info.type_args.len) {
+                try sub_map.put(param_name, inst_info.type_args[i]);
+            }
+        }
+        self.type_substitution = sub_map;
+        defer {
+            self.type_substitution = null;
+            self.is_inlinable_body = false;
+        }
+
+        // Use preserved expr_types from checker
+        const saved_expr_types = self.chk.expr_types;
+        if (inst_info.expr_types) |et| {
+            self.chk.expr_types = et;
+        }
+        defer {
+            self.chk.expr_types = saved_expr_types;
+        }
+
+        // Resolve return type and start function
+        const fd = self.tree.fnDeclData(inst_info.generic_node);
+        const return_type = if (fd.return_type.unwrap()) |rt| self.resolveTypeNode(rt) else TypeRegistry.VOID;
+        const uses_sret = self.needsSret(return_type);
+        const wasm_return_type = if (uses_sret) TypeRegistry.VOID else return_type;
+        const span = self.getSpan(inst_info.generic_node);
+
+        self.builder.startFunc(func_name, TypeRegistry.VOID, wasm_return_type, span);
+        if (self.builder.func()) |fb| {
+            if (uses_sret) fb.sret_return_type = return_type;
+            self.current_func = fb;
+            self.cleanup_stack.clear();
+
+            if (uses_sret) {
+                _ = try fb.addParam("__sret", TypeRegistry.I64, 8);
+            }
+
+            if (is_inlinable) {
+                self.is_inlinable_body = true;
+                // Concrete params
+                const param_slice = self.tree.extraSlice(fd.params);
+                for (param_slice) |param_raw| {
+                    const param_idx: Index = @enumFromInt(param_raw);
+                    const param_name = self.tree.tokenSlice(self.tree.nodeMainToken(param_idx));
+                    var param_type = self.resolveParamType(param_idx);
+                    param_type = self.chk.safeWrapType(param_type) catch param_type;
+                    _ = try fb.addParam(param_name, param_type, self.type_reg.sizeOf(param_type));
+                }
+            } else {
+                // Shared body: params + metadata
+                const param_slice = self.tree.extraSlice(fd.params);
+                for (param_slice) |param_raw| {
+                    const param_idx: Index = @enumFromInt(param_raw);
+                    const param_name = self.tree.tokenSlice(self.tree.nodeMainToken(param_idx));
+                    var param_type = self.resolveParamType(param_idx);
+                    param_type = self.chk.safeWrapType(param_type) catch param_type;
+                    _ = try fb.addParam(param_name, param_type, self.type_reg.sizeOf(param_type));
+                }
+                // Metadata params
+                for (inst_info.type_param_names) |pn| {
+                    const meta_name = try std.fmt.allocPrint(self.allocator, "__metadata_{s}", .{pn});
+                    _ = try fb.addParam(meta_name, TypeRegistry.I64, 8);
+                }
+            }
+
+            if (fd.body.unwrap()) |body_idx| {
+                _ = try self.lowerBlockNode(body_idx);
+                if (return_type == TypeRegistry.VOID and fb.needsTerminator()) {
+                    try self.emitCleanups(0);
+                    _ = try fb.emitRet(null, span);
+                }
+            }
+            self.current_func = null;
+        }
+        try self.builder.endFunc();
+    }
+
+    /// Monomorphized generic function lowering.
+    fn lowerGenericFnMonomorphized(self: *Lowerer, inst_info: checker_mod.GenericInstInfo) !void {
+        return self.lowerGenericFnInstance(inst_info, true);
+    }
+
+    /// Check if a return type refers to a generic type parameter.
+    fn isGenericReturnType(self: *Lowerer, return_type_node: Index, type_param_names: []const []const u8) bool {
+        const tag = self.tree.nodeTag(return_type_node);
+        const name = switch (tag) {
+            .ident => self.tree.tokenSlice(self.tree.nodeMainToken(return_type_node)),
+            .type_named => self.tree.tokenSlice(self.tree.nodeMainToken(return_type_node)),
+            else => return false,
+        };
+        for (type_param_names) |pn| {
+            if (std.mem.eql(u8, name, pn)) return true;
+        }
+        return false;
+    }
+
+    /// Check if a parameter is a type parameter (should be passed indirectly).
+    fn isGenericParamIndirect(self: *Lowerer, inst_info: checker_mod.GenericInstInfo, param_idx_val: usize) bool {
+        _ = self;
+        // Check if param type matches a type parameter name
+        _ = inst_info;
+        _ = param_idx_val;
+        return false; // Simplified — full implementation requires AST type node inspection
+    }
+
+    /// Append metadata arguments for a generic call.
+    fn appendMetadataArgs(self: *Lowerer, fb: *ir.FuncBuilder, inst_info: checker_mod.GenericInstInfo, args: *std.ArrayListUnmanaged(ir.NodeIndex), span: Span) !void {
+        if (self.type_substitution != null and !self.is_inlinable_body) {
+            // Forward metadata from enclosing scope
+            for (inst_info.type_args, 0..) |_, i| {
+                const param_name: ?[]const u8 = if (i < inst_info.type_param_names.len) inst_info.type_param_names[i] else null;
+                if (param_name) |pn| {
+                    const meta_local_name = try std.fmt.allocPrint(self.allocator, "__metadata_{s}", .{pn});
+                    if (fb.lookupLocal(meta_local_name)) |meta_local| {
+                        const meta_val = try fb.emitLoadLocal(meta_local, TypeRegistry.I64, span);
+                        try args.append(self.allocator, meta_val);
+                        continue;
+                    }
+                }
+                const meta = try self.emitTypeMetadataRef(fb, inst_info.type_args[i], span);
+                try args.append(self.allocator, meta);
+            }
+        } else {
+            for (inst_info.type_args) |type_arg| {
+                const meta = try self.emitTypeMetadataRef(fb, type_arg, span);
+                try args.append(self.allocator, meta);
+            }
+        }
+    }
+
+    /// Load @sizeOf(T) from metadata parameter at runtime.
+    fn emitLoadSizeFromMetadata(self: *Lowerer, fb: *ir.FuncBuilder, type_arg_node: Index, sub: std.StringHashMap(TypeIndex), span: Span) !?ir.NodeIndex {
+        const tag = self.tree.nodeTag(type_arg_node);
+        const param_name = switch (tag) {
+            .ident => self.tree.tokenSlice(self.tree.nodeMainToken(type_arg_node)),
+            .type_named => self.tree.tokenSlice(self.tree.nodeMainToken(type_arg_node)),
+            else => return null,
+        };
+        if (!sub.contains(param_name)) return null;
+
+        const meta_local_name = try std.fmt.allocPrint(self.allocator, "__metadata_{s}", .{param_name});
+        const meta_local_idx = fb.lookupLocal(meta_local_name) orelse return null;
+        const meta_val = try fb.emitLoadLocal(meta_local_idx, TypeRegistry.I64, span);
+        const size_offset = try fb.emitConstInt(8, TypeRegistry.I64, span);
+        const size_addr = try fb.emitBinary(.add, meta_val, size_offset, TypeRegistry.I64, span);
+        return try fb.emitPtrLoadValue(size_addr, TypeRegistry.I64, span);
+    }
+
+    /// Load runtime size of T from __metadata_{type_param_name} local.
+    fn emitRuntimeSizeOf(self: *Lowerer, fb: *ir.FuncBuilder, type_param_name: []const u8, span: Span) !ir.NodeIndex {
+        const meta_local_name = try std.fmt.allocPrint(self.allocator, "__metadata_{s}", .{type_param_name});
+        const meta_local_idx = fb.lookupLocal(meta_local_name) orelse {
+            return try fb.emitConstInt(8, TypeRegistry.I64, span);
+        };
+        const meta_val = try fb.emitLoadLocal(meta_local_idx, TypeRegistry.I64, span);
+        const size_offset = try fb.emitConstInt(8, TypeRegistry.I64, span);
+        const size_addr = try fb.emitBinary(.add, meta_val, size_offset, TypeRegistry.I64, span);
+        return try fb.emitPtrLoadValue(size_addr, TypeRegistry.I64, span);
+    }
+
+    /// Emit a reference to the __type_metadata_{Type} global for a concrete type.
+    fn emitTypeMetadataRef(self: *Lowerer, fb: *ir.FuncBuilder, type_idx: TypeIndex, span: Span) !ir.NodeIndex {
+        const type_name = self.type_reg.typeName(type_idx);
+        const meta_global = try std.fmt.allocPrint(self.allocator, "__type_metadata_{s}", .{type_name});
+        if (self.builder.lookupGlobal(meta_global)) |gi| {
+            return try fb.emitAddrGlobal(gi.idx, meta_global, TypeRegistry.I64, span);
+        }
+        return try fb.emitConstInt(0, TypeRegistry.I64, span);
+    }
+
+    /// Phase 8.8: Runtime hash dispatch in shared generic bodies.
+    fn emitRuntimeHashDispatch(self: *Lowerer, tp_name: []const u8, base_idx: Index, span: Span) Error!ir.NodeIndex {
+        const fb = self.current_func orelse return ir.null_node;
+        const meta_local_name = try std.fmt.allocPrint(self.allocator, "__metadata_{s}", .{tp_name});
+        const meta_local_idx = fb.lookupLocal(meta_local_name) orelse return ir.null_node;
+        const meta_val = try fb.emitLoadLocal(meta_local_idx, TypeRegistry.I64, span);
+        const hash_offset = try fb.emitConstInt(32, TypeRegistry.I64, span);
+        const hash_fn_addr = try fb.emitBinary(.add, meta_val, hash_offset, TypeRegistry.I64, span);
+        const hash_fn_ptr = try fb.emitPtrLoadValue(hash_fn_addr, TypeRegistry.I64, span);
+
+        const base = try self.lowerExprNode(base_idx);
+        const receiver_addr = blk: {
+            const base_tag = self.tree.nodeTag(base_idx);
+            if (base_tag == .ident) {
+                const name = self.tree.tokenSlice(self.tree.nodeMainToken(base_idx));
+                if (fb.lookupLocal(name)) |local_idx| {
+                    break :blk try fb.emitAddrLocal(local_idx, TypeRegistry.I64, span);
+                }
+            }
+            const tmp = try fb.addLocalWithSize("__hash_recv", TypeRegistry.I64, false, 24);
+            _ = try fb.emitStoreLocal(tmp, base, span);
+            break :blk try fb.emitAddrLocal(tmp, TypeRegistry.I64, span);
+        };
+
+        var hash_args = [_]ir.NodeIndex{receiver_addr};
+        return try fb.emitCallIndirect(hash_fn_ptr, &hash_args, TypeRegistry.I64, span);
+    }
+
+    /// Emit a VWT wrapper under the concrete name that calls the base function.
+    fn emitVWTWrapper(self: *Lowerer, inst_info: checker_mod.GenericInstInfo, base_name: []const u8) !void {
+        if (self.builder.hasFunc(inst_info.concrete_name)) return;
+
+        const saved_tree = self.tree;
+        const saved_chk_tree = self.chk.tree;
+        self.tree = inst_info.tree;
+        self.chk.tree = inst_info.tree;
+        defer {
+            self.tree = saved_tree;
+            self.chk.tree = saved_chk_tree;
+        }
+
+        const fn_tag = self.tree.nodeTag(inst_info.generic_node);
+        if (fn_tag != .fn_decl) return;
+        const fd = self.tree.fnDeclData(inst_info.generic_node);
+        const return_type = if (fd.return_type.unwrap()) |rt| self.resolveTypeNode(rt) else TypeRegistry.VOID;
+        const uses_sret = self.needsSret(return_type);
+        const wasm_return_type = if (uses_sret) TypeRegistry.VOID else return_type;
+        const span = self.getSpan(inst_info.generic_node);
+
+        self.builder.startFunc(inst_info.concrete_name, TypeRegistry.VOID, wasm_return_type, span);
+        if (self.builder.func()) |fb| {
+            if (uses_sret) fb.sret_return_type = return_type;
+            self.current_func = fb;
+            self.cleanup_stack.clear();
+
+            var call_args = std.ArrayListUnmanaged(ir.NodeIndex){};
+            defer call_args.deinit(self.allocator);
+
+            if (uses_sret) {
+                const sret_param = try fb.addParam("__sret", TypeRegistry.I64, 8);
+                const sret_val = try fb.emitLoadLocal(sret_param, TypeRegistry.I64, span);
+                try call_args.append(self.allocator, sret_val);
+            }
+
+            // Metadata args for each type param
+            for (inst_info.type_args) |type_arg| {
+                const meta = try self.emitTypeMetadataRef(fb, type_arg, span);
+                try call_args.append(self.allocator, meta);
+            }
+
+            // Regular params
+            const param_slice = self.tree.extraSlice(fd.params);
+            for (param_slice) |param_raw| {
+                const param_idx: Index = @enumFromInt(param_raw);
+                const param_name = self.tree.tokenSlice(self.tree.nodeMainToken(param_idx));
+                var param_type = self.resolveParamType(param_idx);
+                param_type = self.chk.safeWrapType(param_type) catch param_type;
+                const p = try fb.addParam(param_name, param_type, self.type_reg.sizeOf(param_type));
+                const v = try fb.emitLoadLocal(p, param_type, span);
+                try call_args.append(self.allocator, v);
+            }
+
+            const result = try fb.emitCall(base_name, call_args.items, false, wasm_return_type, span);
+            if (wasm_return_type == TypeRegistry.VOID) {
+                _ = try fb.emitRet(null, span);
+            } else {
+                _ = try fb.emitRet(result, span);
+            }
             self.current_func = null;
         }
         try self.builder.endFunc();
