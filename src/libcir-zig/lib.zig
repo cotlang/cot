@@ -27,6 +27,7 @@ pub const pass_cse = @import("ssa/passes/cse.zig");
 pub const pass_async_split = @import("ssa/passes/async_split.zig");
 pub const pass_layout = @import("ssa/passes/layout.zig");
 pub const pass_region_isolation = @import("ssa/passes/region_isolation.zig");
+pub const wasm = @import("wasm/wasm.zig");
 
 test {
     _ = ir;
@@ -53,4 +54,5 @@ test {
     _ = pass_async_split;
     _ = pass_layout;
     _ = pass_region_isolation;
+    _ = wasm;
 }
