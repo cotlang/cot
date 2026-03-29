@@ -13,13 +13,13 @@
 
 const std = @import("std");
 const ast = @import("ast.zig");
-const types_mod = @import("types.zig");
-const errors = @import("errors.zig");
-const source = @import("source.zig");
-const tok = @import("token.zig");
-const comptime_mod = @import("comptime.zig");
-const target_mod = @import("target.zig");
-const debug = @import("debug.zig");
+const types_mod = @import("foundation").types;
+const errors = @import("foundation").errors;
+const source = @import("foundation").source;
+const tok = @import("foundation").token;
+const comptime_mod = @import("foundation").comptime_val;
+const target_mod = @import("foundation").target;
+const debug = @import("foundation").debug;
 
 pub const ComptimeValue = comptime_mod.ComptimeValue;
 

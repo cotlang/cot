@@ -12,14 +12,14 @@
 
 const std = @import("std");
 const ast_mod = @import("ast.zig");
-const ir = @import("ir.zig");
-const types_mod = @import("types.zig");
-const source_mod = @import("source.zig");
-const errors_mod = @import("errors.zig");
+const ir = @import("cir").ir;
+const types_mod = @import("foundation").types;
+const source_mod = @import("foundation").source;
+const errors_mod = @import("foundation").errors;
 const checker_mod = @import("checker.zig");
-const comptime_mod = @import("comptime.zig");
-const target_mod = @import("target.zig");
-const token_mod = @import("token.zig");
+const comptime_mod = @import("foundation").comptime_val;
+const target_mod = @import("foundation").target;
+const token_mod = @import("foundation").token;
 
 const Token = token_mod.Token;
 

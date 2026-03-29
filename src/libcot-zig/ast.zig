@@ -15,8 +15,8 @@
 //! unpack the compact representation into ergonomic structs on the stack.
 
 const std = @import("std");
-const source = @import("source.zig");
-const tok = @import("token.zig");
+const source = @import("foundation").source;
+const tok = @import("foundation").token;
 
 const Span = source.Span;
 const Pos = source.Pos;
@@ -434,7 +434,7 @@ pub const StructDecl = struct {
     doc_comment: OptionalTokenIndex,
 };
 
-pub const StructLayout = enum(u32) { auto = 0, @"packed" = 1, @"extern" = 2 };
+pub const StructLayout = @import("foundation").types.StructLayout;
 
 pub const StructFlags = packed struct(u32) {
     is_actor: bool = false,

@@ -14,8 +14,8 @@
 //!   Builder    — top-level IR builder managing functions, globals, structs
 
 const std = @import("std");
-const types_mod = @import("types.zig");
-const source_mod = @import("source.zig");
+const types_mod = @import("foundation").types;
+const source_mod = @import("foundation").source;
 
 const TypeIndex = types_mod.TypeIndex;
 const TypeRegistry = types_mod.TypeRegistry;

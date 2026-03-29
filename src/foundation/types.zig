@@ -9,7 +9,13 @@
 //! ARC dispatch — see ValueWitnessTable and TypeMetadata at the bottom.
 
 const std = @import("std");
-const ast = @import("ast.zig");
+
+/// Optional reference to an AST node. Used for default values in struct fields.
+/// Equivalent to ast.OptionalIndex but defined here to avoid circular dependency.
+pub const NodeRef = enum(u32) {
+    none = std.math.maxInt(u32),
+    _,
+};
 
 /// Index into the type registry. Wrapped in enum(u32) for type safety.
 pub const TypeIndex = enum(u32) {
@@ -150,10 +156,10 @@ pub const StructField = struct {
     offset: u32,
     bit_offset: u8 = 0,
     bit_width: u8 = 0,
-    default_value: ast.OptionalIndex = .none,
+    default_value: NodeRef = .none,
 };
 
-pub const StructLayout = ast.StructLayout;
+pub const StructLayout = enum { auto, @"packed", @"extern" };
 
 pub const StructType = struct {
     name: []const u8,
