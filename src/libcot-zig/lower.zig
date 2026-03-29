@@ -987,6 +987,19 @@ pub const Lowerer = struct {
         const span = self.getSpan(idx);
 
         if (tag == .return_void) {
+            // Implicit return from error!void functions: return success error union (tag=0)
+            const ret_type = fb.return_type;
+            const ret_type_info = self.type_reg.get(ret_type);
+            if (ret_type_info == .error_union) {
+                const eu_size = self.type_reg.sizeOf(ret_type);
+                const tmp_local = try fb.addLocalWithSize("__ret_eu", ret_type, false, eu_size);
+                const tag_zero = try fb.emitConstInt(0, TypeRegistry.I64, span);
+                _ = try fb.emitStoreLocalField(tmp_local, 0, 0, tag_zero, span);
+                const eu_ptr = try fb.emitAddrLocal(tmp_local, TypeRegistry.I64, span);
+                try self.emitCleanups(0);
+                _ = try fb.emitRet(eu_ptr, span);
+                return;
+            }
             try self.emitCleanups(0);
             _ = try fb.emitRet(null, span);
             return;
@@ -996,35 +1009,207 @@ pub const Lowerer = struct {
         const data = self.tree.nodeData(idx);
         const value_idx = data.node;
 
-        // Simple path: lower value, emit cleanups, return
-        const value_node = try self.lowerExprNode(value_idx);
-        if (value_node == ir.null_node) {
-            try self.emitCleanups(0);
+        // Track whether this return is an error path (for errdefer)
+        var is_error_return = false;
+        var value_node: ?ir.NodeIndex = null;
+
+        // Check if value is an error literal
+        const value_tag = self.tree.nodeTag(value_idx);
+        const is_error_literal = (value_tag == .error_literal);
+        const ret_type = fb.return_type;
+        const ret_type_info = self.type_reg.get(ret_type);
+        const is_error_union_fn = ret_type_info == .error_union;
+
+        if (is_error_literal and is_error_union_fn) {
+            // error.X in error union function
+            is_error_return = true;
+            const lowered = try self.lowerExprNode(value_idx);
+            if (lowered != ir.null_node) value_node = lowered;
+        } else if (is_error_union_fn) {
+            // Success value in error union function — wrap as tag=0, payload=value
+            const lowered = try self.lowerExprNode(value_idx);
+            if (lowered != ir.null_node) {
+                const eu_size = self.type_reg.sizeOf(ret_type);
+                const tmp_local = try fb.addLocalWithSize("__ret_eu", ret_type, false, eu_size);
+                const tag_zero = try fb.emitConstInt(0, TypeRegistry.I64, span);
+                _ = try fb.emitStoreLocalField(tmp_local, 0, 0, tag_zero, span);
+                // Check if payload is compound (string = ptr+len)
+                const eu_elem = ret_type_info.error_union.elem;
+                if (eu_elem == TypeRegistry.STRING) {
+                    const ptr_type = self.type_reg.makePointer(TypeRegistry.U8) catch TypeRegistry.VOID;
+                    const ptr_val = try fb.emitSlicePtr(lowered, ptr_type, span);
+                    const len_val = try fb.emitSliceLen(lowered, span);
+                    _ = try fb.emitStoreLocalField(tmp_local, 1, 8, ptr_val, span);
+                    _ = try fb.emitStoreLocalField(tmp_local, 2, 16, len_val, span);
+                } else {
+                    _ = try fb.emitStoreLocalField(tmp_local, 1, 8, lowered, span);
+                }
+                value_node = try fb.emitAddrLocal(tmp_local, TypeRegistry.I64, span);
+            }
+        } else if (fb.sret_return_type) |sret_type| {
+            const sret_info = self.type_reg.get(sret_type);
+            if (sret_info == .optional and !self.isPtrLikeOptional(sret_type)) {
+                // Compound optional return: write tag+payload to __sret buffer
+                const sret_idx_opt = fb.lookupLocal("__sret").?;
+                const sret_ptr_opt = try fb.emitLoadLocal(sret_idx_opt, TypeRegistry.I64, span);
+
+                // Detect null literal return
+                const is_null_return = (value_tag == .literal_null);
+
+                if (is_null_return) {
+                    const tag_zero = try fb.emitConstInt(0, TypeRegistry.I64, span);
+                    _ = try fb.emitStoreField(sret_ptr_opt, 0, 0, tag_zero, span);
+                } else {
+                    const lowered = try self.lowerExprNode(value_idx);
+                    if (lowered != ir.null_node) {
+                        const ret_expr_type = self.inferExprType(value_idx);
+                        const ret_expr_info = self.type_reg.get(ret_expr_type);
+                        if (ret_expr_info == .optional) {
+                            // Already ?T — forward compound (copy all words)
+                            const sret_size = self.type_reg.sizeOf(sret_type);
+                            const num_words: u32 = sret_size / 8;
+                            const tmp_local = try fb.addLocalWithSize("__ret_opt_src", sret_type, false, sret_size);
+                            _ = try fb.emitStoreLocal(tmp_local, lowered, span);
+                            for (0..num_words) |i| {
+                                const offset: i64 = @intCast(i * 8);
+                                const field = try fb.emitFieldLocal(tmp_local, @intCast(i), offset, TypeRegistry.I64, span);
+                                _ = try fb.emitStoreField(sret_ptr_opt, @intCast(i), offset, field, span);
+                            }
+                        } else {
+                            // Plain T → wrap as tag=1, payload=value
+                            const tag_one = try fb.emitConstInt(1, TypeRegistry.I64, span);
+                            _ = try fb.emitStoreField(sret_ptr_opt, 0, 0, tag_one, span);
+                            _ = try fb.emitStoreField(sret_ptr_opt, 1, 8, lowered, span);
+                        }
+                    }
+                }
+
+                // Forward ownership before cleanup
+                if (value_tag == .ident) {
+                    const name = self.tree.tokenSlice(self.tree.nodeMainToken(value_idx));
+                    if (fb.lookupLocal(name)) |local_idx| {
+                        _ = self.cleanup_stack.disableForLocal(local_idx);
+                    }
+                }
+
+                if (self.hasDeferCleanups()) {
+                    try self.emitCleanups(0);
+                }
+                _ = try fb.emitRet(null, span); // void return — SRET
+                return;
+            }
+
+            // SRET: write return value to caller-allocated buffer via __sret pointer
+            const sret_size = self.type_reg.sizeOf(sret_type);
+            const sret_idx = fb.lookupLocal("__sret").?;
+            const sret_ptr = try fb.emitLoadLocal(sret_idx, TypeRegistry.I64, span);
+            const num_words = sret_size / 8;
+
+            // Check if return expr is an ident (for local field copy)
+            if (value_tag == .ident) {
+                const name = self.tree.tokenSlice(self.tree.nodeMainToken(value_idx));
+                if (fb.lookupLocal(name)) |src_local| {
+                    // Swift ensurePlusOne: retain ARC fields before copy
+                    if (!self.target.isWasm() and self.type_reg.couldBeARC(sret_type)) {
+                        const src_val = try fb.emitLoadLocal(src_local, sret_type, span);
+                        _ = try self.emitCopyValue(fb, src_val, sret_type, span);
+                    }
+                    for (0..num_words) |i| {
+                        const offset: i64 = @intCast(i * 8);
+                        const field = try fb.emitFieldLocal(src_local, @intCast(i), offset, TypeRegistry.I64, span);
+                        _ = try fb.emitStoreField(sret_ptr, @intCast(i), offset, field, span);
+                    }
+                    _ = self.cleanup_stack.disableForLocal(src_local);
+                    if (self.hasDeferCleanups()) {
+                        try self.emitCleanups(0);
+                    }
+                    _ = try fb.emitRet(null, span);
+                    return;
+                }
+            }
+
+            {
+                const lowered2 = try self.lowerExprNode(value_idx);
+                if (lowered2 != ir.null_node) {
+                    if (!self.target.isWasm() and self.type_reg.couldBeARC(sret_type)) {
+                        _ = try self.emitCopyValue(fb, lowered2, sret_type, span);
+                    }
+                    const tmp_local = try fb.addLocalWithSize("__ret_sret_src", sret_type, false, sret_size);
+                    _ = try fb.emitStoreLocal(tmp_local, lowered2, span);
+                    for (0..num_words) |i| {
+                        const offset: i64 = @intCast(i * 8);
+                        const field = try fb.emitFieldLocal(tmp_local, @intCast(i), offset, TypeRegistry.I64, span);
+                        _ = try fb.emitStoreField(sret_ptr, @intCast(i), offset, field, span);
+                    }
+                }
+            }
+
+            // Forward ownership before cleanup
+            if (value_tag == .ident) {
+                const name = self.tree.tokenSlice(self.tree.nodeMainToken(value_idx));
+                if (fb.lookupLocal(name)) |local_idx| {
+                    _ = self.cleanup_stack.disableForLocal(local_idx);
+                }
+            }
+
+            if (self.hasDeferCleanups()) {
+                try self.emitCleanups(0);
+            }
             _ = try fb.emitRet(null, span);
             return;
+        } else {
+            // Normal return path
+            const lowered = try self.lowerExprNode(value_idx);
+            if (lowered != ir.null_node) {
+                // Swift ensurePlusOne: retain +0 values for caller
+                if (!self.target.isWasm() and self.type_reg.couldBeARC(ret_type)) {
+                    value_node = try self.emitCopyValue(fb, lowered, ret_type, span);
+                } else {
+                    value_node = lowered;
+                }
+            }
+
+            // Forward ownership: if return expression is an ident with a local cleanup
+            if (value_tag == .ident) {
+                const name = self.tree.tokenSlice(self.tree.nodeMainToken(value_idx));
+                if (fb.lookupLocal(name)) |local_idx| {
+                    _ = self.cleanup_stack.disableForLocal(local_idx);
+                }
+            }
         }
 
-        // SRET path
-        if (fb.sret_return_type) |_| {
-            // TODO: full SRET return handling (compound copy to __sret pointer)
-            try self.emitCleanups(0);
-            _ = try fb.emitRet(null, span);
-            return;
+        // Handle implicit return from error!void functions
+        if (value_node == null) {
+            if (ret_type_info == .error_union) {
+                const eu_size = self.type_reg.sizeOf(ret_type);
+                const tmp_local = try fb.addLocalWithSize("__ret_eu", ret_type, false, eu_size);
+                const tag_zero = try fb.emitConstInt(0, TypeRegistry.I64, span);
+                _ = try fb.emitStoreLocalField(tmp_local, 0, 0, tag_zero, span);
+                value_node = try fb.emitAddrLocal(tmp_local, TypeRegistry.I64, span);
+            }
         }
 
-        // Check for defers — capture return value first
-        if (self.hasDeferCleanups()) {
-            const ret_type = fb.return_type;
+        // Capture return value if defers on stack
+        if (value_node != null and self.hasDeferCleanups()) {
+            const ret_val = value_node.?;
             const ret_size = self.type_reg.sizeOf(ret_type);
             const tmp_local = try fb.addLocalWithSize("__ret_tmp", ret_type, false, ret_size);
-            _ = try fb.emitStoreLocal(tmp_local, value_node, span);
-            try self.emitCleanups(0);
-            const loaded = try fb.emitLoadLocal(tmp_local, ret_type, span);
-            _ = try fb.emitRet(loaded, span);
+            _ = try fb.emitStoreLocal(tmp_local, ret_val, span);
+            if (is_error_return) {
+                try self.emitCleanupsErrorPath(0);
+            } else {
+                try self.emitCleanups(0);
+            }
+            value_node = try fb.emitLoadLocal(tmp_local, ret_type, span);
+            _ = try fb.emitRet(value_node, span);
             return;
         }
 
-        try self.emitCleanups(0);
+        if (is_error_return) {
+            try self.emitCleanupsErrorPath(0);
+        } else {
+            try self.emitCleanups(0);
+        }
         _ = try fb.emitRet(value_node, span);
     }
 
@@ -1036,6 +1221,19 @@ pub const Lowerer = struct {
         var type_idx = TypeRegistry.VOID;
         if (vd.type_expr.unwrap()) |te| {
             type_idx = self.resolveTypeNode(te);
+            // @safe coercion: checker upgrades `var p: Foo = new Foo{...}` to *Foo,
+            // but resolveTypeNode returns raw Foo from AST. Match the checker's coercion.
+            if (self.chk.safe_mode) {
+                if (vd.value.unwrap()) |ve| {
+                    const val_type = self.inferExprType(ve);
+                    if (val_type != TypeRegistry.VOID) {
+                        const val_info = self.type_reg.get(val_type);
+                        if (val_info == .pointer and val_info.pointer.elem == type_idx) {
+                            type_idx = val_type;
+                        }
+                    }
+                }
+            }
         } else if (vd.value.unwrap()) |ve| {
             type_idx = self.inferExprType(ve);
         }
@@ -1046,28 +1244,172 @@ pub const Lowerer = struct {
         if (vd.value.unwrap()) |value_idx| {
             const value_tag = self.tree.nodeTag(value_idx);
 
-            // undefined / .{} zero init
+            // undefined / .{} zero init — zero memory
             if (value_tag == .literal_undefined or value_tag == .zero_init) {
                 const ptr_type = self.type_reg.makePointer(TypeRegistry.U8) catch TypeRegistry.VOID;
                 const local_addr = try fb.emitAddrLocal(local_idx, ptr_type, span);
                 const size_node = try fb.emitConstInt(@intCast(size), TypeRegistry.I64, span);
                 var args = [_]ir.NodeIndex{ local_addr, size_node };
                 _ = try fb.emitCall("memset_zero", &args, false, TypeRegistry.VOID, span);
+
+                // Register ARC release cleanup for zero-init collections/structs with ARC fields
+                if (value_tag == .zero_init) {
+                    if (!self.target.isWasm() and self.type_reg.couldBeARC(type_idx)) {
+                        const loaded = try fb.emitLoadLocal(local_idx, type_idx, span);
+                        const cleanup = Cleanup.initForLocal(.release, loaded, type_idx, local_idx);
+                        _ = try self.cleanup_stack.push(cleanup);
+                    }
+                }
                 return;
             }
 
-            // General case: lower the value and store
-            const value_node = try self.lowerExprNode(value_idx);
-            if (value_node != ir.null_node) {
-                // String compound init
-                if (type_idx == TypeRegistry.STRING) {
+            // Existential coercion: concrete → any Trait
+            if (self.type_reg.get(type_idx) == .existential) {
+                const value_node = try self.lowerExprNode(value_idx);
+                if (value_node == ir.null_node) return;
+                // If source is already existential, just store directly (copy, not erasure)
+                _ = try fb.emitStoreLocal(local_idx, value_node, span);
+                if (!self.target.isWasm()) {
+                    const loaded = try fb.emitLoadLocal(local_idx, type_idx, span);
+                    const cleanup = Cleanup.initForLocal(.release, loaded, type_idx, local_idx);
+                    _ = try self.cleanup_stack.push(cleanup);
+                }
+                return;
+            }
+
+            const is_struct_literal = (value_tag == .struct_init or value_tag == .struct_init_one);
+            const is_tuple_literal = (value_tag == .tuple_literal);
+
+            // String init: compound decomposition (ptr+len)
+            if (type_idx == TypeRegistry.STRING) {
+                const value_node = try self.lowerExprNode(value_idx);
+                if (value_node != ir.null_node) {
                     const ptr_type = self.type_reg.makePointer(TypeRegistry.U8) catch TypeRegistry.VOID;
                     const ptr_val = try fb.emitSlicePtr(value_node, ptr_type, span);
                     const len_val = try fb.emitSliceLen(value_node, span);
                     _ = try fb.emitStoreLocalField(local_idx, 0, 0, ptr_val, span);
                     _ = try fb.emitStoreLocalField(local_idx, 1, 8, len_val, span);
-                } else {
+                }
+                return;
+            }
+
+            // Array init
+            if (self.type_reg.isArray(type_idx)) {
+                const value_node = try self.lowerExprNode(value_idx);
+                if (value_node != ir.null_node) {
                     _ = try fb.emitStoreLocal(local_idx, value_node, span);
+                }
+                // Register ARC release cleanup for arrays with ARC elements
+                if (!self.target.isWasm() and self.type_reg.couldBeARC(type_idx)) {
+                    const loaded = try fb.emitLoadLocal(local_idx, type_idx, span);
+                    const cleanup = Cleanup.initForLocal(.release, loaded, type_idx, local_idx);
+                    _ = try self.cleanup_stack.push(cleanup);
+                }
+                return;
+            }
+
+            // Slice init
+            if (self.type_reg.isSlice(type_idx)) {
+                const value_node = try self.lowerExprNode(value_idx);
+                if (value_node != ir.null_node) {
+                    _ = try fb.emitStoreLocal(local_idx, value_node, span);
+                }
+                return;
+            }
+
+            // Struct literal init
+            if (is_struct_literal) {
+                const value_node = try self.lowerExprNode(value_idx);
+                if (value_node != ir.null_node) {
+                    _ = try fb.emitStoreLocal(local_idx, value_node, span);
+                }
+                // Register ARC release cleanup for structs with ARC fields
+                if (!self.target.isWasm() and self.type_reg.couldBeARC(type_idx)) {
+                    const loaded = try fb.emitLoadLocal(local_idx, type_idx, span);
+                    const cleanup = Cleanup.initForLocal(.release, loaded, type_idx, local_idx);
+                    _ = try self.cleanup_stack.push(cleanup);
+                }
+                return;
+            }
+
+            // Tuple literal init
+            if (is_tuple_literal) {
+                const value_node = try self.lowerExprNode(value_idx);
+                if (value_node != ir.null_node) {
+                    _ = try fb.emitStoreLocal(local_idx, value_node, span);
+                }
+                if (!self.target.isWasm() and self.type_reg.couldBeARC(type_idx)) {
+                    const loaded = try fb.emitLoadLocal(local_idx, type_idx, span);
+                    const cleanup = Cleanup.initForLocal(.release, loaded, type_idx, local_idx);
+                    _ = try self.cleanup_stack.push(cleanup);
+                }
+                return;
+            }
+
+            // Union init
+            if (self.type_reg.get(type_idx) == .union_type) {
+                const value_node = try self.lowerExprNode(value_idx);
+                if (value_node != ir.null_node) {
+                    _ = try fb.emitStoreLocal(local_idx, value_node, span);
+                }
+                return;
+            }
+
+            // Compound optional init: T → ?T wrapping
+            if (self.type_reg.get(type_idx) == .optional and !self.isPtrLikeOptional(type_idx)) {
+                const is_null_init = (value_tag == .literal_null);
+                if (is_null_init) {
+                    // null → tag=0 (payload left uninitialized)
+                    const tag_zero = try fb.emitConstInt(0, TypeRegistry.I64, span);
+                    _ = try fb.emitStoreLocalField(local_idx, 0, 0, tag_zero, span);
+                } else {
+                    const value_node = try self.lowerExprNode(value_idx);
+                    if (value_node == ir.null_node) return;
+                    // Check if lowered is const_null
+                    const is_lowered_null = fb.nodes.items[value_node].data == .const_null;
+                    if (is_lowered_null) {
+                        const tag_zero = try fb.emitConstInt(0, TypeRegistry.I64, span);
+                        _ = try fb.emitStoreLocalField(local_idx, 0, 0, tag_zero, span);
+                    } else {
+                        const value_type = self.inferExprType(value_idx);
+                        const value_info = self.type_reg.get(value_type);
+                        if (value_info == .optional) {
+                            // Already ?T (from function call SRET) — compound copy
+                            _ = try fb.emitStoreLocal(local_idx, value_node, span);
+                        } else {
+                            // Plain T → wrap as tag=1, payload=value
+                            const tag_one = try fb.emitConstInt(1, TypeRegistry.I64, span);
+                            _ = try fb.emitStoreLocalField(local_idx, 0, 0, tag_one, span);
+                            _ = try fb.emitStoreLocalField(local_idx, 1, 8, value_node, span);
+                        }
+                    }
+                }
+                // Register ARC cleanup for compound optionals with managed payloads
+                if (!self.target.isWasm() and self.type_reg.couldBeARC(type_idx)) {
+                    const loaded = try fb.emitLoadLocal(local_idx, type_idx, span);
+                    const cleanup = Cleanup.initForLocal(.release, loaded, type_idx, local_idx);
+                    _ = try self.cleanup_stack.push(cleanup);
+                }
+                return;
+            }
+
+            // General case: lower the value and store
+            {
+                if (!self.target.isWasm() and self.type_reg.couldBeARC(type_idx)) {
+                    // ARC path: copy value for ownership
+                    const value_node = try self.lowerExprNode(value_idx);
+                    if (value_node != ir.null_node) {
+                        _ = try self.emitCopyValue(fb, value_node, type_idx, span);
+                        _ = try fb.emitStoreLocal(local_idx, value_node, span);
+                        const cleanup = Cleanup.initForLocal(.release, value_node, type_idx, local_idx);
+                        _ = try self.cleanup_stack.push(cleanup);
+                    }
+                } else {
+                    // Non-ARC path (trivial types)
+                    const value_node = try self.lowerExprNode(value_idx);
+                    if (value_node != ir.null_node) {
+                        _ = try fb.emitStoreLocal(local_idx, value_node, span);
+                    }
                 }
             }
         }
@@ -1678,33 +2020,339 @@ pub const Lowerer = struct {
         const cd = self.tree.callData(idx);
         const span = self.getSpan(idx);
 
-        // Resolve callee name
         const callee_tag = self.tree.nodeTag(cd.callee);
+
+        // Distinct type constructor: RawPtr(expr) — zero-cost, just lower the argument
         if (callee_tag == .ident) {
-            const func_name = self.tree.tokenSlice(self.tree.nodeMainToken(cd.callee));
-            const resolved_name = try self.resolveCallName(func_name);
+            const callee_name = self.tree.tokenSlice(self.tree.nodeMainToken(cd.callee));
+            if (self.type_reg.lookupByName(callee_name)) |type_idx| {
+                if (self.type_reg.get(type_idx) == .distinct) {
+                    // Single arg = just lower it
+                    if (cd.single_arg.unwrap()) |single| return try self.lowerExprNode(single);
+                    const arg_indices = self.tree.extraNodes(cd.args);
+                    if (arg_indices.len == 1) return try self.lowerExprNode(arg_indices[0]);
+                    return ir.null_node;
+                }
+            }
+        }
 
-            // Collect args
-            var args_list = std.ArrayListUnmanaged(ir.NodeIndex){};
-            defer args_list.deinit(self.allocator);
+        // Method call (value.method(...))
+        if (callee_tag == .field_access) {
+            const fa_data = self.tree.nodeData(cd.callee);
+            const base_idx = fa_data.node_and_token[0];
+            const field_token = fa_data.node_and_token[1];
+            const field_name = self.tree.tokenSlice(field_token);
 
-            if (cd.single_arg.unwrap()) |single| {
-                const arg = try self.lowerExprNode(single);
-                try args_list.append(self.allocator, arg);
-            } else {
-                const arg_indices = self.tree.extraNodes(cd.args);
-                for (arg_indices) |arg_idx| {
-                    const arg = try self.lowerExprNode(arg_idx);
-                    try args_list.append(self.allocator, arg);
+            const base_type_idx = self.inferExprType(base_idx);
+            const base_type = self.type_reg.get(base_type_idx);
+            const type_name: ?[]const u8 = switch (base_type) {
+                .struct_type => |s| s.name,
+                .enum_type => |et| et.name,
+                .pointer => |p| blk: {
+                    const elem = self.type_reg.get(p.elem);
+                    if (elem == .struct_type) break :blk elem.struct_type.name;
+                    if (elem == .enum_type) break :blk elem.enum_type.name;
+                    if (elem == .list) break :blk @as(?[]const u8, "List");
+                    if (elem == .map) break :blk @as(?[]const u8, "Map");
+                    break :blk null;
+                },
+                .basic => |bk| bk.name(),
+                .slice => if (base_type_idx == TypeRegistry.STRING) "string" else null,
+                .list => "List",
+                .map => "Map",
+                else => null,
+            };
+
+            if (type_name) |tname| {
+                if (self.chk.lookupMethod(tname, field_name)) |method_info| {
+                    return try self.lowerMethodCall(idx, base_idx, field_name, method_info, tname);
                 }
             }
 
-            const result_type = self.inferExprType(idx);
-            return fb.emitCall(resolved_name, args_list.items, false, result_type, span);
+            // Union variant constructor: Result.Ok(42)
+            if (base_type == .union_type) {
+                for (base_type.union_type.variants, 0..) |v, i| {
+                    if (std.mem.eql(u8, v.name, field_name)) {
+                        const union_size = self.type_reg.sizeOf(base_type_idx);
+                        if (union_size > 8) {
+                            const tmp_local = try fb.addLocalWithSize("__union_tmp", base_type_idx, false, union_size);
+                            const tag_val = try fb.emitConstInt(@intCast(i), TypeRegistry.I64, span);
+                            _ = try fb.emitStoreLocalField(tmp_local, 0, 0, tag_val, span);
+                            // Lower payload arg
+                            if (cd.single_arg.unwrap()) |single| {
+                                const payload_val = try self.lowerExprNode(single);
+                                _ = try fb.emitStoreLocalField(tmp_local, 1, 8, payload_val, span);
+                            } else {
+                                const arg_indices = self.tree.extraNodes(cd.args);
+                                if (arg_indices.len > 0) {
+                                    const payload_val = try self.lowerExprNode(arg_indices[0]);
+                                    _ = try fb.emitStoreLocalField(tmp_local, 1, 8, payload_val, span);
+                                }
+                            }
+                            return try fb.emitLoadLocal(tmp_local, base_type_idx, span);
+                        }
+                        // Small union
+                        var payload: ?ir.NodeIndex = null;
+                        if (cd.single_arg.unwrap()) |single| {
+                            payload = try self.lowerExprNode(single);
+                        } else {
+                            const arg_indices = self.tree.extraNodes(cd.args);
+                            if (arg_indices.len > 0) payload = try self.lowerExprNode(arg_indices[0]);
+                        }
+                        return try fb.emitUnionInit(@intCast(i), payload, base_type_idx, span);
+                    }
+                }
+                return ir.null_node;
+            }
         }
 
-        // TODO: method calls, indirect calls
+        // Generic function call: max(i64)(3, 5) — callee is a type_generic (the inner call)
+        if (callee_tag == .type_generic) {
+            // Look up generic instantiation from checker
+            if (self.chk.generic_instantiations.get(cd.callee)) |inst_info| {
+                try self.ensureGenericFnQueued(inst_info);
+                // Lower value arguments
+                var gen_args = std.ArrayListUnmanaged(ir.NodeIndex){};
+                defer gen_args.deinit(self.allocator);
+
+                // Collect args
+                if (cd.single_arg.unwrap()) |single| {
+                    const arg = try self.lowerExprNode(single);
+                    try gen_args.append(self.allocator, arg);
+                } else {
+                    const arg_indices = self.tree.extraNodes(cd.args);
+                    for (arg_indices) |arg_idx| {
+                        const arg = try self.lowerExprNode(arg_idx);
+                        if (arg != ir.null_node) try gen_args.append(self.allocator, arg);
+                    }
+                }
+
+                // Get concrete return type
+                const concrete_func_type = blk: {
+                    if (self.chk.scope.lookup(inst_info.concrete_name)) |sym| break :blk sym.type_idx;
+                    break :blk self.type_reg.lookupByName(inst_info.concrete_name) orelse TypeRegistry.VOID;
+                };
+                const concrete_info = self.type_reg.get(concrete_func_type);
+                const ret_type = if (concrete_info == .func) concrete_info.func.return_type else TypeRegistry.VOID;
+
+                // VWT base-name sharing: call sites use the BASE name (shared body)
+                const call_target = self.computeGenericBaseName(inst_info.concrete_name) catch inst_info.concrete_name;
+
+                // SRET for generic function calls
+                if (self.needsSret(ret_type)) {
+                    const ret_size = self.type_reg.sizeOf(ret_type);
+                    const sret_local = try fb.getOrCreateSretLocal(ret_type, ret_size);
+                    const sret_addr = try fb.emitAddrLocal(sret_local, TypeRegistry.I64, span);
+                    var sret_args = std.ArrayListUnmanaged(ir.NodeIndex){};
+                    defer sret_args.deinit(self.allocator);
+                    try sret_args.append(self.allocator, sret_addr);
+                    try sret_args.appendSlice(self.allocator, gen_args.items);
+                    _ = try fb.emitCall(call_target, sret_args.items, false, TypeRegistry.VOID, span);
+                    return try fb.emitLoadLocal(sret_local, ret_type, span);
+                }
+                return try fb.emitCall(call_target, gen_args.items, false, ret_type, span);
+            }
+        }
+
+        // Regular function call
+        if (callee_tag == .ident) {
+            const func_name = self.tree.tokenSlice(self.tree.nodeMainToken(cd.callee));
+
+            // Get function type for parameter checking
+            const func_type_idx = self.inferExprType(cd.callee);
+            const func_type_info = self.type_reg.get(func_type_idx);
+            const param_types: ?[]const types_mod.FuncParam = if (func_type_info == .func) func_type_info.func.params else null;
+
+            var args = std.ArrayListUnmanaged(ir.NodeIndex){};
+            defer args.deinit(self.allocator);
+
+            // Collect args into a list
+            var arg_list = try self.collectCallArgsList(cd);
+            defer arg_list.deinit(self.allocator);
+            for (arg_list.items, 0..) |arg_idx, arg_i| {
+                var arg_node = try self.lowerExprNode(arg_idx);
+                if (arg_node == ir.null_node) continue;
+
+                // Determine parameter type for ABI decomposition
+                var param_is_pointer = false;
+                var param_is_compound = false;
+                if (param_types) |params| {
+                    if (arg_i < params.len) {
+                        const param_type = self.type_reg.get(params[arg_i].type_idx);
+                        param_is_pointer = (param_type == .pointer);
+                        param_is_compound = (param_type == .slice) or (params[arg_i].type_idx == TypeRegistry.STRING);
+                    }
+                }
+
+                // @safe auto-ref: pass struct value as pointer to *Struct param
+                if (self.chk.safe_mode and param_is_pointer) {
+                    if (param_types) |params| {
+                        if (arg_i < params.len) {
+                            const param_info = self.type_reg.get(params[arg_i].type_idx);
+                            if (param_info == .pointer) {
+                                const arg_type = self.inferExprType(arg_idx);
+                                const arg_info = self.type_reg.get(arg_type);
+                                if ((arg_info == .struct_type or arg_info == .union_type) and self.type_reg.isAssignable(arg_type, param_info.pointer.elem)) {
+                                    if (!self.target.isWasmGC()) {
+                                        const ptr_type = self.type_reg.makePointer(arg_type) catch TypeRegistry.I64;
+                                        const arg_tag = self.tree.nodeTag(arg_idx);
+                                        if (arg_tag == .ident) {
+                                            const aname = self.tree.tokenSlice(self.tree.nodeMainToken(arg_idx));
+                                            if (fb.lookupLocal(aname)) |local_idx_a| {
+                                                arg_node = try fb.emitAddrLocal(local_idx_a, ptr_type, span);
+                                            } else if (self.builder.lookupGlobal(aname)) |g| {
+                                                arg_node = try fb.emitAddrGlobal(g.idx, aname, ptr_type, span);
+                                            } else {
+                                                const tmp_local = try fb.addLocalWithSize("__safe_ref", arg_type, true, self.type_reg.sizeOf(arg_type));
+                                                _ = try fb.emitStoreLocal(tmp_local, arg_node, span);
+                                                arg_node = try fb.emitAddrLocal(tmp_local, ptr_type, span);
+                                            }
+                                        } else {
+                                            const tmp_local = try fb.addLocalWithSize("__safe_ref", arg_type, true, self.type_reg.sizeOf(arg_type));
+                                            _ = try fb.emitStoreLocal(tmp_local, arg_node, span);
+                                            arg_node = try fb.emitAddrLocal(tmp_local, ptr_type, span);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // @safe auto-deref: when arg is *T but param expects T
+                if (self.chk.safe_mode and !param_is_pointer) {
+                    if (param_types) |params| {
+                        if (arg_i < params.len) {
+                            const arg_type = self.inferExprType(arg_idx);
+                            const arg_info = self.type_reg.get(arg_type);
+                            const param_tidx = params[arg_i].type_idx;
+                            if (arg_info == .pointer and (self.type_reg.get(arg_info.pointer.elem) == .struct_type or self.type_reg.get(arg_info.pointer.elem) == .union_type) and
+                                self.type_reg.isAssignable(arg_info.pointer.elem, param_tidx))
+                            {
+                                arg_node = try fb.emitPtrLoadValue(arg_node, param_tidx, span);
+                            }
+                        }
+                    }
+                }
+
+                // T → ?T wrapping at call sites
+                if (param_types) |params| {
+                    if (arg_i < params.len) {
+                        const param_type = self.type_reg.get(params[arg_i].type_idx);
+                        if (param_type == .optional and !self.isPtrLikeOptional(params[arg_i].type_idx)) {
+                            const arg_type = self.inferExprType(arg_idx);
+                            if (arg_type == TypeRegistry.UNTYPED_NULL) {
+                                const opt_size = self.type_reg.sizeOf(params[arg_i].type_idx);
+                                const tmp = try fb.addLocalWithSize("__opt_arg", params[arg_i].type_idx, false, opt_size);
+                                const tag_zero = try fb.emitConstInt(0, TypeRegistry.I64, span);
+                                _ = try fb.emitStoreLocalField(tmp, 0, 0, tag_zero, span);
+                                arg_node = try fb.emitLoadLocal(tmp, params[arg_i].type_idx, span);
+                            } else {
+                                const arg_info = self.type_reg.get(arg_type);
+                                if (arg_info != .optional) {
+                                    const opt_size = self.type_reg.sizeOf(params[arg_i].type_idx);
+                                    const tmp = try fb.addLocalWithSize("__opt_arg", params[arg_i].type_idx, false, opt_size);
+                                    const tag_one = try fb.emitConstInt(1, TypeRegistry.I64, span);
+                                    _ = try fb.emitStoreLocalField(tmp, 0, 0, tag_one, span);
+                                    _ = try fb.emitStoreLocalField(tmp, 1, 8, arg_node, span);
+                                    arg_node = try fb.emitLoadLocal(tmp, params[arg_i].type_idx, span);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Go pattern: decompose compound types (slice/string) into (ptr, len)
+                if (param_is_compound) {
+                    const ptr_val = try fb.emitSlicePtr(arg_node, TypeRegistry.I64, span);
+                    const len_val = try fb.emitSliceLen(arg_node, span);
+                    try args.append(self.allocator, ptr_val);
+                    try args.append(self.allocator, len_val);
+                } else {
+                    // Decompose large compound args (struct/union/tuple > 8 bytes)
+                    var is_large_compound = false;
+                    if (param_types) |params| {
+                        if (arg_i < params.len) {
+                            const pt = self.type_reg.get(params[arg_i].type_idx);
+                            const ps = self.type_reg.sizeOf(params[arg_i].type_idx);
+                            const is_compound_opt = pt == .optional and !self.isPtrLikeOptional(params[arg_i].type_idx);
+                            is_large_compound = !self.target.isWasmGC() and (pt == .struct_type or pt == .union_type or pt == .tuple or is_compound_opt) and ps > 8;
+                        }
+                    }
+                    if (is_large_compound) {
+                        const param_type_idx = param_types.?[arg_i].type_idx;
+                        const param_size = self.type_reg.sizeOf(param_type_idx);
+                        const num_slots: u32 = @intCast((param_size + 7) / 8);
+                        for (0..num_slots) |slot| {
+                            const offset: i64 = @intCast(slot * 8);
+                            const field = try fb.emitFieldValue(arg_node, @intCast(slot), offset, TypeRegistry.I64, span);
+                            try args.append(self.allocator, field);
+                        }
+                    } else {
+                        try args.append(self.allocator, arg_node);
+                    }
+                }
+            }
+
+            const return_type = if (func_type_info == .func) func_type_info.func.return_type else self.inferExprType(idx);
+
+            // Check if this is an indirect call (function pointer)
+            const is_indirect = (fb.lookupLocal(func_name) != null);
+
+            if (is_indirect) {
+                // Closure call
+                const closure_ptr = try self.lowerExprNode(cd.callee);
+                const table_idx = try fb.emitPtrLoadValue(closure_ptr, TypeRegistry.I64, span);
+
+                if (self.needsSret(return_type)) {
+                    const ret_size = self.type_reg.sizeOf(return_type);
+                    const tmp_local = try fb.addLocalWithSize("__indirect_sret", return_type, false, ret_size);
+                    const tmp_addr = try fb.emitAddrLocal(tmp_local, TypeRegistry.I64, span);
+                    var sret_args = std.ArrayListUnmanaged(ir.NodeIndex){};
+                    defer sret_args.deinit(self.allocator);
+                    try sret_args.append(self.allocator, tmp_addr);
+                    try sret_args.appendSlice(self.allocator, args.items);
+                    _ = try fb.emitClosureCall(table_idx, closure_ptr, sret_args.items, TypeRegistry.VOID, span);
+                    return try fb.emitLoadLocal(tmp_local, return_type, span);
+                }
+                return try fb.emitClosureCall(table_idx, closure_ptr, args.items, return_type, span);
+            }
+
+            // Direct call
+            const link_name = try self.resolveCallName(func_name);
+
+            // SRET: caller allocates temp, passes address as hidden first arg
+            if (self.needsSret(return_type)) {
+                const ret_size = self.type_reg.sizeOf(return_type);
+                const sret_local = try fb.getOrCreateSretLocal(return_type, ret_size);
+                const sret_addr = try fb.emitAddrLocal(sret_local, TypeRegistry.I64, span);
+                var sret_args = std.ArrayListUnmanaged(ir.NodeIndex){};
+                defer sret_args.deinit(self.allocator);
+                try sret_args.append(self.allocator, sret_addr);
+                try sret_args.appendSlice(self.allocator, args.items);
+                _ = try fb.emitCall(link_name, sret_args.items, false, TypeRegistry.VOID, span);
+                return try fb.emitLoadLocal(sret_local, return_type, span);
+            }
+
+            return try fb.emitCall(link_name, args.items, false, return_type, span);
+        }
+
+        // Fallback: try to lower as generic expression call
         return ir.null_node;
+    }
+
+    /// Collect call arguments as a dynamic list for iteration.
+    fn collectCallArgsList(self: *Lowerer, cd: ast_mod.full.CallFull) !std.ArrayListUnmanaged(Index) {
+        var result = std.ArrayListUnmanaged(Index){};
+        if (cd.single_arg.unwrap()) |single| {
+            try result.append(self.allocator, single);
+        } else {
+            const arg_indices = self.tree.extraNodes(cd.args);
+            for (arg_indices) |arg_idx| {
+                try result.append(self.allocator, arg_idx);
+            }
+        }
+        return result;
     }
 
     // ========================================================================
@@ -3470,6 +4118,399 @@ pub const Lowerer = struct {
             => TypeRegistry.BOOL,
             else => TypeRegistry.I64,
         };
+    }
+
+    // ========================================================================
+    // emitCopyValue — deep copy for non-trivial types (ARC)
+    // Ported from compiler/frontend/lower.zig lines 5012-5261
+    // ========================================================================
+
+    fn emitCopyValue(self: *Lowerer, fb: *ir.FuncBuilder, value: ir.NodeIndex, type_idx: TypeIndex, span: Span) Error!ir.NodeIndex {
+        if (self.target.isWasm()) return value;
+        if (value == ir.null_node) return value;
+        const info = self.type_reg.get(type_idx);
+
+        // Trivial types: no copy needed
+        if (self.type_reg.isTrivial(type_idx)) return value;
+
+        // Existential copy: memcpy the full container (40 bytes)
+        if (info == .existential) {
+            const dst_tmp = try fb.addLocalWithSize("__exist_copy_dst", type_idx, false, 40);
+            const dst_addr = try fb.emitAddrLocal(dst_tmp, TypeRegistry.I64, span);
+            const size_40 = try fb.emitConstInt(40, TypeRegistry.I64, span);
+            var mc_args = [_]ir.NodeIndex{ dst_addr, value, size_40 };
+            _ = try fb.emitCall("memcpy", &mc_args, false, TypeRegistry.VOID, span);
+            return try fb.emitLoadLocal(dst_tmp, type_idx, span);
+        }
+
+        // VWT dispatch: call witness function for all non-trivial types
+        {
+            const type_name = self.type_reg.typeName(type_idx);
+            const copy_name = try std.fmt.allocPrint(self.allocator, "__vwt_initializeWithCopy_{s}", .{type_name});
+            const val_size = self.type_reg.sizeOf(type_idx);
+            const src_tmp = try fb.addLocalWithSize("__vwt_src", type_idx, false, val_size);
+            _ = try fb.emitStoreLocal(src_tmp, value, span);
+            const src_addr = try fb.emitAddrLocal(src_tmp, TypeRegistry.I64, span);
+            const dst_tmp = try fb.addLocalWithSize("__vwt_dst", type_idx, false, val_size);
+            const dst_addr = try fb.emitAddrLocal(dst_tmp, TypeRegistry.I64, span);
+            const meta_name = try std.fmt.allocPrint(self.allocator, "__type_metadata_{s}", .{type_name});
+            const metadata = if (self.builder.lookupGlobal(meta_name)) |gi|
+                try fb.emitAddrGlobal(gi.idx, meta_name, TypeRegistry.I64, span)
+            else
+                try fb.emitConstInt(0, TypeRegistry.I64, span);
+            var args = [_]ir.NodeIndex{ dst_addr, src_addr, metadata };
+            _ = try fb.emitCall(copy_name, &args, false, TypeRegistry.I64, span);
+            return try fb.emitPtrLoadValue(dst_addr, type_idx, span);
+        }
+
+        // NOTE: Inline ARC fallback code below is unreachable when VWT witnesses
+        // are emitted (the unconditional block above handles all cases).
+        // Kept as documentation for the patterns VWT replaces.
+    }
+
+    // ========================================================================
+    // emitDestroyValue — deep destroy at scope exit (ARC)
+    // Ported from compiler/frontend/lower.zig lines 5266-5533
+    // ========================================================================
+
+    fn emitDestroyValue(self: *Lowerer, fb: *ir.FuncBuilder, value: ir.NodeIndex, type_idx: TypeIndex, span: Span) Error!void {
+        if (self.target.isWasm()) return;
+        if (value == ir.null_node) return;
+        const info = self.type_reg.get(type_idx);
+
+        // Trivial types: no destroy needed
+        if (self.type_reg.isTrivial(type_idx)) return;
+
+        // Existential destroy: noop for now (stack-allocated containers)
+        if (info == .existential) return;
+
+        // VWT dispatch: call witness function for all non-trivial types
+        {
+            const type_name = self.type_reg.typeName(type_idx);
+            const destroy_name = try std.fmt.allocPrint(self.allocator, "__vwt_destroy_{s}", .{type_name});
+            const val_size = self.type_reg.sizeOf(type_idx);
+            const tmp = try fb.addLocalWithSize("__vwt_tmp", type_idx, false, val_size);
+            _ = try fb.emitStoreLocal(tmp, value, span);
+            const addr = try fb.emitAddrLocal(tmp, TypeRegistry.I64, span);
+            const meta_name = try std.fmt.allocPrint(self.allocator, "__type_metadata_{s}", .{type_name});
+            const metadata = if (self.builder.lookupGlobal(meta_name)) |gi|
+                try fb.emitAddrGlobal(gi.idx, meta_name, TypeRegistry.I64, span)
+            else
+                try fb.emitConstInt(0, TypeRegistry.I64, span);
+            var args = [_]ir.NodeIndex{ addr, metadata };
+            _ = try fb.emitCall(destroy_name, &args, false, TypeRegistry.VOID, span);
+            return;
+        }
+    }
+
+    // ========================================================================
+    // emitOptionalFieldRetain — conditional retain for ?*T optional field values
+    // Ported from compiler/frontend/lower.zig lines 5539-5564
+    // ========================================================================
+
+    fn emitOptionalFieldRetain(self: *Lowerer, fb: *ir.FuncBuilder, value_node: ir.NodeIndex, opt_type_idx: TypeIndex, span: Span) Error!void {
+        const opt_info = self.type_reg.get(opt_type_idx);
+        if (opt_info != .optional) return;
+        const elem_info = self.type_reg.get(opt_info.optional.elem);
+        if (elem_info != .pointer or !elem_info.pointer.managed) return;
+
+        const opt_size = self.type_reg.sizeOf(opt_type_idx);
+        const tmp = try fb.addLocalWithSize("__opt_retain_tmp", opt_type_idx, false, opt_size);
+        _ = try fb.emitStoreLocal(tmp, value_node, span);
+        const tag = try fb.emitFieldLocal(tmp, 0, 0, TypeRegistry.I64, span);
+        const ptr_val = try fb.emitFieldLocal(tmp, 1, 8, opt_info.optional.elem, span);
+        const zero = try fb.emitConstInt(0, TypeRegistry.I64, span);
+        const is_non_null = try fb.emitBinary(.ne, tag, zero, TypeRegistry.BOOL, span);
+        const retain_blk = try fb.newBlock("opt_ret.retain");
+        const skip_blk = try fb.newBlock("opt_ret.skip");
+        _ = try fb.emitBranch(is_non_null, retain_blk, skip_blk, span);
+        fb.setBlock(retain_blk);
+        var retain_args = [_]ir.NodeIndex{ptr_val};
+        _ = try fb.emitCall("retain", &retain_args, false, opt_info.optional.elem, span);
+        _ = try fb.emitJump(skip_blk, span);
+        fb.setBlock(skip_blk);
+    }
+
+    // ========================================================================
+    // lowerMethodCall — method call lowering with receiver handling
+    // Ported from compiler/frontend/lower.zig lines 10521-10908
+    // ========================================================================
+
+    fn lowerMethodCall(
+        self: *Lowerer,
+        call_idx: Index,
+        base_idx: Index,
+        _: []const u8, // field_name (used for debug logging in compiler)
+        method_info: types_mod.MethodInfo,
+        receiver_type_name: []const u8,
+    ) Error!ir.NodeIndex {
+        const fb = self.current_func orelse return ir.null_node;
+        const span = self.getSpan(call_idx);
+        const cd = self.tree.callData(call_idx);
+
+        // Queue generic impl method for deferred lowering
+        if (self.chk.generics.generic_inst_by_name.get(method_info.func_name)) |inst_info| {
+            try self.ensureGenericFnQueued(inst_info);
+        }
+
+        const is_generic_call = self.chk.generics.generic_inst_by_name.contains(method_info.func_name);
+
+        var args = std.ArrayListUnmanaged(ir.NodeIndex){};
+        defer args.deinit(self.allocator);
+
+        // Static methods: no receiver
+        const receiver_offset: usize = if (method_info.is_static) 0 else 1;
+
+        if (!method_info.is_static) {
+            const base_type_idx = self.inferExprType(base_idx);
+            const base_type = self.type_reg.get(base_type_idx);
+
+            // Prepare receiver
+            const receiver_val = blk: {
+                if (method_info.receiver_is_ptr) {
+                    if (base_type == .pointer) {
+                        break :blk try self.lowerExprNode(base_idx);
+                    } else {
+                        // Need address-of for non-pointer base
+                        const base_tag = self.tree.nodeTag(base_idx);
+                        if (base_tag == .ident) {
+                            const name = self.tree.tokenSlice(self.tree.nodeMainToken(base_idx));
+                            if (fb.lookupLocal(name)) |local_idx| {
+                                const ptr_type = self.type_reg.makePointer(base_type_idx) catch TypeRegistry.I64;
+                                break :blk try fb.emitAddrLocal(local_idx, ptr_type, span);
+                            }
+                            if (self.builder.lookupGlobal(name)) |g| {
+                                const ptr_type = self.type_reg.makePointer(base_type_idx) catch base_type_idx;
+                                break :blk try fb.emitAddrGlobal(g.idx, name, ptr_type, span);
+                            }
+                        }
+                        // Non-lvalue expression — spill to temp local
+                        const val = try self.lowerExprNode(base_idx);
+                        const ptr_type = self.type_reg.makePointer(base_type_idx) catch TypeRegistry.I64;
+                        const tmp_local = try fb.addLocalWithSize("__method_recv", base_type_idx, true, self.type_reg.sizeOf(base_type_idx));
+                        _ = try fb.emitStoreLocal(tmp_local, val, span);
+                        break :blk try fb.emitAddrLocal(tmp_local, ptr_type, span);
+                    }
+                } else {
+                    if (base_type == .pointer) {
+                        const ptr_val = try self.lowerExprNode(base_idx);
+                        break :blk try fb.emitPtrLoadValue(ptr_val, base_type_idx, span);
+                    } else {
+                        break :blk try self.lowerExprNode(base_idx);
+                    }
+                }
+            };
+
+            if (receiver_val == ir.null_node) return ir.null_node;
+            try args.append(self.allocator, receiver_val);
+        }
+
+        // Get param types for ABI decisions
+        const func_type_for_params = self.type_reg.get(method_info.func_type);
+        var param_types: ?[]const types_mod.FuncParam = null;
+        if (func_type_for_params == .func) param_types = func_type_for_params.func.params;
+
+        // Collect call args
+        var call_args = try self.collectCallArgsList(cd);
+        defer call_args.deinit(self.allocator);
+
+        for (call_args.items, 0..) |arg_idx, arg_i| {
+            var arg_node = try self.lowerExprNode(arg_idx);
+            if (arg_node == ir.null_node) continue;
+
+            // Determine parameter type for ABI decomposition (offset by receiver_offset)
+            var param_is_pointer = false;
+            var param_is_compound = false;
+            if (param_types) |params| {
+                const param_idx = arg_i + receiver_offset;
+                if (param_idx < params.len) {
+                    const param_type = self.type_reg.get(params[param_idx].type_idx);
+                    param_is_pointer = (param_type == .pointer);
+                    param_is_compound = (param_type == .slice) or (params[param_idx].type_idx == TypeRegistry.STRING);
+                }
+            }
+
+            // @safe auto-ref: pass struct value as pointer to *Struct param
+            if (self.chk.safe_mode and param_is_pointer) {
+                if (param_types) |params| {
+                    const param_idx = arg_i + receiver_offset;
+                    if (param_idx < params.len) {
+                        const param_info = self.type_reg.get(params[param_idx].type_idx);
+                        if (param_info == .pointer) {
+                            const arg_type = self.inferExprType(arg_idx);
+                            const arg_info = self.type_reg.get(arg_type);
+                            if ((arg_info == .struct_type or arg_info == .union_type) and self.type_reg.isAssignable(arg_type, param_info.pointer.elem)) {
+                                if (!self.target.isWasmGC()) {
+                                    const ptr_type = self.type_reg.makePointer(arg_type) catch TypeRegistry.I64;
+                                    const at = self.tree.nodeTag(arg_idx);
+                                    if (at == .ident) {
+                                        const aname = self.tree.tokenSlice(self.tree.nodeMainToken(arg_idx));
+                                        if (fb.lookupLocal(aname)) |local_idx| {
+                                            arg_node = try fb.emitAddrLocal(local_idx, ptr_type, span);
+                                        } else {
+                                            const tmp_local = try fb.addLocalWithSize("__safe_ref", arg_type, true, self.type_reg.sizeOf(arg_type));
+                                            _ = try fb.emitStoreLocal(tmp_local, arg_node, span);
+                                            arg_node = try fb.emitAddrLocal(tmp_local, ptr_type, span);
+                                        }
+                                    } else {
+                                        const tmp_local = try fb.addLocalWithSize("__safe_ref", arg_type, true, self.type_reg.sizeOf(arg_type));
+                                        _ = try fb.emitStoreLocal(tmp_local, arg_node, span);
+                                        arg_node = try fb.emitAddrLocal(tmp_local, ptr_type, span);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // @safe auto-deref: when arg is *T but param expects T
+            if (self.chk.safe_mode and !param_is_pointer) {
+                if (param_types) |params| {
+                    const param_idx_d = arg_i + receiver_offset;
+                    if (param_idx_d < params.len) {
+                        const arg_type = self.inferExprType(arg_idx);
+                        const arg_info = self.type_reg.get(arg_type);
+                        const param_tidx = params[param_idx_d].type_idx;
+                        if (arg_info == .pointer and (self.type_reg.get(arg_info.pointer.elem) == .struct_type or self.type_reg.get(arg_info.pointer.elem) == .union_type) and
+                            self.type_reg.isAssignable(arg_info.pointer.elem, param_tidx))
+                        {
+                            arg_node = try fb.emitPtrLoadValue(arg_node, param_tidx, span);
+                        }
+                    }
+                }
+            }
+
+            // T → ?T wrapping at call sites
+            if (param_types) |params| {
+                const param_idx_opt = arg_i + receiver_offset;
+                if (param_idx_opt < params.len) {
+                    const param_type = self.type_reg.get(params[param_idx_opt].type_idx);
+                    if (param_type == .optional and !self.isPtrLikeOptional(params[param_idx_opt].type_idx)) {
+                        const arg_type = self.inferExprType(arg_idx);
+                        if (arg_type == TypeRegistry.UNTYPED_NULL) {
+                            const opt_size = self.type_reg.sizeOf(params[param_idx_opt].type_idx);
+                            const tmp = try fb.addLocalWithSize("__opt_arg", params[param_idx_opt].type_idx, false, opt_size);
+                            const tag_zero = try fb.emitConstInt(0, TypeRegistry.I64, span);
+                            _ = try fb.emitStoreLocalField(tmp, 0, 0, tag_zero, span);
+                            arg_node = try fb.emitLoadLocal(tmp, params[param_idx_opt].type_idx, span);
+                        } else {
+                            const arg_info = self.type_reg.get(arg_type);
+                            if (arg_info != .optional) {
+                                const opt_size = self.type_reg.sizeOf(params[param_idx_opt].type_idx);
+                                const tmp = try fb.addLocalWithSize("__opt_arg", params[param_idx_opt].type_idx, false, opt_size);
+                                const tag_one = try fb.emitConstInt(1, TypeRegistry.I64, span);
+                                _ = try fb.emitStoreLocalField(tmp, 0, 0, tag_one, span);
+                                _ = try fb.emitStoreLocalField(tmp, 1, 8, arg_node, span);
+                                arg_node = try fb.emitLoadLocal(tmp, params[param_idx_opt].type_idx, span);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Decompose compound types
+            if (param_is_compound) {
+                const ptr_val = try fb.emitSlicePtr(arg_node, TypeRegistry.I64, span);
+                const len_val = try fb.emitSliceLen(arg_node, span);
+                try args.append(self.allocator, ptr_val);
+                try args.append(self.allocator, len_val);
+            } else {
+                // Decompose large compound args (struct/union/tuple > 8 bytes)
+                var is_large_compound = false;
+                if (param_types) |params| {
+                    const param_idx = arg_i + receiver_offset;
+                    if (param_idx < params.len) {
+                        const pt = self.type_reg.get(params[param_idx].type_idx);
+                        const ps = self.type_reg.sizeOf(params[param_idx].type_idx);
+                        const is_compound_opt = pt == .optional and !self.isPtrLikeOptional(params[param_idx].type_idx);
+                        is_large_compound = !self.target.isWasmGC() and (pt == .struct_type or pt == .union_type or pt == .tuple or is_compound_opt) and ps > 8;
+                    }
+                }
+                if (is_large_compound) {
+                    const param_idx = arg_i + receiver_offset;
+                    const param_type_idx = param_types.?[param_idx].type_idx;
+                    const param_size = self.type_reg.sizeOf(param_type_idx);
+                    const num_slots: u32 = @intCast((param_size + 7) / 8);
+                    for (0..num_slots) |slot| {
+                        const offset: i64 = @intCast(slot * 8);
+                        const field = try fb.emitFieldValue(arg_node, @intCast(slot), offset, TypeRegistry.I64, span);
+                        try args.append(self.allocator, field);
+                    }
+                } else {
+                    try args.append(self.allocator, arg_node);
+                }
+            }
+        }
+
+        const func_type = self.type_reg.get(method_info.func_type);
+        const return_type = if (func_type == .func) func_type.func.return_type else TypeRegistry.VOID;
+
+        // Resolve method call target
+        const method_link_name = if (is_generic_call)
+            self.computeGenericBaseName(method_info.func_name) catch method_info.func_name
+        else
+            try self.resolveMethodName(receiver_type_name, method_info.func_name, method_info.source_tree);
+
+        // SRET for method calls
+        if (self.needsSret(return_type)) {
+            const ret_size = self.type_reg.sizeOf(return_type);
+            const sret_local = try fb.getOrCreateSretLocal(return_type, ret_size);
+            const sret_addr = try fb.emitAddrLocal(sret_local, TypeRegistry.I64, span);
+            var sret_args = std.ArrayListUnmanaged(ir.NodeIndex){};
+            defer sret_args.deinit(self.allocator);
+            try sret_args.append(self.allocator, sret_addr);
+            try sret_args.appendSlice(self.allocator, args.items);
+            _ = try fb.emitCall(method_link_name, sret_args.items, false, TypeRegistry.VOID, span);
+            return try fb.emitLoadLocal(sret_local, return_type, span);
+        }
+        return try fb.emitCall(method_link_name, args.items, false, return_type, span);
+    }
+
+    // ========================================================================
+    // Generic function helpers
+    // ========================================================================
+
+    /// Queue a generic function instantiation for deferred lowering.
+    fn ensureGenericFnQueued(self: *Lowerer, inst_info: checker_mod.GenericInstInfo) !void {
+        if (self.lowered_generics.contains(inst_info.concrete_name)) return;
+        try self.lowered_generics.put(inst_info.concrete_name, {});
+    }
+
+    /// VWT base-name sharing: strip type args to get shared body name.
+    /// "myFunc(i64)" → "myFunc", "Type_method(i64;string)" → "Type_method"
+    fn computeGenericBaseName(self: *Lowerer, concrete_name: []const u8) ![]const u8 {
+        // Find the opening paren that starts type args
+        var paren_pos: ?usize = null;
+        for (concrete_name, 0..) |c, i| {
+            if (c == '(') {
+                paren_pos = i;
+                break;
+            }
+        }
+        if (paren_pos) |pos| {
+            return try self.allocator.dupe(u8, concrete_name[0..pos]);
+        }
+        return concrete_name;
+    }
+
+    /// Resolve method call target name, qualifying with module if needed.
+    fn resolveMethodName(self: *Lowerer, receiver_type_name: []const u8, func_name: []const u8, source_tree: ?*const Ast) ![]const u8 {
+        // If method has a source_tree, resolve module name from tree_module_map
+        if (source_tree) |st| {
+            if (self.tree_module_map) |map| {
+                if (map.get(st)) |target_module| {
+                    return std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ target_module, func_name });
+                }
+            }
+        }
+        // Check if the func_name already contains a dot (already qualified)
+        for (func_name) |c| {
+            if (c == '.') return func_name;
+        }
+        // Check if the receiver type has associated module
+        _ = receiver_type_name;
+        return self.qualifyName(func_name);
     }
 
     // ========================================================================
