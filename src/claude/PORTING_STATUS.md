@@ -1,80 +1,95 @@
-# Porting Status: compiler/ → src/libcot-zig/
+# Porting Status: compiler/ → src/
 
 **Last updated:** 2026-03-29
 
 ---
 
-## Completed (11 files, 9,573 lines, 87 tests)
+## Architecture
 
-| # | File | Lines | Tests | Docs | Notes |
-|---|------|-------|-------|------|-------|
-| 1 | `token.zig` | 565 | 4 | `ac/src/libcot-zig/token.md` | Token enum, keyword table, precedence |
-| 2 | `source.zig` | 264 | 9 | `ac/src/libcot-zig/source.md` | Position tracking, lazy line offsets |
-| 3 | `errors.zig` | 415 | 7 | `ac/src/libcot-zig/errors.md` | Error/warning reporting with codes |
-| 4 | `scanner.zig` | 643 | 11 | `ac/src/libcot-zig/scanner.md` | Lexer with string interpolation |
-| 5 | `target.zig` | 153 | 4 | `ac/src/libcot-zig/target.md` | Platform config: Arch, Os |
-| 6 | `debug.zig` | 168 | 4 | `ac/src/libcot-zig/debug.md` | Pipeline debug logging. @typeInfo transform |
-| 7 | `ast.zig` | 1,594 | 8 | `ac/src/libcot-zig/ast.md` | **Zig-style data-oriented AST.** 125 Tag variants, full.* accessors |
-| 8 | `parser.zig` | 3,218 | 18 | `ac/src/libcot-zig/parser.md` | **Zig-style compact output.** Pre-tokenized, scratch buffer, all syntax |
-| 9 | `comptime.zig` | 108 | 4 | `ac/src/libcot-zig/comptime.md` | Compile-time value system |
-| 10 | `types.zig` | 1,027 | 22 | `ac/src/libcot-zig/types.md` | Type system. TypeIndex as enum(u32), Swift VWT |
-| 11 | `formatter.zig` | 1,399 | 0 | — | First consumer of compact AST. Tests need integration |
+```
+src/
+├── foundation/    (4 files, 1,566 lines)  Language-agnostic shared types
+├── libcot-zig/    (12 files, 22,063 lines) Cot frontend — COMPLETE
+├── libcir-zig/    (24 files, 10,573 lines) IR + SSA + passes + Wasm — COMPLETE
+└── build.zig      Root build with diamond dependency wiring
+```
+
+**Total: 41 files, 34,202+ lines. `zig build test` passes.**
 
 ---
 
-## Next to port — libcot-zig frontend
+## foundation/ — Shared Types (COMPLETE)
 
-| # | File | Original Lines | Deps (all met?) | Status |
-|---|------|---------------|-----------------|--------|
-| 12 | `checker.zig` | 5,162 | ast, types, errors, comptime, target (**all done**) | **Ready** |
-| 13 | `ir.zig` | 816 | types, source (**all done**) | **Ready** |
-| 14 | `arc_insertion.zig` | 456 | ir, types | Blocked on ir.zig |
-| 15 | `lower.zig` | 13,528 | ast, ir, types, checker, comptime, arc_insertion, target | Blocked on checker + ir + arc_insertion |
-| 16 | `vwt_gen.zig` | 1,378 | ir, types, source | Blocked on ir.zig |
-| 17 | `ssa_builder.zig` | 2,908 | ir, types, source, target | Blocked on ir.zig |
+| File | Lines | Notes |
+|------|-------|-------|
+| types.zig | 1,035 | TypeIndex, TypeRegistry, BasicKind, VWT |
+| source.zig | 264 | Span, Pos, Source |
+| target.zig | 153 | Arch, Os, Target |
+| debug.zig | 168 | Pipeline logging |
+| lib.zig | 15 | Module root |
 
-**Critical path:** checker.zig + ir.zig → arc_insertion.zig → lower.zig
-
----
-
-## libcir-zig (IR + Passes + Wasm) — blocked on libcot-zig completion
-
-| File group | Lines | Notes |
-|-----------|-------|-------|
-| SSA core (8 files) | ~3,700 | op.zig, value.zig, func.zig, block.zig, dom.zig, debug.zig, html.zig |
-| SSA passes (13 files) | ~5,200 | schedule, deadcode, lower_wasm, async_split, cse, etc. |
-| CLIF IR (9 files) | ~7,400 | dfg.zig, builder.zig, layout.zig, function.zig, etc. |
-| Wasm codegen (12 files) | ~10,800 | Wasm gen, linker, assembler |
+Language-agnostic — a TypeScript frontend uses the same foundation.
 
 ---
 
-## libclif-zig (Native Backend) — port last
+## libcot-zig/ — Frontend (COMPLETE)
 
-68K lines. Decision deferred: Zig port vs Rust Cranelift crate.
-
----
-
-## Architecture alignment check
-
-Per `COT_IR_ARCHITECTURE.md`, the three-library split is:
-- **libcot** = frontend (scanner → parser → checker → lowerer) — **11 of ~17 files done**
-- **libcir** = IR + passes + Wasm emit — 0% started
-- **libclif** = native backend — 0% started
-
-The current work is correctly focused on completing libcot-zig before moving to libcir-zig.
-
-Files NOT in the architecture plan that exist in compiler/:
-- `project.zig` (cot.json loading) — belongs in cli-zig, not libcot
-- `lsp/*.zig` (16 files) — belongs in libcot-zig/lsp/ per the structure doc
-- `driver.zig`, `main.zig`, `cli.zig` — belong in cli-zig
+| File | Lines | Notes |
+|------|-------|-------|
+| lower.zig | 8,359 | AST → IR lowering (227 functions) |
+| checker.zig | 5,424 | Type checking (122 functions, 4-file split planned) |
+| parser.zig | 3,218 | Recursive descent, compact AST output |
+| ast.zig | 1,594 | Zig-style data-oriented AST, full.* accessors |
+| formatter.zig | 1,399 | Source code formatter |
+| scanner.zig | 643 | Lexer with string interpolation |
+| token.zig | 565 | Cot token definitions |
+| errors.zig | 415 | Error/warning reporting (Cot-specific codes) |
+| comptime.zig | 108 | Compile-time value system |
+| lib.zig | 32 | Module root |
 
 ---
 
-## Process
+## libcir-zig/ — IR + Passes + Wasm (COMPLETE)
 
-For each file ported:
-1. Read compiler/ source, understand every function
-2. Write cleaned code to src/libcot-zig/ with transformations applied
-3. Write companion docs to ac/src/libcot-zig/
-4. Remove reference comments, simplify naming, add /// doc comments
-5. See `src/claude/PORTING_RULES.md` for full rules
+| File | Lines | Notes |
+|------|-------|-------|
+| ir.zig | 1,419 | IR instruction definitions (90+ node types) |
+| arc_insertion.zig | 282 | ARC cleanup stack |
+| vwt_gen.zig | 1,123 | Value Witness Table generation |
+| ssa_builder.zig | ~600 | IR → SSA conversion (core framework) |
+| ssa/op.zig | ~500 | 240+ SSA operations |
+| ssa/value.zig | ~250 | SSA values |
+| ssa/block.zig | ~180 | SSA basic blocks |
+| ssa/func.zig | ~220 | SSA functions |
+| ssa/dom.zig | ~200 | Dominator tree computation |
+| ssa/debug.zig | ~400 | SSA dump, verify, liveness |
+| ssa/html.zig | ~700 | COT_SSA HTML visualizer |
+| ssa/passes/ (13 files) | ~4,100 | schedule, deadcode, lower_wasm, cse, copyelim, phielim, decompose, rewritedec, rewritegeneric, async_split, layout, region_isolation, lower_native |
+| wasm/ (7 files) | ~4,100 | constants, prog, preprocess, gen, assemble, link, wasm entry |
+| lib.zig | ~30 | Module root |
+
+---
+
+## Remaining Work
+
+### Refactoring (non-blocking, quality improvement)
+- checker.zig 4-file split: builtins, comptime_eval, diagnostics, generics
+- lower.zig 7-file split: expr, calls, structs, generics, type_ops, async, collections
+- lower.zig coverage gap: ~7,000 lines of original 13,528 still simplified/missing
+
+### Integration Testing
+- Parse real .cot files through new pipeline end-to-end
+- Compare output with compiler/ pipeline
+
+### Documentation
+- DocC-style restructure of ac/ (symbol-based, not line-numbers)
+- ac/ docs stale for many files after restructuring
+
+### Future Libraries
+- libclif-zig/ — native backend (68K lines, decision: Zig port or Rust Cranelift)
+- libts/ — TypeScript frontend (see TYPESCRIPT_NATIVE.md)
+
+### Build System
+- C ABI export layer (cot_api.zig implementing cot.h)
+- Static library artifact output
+- Integration with root cot build.zig
