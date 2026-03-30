@@ -50,7 +50,7 @@ const executor_runtime = @import("codegen/executor_runtime.zig"); // Executor ru
 
 // Native codegen modules (Cranelift-style AOT compiler)
 const native_compile = @import("codegen/native/compile.zig");
-const wasm_parser = @import("codegen/native/wasm_parser.zig"); // Used by legacy MachO/ELF generators
+const wasm_parser = @import("codegen/native/wasm_parser.zig");
 const clif = @import("ir/clif/mod.zig");
 const macho = @import("codegen/native/macho.zig");
 const elf = @import("codegen/native/elf.zig");
@@ -111,8 +111,9 @@ pub const Driver = struct {
     /// Set via COT_SSA env var or --ssa=funcname CLI flag.
     /// Reference: Go GOSSAFUNC env var (ssagen/ssa.go lines 44-77)
     ssa_html_func: ?[]const u8 = null,
-    /// Use rust/libclif (real Cranelift) for native codegen instead of hand-ported backend.
-    use_libclif: bool = true,
+    /// Native backend: true = rust/libclif (real Cranelift), false = zig/libclif (hand-ported).
+    /// Controlled by --backend=zig CLI flag. Default: cranelift (rust).
+    use_cranelift: bool = true,
     /// Extra .o file path (runtime functions) produced by CIR path. Linked alongside user .o.
     cir_runtime_obj_path: ?[]const u8 = null,
 
@@ -1289,8 +1290,8 @@ pub const Driver = struct {
         self.debug_type_reg = type_reg;
 
         // Native path: SSA → CLIF → native
-        // use_libclif: use CIR serialization → rust/libclif (real Cranelift) instead of hand-ported backend
-        if (self.use_libclif) {
+        // use_cranelift: use CIR serialization → rust/libclif (real Cranelift) instead of hand-ported backend
+        if (self.use_cranelift) {
             return self.generateNativeCodeViaCIR(funcs, globals, type_reg);
         }
         return self.generateNativeCode(funcs, globals, type_reg);
@@ -2395,7 +2396,7 @@ pub const Driver = struct {
                 .Local
             else if (is_export)
                 .Export
-            else if (self.use_libclif)
+            else if (self.use_cranelift)
                 .Export // CIR path: runtime .o is separate, all functions must be visible
             else
                 .Local;
