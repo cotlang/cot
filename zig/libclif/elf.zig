@@ -54,14 +54,14 @@ pub const SHN_UNDEF: u16 = 0;
 pub const R_X86_64_PC32: u32 = 2;
 pub const R_X86_64_PLT32: u32 = 4;
 
-// Section indices (layout-dependent, matches write() section order)
+// Section indices — these are computed dynamically in write() based on which
+// optional sections exist (BSS, rela.text, debug). The constants here are the
+// base case (no BSS). Functions that need section indices should use the
+// dynamic values from ElfWriter, not these constants.
 pub const SHIDX_TEXT: u16 = 1;
 pub const SHIDX_DATA: u16 = 2;
-pub const SHIDX_BSS: u16 = 3;
-pub const SHIDX_SYMTAB: u16 = 3;
-pub const SHIDX_STRTAB: u16 = 4;
-pub const SHIDX_SHSTRTAB: u16 = 5;
-pub const SHIDX_RELA_TEXT: u16 = 6;
+// BSS, SYMTAB, STRTAB, SHSTRTAB, RELA_TEXT indices depend on whether BSS exists.
+// Use ElfWriter.getSymtabIdx() etc. for correct values.
 
 // Symbol info bit layout (ELF spec: binding << 4 | type & 0xF)
 pub const SYM_INFO_TYPE_MASK: u8 = 0xF;
@@ -188,6 +188,13 @@ pub const ElfWriter = struct {
     shstrtab_debug_line: u32 = 0,
     shstrtab_debug_frame: u32 = 0,
 
+    // Dynamic section indices (computed in write() based on optional sections)
+    idx_bss: u16 = 0,
+    idx_symtab: u16 = 3,
+    idx_strtab: u16 = 4,
+    idx_shstrtab: u16 = 5,
+    idx_rela_text: u16 = 6,
+
     // DWARF Debug Info
     debug_abbrev_data: std.ArrayListUnmanaged(u8) = .{},
     debug_info_data: std.ArrayListUnmanaged(u8) = .{},
@@ -197,7 +204,7 @@ pub const ElfWriter = struct {
     source_file: ?[]const u8 = null,
     source_text: ?[]const u8 = null,
     debug_func_infos: []const dwarf.DebugFuncInfo = &.{},
-    debug_type_reg: ?*const @import("types.zig").TypeRegistry = null,
+    debug_type_reg: ?*const @import("../../frontend/types.zig").TypeRegistry = null,
 
     pub const LineEntry = struct {
         code_offset: u32,
@@ -251,7 +258,7 @@ pub const ElfWriter = struct {
         self.debug_func_infos = infos;
     }
 
-    pub fn setTypeRegistry(self: *ElfWriter, reg: *const @import("types.zig").TypeRegistry) void {
+    pub fn setTypeRegistry(self: *ElfWriter, reg: *const @import("../../frontend/types.zig").TypeRegistry) void {
         self.debug_type_reg = reg;
     }
 
@@ -440,8 +447,14 @@ pub const ElfWriter = struct {
         const has_data = self.data.items.len > 0;
         const has_bss = self.bss_size > 0;
         const has_debug = self.debug_abbrev_data.items.len > 0;
-        const debug_section_count: u16 = if (has_debug) 4 else 0; // abbrev, info, line, frame
+        const debug_section_count: u16 = if (has_debug) 4 else 0;
         const num_sections: u16 = (if (has_relocs) @as(u16, 7) else @as(u16, 6)) + (if (has_bss) @as(u16, 1) else @as(u16, 0)) + debug_section_count;
+
+        // Dynamic section indices — BSS shifts everything after .data
+        // Layout: null(0), .text(1), .data(2), [.bss(3)], .symtab, .strtab, .shstrtab, [.rela.text]
+        const shidx_symtab: u16 = if (has_bss) 4 else 3;
+        const shidx_strtab: u16 = if (has_bss) 5 else 4;
+        const shidx_shstrtab: u16 = if (has_bss) 6 else 5;
         const ehdr_size: u64 = @sizeOf(Elf64_Ehdr);
 
         var offset: u64 = ehdr_size;
@@ -509,7 +522,7 @@ pub const ElfWriter = struct {
             .e_machine = if (self.target_arch == .aarch64) EM_AARCH64 else EM_X86_64,
             .e_shoff = shdr_offset,
             .e_shnum = num_sections,
-            .e_shstrndx = SHIDX_SHSTRTAB,
+            .e_shstrndx = shidx_shstrtab,
         };
         try writer.writeAll(std.mem.asBytes(&ehdr));
 
@@ -610,12 +623,24 @@ pub const ElfWriter = struct {
             .sh_addralign = 8,
         }));
 
+        // BSS section must come right after .data (before .symtab) to match section indices
+        if (has_bss) {
+            try writer.writeAll(std.mem.asBytes(&Elf64_Shdr{
+                .sh_name = self.shstrtab_bss,
+                .sh_type = SHT_NOBITS,
+                .sh_flags = SHF_ALLOC | SHF_WRITE,
+                .sh_offset = 0,
+                .sh_size = self.bss_size,
+                .sh_addralign = 4096,
+            }));
+        }
+
         try writer.writeAll(std.mem.asBytes(&Elf64_Shdr{
             .sh_name = self.shstrtab_symtab,
             .sh_type = SHT_SYMTAB,
             .sh_offset = symtab_offset,
             .sh_size = symtab_size,
-            .sh_link = SHIDX_STRTAB,
+            .sh_link = shidx_strtab,
             .sh_info = num_local,
             .sh_addralign = 8,
             .sh_entsize = @sizeOf(Elf64_Sym),
@@ -644,22 +669,10 @@ pub const ElfWriter = struct {
                 .sh_flags = SHF_INFO_LINK,
                 .sh_offset = rela_text_offset,
                 .sh_size = rela_text_size,
-                .sh_link = SHIDX_SYMTAB,
+                .sh_link = shidx_symtab,
                 .sh_info = SHIDX_TEXT,
                 .sh_addralign = 8,
                 .sh_entsize = @sizeOf(Elf64_Rela),
-            }));
-        }
-
-        // BSS section (SHT_NOBITS): zero-fill, no disk space. Placed after all other sections.
-        if (has_bss) {
-            try writer.writeAll(std.mem.asBytes(&Elf64_Shdr{
-                .sh_name = self.shstrtab_bss,
-                .sh_type = SHT_NOBITS,
-                .sh_flags = SHF_ALLOC | SHF_WRITE,
-                .sh_offset = 0, // SHT_NOBITS has no file data
-                .sh_size = self.bss_size,
-                .sh_addralign = 4096, // page alignment
             }));
         }
 
