@@ -1,0 +1,1788 @@
+//! SSA Code Generator for WebAssembly
+//!
+//! Go reference: cmd/compile/internal/wasm/ssa.go
+//!
+//! This generates Prog chains from SSA values and blocks.
+//! Key functions matching Go:
+//! - ssaGenValue: Generate code for a single SSA value
+//! - ssaGenBlock: Generate code for block control flow (emits pseudo-jumps)
+//! - getValue32/getValue64: Get value onto wasm stack
+//! - setReg: Store value to register (local)
+//!
+//! IMPORTANT: This emits PSEUDO-JUMPS (obj.AJMP) not real branches.
+//! The preprocess pass later transforms these into the dispatch loop pattern.
+
+const std = @import("std");
+const c = @import("constants.zig");
+const prog_mod = @import("prog.zig");
+const Prog = prog_mod.Prog;
+const Addr = prog_mod.Addr;
+const Symbol = prog_mod.Symbol;
+const ProgBuilder = prog_mod.ProgBuilder;
+
+// Import real SSA types from compiler/ssa/
+const SsaValue = @import("../../ssa/value.zig").Value;
+const SsaBlock = @import("../../ssa/block.zig").Block;
+const BlockKind = @import("../../ssa/block.zig").BlockKind;
+const SsaFunc = @import("../../ssa/func.zig").Func;
+const SsaOp = @import("../../ssa/op.zig").Op;
+
+const TypeRegistry = @import("../../frontend/types.zig").TypeRegistry;
+const debug = @import("../../pipeline_debug.zig");
+
+/// Error type for code generation
+/// Uses explicit set to allow mutual recursion between getValue64 and ssaGenValueOnStack
+pub const GenError = error{OutOfMemory};
+
+/// Branch tracking - records pseudo-jumps for later resolution
+/// Go reference: cmd/compile/internal/ssagen/ssa.go Branch struct
+pub const Branch = struct {
+    prog: *Prog, // The AJMP instruction
+    target_block_id: u32, // Target block ID
+};
+
+/// Function index map type - maps function names to Wasm function indices
+pub const FuncIndexMap = std.StringHashMapUnmanaged(u32);
+
+/// State for SSA code generation
+/// Go reference: cmd/compile/internal/ssagen/ssa.go State struct
+pub const GenState = struct {
+    allocator: std.mem.Allocator,
+    builder: ProgBuilder,
+    func: *const SsaFunc,
+
+    /// Value to local mapping (Go: regalloc assigns registers)
+    value_to_local: std.AutoHashMapUnmanaged(u32, u32),
+    /// Next local index (set by allocateLocals after counting params)
+    next_local: u32 = 0,
+    param_count: u32 = 0,
+
+    /// Branch tracking (Go: s.Branches)
+    branches: std.ArrayListUnmanaged(Branch),
+
+    /// First Prog of each block (Go: s.bstart)
+    bstart: std.AutoHashMapUnmanaged(u32, *Prog),
+
+    /// OnWasmStack tracking (Go: s.OnWasmStackSkipped)
+    on_wasm_stack_skipped: i32 = 0,
+
+    /// Frame size for locals
+    frame_size: i32 = 0,
+
+    /// Number of f64 locals (at end of declared local range, after all i64 locals)
+    float_local_count: u32 = 0,
+    float_local_start: u32 = 0,
+
+    /// GC ref locals: each entry is a GC struct type index.
+    /// These locals are declared after f64 locals, as (ref null $typeidx).
+    gc_ref_locals: std.ArrayListUnmanaged(u32) = .{},
+
+    /// Maps function names to Wasm function indices
+    func_indices: ?*const FuncIndexMap = null,
+
+    /// Maps string literal content to memory offsets
+    string_offsets: ?*const std.StringHashMap(i32) = null,
+
+    /// Maps type names to metadata memory offsets
+    metadata_offsets: ?*const std.StringHashMap(i32) = null,
+
+    /// Maps function names to element table indices (for addr → call_indirect)
+    /// Go reference: link/internal/wasm/asm.go:476 (funcValueOffset + func_index)
+    func_table_indices: ?*const std.StringHashMap(u32) = null,
+
+    /// Maps struct type names to GC struct type indices (for WasmGC)
+    gc_struct_name_map: ?*const std.StringHashMapUnmanaged(u32) = null,
+
+    /// Maps array type names to GC array type indices (for WasmGC)
+    gc_array_name_map: ?*const std.StringHashMapUnmanaged(u32) = null,
+
+    /// Type registry for resolving type_idx to type info (needed for WasmGC local allocation)
+    type_reg: ?*const TypeRegistry = null,
+
+    /// Maps function names to Wasm type section indices (for call_indirect type)
+    /// Go reference: wasmobj.go:1286-1291 (type index from instruction)
+    func_type_indices: ?*const std.StringHashMap(u32) = null,
+
+    /// Maps SSA value IDs to their compound "len" local index.
+    /// For calls returning compound types (string, slice), the call pushes 2 values.
+    /// The main local (value_to_local) stores ptr, this stores len.
+    compound_len_locals: std.AutoHashMapUnmanaged(u32, u32) = .{},
+
+    pub fn init(allocator: std.mem.Allocator, func: *const SsaFunc) GenState {
+        return .{
+            .allocator = allocator,
+            .builder = ProgBuilder.init(allocator),
+            .func = func,
+            .value_to_local = .{},
+            .branches = .{},
+            .bstart = .{},
+        };
+    }
+
+    pub fn setFuncIndices(self: *GenState, indices: *const FuncIndexMap) void {
+        self.func_indices = indices;
+    }
+
+    pub fn setStringOffsets(self: *GenState, offsets: *const std.StringHashMap(i32)) void {
+        self.string_offsets = offsets;
+    }
+
+    pub fn setMetadataOffsets(self: *GenState, offsets: *const std.StringHashMap(i32)) void {
+        self.metadata_offsets = offsets;
+    }
+
+    pub fn setFuncTableIndices(self: *GenState, indices: *const std.StringHashMap(u32)) void {
+        self.func_table_indices = indices;
+    }
+
+    pub fn setGcStructNameMap(self: *GenState, map: *const std.StringHashMapUnmanaged(u32)) void {
+        self.gc_struct_name_map = map;
+    }
+
+    pub fn setGcArrayNameMap(self: *GenState, map: *const std.StringHashMapUnmanaged(u32)) void {
+        self.gc_array_name_map = map;
+    }
+
+    pub fn setTypeReg(self: *GenState, reg: *const TypeRegistry) void {
+        self.type_reg = reg;
+    }
+
+    pub fn setFuncTypeIndices(self: *GenState, indices: *const std.StringHashMap(u32)) void {
+        self.func_type_indices = indices;
+    }
+
+    pub fn deinit(self: *GenState) void {
+        self.builder.deinit();
+        self.value_to_local.deinit(self.allocator);
+        self.compound_len_locals.deinit(self.allocator);
+        self.gc_ref_locals.deinit(self.allocator);
+        self.branches.deinit(self.allocator);
+        self.bstart.deinit(self.allocator);
+    }
+
+    // ========================================================================
+    // Go's s.Br - emit pseudo-jump
+    // Reference: cmd/compile/internal/ssagen/ssa.go lines 6711-6716
+    // ========================================================================
+
+    /// Emit a pseudo-jump to target block. Will be resolved later.
+    pub fn br(self: *GenState, target: *const SsaBlock) !*Prog {
+        const p = try self.builder.append(.jmp);
+        p.to.type = .branch;
+        // Record for later resolution
+        try self.branches.append(self.allocator, .{
+            .prog = p,
+            .target_block_id = target.id,
+        });
+        return p;
+    }
+
+    // ========================================================================
+    // Go's ssaGenBlock - control flow generation with PSEUDO-JUMPS
+    // Reference: cmd/compile/internal/wasm/ssa.go lines 169-215
+    // ========================================================================
+
+    pub fn ssaGenBlock(self: *GenState, b: *const SsaBlock, next: ?*const SsaBlock) !void {
+        switch (b.kind) {
+            // Go: BlockPlain, BlockDefer (lines 171-174)
+            .plain, .first, .defer_ => {
+                if (b.succs.len > 0) {
+                    const succ = b.succs[0].b;
+                    if (next == null or next.?.id != succ.id) {
+                        _ = try self.br(succ);
+                    }
+                }
+            },
+
+            // Go: BlockIf (lines 176-198)
+            .if_ => {
+                if (b.succs.len < 2) return;
+
+                const succ0 = b.succs[0].b; // true branch
+                const succ1 = b.succs[1].b; // false branch
+
+                if (b.controls[0]) |cond| {
+                    try self.getValue32(cond);
+                }
+
+                if (next != null and next.?.id == succ0.id) {
+                    // if false, jump to succ1 (Go: lines 178-184)
+                    _ = try self.builder.append(.i32_eqz);
+                    _ = try self.builder.append(.@"if");
+                    _ = try self.br(succ1);
+                    _ = try self.builder.append(.end);
+                } else if (next != null and next.?.id == succ1.id) {
+                    // if true, jump to succ0 (Go: lines 185-190)
+                    _ = try self.builder.append(.@"if");
+                    _ = try self.br(succ0);
+                    _ = try self.builder.append(.end);
+                } else {
+                    // neither is next (Go: lines 191-197)
+                    _ = try self.builder.append(.@"if");
+                    _ = try self.br(succ0);
+                    _ = try self.builder.append(.end);
+                    _ = try self.br(succ1);
+                }
+            },
+
+            // Go: BlockRet (lines 200-201)
+            .ret => {
+                // Get return value if any
+                if (b.controls[0]) |ret_val| {
+                    if (ret_val.op == .string_make or ret_val.op == .slice_make or ret_val.op == .opt_make) {
+                        // Compound return: push both components (ptr, len)
+                        // string_make/slice_make are conceptual — push args directly
+                        if (ret_val.args.len >= 2) {
+                            try self.getValue64(ret_val.args[0]); // ptr
+                            try self.getValue64(ret_val.args[1]); // len
+                        }
+                    } else if (ret_val.type_idx == TypeRegistry.STRING and
+                        self.compound_len_locals.get(ret_val.id) != null)
+                    {
+                        // Compound return from a call result — push ptr then len
+                        try self.getValue64(ret_val); // ptr (main local)
+                        const len_local = self.compound_len_locals.get(ret_val.id).?;
+                        _ = try self.builder.appendFrom(.local_get, prog_mod.constAddr(len_local)); // len
+                    } else {
+                        try self.getValue64(ret_val);
+                    }
+                }
+                // Emit ARET pseudo-instruction, NOT real wasm return
+                // Go: s.Prog(obj.ARET) - transformed by preprocess
+                _ = try self.builder.append(.aret);
+            },
+
+            // Go: BlockExit (lines 203-204)
+            .exit => {
+                // Nothing - handled by preprocess
+            },
+
+            else => {},
+        }
+
+        // Go: Every block ends with ARESUMEPOINT (line 210)
+        // This marks the entry point for the next block
+        _ = try self.builder.append(.resume_point);
+
+        // Go: Check stack balance (lines 212-214)
+        if (self.on_wasm_stack_skipped != 0) {
+            debug.log(.codegen, "wasm: bad stack in block b{d}", .{b.id});
+        }
+    }
+
+    /// Emit phi moves before block terminators.
+    /// For each successor block that contains phi nodes, store the appropriate
+    /// phi argument (determined by predecessor index) to the phi's local.
+    /// This implements the "parallel copy" semantics of SSA phi nodes.
+    fn emitPhiMoves(self: *GenState, block: *const SsaBlock) !void {
+        for (block.succs) |edge| {
+            const succ = edge.b;
+            const pred_idx = edge.i; // our index in succ's preds list
+            for (succ.values.items) |v| {
+                if (v.op != .phi) continue;
+                // Skip memory PHIs (stripped by lower_wasm, but guard defensively)
+                if (v.type_idx == TypeRegistry.SSA_MEM) continue;
+                if (pred_idx >= v.args.len) continue;
+                const arg = v.args[pred_idx];
+                // Get arg value on stack
+                try self.getValue64(arg);
+                // Convert between f64↔i64 if source and dest locals have different types
+                if (self.value_to_local.get(v.id)) |local_idx| {
+                    const src_local = self.value_to_local.get(arg.id);
+                    const src_is_f64 = if (src_local) |sl| self.isFloatLocal(sl) else isFloatType(arg.type_idx);
+                    const dst_is_f64 = self.isFloatLocal(local_idx);
+                    if (src_is_f64 and !dst_is_f64) {
+                        _ = try self.builder.append(.i64_reinterpret_f64);
+                    } else if (!src_is_f64 and dst_is_f64) {
+                        _ = try self.builder.append(.f64_reinterpret_i64);
+                    }
+                    _ = try self.builder.appendTo(.local_set, prog_mod.constAddr(local_idx));
+                }
+            }
+        }
+    }
+
+    // ========================================================================
+    // Value access helpers
+    // Go reference: cmd/compile/internal/wasm/ssa.go lines 474-533
+    // ========================================================================
+
+    /// Get 32-bit value onto wasm stack
+    /// Go: getValue32 (lines 474-489)
+    pub fn getValue32(self: *GenState, v: *const SsaValue) GenError!void {
+        // Check if already computed and stored in a local (e.g. call results).
+        // Without this, calls used as if-conditions get emitted TWICE:
+        // once by ssaGenValue (stored in local) and again here for the branch.
+        if (!isRematerializable(v)) {
+            if (self.value_to_local.get(v.id)) |local_idx| {
+                _ = try self.builder.appendFrom(.local_get, prog_mod.constAddr(local_idx));
+                _ = try self.builder.append(.i32_wrap_i64);
+                return;
+            }
+        }
+
+        // Generate value on stack
+        try self.ssaGenValueOnStack(v);
+
+        // Wrap to i32 if not already i32
+        if (!isCmp(v)) {
+            _ = try self.builder.append(.i32_wrap_i64);
+        }
+    }
+
+    /// Get 64-bit value onto wasm stack
+    /// Check if a Wasm local index is an f64 local.
+    fn isFloatLocal(self: *const GenState, local_idx: u32) bool {
+        return local_idx >= self.float_local_start and
+            local_idx < self.float_local_start + self.float_local_count;
+    }
+
+    /// Go: getValue64 (lines 491-503)
+    pub fn getValue64(self: *GenState, v: *const SsaValue) GenError!void {
+        // Check if rematerializable (constants)
+        if (isRematerializable(v)) {
+            try self.ssaGenValueOnStack(v);
+            return;
+        }
+
+        // Get from local
+        if (self.value_to_local.get(v.id)) |local_idx| {
+            // Use local_get directly with local index
+            _ = try self.builder.appendFrom(.local_get, prog_mod.constAddr(local_idx));
+            return;
+        }
+
+        // Generate on stack (on-demand values like comparisons)
+        // Go: ssaGenValueOnStack(s, v, true) — extend=true extends i32 cmp results to i64
+        try self.ssaGenValueOnStack(v);
+        if (isCmp(v)) {
+            _ = try self.builder.append(.i64_extend_i32_u);
+        }
+    }
+
+    /// Store top of stack to local
+    /// Go: setReg (lines 530-533)
+    /// Go: setReg (lines 530-533) — just local.set.
+    pub fn setReg(self: *GenState, v: *const SsaValue) GenError!void {
+        if (self.value_to_local.get(v.id)) |local_idx| {
+            _ = try self.builder.appendTo(.local_set, prog_mod.constAddr(local_idx));
+        }
+    }
+
+    /// Generate value directly onto wasm stack
+    /// Go: ssaGenValueOnStack (lines 313-461)
+    pub fn ssaGenValueOnStack(self: *GenState, v: *const SsaValue) GenError!void {
+        switch (v.op) {
+            // Constants
+            .wasm_i64_const, .const_int, .const_64 => {
+                _ = try self.builder.appendFrom(.i64_const, prog_mod.constAddr(v.aux_int));
+            },
+            .wasm_i32_const, .const_32 => {
+                _ = try self.builder.appendFrom(.i32_const, prog_mod.constAddr(v.aux_int));
+            },
+            .wasm_f64_const, .const_float => {
+                // Float value is bit-cast stored in aux_int
+                _ = try self.builder.appendFrom(.f64_const, prog_mod.floatAddr(@bitCast(v.aux_int)));
+            },
+            .const_bool => {
+                // Go: booleans are i64 (0 or 1) — same as all other values
+                _ = try self.builder.appendFrom(.i64_const, prog_mod.constAddr(if (v.aux_int != 0) @as(i64, 1) else @as(i64, 0)));
+            },
+            .const_nil => {
+                // Nil/null is 0 (null pointer)
+                _ = try self.builder.appendFrom(.i64_const, prog_mod.constAddr(0));
+            },
+
+            // NOTE: const_string is rewritten to string_make by rewritegeneric.zig
+            // NOTE: string_ptr/string_len/slice_ptr/slice_len are decomposed by rewritedec.zig
+
+            // Compound type ops - these are conceptual groupings, no code generated
+            // The components are accessed via extraction ops which get decomposed
+            .string_make, .slice_make, .opt_make => {
+                // No code - these values are decomposed when accessed
+                debug.log(.codegen, "wasm/gen: skip compound type op {s}", .{@tagName(v.op)});
+            },
+
+            // Extraction ops for compound types - should be decomposed by rewritedec.
+            // If they reach here, the arg is a call returning compound type (not string_make).
+            .string_ptr, .slice_ptr => {
+                // Get ptr component: stored in arg's main local (value_to_local)
+                try self.getValue64(v.args[0]);
+            },
+            .string_len, .slice_len => {
+                // Get len component: stored in arg's compound len local
+                if (self.compound_len_locals.get(v.args[0].id)) |len_local| {
+                    _ = try self.builder.appendFrom(.local_get, prog_mod.constAddr(len_local));
+                } else {
+                    // Fallback: try the main local (shouldn't happen for correctly compiled code)
+                    debug.log(.codegen, "wasm/gen: string_len without compound local for v{d}", .{v.args[0].id});
+                    try self.getValue64(v.args[0]);
+                }
+            },
+            // Optional pointer extraction ops - same pattern as string/slice
+            .opt_tag => {
+                // Get tag component: stored in arg's main local (value_to_local)
+                try self.getValue64(v.args[0]);
+            },
+            .opt_data => {
+                // Get payload component: stored in arg's compound len local
+                if (self.compound_len_locals.get(v.args[0].id)) |data_local| {
+                    _ = try self.builder.appendFrom(.local_get, prog_mod.constAddr(data_local));
+                } else {
+                    debug.log(.codegen, "wasm/gen: opt_data without compound local for v{d}", .{v.args[0].id});
+                    try self.getValue64(v.args[0]);
+                }
+            },
+
+            // Arithmetic (i64)
+            .wasm_i64_add => {
+                try self.getValue64(v.args[0]);
+                try self.getValue64(v.args[1]);
+                _ = try self.builder.append(.i64_add);
+            },
+            .wasm_i64_sub => {
+                try self.getValue64(v.args[0]);
+                try self.getValue64(v.args[1]);
+                _ = try self.builder.append(.i64_sub);
+            },
+            .wasm_i64_mul => {
+                try self.getValue64(v.args[0]);
+                try self.getValue64(v.args[1]);
+                _ = try self.builder.append(.i64_mul);
+            },
+            .wasm_i64_div_s => {
+                try self.getValue64(v.args[0]);
+                try self.getValue64(v.args[1]);
+                _ = try self.builder.append(.i64_div_s);
+            },
+            .wasm_i64_rem_s => {
+                try self.getValue64(v.args[0]);
+                try self.getValue64(v.args[1]);
+                _ = try self.builder.append(.i64_rem_s);
+            },
+
+            // Bitwise operations (i64)
+            // Go reference: cmd/compile/internal/wasm/ssa.go line 401
+            .wasm_i64_and => {
+                try self.getValue64(v.args[0]);
+                try self.getValue64(v.args[1]);
+                _ = try self.builder.append(.i64_and);
+            },
+            .wasm_i64_or => {
+                try self.getValue64(v.args[0]);
+                try self.getValue64(v.args[1]);
+                _ = try self.builder.append(.i64_or);
+            },
+            .wasm_i64_xor => {
+                try self.getValue64(v.args[0]);
+                try self.getValue64(v.args[1]);
+                _ = try self.builder.append(.i64_xor);
+            },
+            .wasm_i64_shl => {
+                try self.getValue64(v.args[0]);
+                try self.getValue64(v.args[1]);
+                _ = try self.builder.append(.i64_shl);
+            },
+            .wasm_i64_shr_s => {
+                try self.getValue64(v.args[0]);
+                try self.getValue64(v.args[1]);
+                _ = try self.builder.append(.i64_shr_s);
+            },
+            .wasm_i64_shr_u => {
+                try self.getValue64(v.args[0]);
+                try self.getValue64(v.args[1]);
+                _ = try self.builder.append(.i64_shr_u);
+            },
+
+            // Bit counting (i64) — Wasm spec: clz=0x79, ctz=0x7A, popcnt=0x7B
+            .wasm_i64_clz => {
+                try self.getValue64(v.args[0]);
+                _ = try self.builder.append(.i64_clz);
+            },
+            .wasm_i64_ctz => {
+                try self.getValue64(v.args[0]);
+                _ = try self.builder.append(.i64_ctz);
+            },
+            .wasm_i64_popcnt => {
+                try self.getValue64(v.args[0]);
+                _ = try self.builder.append(.i64_popcnt);
+            },
+
+            // Bitwise operations (i32)
+            .wasm_i32_and => {
+                try self.getValue64(v.args[0]);
+                _ = try self.builder.append(.i32_wrap_i64);
+                try self.getValue64(v.args[1]);
+                _ = try self.builder.append(.i32_wrap_i64);
+                _ = try self.builder.append(.i32_and);
+                _ = try self.builder.append(.i64_extend_i32_u);
+            },
+            .wasm_i32_or => {
+                try self.getValue64(v.args[0]);
+                _ = try self.builder.append(.i32_wrap_i64);
+                try self.getValue64(v.args[1]);
+                _ = try self.builder.append(.i32_wrap_i64);
+                _ = try self.builder.append(.i32_or);
+                _ = try self.builder.append(.i64_extend_i32_u);
+            },
+            .wasm_i32_xor => {
+                try self.getValue64(v.args[0]);
+                _ = try self.builder.append(.i32_wrap_i64);
+                try self.getValue64(v.args[1]);
+                _ = try self.builder.append(.i32_wrap_i64);
+                _ = try self.builder.append(.i32_xor);
+                _ = try self.builder.append(.i64_extend_i32_u);
+            },
+            .wasm_i32_shl => {
+                try self.getValue64(v.args[0]);
+                _ = try self.builder.append(.i32_wrap_i64);
+                try self.getValue64(v.args[1]);
+                _ = try self.builder.append(.i32_wrap_i64);
+                _ = try self.builder.append(.i32_shl);
+                _ = try self.builder.append(.i64_extend_i32_u);
+            },
+            .wasm_i32_shr_s => {
+                try self.getValue64(v.args[0]);
+                _ = try self.builder.append(.i32_wrap_i64);
+                try self.getValue64(v.args[1]);
+                _ = try self.builder.append(.i32_wrap_i64);
+                _ = try self.builder.append(.i32_shr_s);
+                _ = try self.builder.append(.i64_extend_i32_s);
+            },
+            .wasm_i32_shr_u => {
+                try self.getValue64(v.args[0]);
+                _ = try self.builder.append(.i32_wrap_i64);
+                try self.getValue64(v.args[1]);
+                _ = try self.builder.append(.i32_wrap_i64);
+                _ = try self.builder.append(.i32_shr_u);
+                _ = try self.builder.append(.i64_extend_i32_u);
+            },
+
+            // Bitwise NOT - Wasm has no NOT, implement as XOR -1
+            // Go reference: Wasm backend transforms ~x to x ^ -1
+            .not => {
+                try self.getValue64(v.args[0]);
+                _ = try self.builder.appendFrom(.i64_const, prog_mod.constAddr(-1));
+                _ = try self.builder.append(.i64_xor);
+            },
+
+            // Comparisons (produce i32)
+            .wasm_i64_eq => {
+                try self.getValue64(v.args[0]);
+                try self.getValue64(v.args[1]);
+                _ = try self.builder.append(.i64_eq);
+            },
+            .wasm_i64_ne => {
+                try self.getValue64(v.args[0]);
+                try self.getValue64(v.args[1]);
+                _ = try self.builder.append(.i64_ne);
+            },
+            .wasm_i64_lt_s => {
+                try self.getValue64(v.args[0]);
+                try self.getValue64(v.args[1]);
+                _ = try self.builder.append(.i64_lt_s);
+            },
+            .wasm_i64_le_s => {
+                try self.getValue64(v.args[0]);
+                try self.getValue64(v.args[1]);
+                _ = try self.builder.append(.i64_le_s);
+            },
+            .wasm_i64_gt_s => {
+                try self.getValue64(v.args[0]);
+                try self.getValue64(v.args[1]);
+                _ = try self.builder.append(.i64_gt_s);
+            },
+            .wasm_i64_ge_s => {
+                try self.getValue64(v.args[0]);
+                try self.getValue64(v.args[1]);
+                _ = try self.builder.append(.i64_ge_s);
+            },
+            .wasm_i64_lt_u => {
+                try self.getValue64(v.args[0]);
+                try self.getValue64(v.args[1]);
+                _ = try self.builder.append(.i64_lt_u);
+            },
+            .wasm_i64_le_u => {
+                try self.getValue64(v.args[0]);
+                try self.getValue64(v.args[1]);
+                _ = try self.builder.append(.i64_le_u);
+            },
+            .wasm_i64_gt_u => {
+                try self.getValue64(v.args[0]);
+                try self.getValue64(v.args[1]);
+                _ = try self.builder.append(.i64_gt_u);
+            },
+            .wasm_i64_ge_u => {
+                try self.getValue64(v.args[0]);
+                try self.getValue64(v.args[1]);
+                _ = try self.builder.append(.i64_ge_u);
+            },
+            .wasm_i64_eqz => {
+                try self.getValue64(v.args[0]);
+                _ = try self.builder.append(.i64_eqz);
+            },
+
+            // Float arithmetic (f64)
+            .wasm_f64_add => {
+                try self.getValue64(v.args[0]);
+                try self.getValue64(v.args[1]);
+                _ = try self.builder.append(.f64_add);
+            },
+            .wasm_f64_sub => {
+                try self.getValue64(v.args[0]);
+                try self.getValue64(v.args[1]);
+                _ = try self.builder.append(.f64_sub);
+            },
+            .wasm_f64_mul => {
+                try self.getValue64(v.args[0]);
+                try self.getValue64(v.args[1]);
+                _ = try self.builder.append(.f64_mul);
+            },
+            .wasm_f64_div => {
+                try self.getValue64(v.args[0]);
+                try self.getValue64(v.args[1]);
+                _ = try self.builder.append(.f64_div);
+            },
+            .wasm_f64_neg => {
+                try self.getValue64(v.args[0]);
+                _ = try self.builder.append(.f64_neg);
+            },
+            // Float math unary ops (f64)
+            .wasm_f64_abs => {
+                try self.getValue64(v.args[0]);
+                _ = try self.builder.append(.f64_abs);
+            },
+            .wasm_f64_ceil => {
+                try self.getValue64(v.args[0]);
+                _ = try self.builder.append(.f64_ceil);
+            },
+            .wasm_f64_floor => {
+                try self.getValue64(v.args[0]);
+                _ = try self.builder.append(.f64_floor);
+            },
+            .wasm_f64_trunc => {
+                try self.getValue64(v.args[0]);
+                _ = try self.builder.append(.f64_trunc);
+            },
+            .wasm_f64_nearest => {
+                try self.getValue64(v.args[0]);
+                _ = try self.builder.append(.f64_nearest);
+            },
+            .wasm_f64_sqrt => {
+                try self.getValue64(v.args[0]);
+                _ = try self.builder.append(.f64_sqrt);
+            },
+            // Float math binary ops (f64)
+            .wasm_f64_min => {
+                try self.getValue64(v.args[0]);
+                try self.getValue64(v.args[1]);
+                _ = try self.builder.append(.f64_min);
+            },
+            .wasm_f64_max => {
+                try self.getValue64(v.args[0]);
+                try self.getValue64(v.args[1]);
+                _ = try self.builder.append(.f64_max);
+            },
+
+            // Integer negation: 0 - x (Wasm has no i64.neg)
+            .neg => {
+                _ = try self.builder.appendFrom(.i64_const, prog_mod.constAddr(0));
+                try self.getValue64(v.args[0]);
+                _ = try self.builder.append(.i64_sub);
+            },
+
+            // Float comparisons (f64) - produce i32
+            .wasm_f64_eq => {
+                try self.getValue64(v.args[0]);
+                try self.getValue64(v.args[1]);
+                _ = try self.builder.append(.f64_eq);
+            },
+            .wasm_f64_ne => {
+                try self.getValue64(v.args[0]);
+                try self.getValue64(v.args[1]);
+                _ = try self.builder.append(.f64_ne);
+            },
+            .wasm_f64_lt => {
+                try self.getValue64(v.args[0]);
+                try self.getValue64(v.args[1]);
+                _ = try self.builder.append(.f64_lt);
+            },
+            .wasm_f64_le => {
+                try self.getValue64(v.args[0]);
+                try self.getValue64(v.args[1]);
+                _ = try self.builder.append(.f64_le);
+            },
+            .wasm_f64_gt => {
+                try self.getValue64(v.args[0]);
+                try self.getValue64(v.args[1]);
+                _ = try self.builder.append(.f64_gt);
+            },
+            .wasm_f64_ge => {
+                try self.getValue64(v.args[0]);
+                try self.getValue64(v.args[1]);
+                _ = try self.builder.append(.f64_ge);
+            },
+
+            // Float↔Int reinterpret — Go: these are register moves between R and F classes.
+            // Cot: explicit conversion between i64 and f64 on the Wasm stack.
+            .wasm_f64_reinterpret_i64 => {
+                try self.getValue64(v.args[0]); // pushes i64
+                _ = try self.builder.append(.f64_reinterpret_i64); // converts to f64
+            },
+            .wasm_i64_reinterpret_f64 => {
+                try self.getValue64(v.args[0]); // pushes f64 (from f64 local)
+                _ = try self.builder.append(.i64_reinterpret_f64); // converts to i64
+            },
+
+            // Memory operations
+            .wasm_i64_load => {
+                try self.getValue64(v.args[0]);
+                _ = try self.builder.append(.i32_wrap_i64);
+                const p = try self.builder.append(.i64_load);
+                p.from = prog_mod.constAddr(v.aux_int); // offset
+            },
+            .wasm_i64_store => {
+                try self.getValue64(v.args[0]); // address
+                _ = try self.builder.append(.i32_wrap_i64);
+                try self.getValue64(v.args[1]); // value
+                const p = try self.builder.append(.i64_store);
+                p.to = prog_mod.constAddr(v.aux_int); // offset
+            },
+
+            // Float memory operations
+            .wasm_f64_load => {
+                try self.getValue64(v.args[0]);
+                _ = try self.builder.append(.i32_wrap_i64);
+                const p = try self.builder.append(.f64_load);
+                p.from = prog_mod.constAddr(v.aux_int);
+            },
+            .wasm_f64_store => {
+                try self.getValue64(v.args[0]); // address
+                _ = try self.builder.append(.i32_wrap_i64);
+                try self.getValue64(v.args[1]); // value
+                const p = try self.builder.append(.f64_store);
+                p.to = prog_mod.constAddr(v.aux_int);
+            },
+
+            // Sized memory loads - Go reference: wasm/ssa.go loadOp()
+            .wasm_i64_load8_u => {
+                try self.getValue64(v.args[0]);
+                _ = try self.builder.append(.i32_wrap_i64);
+                const p = try self.builder.append(.i64_load8_u);
+                p.from = prog_mod.constAddr(v.aux_int);
+            },
+            .wasm_i64_load8_s => {
+                try self.getValue64(v.args[0]);
+                _ = try self.builder.append(.i32_wrap_i64);
+                const p = try self.builder.append(.i64_load8_s);
+                p.from = prog_mod.constAddr(v.aux_int);
+            },
+            .wasm_i64_load16_u => {
+                try self.getValue64(v.args[0]);
+                _ = try self.builder.append(.i32_wrap_i64);
+                const p = try self.builder.append(.i64_load16_u);
+                p.from = prog_mod.constAddr(v.aux_int);
+            },
+            .wasm_i64_load16_s => {
+                try self.getValue64(v.args[0]);
+                _ = try self.builder.append(.i32_wrap_i64);
+                const p = try self.builder.append(.i64_load16_s);
+                p.from = prog_mod.constAddr(v.aux_int);
+            },
+            .wasm_i64_load32_u => {
+                try self.getValue64(v.args[0]);
+                _ = try self.builder.append(.i32_wrap_i64);
+                const p = try self.builder.append(.i64_load32_u);
+                p.from = prog_mod.constAddr(v.aux_int);
+            },
+            .wasm_i64_load32_s => {
+                try self.getValue64(v.args[0]);
+                _ = try self.builder.append(.i32_wrap_i64);
+                const p = try self.builder.append(.i64_load32_s);
+                p.from = prog_mod.constAddr(v.aux_int);
+            },
+
+            // Sized memory stores - Go reference: wasm/ssa.go storeOp()
+            .wasm_i64_store8 => {
+                try self.getValue64(v.args[0]); // address
+                _ = try self.builder.append(.i32_wrap_i64);
+                try self.getValue64(v.args[1]); // value
+                const p = try self.builder.append(.i64_store8);
+                p.to = prog_mod.constAddr(v.aux_int);
+            },
+            .wasm_i64_store16 => {
+                try self.getValue64(v.args[0]); // address
+                _ = try self.builder.append(.i32_wrap_i64);
+                try self.getValue64(v.args[1]); // value
+                const p = try self.builder.append(.i64_store16);
+                p.to = prog_mod.constAddr(v.aux_int);
+            },
+            .wasm_i64_store32 => {
+                try self.getValue64(v.args[0]); // address
+                _ = try self.builder.append(.i32_wrap_i64);
+                try self.getValue64(v.args[1]); // value
+                const p = try self.builder.append(.i64_store32);
+                p.to = prog_mod.constAddr(v.aux_int);
+            },
+
+            // Local address
+            .local_addr => {
+                // SP + slot_offset * 8
+                // aux_int is a slot offset (in 8-byte units) computed by ssa_builder.zig
+                // which accounts for multi-word locals (structs, tuples)
+                _ = try self.builder.appendFrom(.get, prog_mod.regAddr(.sp));
+                _ = try self.builder.append(.i64_extend_i32_u);
+                const slot_offset: i64 = v.aux_int;
+                const byte_offset: i64 = slot_offset * 8;
+                if (byte_offset != 0) {
+                    _ = try self.builder.appendFrom(.i64_const, prog_mod.constAddr(byte_offset));
+                    _ = try self.builder.append(.i64_add);
+                }
+            },
+
+            // Global address (for global variables in linear memory)
+            // Globals are stored at fixed addresses: GLOBAL_BASE + (index * 8)
+            // GLOBAL_BASE = 0x20000 (128KB, after stack and heap start)
+            .global_addr => {
+                const GLOBAL_BASE: i64 = 0x20000;
+                const global_idx: i64 = v.aux_int;
+                const addr: i64 = GLOBAL_BASE + (global_idx * 8);
+                _ = try self.builder.appendFrom(.i64_const, prog_mod.constAddr(addr));
+            },
+
+            // Type metadata address (for WasmGC type info)
+            // Resolved at link time: metadata_offsets[type_name]
+            .metadata_addr => {
+                const type_name = v.aux.string;
+                if (self.metadata_offsets) |offsets| {
+                    if (offsets.get(type_name)) |offset| {
+                        _ = try self.builder.appendFrom(.i64_const, prog_mod.constAddr(offset));
+                    } else {
+                        // Type has no destructor - pass 0 (null metadata)
+                        _ = try self.builder.appendFrom(.i64_const, prog_mod.constAddr(0));
+                    }
+                } else {
+                    // No metadata available - pass 0
+                    _ = try self.builder.appendFrom(.i64_const, prog_mod.constAddr(0));
+                }
+            },
+
+            // Function address: push element table index as i64
+            // Go reference: link/internal/wasm/asm.go R_ADDR resolves to table index
+            // We use a direct lookup: func_name → table_idx (assigned by linker)
+            .addr => {
+                const fn_name: ?[]const u8 = switch (v.aux) {
+                    .string => |s| s,
+                    else => null,
+                };
+                if (fn_name) |name| {
+                    if (self.func_table_indices) |indices| {
+                        if (indices.get(name)) |table_idx| {
+                            debug.log(.codegen, "wasm/gen: func_addr '{s}' → table_idx={d}", .{ name, table_idx });
+                            _ = try self.builder.appendFrom(.i64_const, prog_mod.constAddr(@intCast(table_idx)));
+                        } else {
+                            debug.log(.codegen, "wasm/gen: addr op: function '{s}' not in func_table_indices", .{name});
+                            _ = try self.builder.appendFrom(.i64_const, prog_mod.constAddr(0));
+                        }
+                    } else {
+                        debug.log(.codegen, "wasm/gen: addr op: no func_table_indices available", .{});
+                        _ = try self.builder.appendFrom(.i64_const, prog_mod.constAddr(0));
+                    }
+                } else {
+                    _ = try self.builder.appendFrom(.i64_const, prog_mod.constAddr(0));
+                }
+            },
+
+            // Pointer offset (for struct field access)
+            .off_ptr => {
+                // base_ptr + offset
+                try self.getValue64(v.args[0]);
+                const offset = v.aux_int;
+                if (offset != 0) {
+                    _ = try self.builder.appendFrom(.i64_const, prog_mod.constAddr(offset));
+                    _ = try self.builder.append(.i64_add);
+                }
+            },
+
+            // Pointer arithmetic
+            .add_ptr => {
+                // base_ptr + (index * elem_size)
+                try self.getValue64(v.args[0]); // base
+                try self.getValue64(v.args[1]); // offset (already scaled)
+                _ = try self.builder.append(.i64_add);
+            },
+
+            .sub_ptr => {
+                // ptr1 - ptr2 (returns offset)
+                try self.getValue64(v.args[0]);
+                try self.getValue64(v.args[1]);
+                _ = try self.builder.append(.i64_sub);
+            },
+
+            // Arguments - params are in locals 0..param_count-1
+            .arg => {
+                const local_idx = self.value_to_local.get(v.id) orelse @as(u32, @intCast(v.aux_int));
+                _ = try self.builder.appendFrom(.local_get, prog_mod.constAddr(local_idx));
+            },
+
+            // Copy
+            // Copy — Go ssa.go:454: getValue64(s, v.Args[0]).
+            // Go uses register allocator to keep float values in F regs and int in R regs.
+            // Cot checks the actual Wasm local types (f64 vs i64) and converts at boundaries.
+            .copy => {
+                try self.getValue64(v.args[0]);
+                // If source local is f64 but dest local is i64: f64 on stack → need i64
+                const src_local = self.value_to_local.get(v.args[0].id);
+                const dst_local = self.value_to_local.get(v.id);
+                const src_is_f64 = if (src_local) |sl| self.isFloatLocal(sl) else false;
+                const dst_is_f64 = if (dst_local) |dl| self.isFloatLocal(dl) else false;
+                if (src_is_f64 and !dst_is_f64) {
+                    _ = try self.builder.append(.i64_reinterpret_f64);
+                } else if (!src_is_f64 and dst_is_f64) {
+                    _ = try self.builder.append(.f64_reinterpret_i64);
+                }
+            },
+
+            // Phi - load from local (populated by emitPhiMoves in predecessor blocks)
+            .phi => {
+                if (self.value_to_local.get(v.id)) |local_idx| {
+                    _ = try self.builder.appendFrom(.local_get, prog_mod.constAddr(local_idx));
+                }
+            },
+
+            // Conditional select (ternary)
+            // Go reference: cmd/compile/internal/wasm/ssa.go line 359-363
+            // Stack order: then_val, else_val, condition -> result
+            .cond_select => {
+                try self.getValue64(v.args[1]); // then_value
+                try self.getValue64(v.args[2]); // else_value
+                try self.getValue32(v.args[0]); // condition (must be i32)
+                _ = try self.builder.append(.select);
+            },
+
+            // Function calls
+            .wasm_call => {
+                // Push arguments onto stack (skip last arg = memory state).
+                const wc_end = if (v.memoryArg() != null and v.args.len > 0) v.args.len - 1 else v.args.len;
+                for (v.args[0..wc_end]) |arg| {
+                    try self.getValue64(arg);
+                }
+                // Emit call with function index from aux_int
+                // Pipeline debug: flag unresolved function calls (index 0 = fd_write = likely bug)
+                if (v.aux_int == 0) {
+                    const func_name_str = if (v.aux.string.len > 0) v.aux.string else "<no_name>";
+                    debug.log(.codegen, "WARNING: call to func_idx=0 (fd_write fallback) — likely unresolved '{s}' (args={d})", .{ func_name_str, v.args.len });
+                }
+                const p = try self.builder.append(.call);
+                p.to = prog_mod.constAddr(v.aux_int);
+            },
+
+            // Wasm 3.0 tail call — return_call (opcode 0x12)
+            // Same as wasm_call/wasm_lowered_static_call but emits return_call
+            // The call implicitly returns, so no separate return is needed.
+            .wasm_return_call => {
+                // Push arguments onto stack (skip last arg = memory state)
+                const rc_end = if (v.memoryArg() != null and v.args.len > 0) v.args.len - 1 else v.args.len;
+                for (v.args[0..rc_end]) |arg| {
+                    try self.getValue64(arg);
+                }
+                // Get function index from name (same as wasm_lowered_static_call)
+                const rc_fn_name: ?[]const u8 = switch (v.aux) {
+                    .string => |s| s,
+                    else => null,
+                };
+                const rc_func_idx: i64 = if (rc_fn_name) |name_str| blk: {
+                    if (self.func_indices) |indices| {
+                        if (indices.get(name_str)) |idx| {
+                            break :blk @intCast(idx);
+                        }
+                    }
+                    break :blk v.aux_int;
+                } else v.aux_int;
+
+                const rc_p = try self.builder.append(.return_call);
+                rc_p.to = prog_mod.constAddr(rc_func_idx);
+            },
+
+            .wasm_lowered_static_call => {
+                // Push arguments onto stack (skip last arg = memory state).
+                const sc_end = if (v.memoryArg() != null and v.args.len > 0) v.args.len - 1 else v.args.len;
+                for (v.args[0..sc_end]) |arg| {
+                    try self.getValue64(arg);
+                }
+                // Get function index from name
+                const fn_name: ?[]const u8 = switch (v.aux) {
+                    .string => |s| s,
+                    else => null,
+                };
+                const func_idx: i64 = if (fn_name) |name| blk: {
+                    if (self.func_indices) |indices| {
+                        if (indices.get(name)) |idx| {
+                            break :blk @intCast(idx);
+                        }
+                    }
+                    // Unresolved function: emit unreachable trap instead of silent fallback to fd_write.
+                    // This prevents type mismatches and silent corruption.
+                    debug.log(.codegen, "UNRESOLVED: static call '{s}' not in func_indices — emitting unreachable", .{name});
+                    _ = try self.builder.append(.@"unreachable");
+                    break :blk v.aux_int;
+                } else v.aux_int;
+
+                const p = try self.builder.append(.call);
+                p.to = prog_mod.constAddr(func_idx);
+            },
+
+            // Closure call via table with CTXT global
+            // Go reference: wasm/ssa.go:229-231 — set CTXT, then call
+            // Args[0] = table_idx, Args[1] = context_ptr, Args[2..] = function args
+            .wasm_lowered_closure_call => {
+                const args = v.args;
+                // Go: getValue64(s, v.Args[1]); setReg(s, wasm.REG_CTXT)
+                try self.getValue64(args[1]);
+                {
+                    const p = try self.builder.append(.global_set);
+                    p.to = prog_mod.constAddr(1); // CTXT = global 1
+                }
+                // Push function arguments (args[2..end], skip last = memory state)
+                const cc_end = if (v.memoryArg() != null and args.len > 0) args.len - 1 else args.len;
+                for (args[2..cc_end]) |arg| {
+                    try self.getValue64(arg);
+                }
+                // Push callee table index (args[0]) — must be i32 for call_indirect
+                try self.getValue64(args[0]);
+                _ = try self.builder.append(.i32_wrap_i64);
+
+                // Go: type index comes from p.To.Offset (stored in instruction)
+                // We use aux_int which carries the Wasm type index set by the driver
+                const p = try self.builder.append(.call_indirect);
+                p.to = prog_mod.constAddr(v.aux_int);
+            },
+
+            // Plain indirect function call via table (function pointers, no CTXT)
+            // Go reference: wasm/ssa.go:219 — InterCall, no CTXT setup
+            // Args[0] = callee (table index), Args[1..] = function arguments
+            .wasm_lowered_inter_call => {
+                const args = v.args;
+                // Push function arguments (skip arg[0]=callee, skip last = memory state)
+                const ic_end = if (v.memoryArg() != null and args.len > 0) args.len - 1 else args.len;
+                for (args[1..ic_end]) |arg| {
+                    try self.getValue64(arg);
+                }
+                // Push callee (table index) — must be i32 for call_indirect
+                try self.getValue64(args[0]);
+                _ = try self.builder.append(.i32_wrap_i64);
+
+                // Go: type index from p.To.Offset
+                const p = try self.builder.append(.call_indirect);
+                p.to = prog_mod.constAddr(v.aux_int);
+            },
+
+            // Wasm global get/set
+            .wasm_global_get => {
+                const p = try self.builder.append(.global_get);
+                p.from = prog_mod.constAddr(v.aux_int);
+            },
+
+            .wasm_global_set => {
+                try self.getValue64(v.args[0]);
+                const p = try self.builder.append(.global_set);
+                p.to = prog_mod.constAddr(v.aux_int);
+            },
+
+            // WasmGC struct operations
+            // Reference: Wasm GC proposal spec — 0xFB prefix + opcode + type/field indices
+            .wasm_gc_struct_new => {
+                // Push all field values onto stack, then emit struct.new $typeidx
+                // Result ref left on stack — setReg in ssaGenValue handles local.set
+                for (v.args) |arg| {
+                    try self.getValue64(arg);
+                }
+                const type_name = v.aux.string;
+                const gc_type_idx: i64 = if (self.gc_struct_name_map) |m| @intCast(m.get(type_name) orelse 0) else 0;
+                const p = try self.builder.append(.gc_struct_new);
+                p.from = prog_mod.constAddr(gc_type_idx);
+            },
+
+            .wasm_gc_struct_get => {
+                // Push ref onto stack, then emit struct.get $typeidx $fieldidx
+                // Result value left on stack — setReg in ssaGenValue handles local.set
+                try self.getValue64(v.args[0]);
+                const type_name = v.aux.string;
+                const gc_type_idx: i64 = if (self.gc_struct_name_map) |m| @intCast(m.get(type_name) orelse 0) else 0;
+                const field_idx = v.aux_int;
+                const p = try self.builder.append(.gc_struct_get);
+                p.from = prog_mod.constAddr(gc_type_idx);
+                p.to = prog_mod.constAddr(field_idx);
+            },
+
+            .wasm_gc_struct_set => {
+                // Push ref + value onto stack, then emit struct.set $typeidx $fieldidx
+                try self.getValue64(v.args[0]); // ref
+                try self.getValue64(v.args[1]); // value
+                // Resolve type name → GC type index, field_idx from aux_int
+                const type_name = v.aux.string;
+                const gc_type_idx: i64 = if (self.gc_struct_name_map) |m| @intCast(m.get(type_name) orelse 0) else 0;
+                const field_idx = v.aux_int;
+                const p = try self.builder.append(.gc_struct_set);
+                p.from = prog_mod.constAddr(gc_type_idx);
+                p.to = prog_mod.constAddr(field_idx);
+                // No result (void)
+            },
+
+            // WasmGC array operations
+            .wasm_gc_array_new => {
+                // stack: [init_val, length] → [ref]
+                try self.getValue64(v.args[0]); // init_val
+                try self.getValue64(v.args[1]); // length
+                const type_name = v.aux.string;
+                const gc_type_idx: i64 = if (self.gc_array_name_map) |m| @intCast(m.get(type_name) orelse 0) else 0;
+                const p = try self.builder.append(.gc_array_new);
+                p.from = prog_mod.constAddr(gc_type_idx);
+            },
+
+            .wasm_gc_array_new_default => {
+                // stack: [length] → [ref]
+                try self.getValue64(v.args[0]); // length
+                const type_name = v.aux.string;
+                const gc_type_idx: i64 = if (self.gc_array_name_map) |m| @intCast(m.get(type_name) orelse 0) else 0;
+                const p = try self.builder.append(.gc_array_new_default);
+                p.from = prog_mod.constAddr(gc_type_idx);
+            },
+
+            .wasm_gc_array_new_data => {
+                // stack: [offset, length] → [ref]
+                try self.getValue64(v.args[0]); // offset
+                try self.getValue64(v.args[1]); // length
+                const type_name = v.aux.string;
+                const gc_type_idx: i64 = if (self.gc_array_name_map) |m| @intCast(m.get(type_name) orelse 0) else 0;
+                const data_idx = v.aux_int;
+                const p = try self.builder.append(.gc_array_new_data);
+                p.from = prog_mod.constAddr(gc_type_idx);
+                p.to = prog_mod.constAddr(data_idx);
+            },
+
+            .wasm_gc_array_new_fixed => {
+                // stack: [vals...] → [ref]
+                for (v.args) |arg| {
+                    try self.getValue64(arg);
+                }
+                const type_name = v.aux.string;
+                const gc_type_idx: i64 = if (self.gc_array_name_map) |m| @intCast(m.get(type_name) orelse 0) else 0;
+                const count = v.aux_int;
+                const p = try self.builder.append(.gc_array_new_fixed);
+                p.from = prog_mod.constAddr(gc_type_idx);
+                p.to = prog_mod.constAddr(count);
+            },
+
+            .wasm_gc_array_get => {
+                // stack: [ref, idx] → [val]
+                try self.getValue64(v.args[0]); // ref
+                try self.getValue64(v.args[1]); // idx
+                const type_name = v.aux.string;
+                const gc_type_idx: i64 = if (self.gc_array_name_map) |m| @intCast(m.get(type_name) orelse 0) else 0;
+                const p = try self.builder.append(.gc_array_get);
+                p.from = prog_mod.constAddr(gc_type_idx);
+            },
+
+            .wasm_gc_array_set => {
+                // stack: [ref, idx, val] → []
+                try self.getValue64(v.args[0]); // ref
+                try self.getValue64(v.args[1]); // idx
+                try self.getValue64(v.args[2]); // val
+                const type_name = v.aux.string;
+                const gc_type_idx: i64 = if (self.gc_array_name_map) |m| @intCast(m.get(type_name) orelse 0) else 0;
+                const p = try self.builder.append(.gc_array_set);
+                p.from = prog_mod.constAddr(gc_type_idx);
+            },
+
+            .wasm_gc_array_len => {
+                // stack: [ref] → [i32]
+                try self.getValue64(v.args[0]); // ref
+                _ = try self.builder.append(.gc_array_len);
+            },
+
+            .wasm_gc_array_copy => {
+                // stack: [dst, dst_off, src, src_off, len] → []
+                for (v.args) |arg| {
+                    try self.getValue64(arg);
+                }
+                const dst_type_name = v.aux.string;
+                const dst_type_idx: i64 = if (self.gc_array_name_map) |m| @intCast(m.get(dst_type_name) orelse 0) else 0;
+                const src_type_idx = v.aux_int;
+                const p = try self.builder.append(.gc_array_copy);
+                p.from = prog_mod.constAddr(dst_type_idx);
+                p.to = prog_mod.constAddr(src_type_idx);
+            },
+
+            // WasmGC reference operations
+            .wasm_gc_ref_test => {
+                try self.getValue64(v.args[0]);
+                // Resolve type name → GC struct type index for heap type
+                const type_name = v.aux.string;
+                const heap_type: i64 = if (self.gc_struct_name_map) |m| @intCast(m.get(type_name) orelse 0) else v.aux_int;
+                const p = try self.builder.append(.ref_test);
+                p.from = prog_mod.constAddr(heap_type);
+            },
+
+            .wasm_gc_ref_cast => {
+                try self.getValue64(v.args[0]);
+                const type_name = v.aux.string;
+                const heap_type: i64 = if (self.gc_struct_name_map) |m| @intCast(m.get(type_name) orelse 0) else v.aux_int;
+                const p = try self.builder.append(.ref_cast);
+                p.from = prog_mod.constAddr(heap_type);
+            },
+
+            .wasm_gc_ref_null => {
+                const type_name = v.aux.string;
+                const heap_type: i64 = if (self.gc_struct_name_map) |m| @intCast(m.get(type_name) orelse 0) else v.aux_int;
+                const p = try self.builder.append(.ref_null);
+                p.from = prog_mod.constAddr(heap_type);
+            },
+
+            .wasm_gc_ref_is_null => {
+                try self.getValue64(v.args[0]);
+                _ = try self.builder.append(.ref_is_null);
+            },
+
+            .wasm_gc_ref_eq => {
+                try self.getValue64(v.args[0]);
+                try self.getValue64(v.args[1]);
+                _ = try self.builder.append(.ref_eq);
+            },
+
+            // WasmGC function reference operations
+            .wasm_gc_ref_func => {
+                // ref.func $funcidx — resolve func name to index
+                const func_name = v.aux.string;
+                const func_idx: i64 = if (self.func_indices) |fi| @intCast(fi.get(func_name) orelse 0) else 0;
+                const p = try self.builder.append(.ref_func);
+                p.from = prog_mod.constAddr(func_idx);
+            },
+
+            .wasm_gc_call_ref => {
+                // Push args then func_ref, then call_ref $typeidx
+                for (v.args) |arg| {
+                    try self.getValue64(arg);
+                }
+                const type_idx = v.aux_int;
+                const p = try self.builder.append(.call_ref);
+                p.from = prog_mod.constAddr(type_idx);
+            },
+
+            .wasm_gc_return_call_ref => {
+                for (v.args) |arg| {
+                    try self.getValue64(arg);
+                }
+                const type_idx = v.aux_int;
+                const p = try self.builder.append(.return_call_ref);
+                p.from = prog_mod.constAddr(type_idx);
+            },
+
+            // Type conversion (int cast, float-to-int, int-to-float)
+            // Go reference: cmd/compile/internal/wasm/ssa.go:479-501
+            .convert => {
+                const from_type = v.aux.type_ref;
+                const to_type = v.type_idx;
+
+                // Get the value onto stack
+                try self.getValue64(v.args[0]);
+
+                // TypeRegistry: I32=4, I64=5, F32=10, F64=11, UNTYPED_FLOAT=14
+                const from_is_float = (from_type == 10 or from_type == 11 or from_type == 14);
+                const to_is_float = (to_type == 10 or to_type == 11 or to_type == 14);
+                const from_is_32 = (from_type == 4); // I32
+                const to_is_32 = (to_type == 4); // I32
+
+                if (from_is_float and to_is_float) {
+                    // float -> float: precision conversion
+                    // Cot stores all floats as f64 on the stack. For @floatCast(f32, val),
+                    // we demote then promote to get f32 precision loss while keeping f64 type.
+                    // Ref: Wasm spec f32.demote_f64 (0xB6), f64.promote_f32 (0xBB)
+                    const to_is_f32 = (to_type == 10); // TypeRegistry.F32
+                    if (to_is_f32) {
+                        // f64 -> f32 precision: demote then promote (round-trip loses precision)
+                        _ = try self.builder.append(.f32_demote_f64);
+                        _ = try self.builder.append(.f64_promote_f32);
+                    }
+                    // f32 -> f64 or same type: no-op (values are already f64 on stack)
+                } else if (from_is_float and !to_is_float) {
+                    // f64 -> i64: saturating truncate float to signed integer (Wasm 2.0)
+                    // trunc_sat returns 0 for NaN, min/max for overflow (never traps)
+                    if (to_is_32) {
+                        _ = try self.builder.append(.i32_trunc_sat_f64_s);
+                        _ = try self.builder.append(.i64_extend_i32_s);
+                    } else {
+                        _ = try self.builder.append(.i64_trunc_sat_f64_s);
+                    }
+                } else if (!from_is_float and to_is_float) {
+                    // i64 -> f64: convert signed integer to float
+                    _ = try self.builder.append(.f64_convert_i64_s);
+                } else if (!from_is_32 and to_is_32) {
+                    // i64 -> i32: wrap then extend back to i64 for stack consistency
+                    _ = try self.builder.append(.i32_wrap_i64);
+                    _ = try self.builder.append(.i64_extend_i32_s);
+                } else if (from_is_32 and !to_is_32) {
+                    // i32 -> i64: already extended by getValue64
+                }
+                // Same size: no conversion needed
+            },
+
+            // Bulk memory copy using memory.copy (Wasm 2.0)
+            // Stack: [dest_i32, src_i32, size_i32] → []
+            .wasm_lowered_move => {
+                const size: i32 = @intCast(v.aux_int);
+                try self.getValue64(v.args[0]); // dest addr
+                _ = try self.builder.append(.i32_wrap_i64);
+                try self.getValue64(v.args[1]); // src addr
+                _ = try self.builder.append(.i32_wrap_i64);
+                const size_op = try self.builder.append(.i32_const);
+                size_op.from = prog_mod.constAddr(size);
+                _ = try self.builder.append(.memory_copy);
+            },
+
+            // Bulk memory zero using memory.fill (Wasm 2.0)
+            // Go reference: wasm/ssa.go:254-258 (OpWasmLoweredZero)
+            // Stack: [dest_i32, fill_value_i32, size_i32] → []
+            .wasm_lowered_zero => {
+                const size: i32 = @intCast(v.aux_int);
+                try self.getValue64(v.args[0]); // dest addr
+                _ = try self.builder.append(.i32_wrap_i64);
+                const zero_op = try self.builder.append(.i32_const);
+                zero_op.from = prog_mod.constAddr(0); // fill value = 0
+                const size_op = try self.builder.append(.i32_const);
+                size_op.from = prog_mod.constAddr(size);
+                _ = try self.builder.append(.memory_fill);
+            },
+
+            .wasm_unreachable => {
+                _ = try self.builder.append(.@"unreachable");
+            },
+
+            else => {
+                debug.log(.codegen, "wasm/gen: unhandled op {s}", .{@tagName(v.op)});
+            },
+        }
+    }
+
+    // ========================================================================
+    // Generate entire function
+    // ========================================================================
+
+    pub fn generate(self: *GenState) !void {
+        const blocks = self.func.blocks.items;
+
+        debug.log(.codegen, "wasm/gen: generating '{s}' ({d} blocks)", .{
+            self.func.name,
+            blocks.len,
+        });
+
+        // Allocate locals for values
+        try self.allocateLocals();
+
+        // Compute frame size
+        self.frame_size = self.computeFrameSize();
+
+        // Emit TEXT marker at start
+        const text = try self.builder.append(.text);
+        text.from = prog_mod.constAddr(self.frame_size);
+
+        debug.log(.codegen, "wasm/gen: frame_size={d}, {d} locals allocated", .{
+            self.frame_size, self.next_local,
+        });
+
+        // Generate code for each block
+        for (blocks, 0..) |block, i| {
+            const next: ?*const SsaBlock = if (i + 1 < blocks.len) blocks[i + 1] else null;
+            debug.log(.codegen, "wasm/gen: block b{d} ({s}, {d} values, {d} succs)", .{
+                block.id, @tagName(block.kind), block.values.items.len, block.succs.len,
+            });
+
+            // Record first Prog of this block
+            const first_prog = self.builder.last;
+
+            // Generate values
+            for (block.values.items) |v| {
+                try self.ssaGenValue(v);
+            }
+
+            // Record bstart after values but before control flow
+            // (or use current position if no values)
+            if (self.builder.last != first_prog) {
+                if (self.builder.last) |last| {
+                    try self.bstart.put(self.allocator, block.id, last);
+                }
+            } else if (self.builder.last) |last| {
+                try self.bstart.put(self.allocator, block.id, last);
+            }
+
+            // Emit phi moves: store phi args to phi locals before branches
+            try self.emitPhiMoves(block);
+
+            // Generate block control flow
+            try self.ssaGenBlock(block, next);
+        }
+
+        // Resolve branches (Go: lines 7312-7320)
+        for (self.branches.items) |branch| {
+            if (self.bstart.get(branch.target_block_id)) |target_prog| {
+                branch.prog.to.branch_target = target_prog;
+            }
+        }
+
+        debug.log(.codegen, "wasm/gen: generated {d} instructions, {d} branches", .{
+            self.builder.count,
+            self.branches.items.len,
+        });
+    }
+
+    /// Generate code for a single SSA value
+    /// Go: ssaGenValue (lines 217-311)
+    pub fn ssaGenValue(self: *GenState, v: *const SsaValue) !void {
+        // Skip values with no uses (dead code) unless they have side effects
+        if (v.uses == 0 and !v.hasSideEffects()) return;
+
+        // Go pattern: compound type ops (SliceMake, StringMake) are conceptual groupings
+        // that generate no Wasm code. By the time codegen runs, all extraction ops
+        // (slice_ptr, slice_len, etc.) have been decomposed by rewritedec.
+        // Skip these entirely — they must never call setReg (empty stack).
+        // Reference: Go's wasm/ssa.go has no case for OpSliceMake/OpStringMake.
+        if (v.op == .slice_make or v.op == .string_make or v.op == .opt_make) return;
+
+        // Skip rematerializable values (generate on demand)
+        if (isRematerializable(v)) return;
+
+        // Skip comparisons - they're generated on-demand by ssaGenBlock
+        // Go: these have OnWasmStack = true and are handled inline
+        if (isCmp(v)) return;
+
+        // Skip phi values - their locals are populated by emitPhiMoves in predecessor blocks
+        // Go: "case ssa.OpPhi: // nothing to do"
+        if (v.op == .phi) return;
+
+        // Skip memory-state values (init_mem, memory PHIs, memory copies).
+        // Memory threading adds SSA_MEM-typed values for ordering but they
+        // produce no wasm stack values.
+        if (v.type_idx == TypeRegistry.SSA_MEM) return;
+        if (v.op == .init_mem) return;
+
+        // Generate value and store to local
+        try self.ssaGenValueOnStack(v);
+
+        // Pipeline debug: log every setReg to catch double-set
+        if (self.value_to_local.get(v.id)) |li| {
+            debug.log(.codegen, "  ssaGenValue: v{d} op={s} type={d} → local.set {d} (float_local={s})", .{
+                v.id, @tagName(v.op), v.type_idx, li,
+                if (self.isFloatLocal(li)) "yes" else "no",
+            });
+        }
+
+        // wasm_return_call is a terminator (opcode 0x12) — it doesn't leave
+        // a value on the Wasm stack. Skip setReg to avoid popping from empty stack.
+        if (v.op == .wasm_return_call) return;
+
+        // Store ops consume stack values and produce nothing — don't call setReg.
+        // Go: ssaGenValue lines 280-284 — stores have no setReg call.
+        if (v.op == .wasm_i64_store or v.op == .wasm_i64_store8 or
+            v.op == .wasm_i64_store16 or v.op == .wasm_i64_store32 or
+            v.op == .wasm_f64_store or v.op == .wasm_gc_struct_set or
+            v.op == .wasm_gc_array_set or v.op == .wasm_gc_array_copy) return;
+
+        // Compound return handling: calls returning string/slice push 2 values (ptr, len).
+        // Store len to a separate local, then ptr to the value's main local.
+        const is_call = v.op == .wasm_call or v.op == .wasm_lowered_static_call;
+        const is_compound_ret = is_call and (v.type_idx == TypeRegistry.STRING);
+        if (is_compound_ret) {
+            // Stack: [ptr, len] — store len first (top of stack), then ptr
+            // Len local is pre-allocated in Pass 1 of allocateLocals.
+            const len_local = self.compound_len_locals.get(v.id) orelse blk: {
+                // Fallback: allocate on the fly (shouldn't happen if allocateLocals ran)
+                const l = self.next_local;
+                self.next_local += 1;
+                try self.compound_len_locals.put(self.allocator, v.id, l);
+                break :blk l;
+            };
+            _ = try self.builder.appendTo(.local_set, prog_mod.constAddr(len_local));
+            if (v.uses > 0) {
+                try self.setReg(v); // stores ptr to v's main local
+            }
+        } else if (v.uses > 0 and v.type_idx != TypeRegistry.VOID and v.type_idx != TypeRegistry.SSA_MEM) {
+            // Non-VOID, non-SSA_MEM values with uses always need setReg.
+            try self.setReg(v);
+        } else if (v.uses > 0 and v.type_idx == TypeRegistry.VOID and v.op.producesAddressValue()) {
+            // Address-computing ops have VOID type but DO produce an i64 stack value.
+            // They need setReg to pop from the wasm stack into a local.
+            try self.setReg(v);
+        } else if (v.op.info().call and v.type_idx != TypeRegistry.VOID and v.type_idx != TypeRegistry.SSA_MEM) {
+            // Side-effect call with discarded non-void return: drop from Wasm stack.
+            // Without this, the return value remains on the Wasm value stack and
+            // causes "values remaining on stack at end of block" validation errors.
+            _ = try self.builder.append(.drop);
+        } else if (v.op == .wasm_gc_struct_new or v.op == .wasm_gc_array_new or
+            v.op == .wasm_gc_array_new_default or v.op == .wasm_gc_array_new_fixed or
+            v.op == .wasm_gc_array_new_data)
+        {
+            // GC alloc with uses=0: result left on stack must be dropped.
+            _ = try self.builder.append(.drop);
+        }
+    }
+
+    /// Allocate locals for values that need them.
+    /// Two-pass: i64 locals first, then f64 locals (so assemble.zig can use contiguous groups).
+    fn allocateLocals(self: *GenState) !void {
+        // Count parameters - Wasm assigns them to locals 0..param_count-1 automatically
+        for (self.func.blocks.items) |block| {
+            for (block.values.items) |v| {
+                if (v.op == .arg) {
+                    const arg_idx: u32 = @intCast(v.aux_int);
+                    // Params use locals 0..param_count-1 (assigned by Wasm)
+                    try self.value_to_local.put(self.allocator, v.id, arg_idx);
+                    if (arg_idx >= self.param_count) {
+                        self.param_count = arg_idx + 1;
+                    }
+                    // STRING args occupy two consecutive param locals (ptr, len).
+                    // Register the len local so compound return handling can find it.
+                    if (v.type_idx == TypeRegistry.STRING) {
+                        try self.compound_len_locals.put(self.allocator, v.id, arg_idx + 1);
+                        if (arg_idx + 1 >= self.param_count) {
+                            self.param_count = arg_idx + 2;
+                        }
+                    }
+                }
+            }
+        }
+        // PC_B is first declared local (index = param_count)
+        // Value locals start after PC_B (param_count+1, param_count+2, ...)
+        self.next_local = self.param_count + 1;
+
+        // Pass 1: Allocate i64 locals (non-float values)
+        for (self.func.blocks.items) |block| {
+            for (block.values.items) |v| {
+                if (v.op == .arg) continue;
+                if (v.uses == 0 and !v.hasSideEffects()) continue;
+                if (isRematerializable(v)) continue;
+                // Memory-state values produce no wasm stack values — no local needed
+                if (v.type_idx == TypeRegistry.SSA_MEM or v.op == .init_mem) continue;
+                if (isCmp(v)) continue;
+                // Go: SliceMake/StringMake are conceptual — no Wasm local needed
+                // wasm_lowered_move is inline bulk copy — no value produced
+                // wasm_return_call is a terminator (opcode 0x12) — no value on stack
+                if (v.op == .slice_make or v.op == .string_make or v.op == .opt_make or v.op == .wasm_lowered_move or v.op == .wasm_lowered_zero or v.op == .wasm_return_call) continue;
+                // Store ops write to memory and produce no value — no local needed
+                // Go: ssaGenValue lines 280-284 — stores have no setReg call
+                if (v.op == .wasm_i64_store or v.op == .wasm_i64_store8 or
+                    v.op == .wasm_i64_store16 or v.op == .wasm_i64_store32 or
+                    v.op == .wasm_f64_store or v.op == .wasm_gc_struct_set or
+                    v.op == .wasm_gc_array_set or v.op == .wasm_gc_array_copy) continue;
+                if (isFloatType(v.type_idx)) continue; // Skip floats for pass 2
+                if (v.op == .wasm_gc_struct_new or v.op == .wasm_gc_array_new or
+                    v.op == .wasm_gc_array_new_default or v.op == .wasm_gc_array_new_fixed or
+                    v.op == .wasm_gc_array_new_data) continue; // Skip GC refs for pass 3
+                if (isGcRefType(v.type_idx, self.type_reg, self.gc_struct_name_map)) continue; // Skip GC ref results for pass 3
+
+                const local_idx = self.next_local;
+                self.next_local += 1;
+                try self.value_to_local.put(self.allocator, v.id, local_idx);
+
+                // Pre-allocate compound return len local: calls returning STRING push
+                // 2 values (ptr, len). The len local must be allocated here in Pass 1
+                // (not during code gen) so it comes before GC ref locals in Pass 3.
+                const is_call_p1 = v.op == .wasm_call or v.op == .wasm_lowered_static_call;
+                if (is_call_p1 and v.type_idx == TypeRegistry.STRING) {
+                    const len_local = self.next_local;
+                    self.next_local += 1;
+                    try self.compound_len_locals.put(self.allocator, v.id, len_local);
+                }
+            }
+        }
+
+        // Pass 2: Allocate f64 locals (float values - contiguous at end)
+        self.float_local_start = self.next_local;
+        var float_count: u32 = 0;
+        for (self.func.blocks.items) |block| {
+            for (block.values.items) |v| {
+                if (v.op == .arg) continue;
+                if (v.uses == 0 and !v.hasSideEffects()) continue;
+                if (isRematerializable(v)) continue;
+                if (isCmp(v)) continue;
+                if (!isFloatType(v.type_idx)) continue; // Only floats in pass 2
+
+                const local_idx = self.next_local;
+                self.next_local += 1;
+                float_count += 1;
+                try self.value_to_local.put(self.allocator, v.id, local_idx);
+            }
+        }
+        self.float_local_count = float_count;
+
+        // Pass 3: Allocate GC ref locals (reference-typed, after f64 locals)
+        for (self.func.blocks.items) |block| {
+            for (block.values.items) |v| {
+                if (v.op == .arg) continue;
+                if (v.uses == 0) continue; // GC ref locals only needed if value is actually read
+
+                const is_gc_struct_new = v.op == .wasm_gc_struct_new;
+                const is_gc_array_alloc = v.op == .wasm_gc_array_new or
+                    v.op == .wasm_gc_array_new_default or v.op == .wasm_gc_array_new_fixed or
+                    v.op == .wasm_gc_array_new_data;
+                const is_gc_ref = isGcRefType(v.type_idx, self.type_reg, self.gc_struct_name_map);
+                if (!is_gc_struct_new and !is_gc_array_alloc and !is_gc_ref) continue;
+
+                // Already allocated (e.g., by pass 1 before gc ref check was added)
+                if (self.value_to_local.contains(v.id)) continue;
+
+                const local_idx = self.next_local;
+                self.next_local += 1;
+                // Resolve GC type index: gc_struct_new has name in aux, array ops use gc_array_name_map
+                const gc_type_idx: u32 = blk: {
+                    if (is_gc_struct_new) {
+                        const type_name = v.aux.string;
+                        break :blk if (self.gc_struct_name_map) |m| m.get(type_name) orelse 0 else 0;
+                    }
+                    if (is_gc_array_alloc) {
+                        const type_name = v.aux.string;
+                        break :blk if (self.gc_array_name_map) |m| m.get(type_name) orelse 0 else 0;
+                    }
+                    // For call results etc., look up type name from type_reg
+                    if (self.type_reg) |reg| {
+                        const t = reg.get(v.type_idx);
+                        const name = switch (t) {
+                            .struct_type => |st| st.name,
+                            .pointer => |ptr| switch (reg.get(ptr.elem)) {
+                                .struct_type => |st| st.name,
+                                else => null,
+                            },
+                            else => null,
+                        };
+                        if (name) |n| {
+                            break :blk if (self.gc_struct_name_map) |m| m.get(n) orelse 0 else 0;
+                        }
+                    }
+                    break :blk 0;
+                };
+                try self.gc_ref_locals.append(self.allocator, gc_type_idx);
+                try self.value_to_local.put(self.allocator, v.id, local_idx);
+            }
+        }
+    }
+
+    /// Compute byte offset for a local variable by summing sizes of all preceding locals.
+    /// This handles variable-sized locals (e.g., strings are 16 bytes, i64 is 8 bytes).
+    fn getLocalOffset(self: *const GenState, local_idx: usize) i64 {
+        if (self.func.local_sizes.len == 0) {
+            // Fallback: assume 8 bytes per slot
+            return @intCast(local_idx * 8);
+        }
+        // Go pattern: all stack slots are 8-byte aligned.
+        // Wasm uses i64.store/i64.load for all values (8 bytes),
+        // so each slot must be at least 8 bytes to prevent overlap.
+        var offset: i64 = 0;
+        const count = @min(local_idx, self.func.local_sizes.len);
+        for (0..count) |i| {
+            const size: i64 = @intCast(self.func.local_sizes[i]);
+            offset += if (size < 8) 8 else size;
+        }
+        return offset;
+    }
+
+    /// Compute frame size from local sizes (copied from IR)
+    /// Go reference: This matches how Go computes frame layout in obj/link.go
+    fn computeFrameSize(self: *const GenState) i32 {
+        // Use actual local sizes from IR (populated by ssa_builder.zig)
+        // Go pattern: all stack slots are at least 8 bytes (i64.store/load alignment)
+        if (self.func.local_sizes.len > 0) {
+            var total: i32 = 0;
+            for (self.func.local_sizes) |size| {
+                total += if (size < 8) 8 else @as(i32, @intCast(size));
+            }
+            // Align to 16 bytes
+            return @divTrunc((total + 15), 16) * 16;
+        }
+
+        // Fallback: scan for local_addr ops (for backwards compatibility)
+        var max_slot: i32 = -1;
+        for (self.func.blocks.items) |block| {
+            for (block.values.items) |v| {
+                if (v.op == .local_addr) {
+                    const slot: i32 = @intCast(v.aux_int);
+                    if (slot > max_slot) max_slot = slot;
+                }
+            }
+        }
+        if (max_slot < 0) return 0;
+        const size = (max_slot + 1) * 8;
+        return @divTrunc((size + 15), 16) * 16;
+    }
+};
+
+// ============================================================================
+// Helper functions
+// ============================================================================
+
+fn isRematerializable(v: *const SsaValue) bool {
+    return switch (v.op) {
+        .wasm_i64_const, .wasm_i32_const, .wasm_f64_const,
+        .const_int, .const_32, .const_64, .const_float, .const_bool,
+        .local_addr, .global_addr, .metadata_addr,
+        => true,
+        else => false,
+    };
+}
+
+fn isCmp(v: *const SsaValue) bool {
+    // Returns true if value is already i32 (comparisons produce i32 in wasm)
+    // Go: isCmp (ssa.go:463-471) — only wasm comparison ops
+    return switch (v.op) {
+        .wasm_i64_eq, .wasm_i64_ne, .wasm_i64_lt_s, .wasm_i64_le_s,
+        .wasm_i64_gt_s, .wasm_i64_ge_s,
+        .wasm_i64_lt_u, .wasm_i64_le_u, .wasm_i64_gt_u, .wasm_i64_ge_u,
+        .wasm_i64_eqz,
+        .wasm_f64_eq, .wasm_f64_ne, .wasm_f64_lt, .wasm_f64_le,
+        .wasm_f64_gt, .wasm_f64_ge,
+        => true,
+        else => false,
+    };
+}
+
+fn isFloatType(type_idx: @import("../../ssa/value.zig").TypeIndex) bool {
+    return type_idx == TypeRegistry.F64 or type_idx == TypeRegistry.F32 or type_idx == TypeRegistry.UNTYPED_FLOAT;
+}
+
+/// Check if a type_idx is a GC struct type (requires type_reg and gc_struct_name_map)
+fn isGcRefType(type_idx: @import("../../ssa/value.zig").TypeIndex, type_reg: ?*const TypeRegistry, gc_map: ?*const std.StringHashMapUnmanaged(u32)) bool {
+    const reg = type_reg orelse return false;
+    const map = gc_map orelse return false;
+    const t = reg.get(type_idx);
+    return switch (t) {
+        .struct_type => |st| map.contains(st.name),
+        .pointer => |ptr| blk: {
+            // Raw pointers (@intToPtr) are i64 linear memory addresses, not GC refs.
+            if (!ptr.managed) break :blk false;
+            const elem = reg.get(ptr.elem);
+            break :blk switch (elem) {
+                .struct_type => |st| map.contains(st.name),
+                else => false,
+            };
+        },
+        else => false,
+    };
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+const testing = std.testing;
+
+test "GenState init/deinit" {
+    const allocator = testing.allocator;
+
+    // Create minimal SSA func for testing
+    var func = SsaFunc.init(allocator, "test");
+    defer func.deinit();
+
+    var state = GenState.init(allocator, &func);
+    defer state.deinit();
+
+    // next_local starts at 0 (set by allocateLocals after counting params)
+    try testing.expectEqual(@as(u32, 0), state.next_local);
+}

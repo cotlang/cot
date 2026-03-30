@@ -1,0 +1,5162 @@
+//! Type checker for Cot.
+
+const std = @import("std");
+const ast = @import("ast.zig");
+const types = @import("types.zig");
+const errors = @import("errors.zig");
+const source = @import("source.zig");
+const token = @import("token.zig");
+const comptime_mod = @import("comptime.zig");
+
+const target_mod = @import("target.zig");
+const debug = @import("../pipeline_debug.zig");
+
+pub const ComptimeValue = comptime_mod.ComptimeValue;
+
+const Ast = ast.Ast;
+const Node = ast.Node;
+const NodeIndex = ast.NodeIndex;
+const null_node = ast.null_node;
+const Expr = ast.Expr;
+const Stmt = ast.Stmt;
+const Decl = ast.Decl;
+const TypeKind = ast.TypeKind;
+const LiteralKind = ast.LiteralKind;
+const Token = token.Token;
+const Type = types.Type;
+const TypeIndex = types.TypeIndex;
+const TypeRegistry = types.TypeRegistry;
+const BasicKind = types.BasicKind;
+const invalid_type = types.invalid_type;
+const ErrorReporter = errors.ErrorReporter;
+const Pos = source.Pos;
+const Span = source.Span;
+
+pub const CheckError = error{OutOfMemory};
+
+pub const SymbolKind = enum { variable, constant, function, type_name, parameter };
+
+pub const Symbol = struct {
+    name: []const u8,
+    kind: SymbolKind,
+    type_idx: TypeIndex,
+    node: NodeIndex,
+    mutable: bool,
+    is_extern: bool = false,
+    is_export: bool = false,
+    const_value: ?i64 = null,
+    float_const_value: ?f64 = null,
+    comptime_val: ?ComptimeValue = null,
+    used: bool = false,
+    /// Tracks which AST (file) defined this symbol, for cross-file redefinition checks.
+    source_tree: ?*const Ast = null,
+
+    pub fn init(name: []const u8, kind: SymbolKind, type_idx: TypeIndex, node: NodeIndex, mutable: bool) Symbol {
+        return .{ .name = name, .kind = kind, .type_idx = type_idx, .node = node, .mutable = mutable };
+    }
+
+    pub fn initExtern(name: []const u8, kind: SymbolKind, type_idx: TypeIndex, node: NodeIndex, mutable: bool, is_extern: bool) Symbol {
+        return .{ .name = name, .kind = kind, .type_idx = type_idx, .node = node, .mutable = mutable, .is_extern = is_extern };
+    }
+
+    pub fn initConst(name: []const u8, type_idx: TypeIndex, node: NodeIndex, value: i64) Symbol {
+        return .{ .name = name, .kind = .constant, .type_idx = type_idx, .node = node, .mutable = false, .const_value = value };
+    }
+
+    pub fn initFloatConst(name: []const u8, type_idx: TypeIndex, node: NodeIndex, value: f64) Symbol {
+        return .{ .name = name, .kind = .constant, .type_idx = type_idx, .node = node, .mutable = false, .float_const_value = value };
+    }
+};
+
+pub const Scope = struct {
+    parent: ?*Scope,
+    symbols: std.StringHashMap(Symbol),
+    allocator: std.mem.Allocator,
+
+    pub fn init(allocator: std.mem.Allocator, parent: ?*Scope) Scope {
+        return .{ .parent = parent, .symbols = std.StringHashMap(Symbol).init(allocator), .allocator = allocator };
+    }
+
+    pub fn deinit(self: *Scope) void { self.symbols.deinit(); }
+    pub fn define(self: *Scope, sym: Symbol) !void { try self.symbols.put(sym.name, sym); }
+    pub fn lookupLocal(self: *const Scope, name: []const u8) ?Symbol { return self.symbols.get(name); }
+
+    pub fn lookup(self: *const Scope, name: []const u8) ?Symbol {
+        return self.symbols.get(name) orelse if (self.parent) |p| p.lookup(name) else null;
+    }
+
+    /// Mark a symbol as used (for lint: unused variable detection).
+    /// Walks up scopes like lookup() but mutates via getPtr().
+    pub fn markUsed(self: *Scope, name: []const u8) void {
+        if (self.symbols.getPtr(name)) |ptr| {
+            ptr.used = true;
+        } else if (self.parent) |p| {
+            p.markUsed(name);
+        }
+    }
+
+    pub fn isDefined(self: *const Scope, name: []const u8) bool { return self.symbols.contains(name); }
+};
+
+/// Info about a generic struct or function definition.
+/// Rust: hir::Generics stores param + bound. Go 1.18: types2.TypeParam stores Constraint.
+pub const GenericInfo = struct {
+    type_params: []const []const u8,
+    type_param_bounds: []const ?[]const u8 = &.{}, // parallel array, null = unbounded
+    node_idx: NodeIndex,
+    tree: *const Ast, // which file's AST this node_idx belongs to (for cross-file generics)
+    scope: ?*Scope = null, // defining file's scope (for cross-file generic resolution)
+};
+
+/// Info about a resolved generic function instantiation for the lowerer.
+pub const GenericInstInfo = struct {
+    concrete_name: []const u8,
+    generic_node: NodeIndex,
+    type_args: []const TypeIndex,
+    type_param_names: []const []const u8 = &.{}, // For impl block methods (type params come from impl, not fn)
+    tree: *const Ast, // which file's AST this generic_node belongs to (for cross-file generics)
+    scope: ?*Scope = null, // defining file's scope (for cross-file generic resolution in lowerer re-check)
+    /// Go pattern: expr_types from Phase 2 body checking, preserved for Phase 3 lowering.
+    /// Eliminates the need for Phase 3 re-checking (checkFnDeclBody), which causes stack
+    /// overflow for complex files. Go's type checker fully resolves all types during checking;
+    /// codegen just reads the results. Same pattern here.
+    expr_types: ?std.AutoHashMap(NodeIndex, TypeIndex) = null,
+    /// Swift ResultConvention: true when return type is a generic type parameter (T).
+    /// Forces indirect return (SRET) regardless of concrete type size, ensuring
+    /// uniform calling convention across all instantiations.
+    /// Reference: swift/include/swift/AST/Types.h ResultConvention::Indirect
+    has_indirect_result: bool = false,
+};
+
+/// Info about a trait definition.
+/// Swift reference: protocol declaration with associated types (SE-0142).
+pub const TraitDef = struct {
+    name: []const u8,
+    type_params: []const []const u8 = &.{},
+    method_names: []const []const u8,
+    assoc_type_names: []const []const u8 = &.{},
+};
+
+/// Shared generic context — lives across all checkers in multi-file mode.
+/// Created once in the driver, passed to all Checker instances so that
+/// File B can see generic definitions from File A.
+pub const SharedGenericContext = struct {
+    generic_structs: std.StringHashMap(GenericInfo),
+    generic_functions: std.StringHashMap(GenericInfo),
+    instantiation_cache: std.StringHashMap(TypeIndex),
+    generic_inst_by_name: std.StringHashMap(GenericInstInfo),
+    generic_impl_blocks: std.StringHashMap(std.ArrayListUnmanaged(GenericImplInfo)),
+    trait_defs: std.StringHashMap(TraitDef),
+    trait_impls: std.StringHashMap([]const u8),
+
+    pub fn init(allocator: std.mem.Allocator) SharedGenericContext {
+        return .{
+            .generic_structs = std.StringHashMap(GenericInfo).init(allocator),
+            .generic_functions = std.StringHashMap(GenericInfo).init(allocator),
+            .instantiation_cache = std.StringHashMap(TypeIndex).init(allocator),
+            .generic_inst_by_name = std.StringHashMap(GenericInstInfo).init(allocator),
+            .generic_impl_blocks = std.StringHashMap(std.ArrayListUnmanaged(GenericImplInfo)).init(allocator),
+            .trait_defs = std.StringHashMap(TraitDef).init(allocator),
+            .trait_impls = std.StringHashMap([]const u8).init(allocator),
+        };
+    }
+
+    pub fn deinit(self: *SharedGenericContext, allocator: std.mem.Allocator) void {
+        self.generic_structs.deinit();
+        self.generic_functions.deinit();
+        self.instantiation_cache.deinit();
+        self.generic_inst_by_name.deinit();
+        var gib_it = self.generic_impl_blocks.valueIterator();
+        while (gib_it.next()) |list| list.deinit(allocator);
+        self.generic_impl_blocks.deinit();
+        self.trait_defs.deinit();
+        self.trait_impls.deinit();
+    }
+};
+
+/// Info about a generic impl block definition.
+pub const GenericImplInfo = struct {
+    type_params: []const []const u8,
+    methods: []const NodeIndex,
+    tree: *const Ast, // which file's AST these method NodeIndexes belong to (for cross-file generics)
+    scope: ?*Scope = null, // defining file's scope (for cross-file generic resolution)
+};
+
+/// Parse type arguments from a generic Map name like "Map(5;5)" → [K, V] TypeIndex values.
+/// Returns null if the name cannot be parsed.
+pub fn parseMapTypeArgs(name: []const u8) ?[2]TypeIndex {
+    // Format: "Map(K;V)" where K and V are decimal TypeIndex integers
+    const open = std.mem.indexOfScalar(u8, name, '(') orelse return null;
+    const close = std.mem.lastIndexOfScalar(u8, name, ')') orelse return null;
+    if (close <= open + 1) return null;
+    const args_str = name[open + 1 .. close];
+    const semi = std.mem.indexOfScalar(u8, args_str, ';') orelse return null;
+    const k_str = args_str[0..semi];
+    const v_str = args_str[semi + 1 ..];
+    const k = std.fmt.parseInt(TypeIndex, k_str, 10) catch return null;
+    const v = std.fmt.parseInt(TypeIndex, v_str, 10) catch return null;
+    return .{ k, v };
+}
+
+pub const Checker = struct {
+    types: *TypeRegistry,
+    scope: *Scope,
+    /// Zig pattern: generic instances belong in the declaring module's namespace.
+    /// We store the global scope so generic instance symbols (e.g. List_append(5))
+    /// survive function scope destruction and remain accessible during lowering.
+    global_scope: *Scope,
+    err: *ErrorReporter,
+    tree: *const Ast,
+    allocator: std.mem.Allocator,
+    expr_types: std.AutoHashMap(NodeIndex, TypeIndex),
+    current_return_type: TypeIndex = TypeRegistry.VOID,
+    /// Expected type for anonymous struct literal resolution
+    expected_type: TypeIndex = invalid_type,
+    in_loop: bool = false,
+    in_labeled_block: u32 = 0,
+    labeled_block_result_type: TypeIndex = invalid_type,
+    // Generics support (Zig-style lazy generic instantiation + Go checker flow)
+    // Shared across all checkers in multi-file mode (owned by driver)
+    generics: *SharedGenericContext,
+    // Per-checker: keyed by call-site NodeIndex (file-specific)
+    generic_instantiations: std.AutoHashMap(NodeIndex, GenericInstInfo) = undefined,
+    /// Type substitution map, active during generic instantiation
+    type_substitution: ?std.StringHashMap(TypeIndex) = null,
+    /// Compilation target — used for @targetOs(), @targetArch(), @target() comptime builtins
+    target: target_mod.Target = target_mod.Target.native(),
+    /// @safe file annotation: auto-wrap struct types with pointer in function signatures
+    safe_mode: bool = false,
+    /// Lint mode: track symbol usage for unused variable/parameter warnings
+    lint_mode: bool = false,
+    /// Zig Sema pattern: current switch subject enum type for .variant shorthand resolution
+    current_switch_enum_type: TypeIndex = invalid_type,
+    /// Swift actor isolation: tracks which type names are actors.
+    /// Used by the isolation checker to determine when `await` is required.
+    actor_types: std.StringHashMap(void) = std.StringHashMap(void).init(std.heap.page_allocator),
+    /// Types with `impl @unchecked Sendable for Type` — bypass recursive Sendable check.
+    /// Swift reference: TypeCheckConcurrency.cpp:7488 — @unchecked Sendable conformance.
+    unchecked_sendable_types: std.StringHashMap(void) = std.StringHashMap(void).init(std.heap.page_allocator),
+    /// Current actor context: non-null when inside an actor method body.
+    /// Cross-actor calls (calling methods on a different actor) require `await`.
+    current_actor_type: ?[]const u8 = null,
+    /// Tracks cross-actor calls that require `await`. Keyed by source offset.
+    cross_actor_calls: std.AutoHashMap(u32, void) = std.AutoHashMap(u32, void).init(std.heap.page_allocator),
+    /// Swift SE-0430: variables that have been sent (transferred ownership).
+    /// Any use after sending is a compile-time error.
+    /// Swift reference: RegionAnalysis.cpp — PartitionOp::Send marks region as transferred.
+    sent_variables: std.StringHashMap(void) = std.StringHashMap(void).init(std.heap.page_allocator),
+    /// Swift SE-0316: functions annotated with @globalActor (e.g. @MainActor).
+    /// Keyed by function name, value is the actor name.
+    global_actor_fns: std.StringHashMap([]const u8) = std.StringHashMap([]const u8).init(std.heap.page_allocator),
+    /// True when currently inside an `await` expression (suppresses cross-actor errors).
+    in_await: bool = false,
+    /// Swift SE-0316: current global actor context (e.g. "MainActor").
+    /// Non-null when inside a @MainActor function or @MainActor type member.
+    /// Cross-global-actor calls require await (TypeCheckConcurrency.cpp:3954).
+    current_global_actor: ?[]const u8 = null,
+    /// Mutable comptime variable storage — active during comptime block evaluation.
+    /// Zig Sema: ComptimeAlloc list holds mutable values, runtime_index prevents time travel.
+    comptime_vars: ?std.StringHashMap(ComptimeValue) = null,
+
+    /// Go resolver.go pattern: file_scope is per-file, global_scope is shared across all files.
+    /// Single-file callers pass the same scope for both.
+    pub fn init(allocator: std.mem.Allocator, tree: *const Ast, type_reg: *TypeRegistry, reporter: *ErrorReporter, file_scope: *Scope, global_scope: *Scope, generic_ctx: *SharedGenericContext, target: target_mod.Target) Checker {
+        return .{
+            .types = type_reg,
+            .scope = file_scope,
+            .global_scope = global_scope,
+            .err = reporter,
+            .tree = tree,
+            .allocator = allocator,
+            .expr_types = std.AutoHashMap(NodeIndex, TypeIndex).init(allocator),
+            .generics = generic_ctx,
+            .generic_instantiations = std.AutoHashMap(NodeIndex, GenericInstInfo).init(allocator),
+            .target = target,
+        };
+    }
+
+    pub fn deinit(self: *Checker) void {
+        self.expr_types.deinit();
+        self.generic_instantiations.deinit();
+        // SharedGenericContext is owned by the driver, not the checker
+    }
+
+    /// Define a symbol in scope with source_tree tracking (Go resolver.go pattern).
+    /// source_tree enables import filtering: when copying imported symbols, only
+    /// symbols owned by the imported file (source_tree == file's tree) are copied.
+    fn defineInFileScope(self: *Checker, sym: Symbol) !void {
+        var s = sym;
+        s.source_tree = self.tree;
+        try self.scope.define(s);
+    }
+
+    /// Go pattern: resolve a type name through scope chain first, then type registry.
+    /// Go's check.ident() walks the scope chain for type names (typexpr.go:20).
+    /// With per-file scopes, scope lookup correctly distinguishes same-named types
+    /// from different files, while the global type registry (name_map) does not.
+    pub fn resolveTypeByName(self: *Checker, name: []const u8) ?TypeIndex {
+        if (self.scope.lookup(name)) |sym| {
+            if (sym.kind == .type_name) return sym.type_idx;
+        }
+        return self.types.lookupByName(name);
+    }
+
+    /// Swift ResultConvention: check if an AST type node refers to a type parameter.
+    /// Used at type-checking time to determine indirect result convention.
+    /// Reference: swift/include/swift/AST/Types.h isIndirectFormalResult()
+    pub fn isTypeParamName(self: *const Checker, type_node: NodeIndex, type_param_names: []const []const u8) bool {
+        const node = self.tree.getNode(type_node) orelse return false;
+        const expr = node.asExpr() orelse return false;
+        const name = switch (expr) {
+            .ident => |id| id.name,
+            .type_expr => |te| switch (te.kind) {
+                .named => |n| n,
+                else => return false,
+            },
+            else => return false,
+        };
+        for (type_param_names) |pn| {
+            if (std.mem.eql(u8, name, pn)) return true;
+        }
+        return false;
+    }
+
+    /// Run lint checks on the file scope (top-level unused functions/vars).
+    /// Function-local lint checks are emitted inline during checkFnDeclWithName.
+    /// Go resolver.go pattern: lint checks run on file_scope (self.scope at top level).
+    pub fn runLintChecks(self: *Checker) void {
+        self.checkScopeUnused(self.scope);
+    }
+
+    /// Emit warnings for unused symbols in a scope.
+    fn checkScopeUnused(self: *Checker, scope_ptr: *const Scope) void {
+        var it = scope_ptr.symbols.iterator();
+        while (it.next()) |entry| {
+            const sym = entry.value_ptr;
+            if (sym.used) continue;
+            // Skip _ prefixed names (intentionally unused, Zig/Go convention)
+            if (sym.name.len > 0 and sym.name[0] == '_') continue;
+            // Skip "self" parameter
+            if (std.mem.eql(u8, sym.name, "self")) continue;
+            // Skip functions and type names (only lint vars/consts/params)
+            if (sym.kind == .function or sym.kind == .type_name) continue;
+
+            // Get position from the node's span
+            const pos = if (self.tree.getNode(sym.node)) |n| n.span().start else Pos.zero;
+            if (sym.kind == .parameter) {
+                self.err.warningWithCode(pos, .w002, sym.name);
+            } else {
+                self.err.warningWithCode(pos, .w001, sym.name);
+            }
+        }
+    }
+
+    /// Check a statement list for unreachable code after return/break/continue.
+    /// Zig pattern: compiler warns on statements after `return` in a block.
+    fn checkStmtsWithReachability(self: *Checker, stmts: []const NodeIndex) void {
+        // Pre-pass: collect type declarations from statement list
+        // (struct/enum/union decls that appear as Decl nodes in block context)
+        for (stmts) |stmt_idx| {
+            const node = self.tree.getNode(stmt_idx) orelse continue;
+            if (node.asDecl()) |decl| {
+                switch (decl) {
+                    .struct_decl, .enum_decl, .union_decl, .type_alias, .error_set_decl, .trait_decl,
+                    .fn_decl,
+                        => self.collectDecl(stmt_idx) catch {},
+                    else => {},
+                }
+            }
+        }
+        // Post-collect: check method bodies for block-scoped structs
+        // (collectDecl registers types+methods, checkDecl checks fn bodies)
+        for (stmts) |stmt_idx| {
+            const node = self.tree.getNode(stmt_idx) orelse continue;
+            if (node.asDecl()) |decl| {
+                if (decl == .struct_decl or decl == .fn_decl) self.checkDecl(stmt_idx) catch {};
+            }
+        }
+        var seen_terminal = false;
+        var warned = false;
+        for (stmts) |stmt_idx| {
+            if (seen_terminal and self.lint_mode and !warned) {
+                // Warn once on the first unreachable statement (Zig pattern)
+                const pos = if (self.tree.getNode(stmt_idx)) |n| n.span().start else Pos.zero;
+                self.err.warningWithCode(pos, .w004, "unreachable code after return");
+                warned = true;
+            }
+            if (!seen_terminal) {
+                self.checkStmt(stmt_idx) catch {};
+            }
+            // Check if this statement is terminal (return, break, continue)
+            if (!seen_terminal) {
+                if (self.tree.getNode(stmt_idx)) |node| {
+                    if (node.asStmt()) |stmt| {
+                        switch (stmt) {
+                            .return_stmt, .break_stmt, .continue_stmt => {
+                                seen_terminal = true;
+                            },
+                            else => {},
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Check if a node is an empty block (for lint W005).
+    fn isEmptyBlock(self: *Checker, idx: NodeIndex) bool {
+        const node = self.tree.getNode(idx) orelse return false;
+        if (node.asStmt()) |stmt| {
+            if (stmt == .block_stmt) return stmt.block_stmt.stmts.len == 0;
+        }
+        if (node.asExpr()) |expr| {
+            if (expr == .block_expr) return expr.block_expr.stmts.len == 0 and expr.block_expr.expr == ast.null_node;
+        }
+        return false;
+    }
+
+    pub fn checkFile(self: *Checker) CheckError!void {
+        const file = self.tree.file orelse return;
+        self.safe_mode = file.safe_mode;
+        debug.log(.check, "=== Type checking file ({d} declarations, safe={}) ===", .{
+            file.decls.len, self.safe_mode,
+        });
+
+        // Pass 1: Collect type declarations (structs, enums, unions, type aliases)
+        for (file.decls) |idx| try self.collectTypeDecl(idx);
+        debug.log(.check, "  pass 1: type declarations collected", .{});
+
+        // Pass 2: Collect non-type declarations (functions, variables, impl blocks)
+        for (file.decls) |idx| try self.collectNonTypeDecl(idx);
+        debug.log(.check, "  pass 2: non-type declarations collected", .{});
+
+        // Pass 3: Check all declarations (type check function bodies, expressions)
+        for (file.decls) |idx| try self.checkDecl(idx);
+        debug.log(.check, "=== Type checking complete ({d} types registered) ===", .{
+            self.types.types.items.len,
+        });
+    }
+
+    fn collectTypeDecl(self: *Checker, idx: NodeIndex) CheckError!void {
+        const decl = (self.tree.getNode(idx) orelse return).asDecl() orelse return;
+        switch (decl) {
+            .struct_decl, .enum_decl, .union_decl, .type_alias, .error_set_decl, .trait_decl => try self.collectDecl(idx),
+            else => {},
+        }
+    }
+
+    fn collectNonTypeDecl(self: *Checker, idx: NodeIndex) CheckError!void {
+        const decl = (self.tree.getNode(idx) orelse return).asDecl() orelse return;
+        switch (decl) {
+            .fn_decl, .var_decl, .impl_block, .impl_trait => try self.collectDecl(idx),
+            else => {},
+        }
+    }
+
+    fn collectDecl(self: *Checker, idx: NodeIndex) CheckError!void {
+        const decl = (self.tree.getNode(idx) orelse return).asDecl() orelse return;
+        switch (decl) {
+            .fn_decl => |f| {
+                if (self.scope.isDefined(f.name)) {
+                    if (f.is_extern) if (self.scope.lookup(f.name)) |e| if (e.is_extern) return;
+                    self.reportRedefined(f.span.start, f.name);
+                    return;
+                }
+                // Export functions cannot be generic (generics aren't C ABI compatible)
+                if (f.is_export and f.type_params.len > 0) {
+                    self.err.errorWithCode(f.span.start, .e302, "export functions cannot be generic");
+                    return;
+                }
+                // Generic functions: store definition, don't build concrete type yet
+                if (f.type_params.len > 0) {
+                    try self.generics.generic_functions.put(f.name, .{ .type_params = f.type_params, .type_param_bounds = f.type_param_bounds, .node_idx = idx, .tree = self.tree, .scope = self.scope });
+                    // Register as a type_name so checkIdentifier knows it's generic
+                    try self.defineInFileScope(Symbol.init(f.name, .type_name, invalid_type, idx, false));
+                    return;
+                }
+                var func_type = try self.buildFuncType(f.params, f.return_type);
+                // async fn: wrap return type in Task(T), check Sendable
+                if (f.is_async) {
+                    const inner_ret = self.types.get(func_type).func.return_type;
+                    // Sendable check: return type must be safe to transfer across concurrency boundary
+                    if (inner_ret != TypeRegistry.VOID and !self.isSendable(inner_ret)) {
+                        self.err.errorWithCode(f.span.start, .e300,
+                            "async function return type is not Sendable");
+                    }
+                    // Sendable check: parameters cross from caller to async context
+                    for (self.types.get(func_type).func.params) |param| {
+                        if (!self.isSendable(param.type_idx)) {
+                            self.err.errorWithCode(f.span.start, .e300,
+                                "async function parameter is not Sendable");
+                        }
+                    }
+                    const task_ret = try self.types.makeTask(inner_ret);
+                    func_type = try self.types.makeFunc(self.types.get(func_type).func.params, task_ret);
+                }
+                var sym = Symbol.initExtern(f.name, .function, func_type, idx, false, f.is_extern);
+                sym.is_export = f.is_export;
+                try self.defineInFileScope(sym);
+                if (f.params.len > 0 and std.mem.eql(u8, f.params[0].name, "self"))
+                    try self.registerMethod(f.name, f.params[0].type_expr, func_type);
+                // Track @globalActor functions (SE-0316)
+                if (f.global_actor) |actor| {
+                    self.global_actor_fns.put(f.name, actor) catch {};
+                }
+            },
+            .var_decl => |v| {
+                if (self.scope.isDefined(v.name)) { self.reportRedefined(v.span.start, v.name); return; }
+                try self.defineInFileScope(Symbol.init(v.name, if (v.is_const) .constant else .variable, invalid_type, idx, !v.is_const));
+            },
+            .struct_decl => |s| {
+                if (self.scope.isDefined(s.name)) { self.reportRedefined(s.span.start, s.name); return; }
+                // Track actor types for isolation checking
+                if (s.is_actor) self.actor_types.put(s.name, {}) catch {};
+                // Generic structs: store definition, don't build concrete type yet
+                if (s.type_params.len > 0) {
+                    try self.generics.generic_structs.put(s.name, .{ .type_params = s.type_params, .node_idx = idx, .tree = self.tree, .scope = self.scope });
+                    try self.defineInFileScope(Symbol.init(s.name, .type_name, invalid_type, idx, false));
+                    // Register nested fn_decls as generic impl block (inferred impl on generic struct)
+                    if (s.nested_decls.len > 0) {
+                        var method_indices = std.ArrayListUnmanaged(NodeIndex){};
+                        defer method_indices.deinit(self.allocator);
+                        for (s.nested_decls) |nested_idx| {
+                            const nested = (self.tree.getNode(nested_idx) orelse continue).asDecl() orelse continue;
+                            if (nested == .fn_decl) try method_indices.append(self.allocator, nested_idx);
+                        }
+                        if (method_indices.items.len > 0) {
+                            const gop = try self.generics.generic_impl_blocks.getOrPut(s.name);
+                            if (!gop.found_existing) gop.value_ptr.* = .{};
+                            try gop.value_ptr.append(self.allocator, .{ .type_params = s.type_params, .methods = try self.allocator.dupe(NodeIndex, method_indices.items), .tree = self.tree, .scope = self.scope });
+                        }
+                    }
+                    return;
+                }
+                // Register name BEFORE resolving fields to support self-referential types
+                // (e.g., LinkedList with next: ?*LinkedList). Placeholder type index is updated after.
+                const placeholder = try self.types.add(.{ .struct_type = .{ .name = s.name, .fields = &.{}, .size = 0, .alignment = 8 } });
+                try self.types.registerNamed(s.name, placeholder);
+                try self.defineInFileScope(Symbol.init(s.name, .type_name, placeholder, idx, false));
+                // Register nested TYPE declarations BEFORE resolving fields, so parent struct
+                // fields can reference nested types (e.g. ComptimeValue has field of type ComptimeValue_ComptimeArray).
+                // Non-type nested decls (fn_decl, var_decl) are registered after field resolution.
+                for (s.nested_decls) |nested_idx| {
+                    const nested = (self.tree.getNode(nested_idx) orelse continue).asDecl() orelse continue;
+                    switch (nested) {
+                        .error_set_decl => |es| {
+                            const qualified = try std.fmt.allocPrint(self.allocator, "{s}_{s}", .{ s.name, es.name });
+                            const es_type = try self.types.add(.{ .error_set = .{ .name = qualified, .variants = es.variants } });
+                            try self.defineInFileScope(Symbol.init(qualified, .type_name, es_type, nested_idx, false));
+                            try self.types.registerNamed(qualified, es_type);
+                        },
+                        .enum_decl => |e| {
+                            const qualified = try std.fmt.allocPrint(self.allocator, "{s}_{s}", .{ s.name, e.name });
+                            const enum_type = try self.buildEnumType(e);
+                            try self.defineInFileScope(Symbol.init(qualified, .type_name, enum_type, nested_idx, false));
+                            try self.types.registerNamed(qualified, enum_type);
+                        },
+                        .struct_decl => |ns| {
+                            const qualified = try std.fmt.allocPrint(self.allocator, "{s}_{s}", .{ s.name, ns.name });
+                            const ns_type = try self.buildStructTypeWithLayout(qualified, ns.fields, ns.layout);
+                            try self.defineInFileScope(Symbol.init(qualified, .type_name, ns_type, nested_idx, false));
+                            try self.types.registerNamed(qualified, ns_type);
+                        },
+                        .type_alias => |t| {
+                            const qualified = try std.fmt.allocPrint(self.allocator, "{s}_{s}", .{ s.name, t.name });
+                            const target_type = self.resolveTypeExpr(t.target) catch invalid_type;
+                            try self.defineInFileScope(Symbol.init(qualified, .type_name, target_type, nested_idx, false));
+                            try self.types.registerNamed(qualified, target_type);
+                        },
+                        .var_decl => |v| {
+                            const qualified = try std.fmt.allocPrint(self.allocator, "{s}_{s}", .{ s.name, v.name });
+                            try self.defineInFileScope(Symbol.init(qualified, if (v.is_const) .constant else .variable, invalid_type, nested_idx, !v.is_const));
+                        },
+                        .fn_decl => |f| {
+                            const synth_name = try std.fmt.allocPrint(self.allocator, "{s}_{s}", .{ s.name, f.name });
+                            const func_type = try self.buildFuncType(f.params, f.return_type);
+                            // Without @safe, a method with no self param is effectively static
+                            // even if the parser didn't mark it. In @safe mode or actor mode, self gets injected.
+                            // Swift: actor methods always have implicit isolated self.
+                            const safe_or_actor = self.safe_mode or s.is_actor;
+                            const effective_static = f.is_static or (!safe_or_actor and (f.params.len == 0 or !std.mem.eql(u8, f.params[0].name, "self")));
+                            var is_ptr = !effective_static;
+                            if (!effective_static) {
+                                const func_info = self.types.get(func_type);
+                                if (func_info == .func and func_info.func.params.len > 0) {
+                                    const first_param_type = self.types.get(func_info.func.params[0].type_idx);
+                                    if (first_param_type != .pointer) is_ptr = false;
+                                }
+                            }
+                            try self.defineInFileScope(Symbol.initExtern(synth_name, .function, func_type, nested_idx, false, false));
+                            try self.types.registerMethod(s.name, types.MethodInfo{ .name = f.name, .func_name = synth_name, .func_type = func_type, .receiver_is_ptr = is_ptr, .is_static = effective_static, .is_nonisolated = f.is_nonisolated, .source_tree = self.tree });
+                        },
+                        else => {},
+                    }
+                }
+                // Build struct type AFTER nested types are registered (so fields can reference them)
+                const struct_type = try self.buildStructTypeWithLayout(s.name, s.fields, s.layout);
+                // Update the placeholder with the real type
+                const st = self.types.get(struct_type).struct_type;
+                self.types.types.items[@intCast(placeholder)] = .{ .struct_type = .{ .name = s.name, .fields = st.fields, .size = st.size, .alignment = st.alignment, .layout = s.layout, .backing_int = st.backing_int } };
+            },
+            .enum_decl => |e| {
+                if (self.scope.isDefined(e.name)) { self.reportRedefined(e.span.start, e.name); return; }
+                const enum_type = try self.buildEnumType(e);
+                try self.defineInFileScope(Symbol.init(e.name, .type_name, enum_type, idx, false));
+                try self.types.registerNamed(e.name, enum_type);
+                // Register nested declarations (inferred impl: fn/static fn/const inside enum body)
+                for (e.nested_decls) |nested_idx| {
+                    const nested = (self.tree.getNode(nested_idx) orelse continue).asDecl() orelse continue;
+                    switch (nested) {
+                        .fn_decl => |f| {
+                            const synth_name = try std.fmt.allocPrint(self.allocator, "{s}_{s}", .{ e.name, f.name });
+                            const func_type = try self.buildFuncType(f.params, f.return_type);
+                            const effective_static_e = f.is_static or (!self.safe_mode and (f.params.len == 0 or !std.mem.eql(u8, f.params[0].name, "self")));
+                            var is_ptr = !effective_static_e;
+                            if (!effective_static_e) {
+                                const func_info = self.types.get(func_type);
+                                if (func_info == .func and func_info.func.params.len > 0) {
+                                    const first_param_type = self.types.get(func_info.func.params[0].type_idx);
+                                    if (first_param_type != .pointer) is_ptr = false;
+                                }
+                            }
+                            try self.defineInFileScope(Symbol.initExtern(synth_name, .function, func_type, nested_idx, false, false));
+                            try self.types.registerMethod(e.name, types.MethodInfo{ .name = f.name, .func_name = synth_name, .func_type = func_type, .receiver_is_ptr = is_ptr, .is_static = effective_static_e, .source_tree = self.tree });
+                        },
+                        .var_decl => |v| {
+                            const qualified = try std.fmt.allocPrint(self.allocator, "{s}_{s}", .{ e.name, v.name });
+                            try self.defineInFileScope(Symbol.init(qualified, if (v.is_const) .constant else .variable, invalid_type, nested_idx, !v.is_const));
+                        },
+                        else => {},
+                    }
+                }
+            },
+            .union_decl => |u| {
+                if (self.scope.isDefined(u.name)) { self.reportRedefined(u.span.start, u.name); return; }
+                const union_type = try self.buildUnionType(u);
+                try self.defineInFileScope(Symbol.init(u.name, .type_name, union_type, idx, false));
+                try self.types.registerNamed(u.name, union_type);
+            },
+            .error_set_decl => |es| {
+                if (self.scope.isDefined(es.name)) { self.reportRedefined(es.span.start, es.name); return; }
+                const es_type = try self.types.add(.{ .error_set = .{ .name = es.name, .variants = es.variants } });
+                try self.defineInFileScope(Symbol.init(es.name, .type_name, es_type, idx, false));
+                try self.types.registerNamed(es.name, es_type);
+            },
+            // Go reference: types2/alias.go - Alias stores RHS and resolves through it
+            .type_alias => |t| {
+                if (self.scope.isDefined(t.name)) { self.reportRedefined(t.span.start, t.name); return; }
+                const target_type = self.resolveTypeExpr(t.target) catch invalid_type;
+                if (t.is_distinct) {
+                    // Rust reference: newtype pattern — create a nominally distinct type
+                    // wrapping the underlying type. Prevents cross-type assignment at compile time.
+                    const distinct_idx = try self.types.add(.{ .distinct = .{ .name = t.name, .underlying = target_type } });
+                    try self.defineInFileScope(Symbol.init(t.name, .type_name, distinct_idx, idx, false));
+                    try self.types.registerNamed(t.name, distinct_idx);
+                } else {
+                    try self.defineInFileScope(Symbol.init(t.name, .type_name, target_type, idx, false));
+                    try self.types.registerNamed(t.name, target_type);
+                }
+            },
+            .impl_block => |impl_b| {
+                // Generic impl blocks: store definition, instantiate when struct is instantiated
+                if (impl_b.type_params.len > 0) {
+                    const gop = try self.generics.generic_impl_blocks.getOrPut(impl_b.type_name);
+                    if (!gop.found_existing) gop.value_ptr.* = .{};
+                    try gop.value_ptr.append(self.allocator, .{ .type_params = impl_b.type_params, .methods = impl_b.methods, .tree = self.tree, .scope = self.scope });
+                    return;
+                }
+                // Register associated constants with qualified names: TypeName_ConstName
+                for (impl_b.consts) |const_idx| {
+                    const const_decl = (self.tree.getNode(const_idx) orelse continue).asDecl() orelse continue;
+                    if (const_decl == .var_decl) {
+                        const v = const_decl.var_decl;
+                        var const_type: TypeIndex = invalid_type;
+                        if (v.type_expr != null_node) const_type = self.resolveTypeExpr(v.type_expr) catch invalid_type;
+                        const qualified = try std.fmt.allocPrint(self.allocator, "{s}_{s}", .{ impl_b.type_name, v.name });
+                        try self.defineInFileScope(Symbol.init(qualified, .constant, const_type, const_idx, false));
+                    }
+                }
+                for (impl_b.methods) |method_idx| {
+                    const method_decl = (self.tree.getNode(method_idx) orelse continue).asDecl() orelse continue;
+                    if (method_decl == .fn_decl) {
+                        const f = method_decl.fn_decl;
+                        const synth_name = try std.fmt.allocPrint(self.allocator, "{s}_{s}", .{ impl_b.type_name, f.name });
+                        const func_type = try self.buildFuncType(f.params, f.return_type);
+                        const effective_static_i = f.is_static or (!self.safe_mode and (f.params.len == 0 or !std.mem.eql(u8, f.params[0].name, "self")));
+                        var is_ptr = !effective_static_i;
+                        if (!effective_static_i) {
+                            const func_info = self.types.get(func_type);
+                            if (func_info == .func and func_info.func.params.len > 0) {
+                                const first_param_type = self.types.get(func_info.func.params[0].type_idx);
+                                if (first_param_type != .pointer) is_ptr = false;
+                            }
+                        }
+                        try self.defineInFileScope(Symbol.initExtern(synth_name, .function, func_type, method_idx, false, false));
+                        try self.types.registerMethod(impl_b.type_name, types.MethodInfo{ .name = f.name, .func_name = synth_name, .func_type = func_type, .receiver_is_ptr = is_ptr, .is_static = effective_static_i, .source_tree = self.tree });
+                    }
+                }
+            },
+            .trait_decl => |td| {
+                // Collect trait method names and associated type names.
+                // Swift reference: protocol declaration with associated types (SE-0142).
+                var method_names = std.ArrayListUnmanaged([]const u8){};
+                defer method_names.deinit(self.allocator);
+                for (td.methods) |method_idx| {
+                    const method_decl = (self.tree.getNode(method_idx) orelse continue).asDecl() orelse continue;
+                    if (method_decl == .fn_decl) try method_names.append(self.allocator, method_decl.fn_decl.name);
+                }
+                var assoc_type_names = std.ArrayListUnmanaged([]const u8){};
+                defer assoc_type_names.deinit(self.allocator);
+                for (td.assoc_types) |at| {
+                    try assoc_type_names.append(self.allocator, at.name);
+                }
+                try self.generics.trait_defs.put(td.name, .{
+                    .name = td.name,
+                    .type_params = td.type_params,
+                    .method_names = try self.allocator.dupe([]const u8, method_names.items),
+                    .assoc_type_names = try self.allocator.dupe([]const u8, assoc_type_names.items),
+                });
+            },
+            .impl_trait => |it| {
+                // Validate trait exists
+                const trait_def = self.generics.trait_defs.get(it.trait_name) orelse {
+                    self.errWithSuggestion(it.span.start, "undefined trait", self.findSimilarTrait(it.trait_name));
+                    return;
+                };
+                // Validate all required methods are provided (name check)
+                for (trait_def.method_names) |required_name| {
+                    var found = false;
+                    for (it.methods) |method_idx| {
+                        const method_decl = (self.tree.getNode(method_idx) orelse continue).asDecl() orelse continue;
+                        if (method_decl == .fn_decl and std.mem.eql(u8, method_decl.fn_decl.name, required_name)) { found = true; break; }
+                    }
+                    if (!found) { self.err.errorWithCode(it.span.start, .e300, "missing required trait method"); return; }
+                }
+                // Register methods (same pattern as impl_block)
+                for (it.methods) |method_idx| {
+                    const method_decl = (self.tree.getNode(method_idx) orelse continue).asDecl() orelse continue;
+                    if (method_decl == .fn_decl) {
+                        const f = method_decl.fn_decl;
+                        const synth_name = try std.fmt.allocPrint(self.allocator, "{s}_{s}", .{ it.target_type, f.name });
+                        const func_type = try self.buildFuncType(f.params, f.return_type);
+                        try self.defineInFileScope(Symbol.initExtern(synth_name, .function, func_type, method_idx, false, false));
+                        try self.types.registerMethod(it.target_type, types.MethodInfo{ .name = f.name, .func_name = synth_name, .func_type = func_type, .receiver_is_ptr = true, .source_tree = self.tree });
+                    }
+                }
+                const impl_key = try std.fmt.allocPrint(self.allocator, "{s}:{s}", .{ it.trait_name, it.target_type });
+                try self.generics.trait_impls.put(impl_key, it.trait_name);
+            },
+            else => {},
+        }
+    }
+
+    fn registerMethod(self: *Checker, func_name: []const u8, self_type_expr: NodeIndex, func_type: TypeIndex) CheckError!void {
+        const expr = (self.tree.getNode(self_type_expr) orelse return).asExpr() orelse return;
+        if (expr != .type_expr) return;
+        const te = expr.type_expr;
+        var receiver_name: []const u8 = undefined;
+        var is_ptr = false;
+        switch (te.kind) {
+            .named => |n| receiver_name = n,
+            .pointer => |ptr_elem| {
+                const elem_expr = (self.tree.getNode(ptr_elem) orelse return).asExpr() orelse return;
+                if (elem_expr != .type_expr or elem_expr.type_expr.kind != .named) return;
+                receiver_name = elem_expr.type_expr.kind.named;
+                is_ptr = true;
+            },
+            else => return,
+        }
+        try self.types.registerMethod(receiver_name, types.MethodInfo{ .name = func_name, .func_name = func_name, .func_type = func_type, .receiver_is_ptr = is_ptr, .source_tree = self.tree });
+    }
+
+    pub fn lookupMethod(self: *const Checker, type_name: []const u8, method_name: []const u8) ?types.MethodInfo {
+        return self.types.lookupMethod(type_name, method_name);
+    }
+
+    /// Report E302 with a note pointing to the previous definition (Zig pattern).
+    fn reportRedefined(self: *Checker, span_start: source.Pos, name: []const u8) void {
+        if (self.scope.lookup(name)) |sym| {
+            if (self.tree.getNode(sym.node)) |node| {
+                self.err.errorWithCodeAndNote(span_start, .e302, "redefined identifier", node.span().start, "previously defined here");
+                return;
+            }
+        }
+        self.err.errorWithCode(span_start, .e302, "redefined identifier");
+    }
+
+    fn checkDecl(self: *Checker, idx: NodeIndex) CheckError!void {
+        const decl = (self.tree.getNode(idx) orelse return).asDecl() orelse return;
+        switch (decl) {
+            .fn_decl => |f| {
+                // Skip generic function definitions — they're checked at instantiation time
+                if (f.type_params.len > 0) return;
+                try self.checkFnDeclWithName(f, idx, f.name);
+            },
+            .var_decl => |v| try self.checkVarDecl(v, idx),
+            .impl_block => |impl_b| {
+                // Generic impl blocks: bodies checked at instantiation time
+                if (impl_b.type_params.len > 0) return;
+                for (impl_b.methods) |method_idx| {
+                    const method_decl = (self.tree.getNode(method_idx) orelse continue).asDecl() orelse continue;
+                    if (method_decl == .fn_decl) {
+                        const f = method_decl.fn_decl;
+                        const synth_name = try std.fmt.allocPrint(self.allocator, "{s}_{s}", .{ impl_b.type_name, f.name });
+                        try self.checkFnDeclWithName(f, method_idx, synth_name);
+                    }
+                }
+            },
+            .impl_trait => |it| {
+                for (it.methods) |method_idx| {
+                    const method_decl = (self.tree.getNode(method_idx) orelse continue).asDecl() orelse continue;
+                    if (method_decl == .fn_decl) {
+                        const f = method_decl.fn_decl;
+                        const synth_name = try std.fmt.allocPrint(self.allocator, "{s}_{s}", .{ it.target_type, f.name });
+                        try self.checkFnDeclWithName(f, method_idx, synth_name);
+                    }
+                }
+            },
+            .struct_decl => |s| {
+                if (s.type_params.len > 0) return;
+                // Set actor context for isolation checking inside actor method bodies
+                const saved_actor = self.current_actor_type;
+                if (s.is_actor) self.current_actor_type = s.name;
+                defer self.current_actor_type = saved_actor;
+                for (s.nested_decls) |nested_idx| {
+                    const nested = (self.tree.getNode(nested_idx) orelse continue).asDecl() orelse continue;
+                    if (nested == .fn_decl) {
+                        const f = nested.fn_decl;
+                        if (f.type_params.len > 0) continue;
+                        const synth_name = try std.fmt.allocPrint(self.allocator, "{s}_{s}", .{ s.name, f.name });
+                        try self.checkFnDeclWithName(f, nested_idx, synth_name);
+                    }
+                }
+            },
+            .enum_decl => |e| {
+                for (e.nested_decls) |nested_idx| {
+                    const nested = (self.tree.getNode(nested_idx) orelse continue).asDecl() orelse continue;
+                    if (nested == .fn_decl) {
+                        const f = nested.fn_decl;
+                        const synth_name = try std.fmt.allocPrint(self.allocator, "{s}_{s}", .{ e.name, f.name });
+                        try self.checkFnDeclWithName(f, nested_idx, synth_name);
+                    }
+                }
+            },
+            .unchecked_sendable => |us| {
+                try self.unchecked_sendable_types.put(us.type_name, {});
+            },
+            .test_decl => |t| try self.checkTestDecl(t),
+            .bench_decl => |b| try self.checkBenchDecl(b),
+            else => {},
+        }
+    }
+
+    fn checkTestDecl(self: *Checker, t: ast.TestDecl) CheckError!void {
+        var test_scope = Scope.init(self.allocator, self.scope);
+        defer test_scope.deinit();
+        const old_scope = self.scope;
+        const old_return = self.current_return_type;
+        self.scope = &test_scope;
+        self.current_return_type = TypeRegistry.VOID;
+        if (t.body != null_node) try self.checkStmt(t.body);
+        if (self.lint_mode) self.checkScopeUnused(&test_scope);
+        self.scope = old_scope;
+        self.current_return_type = old_return;
+    }
+
+    fn checkBenchDecl(self: *Checker, b: ast.BenchDecl) CheckError!void {
+        var bench_scope = Scope.init(self.allocator, self.scope);
+        defer bench_scope.deinit();
+        const old_scope = self.scope;
+        const old_return = self.current_return_type;
+        self.scope = &bench_scope;
+        self.current_return_type = TypeRegistry.VOID;
+        if (b.body != null_node) try self.checkStmt(b.body);
+        if (self.lint_mode) self.checkScopeUnused(&bench_scope);
+        self.scope = old_scope;
+        self.current_return_type = old_return;
+    }
+
+    pub fn checkFnDeclWithName(self: *Checker, f: ast.FnDecl, idx: NodeIndex, lookup_name: []const u8) CheckError!void {
+        debug.log(.check, "  check fn '{s}' ({d} params, async={}, export={}, extern={})", .{
+            lookup_name, f.params.len, f.is_async, f.is_export, f.is_extern,
+        });
+        const sym = self.scope.lookup(lookup_name) orelse return;
+        const return_type = if (self.types.get(sym.type_idx) == .func) self.types.get(sym.type_idx).func.return_type else TypeRegistry.VOID;
+        // For async functions, the registered return type is Task(T) — body returns T
+        const body_return_type = if (f.is_async and self.types.get(return_type) == .task)
+            self.types.get(return_type).task.result_type
+        else
+            return_type;
+        var func_scope = Scope.init(self.allocator, self.scope);
+        defer func_scope.deinit();
+        for (f.params) |param| {
+            var param_type = try self.resolveTypeExpr(param.type_expr);
+            // Don't auto-ref parameters whose type is a generic type parameter (T).
+            // Generic code uses value semantics for T; wrapping T to *T when T=struct
+            // would break body code (e.g. `ptr.* = value` expects T, not *T).
+            const is_generic_param = if (self.type_substitution) |sub| blk: {
+                if (param.type_expr != null_node) {
+                    if (self.tree.getNode(param.type_expr)) |node| {
+                        if (node.asExpr()) |expr| {
+                            if (expr == .ident) {
+                                break :blk sub.contains(expr.ident.name);
+                            } else if (expr == .type_expr and expr.type_expr.kind == .named) {
+                                break :blk sub.contains(expr.type_expr.kind.named);
+                            }
+                        }
+                    }
+                }
+                break :blk false;
+            } else false;
+            if (!is_generic_param) param_type = try self.safeWrapType(param_type);
+            try func_scope.define(Symbol.init(param.name, .parameter, param_type, idx, false));
+        }
+        const old_scope = self.scope;
+        const old_return = self.current_return_type;
+        const old_global_actor = self.current_global_actor;
+        self.scope = &func_scope;
+        self.current_return_type = body_return_type;
+        // Swift SE-0316: set global actor context for isolation checking
+        if (f.global_actor) |ga| self.current_global_actor = ga;
+        // Swift SE-0430: clear sent_variables at function boundary.
+        // Each function has its own sending scope — sent state doesn't leak across functions.
+        self.sent_variables.clearRetainingCapacity();
+        if (f.body != null_node) try self.checkBlockExpr(f.body);
+        // Lint: check for unused vars/params before scope exits
+        if (self.lint_mode) self.checkScopeUnused(&func_scope);
+        self.scope = old_scope;
+        self.current_return_type = old_return;
+        self.current_global_actor = old_global_actor;
+    }
+
+    fn checkVarDecl(self: *Checker, v: ast.VarDecl, idx: NodeIndex) CheckError!void {
+        var var_type: TypeIndex = if (v.type_expr != null_node) try self.resolveTypeExpr(v.type_expr) else invalid_type;
+        if (v.value != null_node and !self.isUndefinedLit(v.value)) {
+            const val_type = try self.checkExpr(v.value);
+            if (var_type == invalid_type) var_type = self.materializeType(val_type)
+            else if (!self.types.isAssignable(val_type, var_type)) self.err.errorWithCode(v.span.start, .e300, "type mismatch");
+        }
+        if (self.scope.lookupLocal(v.name) != null) {
+            if (v.is_const and v.value != null_node) {
+                if (self.evalConstExpr(v.value)) |cv| {
+                    try self.scope.define(Symbol.initConst(v.name, var_type, idx, cv));
+                    return;
+                }
+                if (self.isFloatType(var_type)) if (self.evalConstFloat(v.value)) |fv| {
+                    try self.scope.define(Symbol.initFloatConst(v.name, var_type, idx, fv));
+                    return;
+                };
+            }
+            try self.scope.define(Symbol.init(v.name, if (v.is_const) .constant else .variable, var_type, idx, !v.is_const));
+        }
+        // Register error set consts as named types for use in type positions
+        // Enables: const AllErrors = FileError || NetError
+        if (v.is_const and var_type != invalid_type and self.types.get(var_type) == .error_set) {
+            try self.types.registerNamed(v.name, var_type);
+        }
+    }
+
+    fn isUndefinedLit(self: *Checker, idx: NodeIndex) bool {
+        const expr = (self.tree.getNode(idx) orelse return false).asExpr() orelse return false;
+        return expr == .literal and expr.literal.kind == .undefined_lit;
+    }
+
+    fn isZeroInitLit(self: *Checker, idx: NodeIndex) bool {
+        const expr = (self.tree.getNode(idx) orelse return false).asExpr() orelse return false;
+        return expr == .zero_init;
+    }
+
+    /// Rich comptime evaluator — returns structured values (arrays, strings, ints, bools).
+    /// Zig Sema pattern: resolveInstValue evaluates ZIR instructions to comptime values.
+    /// Delegates to evalConstExpr/evalConstString for leaf cases, adds support for
+    /// comptime blocks with statements, arrays, struct field access, etc.
+    pub fn evalComptimeValue(self: *Checker, idx: NodeIndex) ?ComptimeValue {
+        const expr = (self.tree.getNode(idx) orelse return null).asExpr() orelse return null;
+        return switch (expr) {
+            .literal => |lit| switch (lit.kind) {
+                .int => if (std.fmt.parseInt(i64, lit.value, 0) catch null) |v| ComptimeValue{ .int = v } else null,
+                .float => if (std.fmt.parseFloat(f64, lit.value) catch null) |v| ComptimeValue{ .float = v } else null,
+                .true_lit => ComptimeValue{ .boolean = true },
+                .false_lit => ComptimeValue{ .boolean = false },
+                .string => blk: {
+                    const v = lit.value;
+                    const s = if (v.len >= 2 and v[0] == '"' and v[v.len - 1] == '"') v[1 .. v.len - 1] else v;
+                    break :blk ComptimeValue{ .string = s };
+                },
+                .undefined_lit => ComptimeValue.undefined_val,
+                else => null,
+            },
+            .unary => |un| if (self.evalComptimeValue(un.operand)) |op| switch (op) {
+                .int => |v| switch (un.op) {
+                    .sub => ComptimeValue{ .int = -v },
+                    .not => ComptimeValue{ .int = ~v },
+                    .lnot => ComptimeValue{ .int = if (v == 0) @as(i64, 1) else @as(i64, 0) },
+                    else => null,
+                },
+                .boolean => |b| switch (un.op) {
+                    .lnot => ComptimeValue{ .boolean = !b },
+                    else => null,
+                },
+                else => null,
+            } else null,
+            .binary => |bin| blk: {
+                // Try integer const-fold
+                const l = self.evalComptimeValue(bin.left) orelse break :blk null;
+                const r = self.evalComptimeValue(bin.right) orelse break :blk null;
+                // Int-int binary
+                if (l.asInt()) |li| {
+                    if (r.asInt()) |ri| {
+                        const result: ?i64 = switch (bin.op) {
+                            .add => li + ri,
+                            .sub => li - ri,
+                            .mul => li * ri,
+                            .quo => if (ri != 0) @divTrunc(li, ri) else null,
+                            .rem => if (ri != 0) @rem(li, ri) else null,
+                            .@"and" => li & ri,
+                            .@"or" => li | ri,
+                            .xor => li ^ ri,
+                            .shl => li << @intCast(ri),
+                            .shr => li >> @intCast(ri),
+                            .eql => if (li == ri) @as(i64, 1) else @as(i64, 0),
+                            .neq => if (li != ri) @as(i64, 1) else @as(i64, 0),
+                            .lss => if (li < ri) @as(i64, 1) else @as(i64, 0),
+                            .leq => if (li <= ri) @as(i64, 1) else @as(i64, 0),
+                            .gtr => if (li > ri) @as(i64, 1) else @as(i64, 0),
+                            .geq => if (li >= ri) @as(i64, 1) else @as(i64, 0),
+                            else => null,
+                        };
+                        break :blk if (result) |v| ComptimeValue{ .int = v } else null;
+                    }
+                }
+                // String-string equality
+                if (l.asString()) |ls| {
+                    if (r.asString()) |rs| {
+                        if (bin.op == .eql or bin.op == .neq) {
+                            const equal = std.mem.eql(u8, ls, rs);
+                            const v: i64 = if (bin.op == .eql)
+                                (if (equal) @as(i64, 1) else @as(i64, 0))
+                            else
+                                (if (!equal) @as(i64, 1) else @as(i64, 0));
+                            break :blk ComptimeValue{ .int = v };
+                        }
+                    }
+                }
+                break :blk null;
+            },
+            .paren => |p| self.evalComptimeValue(p.inner),
+            .ident => |id| {
+                // Check comptime mutable vars first (Phase 2: ComptimeAlloc lookup)
+                if (self.comptime_vars) |*cv| {
+                    if (cv.get(id.name)) |val| return val;
+                }
+                // Fall back to const symbol lookup
+                if (self.scope.lookup(id.name)) |sym| {
+                    if (sym.kind == .constant) {
+                        if (sym.const_value) |v| return ComptimeValue{ .int = v };
+                        if (sym.float_const_value) |v| return ComptimeValue{ .float = v };
+                        // Check for comptime_value on symbol (Phase 5: inline for bindings)
+                        if (sym.comptime_val) |cv| return cv;
+                    }
+                }
+                return null;
+            },
+            .builtin_call => |bc| {
+                if (bc.kind == .size_of) {
+                    const type_idx = self.resolveTypeExpr(bc.type_arg) catch return null;
+                    if (type_idx == invalid_type) return null;
+                    return ComptimeValue{ .int = @as(i64, @intCast(self.types.sizeOf(type_idx))) };
+                }
+                if (bc.kind == .align_of) {
+                    const type_idx = self.resolveTypeExpr(bc.type_arg) catch return null;
+                    if (type_idx == invalid_type) return null;
+                    return ComptimeValue{ .int = @as(i64, @intCast(self.types.alignmentOf(type_idx))) };
+                }
+                if (bc.kind == .offset_of) {
+                    const type_idx = self.resolveTypeExpr(bc.type_arg) catch return null;
+                    if (type_idx == invalid_type) return null;
+                    const name_str = self.evalConstString(bc.args[0]) orelse return null;
+                    const info = self.types.get(type_idx);
+                    if (info == .struct_type) {
+                        var offset: i64 = 0;
+                        for (info.struct_type.fields) |sf| {
+                            if (std.mem.eql(u8, sf.name, name_str)) return ComptimeValue{ .int = offset };
+                            offset += @as(i64, @intCast(self.types.sizeOf(sf.type_idx)));
+                        }
+                    }
+                    return null;
+                }
+                if (bc.kind == .int_from_bool) {
+                    if (self.evalComptimeValue(bc.args[0])) |v| {
+                        const iv = v.asInt() orelse return null;
+                        return ComptimeValue{ .int = if (iv != 0) @as(i64, 1) else @as(i64, 0) };
+                    }
+                    return null;
+                }
+                if (bc.kind == .min) {
+                    const a = (self.evalComptimeValue(bc.args[0]) orelse return null).asInt() orelse return null;
+                    const b = (self.evalComptimeValue(bc.args[1]) orelse return null).asInt() orelse return null;
+                    return ComptimeValue{ .int = if (a < b) a else b };
+                }
+                if (bc.kind == .max) {
+                    const a = (self.evalComptimeValue(bc.args[0]) orelse return null).asInt() orelse return null;
+                    const b = (self.evalComptimeValue(bc.args[1]) orelse return null).asInt() orelse return null;
+                    return ComptimeValue{ .int = if (a > b) a else b };
+                }
+                if (bc.kind == .has_field) {
+                    const type_idx = self.resolveTypeExpr(bc.type_arg) catch return null;
+                    if (type_idx == invalid_type) return null;
+                    const name_str = self.evalConstString(bc.args[0]) orelse return null;
+                    const info = self.types.get(type_idx);
+                    if (info == .struct_type) {
+                        for (info.struct_type.fields) |sf| {
+                            if (std.mem.eql(u8, sf.name, name_str)) return ComptimeValue{ .int = 1 };
+                        }
+                        return ComptimeValue{ .int = 0 };
+                    }
+                    if (info == .enum_type) {
+                        for (info.enum_type.variants) |v| {
+                            if (std.mem.eql(u8, v.name, name_str)) return ComptimeValue{ .int = 1 };
+                        }
+                        return ComptimeValue{ .int = 0 };
+                    }
+                    if (info == .union_type) {
+                        for (info.union_type.variants) |v| {
+                            if (std.mem.eql(u8, v.name, name_str)) return ComptimeValue{ .int = 1 };
+                        }
+                        return ComptimeValue{ .int = 0 };
+                    }
+                    return ComptimeValue{ .int = 0 };
+                }
+                if (bc.kind == .enum_len) {
+                    const type_idx = self.resolveTypeExpr(bc.type_arg) catch return null;
+                    if (type_idx == invalid_type) return null;
+                    const info = self.types.get(type_idx);
+                    if (info == .enum_type) return ComptimeValue{ .int = @intCast(info.enum_type.variants.len) };
+                    return null;
+                }
+                // String-producing builtins
+                if (bc.kind == .target_os) return ComptimeValue{ .string = self.target.os.name() };
+                if (bc.kind == .target_arch) return ComptimeValue{ .string = self.target.arch.name() };
+                if (bc.kind == .target) return ComptimeValue{ .string = self.target.name() };
+                // @typeName(T) — Phase 3
+                if (bc.kind == .type_name) {
+                    const type_idx = self.resolveTypeExpr(bc.type_arg) catch return null;
+                    if (type_idx == invalid_type) return null;
+                    return ComptimeValue{ .string = self.types.typeName(type_idx) };
+                }
+                // @enumName(T, index) — Phase 3
+                if (bc.kind == .enum_name) {
+                    const type_idx = self.resolveTypeExpr(bc.type_arg) catch return null;
+                    if (type_idx == invalid_type) return null;
+                    const index_val = (self.evalComptimeValue(bc.args[0]) orelse return null).asInt() orelse return null;
+                    const info = self.types.get(type_idx);
+                    if (info == .enum_type) {
+                        for (info.enum_type.variants) |v| {
+                            if (v.value == index_val) return ComptimeValue{ .string = v.name };
+                        }
+                    }
+                    return null;
+                }
+                // @typeInfo(T) — Phase 4
+                if (bc.kind == .type_info) {
+                    const type_idx = self.resolveTypeExpr(bc.type_arg) catch return null;
+                    if (type_idx == invalid_type) return null;
+                    const info = self.types.get(type_idx);
+                    if (info == .enum_type) {
+                        var fields = std.ArrayListUnmanaged(ComptimeValue){};
+                        for (info.enum_type.variants) |v| {
+                            fields.append(self.allocator, ComptimeValue{ .enum_field = .{
+                                .name = v.name,
+                                .value = v.value,
+                            } }) catch return null;
+                        }
+                        return ComptimeValue{ .type_info = .{
+                            .kind = .enum_info,
+                            .name = info.enum_type.name,
+                            .fields = fields,
+                        } };
+                    }
+                    return null;
+                }
+                // @intFromEnum — comptime when arg is comptime-known
+                if (bc.kind == .int_from_enum) {
+                    if (self.evalConstExpr(bc.args[0])) |v| return ComptimeValue{ .int = v };
+                    return null;
+                }
+                return null;
+            },
+            .if_expr => |ie| {
+                const cond_val = (self.evalComptimeValue(ie.condition) orelse return null).asInt() orelse return null;
+                if (cond_val != 0) return self.evalComptimeValue(ie.then_branch);
+                if (ie.else_branch != null_node) return self.evalComptimeValue(ie.else_branch);
+                return null;
+            },
+            .block_expr => |blk| {
+                if (blk.stmts.len == 0) return self.evalComptimeValue(blk.expr);
+                // Phase 2: comptime blocks with statements
+                if (self.comptime_vars != null) return self.evalComptimeBlock(blk.stmts, blk.expr);
+                return null;
+            },
+            .comptime_block => |cb| {
+                // Try evaluating body as a comptime block with statements
+                const body_node = self.tree.getNode(cb.body) orelse return null;
+                const body_expr = body_node.asExpr() orelse return null;
+                if (body_expr == .block_expr) {
+                    const blk = body_expr.block_expr;
+                    // Push comptime context, evaluate block with statements
+                    const old_vars = self.comptime_vars;
+                    const new_vars = std.StringHashMap(ComptimeValue).init(self.allocator);
+                    self.comptime_vars = new_vars;
+                    defer {
+                        if (self.comptime_vars) |*cv| cv.deinit();
+                        self.comptime_vars = old_vars;
+                    }
+                    return self.evalComptimeBlock(blk.stmts, blk.expr);
+                }
+                // Single expression
+                return self.evalComptimeValue(cb.body);
+            },
+            .field_access => |fa| {
+                // Support field access on comptime values (Phase 4: @typeInfo fields)
+                const base_val = self.evalComptimeValue(fa.base) orelse return null;
+                return switch (base_val) {
+                    .type_info => |ti| {
+                        if (std.mem.eql(u8, fa.field, "fields")) {
+                            return ComptimeValue{ .array = .{
+                                .elements = ti.fields,
+                                .elem_type_name = "EnumField",
+                            } };
+                        }
+                        if (std.mem.eql(u8, fa.field, "name")) return ComptimeValue{ .string = ti.name };
+                        return null;
+                    },
+                    .enum_field => |ef| {
+                        if (std.mem.eql(u8, fa.field, "name")) return ComptimeValue{ .string = ef.name };
+                        if (std.mem.eql(u8, fa.field, "value")) return ComptimeValue{ .int = ef.value };
+                        return null;
+                    },
+                    .array => |arr| {
+                        if (std.mem.eql(u8, fa.field, "len")) return ComptimeValue{ .int = @intCast(arr.elements.items.len) };
+                        return null;
+                    },
+                    else => null,
+                };
+            },
+            .index => |ix| {
+                // Support indexing comptime arrays: arr[i]
+                const base_val = self.evalComptimeValue(ix.base) orelse return null;
+                const idx_val = (self.evalComptimeValue(ix.idx) orelse return null).asInt() orelse return null;
+                if (base_val == .array) {
+                    if (idx_val < 0 or idx_val >= @as(i64, @intCast(base_val.array.elements.items.len))) return null;
+                    return base_val.array.elements.items[@intCast(idx_val)];
+                }
+                return null;
+            },
+            else => null,
+        };
+    }
+
+    /// Evaluate a comptime block containing statements (var, assign, for, if) + final expression.
+    /// Zig Sema: ComptimeAlloc list holds mutable values, runtime_index prevents time travel.
+    pub fn evalComptimeBlock(self: *Checker, stmts: []const NodeIndex, final_expr: NodeIndex) ?ComptimeValue {
+        for (stmts) |stmt_idx| {
+            const stmt_node = self.tree.getNode(stmt_idx) orelse return null;
+            if (stmt_node.asStmt()) |stmt| {
+                switch (stmt) {
+                    .var_stmt => |vs| {
+                        // Evaluate initializer, store in comptime_vars
+                        var init_val: ComptimeValue = undefined;
+                        if (vs.value != null_node) {
+                            const raw_val = self.evalComptimeValue(vs.value) orelse return null;
+                            // If initializing an array type with undefined, create a sized array
+                            if (raw_val == .undefined_val and vs.type_expr != null_node) {
+                                if (self.evalComptimeArrayType(vs.type_expr)) |arr_info| {
+                                    var elements = std.ArrayListUnmanaged(ComptimeValue){};
+                                    elements.ensureTotalCapacity(self.allocator, @intCast(arr_info.size)) catch return null;
+                                    var j: usize = 0;
+                                    while (j < arr_info.size) : (j += 1) {
+                                        elements.appendAssumeCapacity(ComptimeValue.undefined_val);
+                                    }
+                                    init_val = ComptimeValue{ .array = .{
+                                        .elements = elements,
+                                        .elem_type_name = arr_info.elem_name,
+                                    } };
+                                } else {
+                                    init_val = raw_val;
+                                }
+                            } else {
+                                init_val = raw_val;
+                            }
+                        } else {
+                            init_val = ComptimeValue.undefined_val;
+                        }
+                        if (self.comptime_vars) |*cv| cv.put(vs.name, init_val) catch return null;
+                    },
+                    .assign_stmt => |as| {
+                        self.evalComptimeAssign(as) orelse return null;
+                    },
+                    .for_stmt => |fs| {
+                        if (fs.is_inline) {
+                            self.evalComptimeInlineFor(fs) orelse return null;
+                        } else {
+                            return null; // Non-inline for not allowed in comptime
+                        }
+                    },
+                    .expr_stmt => |es| {
+                        _ = self.evalComptimeValue(es.expr);
+                    },
+                    else => return null, // Unsupported stmt in comptime context
+                }
+            } else {
+                // Expression statement (as node)
+                _ = self.evalComptimeValue(stmt_idx);
+            }
+        }
+        return self.evalComptimeValue(final_expr);
+    }
+
+    /// Evaluate comptime assignment: x = expr, arr[i] = expr
+    fn evalComptimeAssign(self: *Checker, as: ast.AssignStmt) ?void {
+        const val = self.evalComptimeValue(as.value) orelse return null;
+        const target = (self.tree.getNode(as.target) orelse return null).asExpr() orelse return null;
+        switch (target) {
+            .ident => |id| {
+                if (self.comptime_vars) |*cv| {
+                    // Handle compound assignment operators
+                    if (as.op != .assign) {
+                        const old = cv.get(id.name) orelse return null;
+                        const old_int = old.asInt() orelse return null;
+                        const val_int = val.asInt() orelse return null;
+                        const new_val: i64 = switch (as.op) {
+                            .add_assign => old_int + val_int,
+                            .sub_assign => old_int - val_int,
+                            .mul_assign => old_int * val_int,
+                            else => return null,
+                        };
+                        cv.put(id.name, ComptimeValue{ .int = new_val }) catch return null;
+                    } else {
+                        cv.put(id.name, val) catch return null;
+                    }
+                }
+            },
+            .index => |ix| {
+                // arr[i] = val — mutate comptime array element
+                const base_name = self.getComptimeIdentName(ix.base) orelse return null;
+                const index_val = (self.evalComptimeValue(ix.idx) orelse return null).asInt() orelse return null;
+                if (self.comptime_vars) |*cv| {
+                    const arr_ptr = cv.getPtr(base_name) orelse return null;
+                    if (arr_ptr.* != .array) return null;
+                    if (index_val < 0 or index_val >= @as(i64, @intCast(arr_ptr.array.elements.items.len))) return null;
+                    arr_ptr.array.elements.items[@intCast(index_val)] = val;
+                }
+            },
+            else => return null,
+        }
+    }
+
+    /// Extract identifier name from a node (for comptime array mutation)
+    fn getComptimeIdentName(self: *Checker, idx: NodeIndex) ?[]const u8 {
+        const expr = (self.tree.getNode(idx) orelse return null).asExpr() orelse return null;
+        if (expr == .ident) return expr.ident.name;
+        return null;
+    }
+
+    const ComptimeArrayTypeInfo = struct { size: usize, elem_name: []const u8 };
+
+    /// Extract comptime array type info from a type expression node.
+    /// For `[5]i64`, returns { size: 5, elem_name: "i64" }.
+    fn evalComptimeArrayType(self: *Checker, type_node_idx: NodeIndex) ?ComptimeArrayTypeInfo {
+        const node = self.tree.getNode(type_node_idx) orelse return null;
+        const expr = node.asExpr() orelse return null;
+        if (expr != .type_expr) return null;
+        if (expr.type_expr.kind != .array) return null;
+        const arr = expr.type_expr.kind.array;
+        // Evaluate array size as comptime int
+        const size_val = self.evalConstExpr(arr.size) orelse return null;
+        if (size_val <= 0) return null;
+        // Get element type name
+        const elem_node = self.tree.getNode(arr.elem) orelse return null;
+        const elem_expr = elem_node.asExpr() orelse return null;
+        if (elem_expr == .type_expr) {
+            if (elem_expr.type_expr.kind == .named) return .{ .size = @intCast(size_val), .elem_name = elem_expr.type_expr.kind.named };
+        }
+        return .{ .size = @intCast(size_val), .elem_name = "unknown" };
+    }
+
+    /// Evaluate inline for in comptime context
+    fn evalComptimeInlineFor(self: *Checker, fs: ast.ForStmt) ?void {
+        if (fs.isRange()) {
+            // Range iteration: inline for i in 0..N
+            const start_val = (self.evalComptimeValue(fs.range_start) orelse return null).asInt() orelse return null;
+            const end_val = (self.evalComptimeValue(fs.range_end) orelse return null).asInt() orelse return null;
+            var i = start_val;
+            while (i < end_val) : (i += 1) {
+                if (self.comptime_vars) |*cv| cv.put(fs.binding, ComptimeValue{ .int = i }) catch return null;
+                // Evaluate body as comptime statements
+                const body_node = self.tree.getNode(fs.body) orelse return null;
+                if (body_node.asStmt()) |stmt| {
+                    switch (stmt) {
+                        .block_stmt => |bs| {
+                            for (bs.stmts) |stmt_idx| {
+                                const s_node = self.tree.getNode(stmt_idx) orelse return null;
+                                if (s_node.asStmt()) |inner_stmt| {
+                                    switch (inner_stmt) {
+                                        .assign_stmt => |as| self.evalComptimeAssign(as) orelse return null,
+                                        .expr_stmt => |es| {
+                                            _ = self.evalComptimeValue(es.expr);
+                                        },
+                                        .var_stmt => |vs| {
+                                            const init_val = if (vs.value != null_node)
+                                                self.evalComptimeValue(vs.value) orelse return null
+                                            else
+                                                ComptimeValue.undefined_val;
+                                            if (self.comptime_vars) |*cv2| cv2.put(vs.name, init_val) catch return null;
+                                        },
+                                        else => return null,
+                                    }
+                                }
+                            }
+                        },
+                        .assign_stmt => |as| self.evalComptimeAssign(as) orelse return null,
+                        .expr_stmt => |es| {
+                            _ = self.evalComptimeValue(es.expr);
+                        },
+                        else => return null,
+                    }
+                }
+            }
+        } else {
+            // Comptime array iteration: inline for field in @typeInfo(T).fields
+            const iter_val = self.evalComptimeValue(fs.iterable) orelse return null;
+            if (iter_val != .array) return null;
+            for (iter_val.array.elements.items, 0..) |elem, idx| {
+                if (self.comptime_vars) |*cv| {
+                    cv.put(fs.binding, elem) catch return null;
+                    if (fs.index_binding) |ib| cv.put(ib, ComptimeValue{ .int = @intCast(idx) }) catch return null;
+                }
+                // Evaluate body
+                const body_node = self.tree.getNode(fs.body) orelse return null;
+                if (body_node.asStmt()) |stmt| {
+                    switch (stmt) {
+                        .block_stmt => |bs| {
+                            for (bs.stmts) |stmt_idx| {
+                                const s_node = self.tree.getNode(stmt_idx) orelse return null;
+                                if (s_node.asStmt()) |inner_stmt| {
+                                    switch (inner_stmt) {
+                                        .assign_stmt => |as| self.evalComptimeAssign(as) orelse return null,
+                                        .expr_stmt => |es| {
+                                            _ = self.evalComptimeValue(es.expr);
+                                        },
+                                        .var_stmt => |vs| {
+                                            const init_val = if (vs.value != null_node)
+                                                self.evalComptimeValue(vs.value) orelse return null
+                                            else
+                                                ComptimeValue.undefined_val;
+                                            if (self.comptime_vars) |*cv2| cv2.put(vs.name, init_val) catch return null;
+                                        },
+                                        else => return null,
+                                    }
+                                }
+                            }
+                        },
+                        .assign_stmt => |as| self.evalComptimeAssign(as) orelse return null,
+                        .expr_stmt => |es| {
+                            _ = self.evalComptimeValue(es.expr);
+                        },
+                        else => return null,
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn evalConstExpr(self: *Checker, idx: NodeIndex) ?i64 {
+        const expr = (self.tree.getNode(idx) orelse return null).asExpr() orelse return null;
+        return switch (expr) {
+            .literal => |lit| switch (lit.kind) {
+                .int => std.fmt.parseInt(i64, lit.value, 0) catch null,
+                .true_lit => 1, .false_lit => 0, else => null,
+            },
+            .unary => |un| if (self.evalConstExpr(un.operand)) |op| switch (un.op) {
+                .sub => -op, .not => ~op, .lnot => if (op == 0) @as(i64, 1) else @as(i64, 0), else => null,
+            } else null,
+            .binary => |bin| {
+                // Try integer const-fold first
+                if (self.evalConstExpr(bin.left)) |l| {
+                    if (self.evalConstExpr(bin.right)) |r| {
+                        return switch (bin.op) {
+                            .add => l + r, .sub => l - r, .mul => l * r,
+                            .quo => if (r != 0) @divTrunc(l, r) else null,
+                            .rem => if (r != 0) @rem(l, r) else null,
+                            .@"and" => l & r, .@"or" => l | r, .xor => l ^ r,
+                            .shl => l << @intCast(r), .shr => l >> @intCast(r),
+                            .eql => if (l == r) @as(i64, 1) else @as(i64, 0),
+                            .neq => if (l != r) @as(i64, 1) else @as(i64, 0),
+                            .lss => if (l < r) @as(i64, 1) else @as(i64, 0),
+                            .leq => if (l <= r) @as(i64, 1) else @as(i64, 0),
+                            .gtr => if (l > r) @as(i64, 1) else @as(i64, 0),
+                            .geq => if (l >= r) @as(i64, 1) else @as(i64, 0),
+                            else => null,
+                        };
+                    }
+                }
+                // Fallback: comptime string equality (for @targetOs() == "linux" etc.)
+                if (bin.op == .eql or bin.op == .neq) {
+                    if (self.evalConstString(bin.left)) |ls| {
+                        if (self.evalConstString(bin.right)) |rs| {
+                            const equal = std.mem.eql(u8, ls, rs);
+                            return if (bin.op == .eql)
+                                (if (equal) @as(i64, 1) else @as(i64, 0))
+                            else
+                                (if (!equal) @as(i64, 1) else @as(i64, 0));
+                        }
+                    }
+                }
+                return null;
+            },
+            .paren => |p| self.evalConstExpr(p.inner),
+            .ident => |id| if (self.scope.lookup(id.name)) |sym| if (sym.kind == .constant) sym.const_value else null else null,
+            // Go: cmd/compile/internal/ir/const.go — const folding includes sizeof.
+            // Zig: Sema.zig resolves @sizeOf at comptime. We follow Go's limited approach.
+            .builtin_call => |bc| {
+                if (bc.kind == .size_of) {
+                    const type_idx = self.resolveTypeExpr(bc.type_arg) catch return null;
+                    if (type_idx == invalid_type) return null;
+                    return @as(i64, @intCast(self.types.sizeOf(type_idx)));
+                }
+                // @alignOf(T) — comptime, Zig Sema.zig
+                if (bc.kind == .align_of) {
+                    const type_idx = self.resolveTypeExpr(bc.type_arg) catch return null;
+                    if (type_idx == invalid_type) return null;
+                    return @as(i64, @intCast(self.types.alignmentOf(type_idx)));
+                }
+                // @offsetOf(T, "field") — always comptime, Zig Sema.zig:23060
+                if (bc.kind == .offset_of) {
+                    const type_idx = self.resolveTypeExpr(bc.type_arg) catch return null;
+                    if (type_idx == invalid_type) return null;
+                    const name_str = self.evalConstString(bc.args[0]) orelse return null;
+                    const info = self.types.get(type_idx);
+                    if (info == .struct_type) {
+                        var offset: i64 = 0;
+                        for (info.struct_type.fields) |sf| {
+                            if (std.mem.eql(u8, sf.name, name_str)) return offset;
+                            offset += @as(i64, @intCast(self.types.sizeOf(sf.type_idx)));
+                        }
+                    }
+                    return null;
+                }
+                // @intFromBool(b) — comptime when arg is comptime-known
+                if (bc.kind == .int_from_bool) {
+                    if (self.evalConstExpr(bc.args[0])) |v| {
+                        return if (v != 0) @as(i64, 1) else @as(i64, 0);
+                    }
+                    return null;
+                }
+                // @min(a, b) / @max(a, b) — comptime fold
+                if (bc.kind == .min) {
+                    if (self.evalConstExpr(bc.args[0])) |a| {
+                        if (self.evalConstExpr(bc.args[1])) |b| {
+                            return if (a < b) a else b;
+                        }
+                    }
+                    return null;
+                }
+                if (bc.kind == .max) {
+                    if (self.evalConstExpr(bc.args[0])) |a| {
+                        if (self.evalConstExpr(bc.args[1])) |b| {
+                            return if (a > b) a else b;
+                        }
+                    }
+                    return null;
+                }
+                if (bc.kind == .has_field) {
+                    const type_idx = self.resolveTypeExpr(bc.type_arg) catch return null;
+                    if (type_idx == invalid_type) return null;
+                    const name_str = self.evalConstString(bc.args[0]) orelse return null;
+                    const info = self.types.get(type_idx);
+                    if (info == .struct_type) {
+                        for (info.struct_type.fields) |sf| {
+                            if (std.mem.eql(u8, sf.name, name_str)) return 1;
+                        }
+                        return 0;
+                    }
+                    if (info == .enum_type) {
+                        for (info.enum_type.variants) |v| {
+                            if (std.mem.eql(u8, v.name, name_str)) return 1;
+                        }
+                        return 0;
+                    }
+                    if (info == .union_type) {
+                        for (info.union_type.variants) |v| {
+                            if (std.mem.eql(u8, v.name, name_str)) return 1;
+                        }
+                        return 0;
+                    }
+                    return 0;
+                }
+                // @intFromEnum(e) — comptime when arg resolves to enum variant value
+                // Zig Sema.zig:8420 — evaluate to backing integer at comptime.
+                if (bc.kind == .int_from_enum) {
+                    if (self.evalConstExpr(bc.args[0])) |v| return v;
+                    return null;
+                }
+                // @enumLen(T) — comptime, returns number of enum variants
+                if (bc.kind == .enum_len) {
+                    const type_idx = self.resolveTypeExpr(bc.type_arg) catch return null;
+                    if (type_idx == invalid_type) return null;
+                    const info = self.types.get(type_idx);
+                    if (info == .enum_type) return @intCast(info.enum_type.variants.len);
+                    return null;
+                }
+                return null;
+            },
+            // Enum field access: Color.Red → integer variant value
+            // Zig Sema.zig: enum values are comptime-known when accessed as Type.field.
+            .field_access => |fa| {
+                const base_node = self.tree.getNode(fa.base) orelse return null;
+                const base_expr = base_node.asExpr() orelse return null;
+                if (base_expr == .ident) {
+                    const type_idx = self.resolveTypeByName(base_expr.ident.name) orelse return null;
+                    const info = self.types.get(type_idx);
+                    if (info == .enum_type) {
+                        for (info.enum_type.variants) |v| {
+                            if (std.mem.eql(u8, v.name, fa.field)) return @intCast(v.value);
+                        }
+                    }
+                }
+                return null;
+            },
+            // Comptime if-expression: fold when condition is comptime-known
+            .if_expr => |ie| {
+                const cond_val = self.evalConstExpr(ie.condition) orelse return null;
+                if (cond_val != 0) return self.evalConstExpr(ie.then_branch);
+                if (ie.else_branch != null_node) return self.evalConstExpr(ie.else_branch);
+                return null;
+            },
+            // Block expression: { stmts; expr } — evaluate final expr if no stmts
+            .block_expr => |blk| {
+                if (blk.stmts.len == 0) return self.evalConstExpr(blk.expr);
+                return null;
+            },
+            // comptime { body } — evaluate body at compile time
+            .comptime_block => |cb| self.evalConstExpr(cb.body),
+            else => null,
+        };
+    }
+
+    /// Evaluate a comptime float expression. Returns the f64 value or null.
+    pub fn evalConstFloat(self: *Checker, idx: NodeIndex) ?f64 {
+        const expr = (self.tree.getNode(idx) orelse return null).asExpr() orelse return null;
+        return switch (expr) {
+            .literal => |lit| switch (lit.kind) {
+                .float => std.fmt.parseFloat(f64, lit.value) catch null,
+                .int => blk: {
+                    const iv = std.fmt.parseInt(i64, lit.value, 0) catch break :blk null;
+                    break :blk @floatFromInt(iv);
+                },
+                else => null,
+            },
+            .unary => |un| if (un.op == .sub) blk: {
+                const v = self.evalConstFloat(un.operand) orelse break :blk null;
+                break :blk -v;
+            } else null,
+            .binary => |bin| blk: {
+                const l = self.evalConstFloat(bin.left) orelse break :blk null;
+                const r = self.evalConstFloat(bin.right) orelse break :blk null;
+                break :blk switch (bin.op) {
+                    .add => l + r,
+                    .sub => l - r,
+                    .mul => l * r,
+                    .quo => l / r,
+                    else => null,
+                };
+            },
+            .paren => |p| self.evalConstFloat(p.inner),
+            .ident => |id| if (self.scope.lookup(id.name)) |sym| if (sym.kind == .constant) sym.float_const_value else null else null,
+            else => null,
+        };
+    }
+
+    fn isFloatType(_: *Checker, type_idx: TypeIndex) bool {
+        return type_idx == TypeRegistry.F32 or type_idx == TypeRegistry.F64;
+    }
+
+    /// Evaluate a comptime string expression. Returns the string value or null.
+    pub fn evalConstString(self: *Checker, idx: NodeIndex) ?[]const u8 {
+        const expr = (self.tree.getNode(idx) orelse return null).asExpr() orelse return null;
+        return switch (expr) {
+            .literal => |lit| if (lit.kind == .string) blk: {
+                // Strip surrounding quotes from string literal (scanner includes them)
+                const v = lit.value;
+                break :blk if (v.len >= 2 and v[0] == '"' and v[v.len - 1] == '"') v[1 .. v.len - 1] else v;
+            } else null,
+            .paren => |p| self.evalConstString(p.inner),
+            .builtin_call => |bc| {
+                return switch (bc.kind) {
+                    .target_os => self.target.os.name(),
+                    .target_arch => self.target.arch.name(),
+                    .target => self.target.name(),
+                    else => null,
+                };
+            },
+            else => null,
+        };
+    }
+
+    pub fn checkExpr(self: *Checker, idx: NodeIndex) CheckError!TypeIndex {
+        if (idx == null_node) return invalid_type;
+        // During generic instantiation (type_substitution active), skip cache reads —
+        // shared AST nodes need fresh type checking with the current substitution.
+        // Go: each instantiation gets independent type checking (types2/instantiate.go).
+        if (self.type_substitution == null) {
+            if (self.expr_types.get(idx)) |t| return t;
+        }
+        const result = try self.checkExprInner(idx);
+        try self.expr_types.put(idx, result);
+        return result;
+    }
+
+    fn checkExprInner(self: *Checker, idx: NodeIndex) CheckError!TypeIndex {
+        const expr = (self.tree.getNode(idx) orelse return invalid_type).asExpr() orelse return invalid_type;
+        return switch (expr) {
+            .ident => |id| self.checkIdentifier(id),
+            .literal => |lit| self.checkLiteral(lit),
+            .binary => |bin| self.checkBinary(bin),
+            .unary => |un| self.checkUnary(un),
+            .call => |c| self.checkCall(c),
+            .index => |i| self.checkIndex(i),
+            .slice_expr => |se| self.checkSliceExpr(se),
+            .field_access => |f| self.checkFieldAccess(f),
+            .array_literal => |al| self.checkArrayLiteral(al),
+            .paren => |p| self.checkExpr(p.inner),
+            .if_expr => |ie| self.checkIfExpr(ie),
+            .switch_expr => |se| self.checkSwitchExpr(se),
+            .block_expr => |b| self.checkBlock(b),
+            .struct_init => |si| self.checkStructInit(si),
+            .new_expr => |ne| self.checkNewExpr(ne),
+            .builtin_call => |bc| self.checkBuiltinCall(bc),
+            .string_interp => |si| self.checkStringInterp(si),
+            .try_expr => |te| self.checkTryExpr(te),
+            .await_expr => |ae| self.checkAwaitExpr(ae),
+            .task_expr => |te| self.checkTaskExpr(te),
+            .catch_expr => |ce| self.checkCatchExpr(ce),
+            .orelse_expr => |oe| self.checkOrElseExpr(oe),
+            .error_literal => |el| self.checkErrorLiteral(el),
+            .closure_expr => |ce| self.checkClosureExpr(ce),
+            .addr_of => |ao| self.checkAddrOf(ao),
+            .deref => |d| self.checkDeref(d),
+            .tuple_literal => |tl| self.checkTupleLiteral(tl),
+            .comptime_block => |cb| {
+                // Zig Sema pattern: comptime {} body must be comptime-evaluable.
+                // Check the body for type errors, then verify it produces a comptime value.
+                const body_node = self.tree.getNode(cb.body) orelse return invalid_type;
+                const body_expr = body_node.asExpr() orelse return invalid_type;
+                if (body_expr == .block_expr) {
+                    const blk = body_expr.block_expr;
+                    // Type-check stmts in a new scope (vars defined in comptime block)
+                    var block_scope = Scope.init(self.allocator, self.scope);
+                    defer block_scope.deinit();
+                    const old_scope = self.scope;
+                    self.scope = &block_scope;
+                    for (blk.stmts) |stmt_idx| {
+                        try self.checkStmt(stmt_idx);
+                    }
+                    const body_type = if (blk.expr != null_node) try self.checkExpr(blk.expr) else TypeRegistry.VOID;
+                    self.scope = old_scope;
+                    // Verify comptime evaluability — set up comptime context
+                    const old_vars = self.comptime_vars;
+                    const new_vars = std.StringHashMap(ComptimeValue).init(self.allocator);
+                    self.comptime_vars = new_vars;
+                    defer {
+                        if (self.comptime_vars) |*cv| cv.deinit();
+                        self.comptime_vars = old_vars;
+                    }
+                    if (self.evalComptimeBlock(blk.stmts, blk.expr) == null) {
+                        self.err.errorWithCode(cb.span.start, .e300, "unable to evaluate comptime expression");
+                    }
+                    return body_type;
+                }
+                // Single expression path
+                const body_type = try self.checkExpr(cb.body);
+                if (self.evalComptimeValue(cb.body) == null) {
+                    self.err.errorWithCode(cb.span.start, .e300, "unable to evaluate comptime expression");
+                }
+                return body_type;
+            },
+            .zero_init => if (self.expected_type != invalid_type) self.expected_type else TypeRegistry.VOID,
+            .type_expr, .bad_expr => invalid_type,
+        };
+    }
+
+    fn checkIdentifier(self: *Checker, id: ast.Ident) TypeIndex {
+        // Swift SE-0430: use-after-send detection.
+        // Swift reference: RegionAnalysis.cpp PartitionOpKind::Require
+        //   A Require on a sent element produces LocalUseAfterSendError.
+        // Cot Phase 1: checker-level tracking via sent_variables map.
+        if (self.sent_variables.contains(id.name)) {
+            self.err.errorWithCode(id.span.start, .e300,
+                "use of variable after it has been sent; sending transfers ownership");
+        }
+        if (self.resolveTypeByName(id.name)) |type_idx| {
+            const t = self.types.get(type_idx);
+            // Allow enum, union, and error_set types to be used as expressions
+            // (enum/union for variant access, error_set for merge with ||)
+            if (t == .enum_type or t == .union_type or t == .error_set) return type_idx;
+            self.err.errorWithCode(id.span.start, .e301, "type name cannot be used as expression");
+            return invalid_type;
+        }
+        // Go pattern: generic function names cannot be used without instantiation.
+        // Go types2/call.go:33 — funcInst() requires IndexExpr (explicit type args).
+        if (self.generics.generic_functions.contains(id.name)) {
+            self.err.errorWithCode(id.span.start, .e300, "generic function requires type arguments");
+            return invalid_type;
+        }
+        if (self.scope.lookup(id.name)) |sym| {
+            if (self.lint_mode) self.scope.markUsed(id.name);
+            return sym.type_idx;
+        }
+        // Check type substitution (for type params used as values)
+        if (self.type_substitution) |sub| {
+            if (sub.get(id.name)) |_| return invalid_type;
+        }
+        self.errWithSuggestion(id.span.start, "undefined identifier", self.findSimilarName(id.name));
+        return invalid_type;
+    }
+
+    fn checkLiteral(_: *Checker, lit: ast.Literal) TypeIndex {
+        return switch (lit.kind) {
+            .int => TypeRegistry.UNTYPED_INT, .float => TypeRegistry.UNTYPED_FLOAT,
+            .string => TypeRegistry.STRING, .char => TypeRegistry.U8,
+            .true_lit, .false_lit => TypeRegistry.UNTYPED_BOOL,
+            .null_lit, .undefined_lit => TypeRegistry.UNTYPED_NULL,
+            .unreachable_lit => TypeRegistry.NORETURN,
+        };
+    }
+
+    fn checkBinary(self: *Checker, bin: ast.Binary) CheckError!TypeIndex {
+        const left_type = try self.checkExpr(bin.left);
+
+        // Enum/Union variant comparison: set context so .variant shorthand resolves for RHS.
+        // Zig Sema pattern: same as switch enum context but for == / != with enum/union LHS.
+        // @safe auto-deref: if LHS is *Enum/*Union, unwrap to Enum/Union for comparison context.
+        const old_switch_enum = self.current_switch_enum_type;
+        if (bin.op == .eql or bin.op == .neq) {
+            var cmp_type = left_type;
+            const left_info = self.types.get(left_type);
+            if (left_info == .pointer) {
+                const elem = self.types.get(left_info.pointer.elem);
+                if (elem == .union_type or elem == .enum_type) {
+                    cmp_type = left_info.pointer.elem;
+                }
+            }
+            const cmp_info = self.types.get(cmp_type);
+            if (cmp_info == .union_type or cmp_info == .enum_type) {
+                self.current_switch_enum_type = cmp_type;
+            }
+        }
+        const right_type = try self.checkExpr(bin.right);
+        self.current_switch_enum_type = old_switch_enum;
+
+        const left = self.types.get(left_type);
+        const right = self.types.get(right_type);
+
+        // Distinct types: Go spec — "if one operand is an untyped constant and the other
+        // is not, the constant is implicitly converted to the type of the other operand."
+        // Go reference: expr.go:810 (identity check), predicates.go:37 (underlying check)
+        {
+            // Resolve: if one side is distinct and the other is untyped, treat as same-distinct
+            var eff_left = left_type;
+            var eff_right = right_type;
+            var distinct_type: ?TypeIndex = null;
+
+            if (left == .distinct and right == .distinct and
+                std.mem.eql(u8, left.distinct.name, right.distinct.name))
+            {
+                distinct_type = left_type;
+            } else if (left == .distinct and types.isUntyped(right)) {
+                if (self.types.isAssignable(right_type, left.distinct.underlying)) {
+                    distinct_type = left_type;
+                    eff_right = left_type;
+                }
+            } else if (right == .distinct and types.isUntyped(left)) {
+                if (self.types.isAssignable(left_type, right.distinct.underlying)) {
+                    distinct_type = right_type;
+                    eff_left = right_type;
+                }
+            }
+            // Pointer arithmetic: distinct_int + typed_int → distinct_int
+            // C reference: pointer + int → pointer (not Go — Go has no pointer arithmetic)
+            // Only for add/sub, only when underlying is integer
+            if (distinct_type == null) {
+                if (left == .distinct and types.isInteger(self.types.get(left.distinct.underlying)) and types.isInteger(right)) {
+                    if (bin.op == .add or bin.op == .sub) distinct_type = left_type;
+                } else if (right == .distinct and types.isInteger(self.types.get(right.distinct.underlying)) and types.isInteger(left)) {
+                    if (bin.op == .add) distinct_type = right_type; // int + ptr → ptr (add only, not sub)
+                }
+            }
+
+            if (distinct_type) |dt| {
+                const ul = self.types.get(self.types.get(dt).distinct.underlying);
+                switch (bin.op) {
+                    .eql, .neq, .lss, .leq, .gtr, .geq => {
+                        if (types.isNumeric(ul) or (ul == .basic and ul.basic == .bool_type)) return TypeRegistry.BOOL;
+                        self.err.errorWithCode(bin.span.start, .e300, "invalid operation");
+                        return invalid_type;
+                    },
+                    .add, .sub, .mul, .quo, .rem => {
+                        if (types.isNumeric(ul)) return dt;
+                        self.err.errorWithCode(bin.span.start, .e300, "invalid operation");
+                        return invalid_type;
+                    },
+                    .@"and", .@"or", .xor, .shl, .shr => {
+                        if (types.isInteger(ul)) return dt;
+                        self.err.errorWithCode(bin.span.start, .e300, "invalid operation");
+                        return invalid_type;
+                    },
+                    else => {},
+                }
+            }
+        }
+
+        switch (bin.op) {
+            .concat => {
+                // String ++ String → String
+                if (left_type == TypeRegistry.STRING and right_type == TypeRegistry.STRING) return TypeRegistry.STRING;
+                // [N]T ++ [M]T → [N+M]T (array concat, Zig Sema.zig:zirArrayCat)
+                if (left == .array and right == .array) {
+                    if (left.array.elem == right.array.elem) {
+                        return self.types.makeArray(left.array.elem, left.array.length + right.array.length) catch return invalid_type;
+                    }
+                    self.err.errorWithCode(bin.span.start, .e300, "'++' requires matching element types");
+                    return invalid_type;
+                }
+                // []T ++ []T → []T (slice concat)
+                if (left == .slice and right == .slice) {
+                    if (left.slice.elem == right.slice.elem) return left_type;
+                    self.err.errorWithCode(bin.span.start, .e300, "'++' requires matching element types");
+                    return invalid_type;
+                }
+                self.err.errorWithCode(bin.span.start, .e300, "'++' requires two strings, arrays, or slices of the same type");
+                return invalid_type;
+            },
+            .add => {
+                // String + String: @safe desugars to ++, normal mode errors
+                if (left_type == TypeRegistry.STRING and right_type == TypeRegistry.STRING) {
+                    if (self.safe_mode) return TypeRegistry.STRING;
+                    self.err.errorWithCode(bin.span.start, .e300, "'+' cannot concatenate strings; use '++' operator");
+                    return invalid_type;
+                }
+                // Array + Array: @safe desugars to ++, normal mode errors
+                if (left == .array and right == .array and left.array.elem == right.array.elem) {
+                    if (self.safe_mode) return self.types.makeArray(left.array.elem, left.array.length + right.array.length) catch return invalid_type;
+                    self.err.errorWithCode(bin.span.start, .e300, "'+' cannot concatenate arrays; use '++' operator");
+                    return invalid_type;
+                }
+                // Slice + Slice: @safe desugars to ++, normal mode errors
+                if (left == .slice and right == .slice and left.slice.elem == right.slice.elem) {
+                    if (self.safe_mode) return left_type;
+                    self.err.errorWithCode(bin.span.start, .e300, "'+' cannot concatenate slices; use '++' operator");
+                    return invalid_type;
+                }
+                if (left == .pointer and types.isInteger(right)) return left_type;
+                if (types.isInteger(left) and right == .pointer) return right_type;
+                if (!types.isNumeric(left) or !types.isNumeric(right)) { self.err.errorWithCode(bin.span.start, .e300, "invalid operation"); return invalid_type; }
+                // Zig Sema.zig:peerType — common type of both operands
+                return TypeRegistry.commonType(left_type, right_type);
+            },
+            .sub => {
+                if (left == .pointer and types.isInteger(right)) return left_type;
+                if (!types.isNumeric(left) or !types.isNumeric(right)) { self.err.errorWithCode(bin.span.start, .e300, "invalid operation"); return invalid_type; }
+                return TypeRegistry.commonType(left_type, right_type);
+            },
+            .mul, .quo, .rem => {
+                if (!types.isNumeric(left) or !types.isNumeric(right)) { self.err.errorWithCode(bin.span.start, .e300, "invalid operation"); return invalid_type; }
+                return TypeRegistry.commonType(left_type, right_type);
+            },
+            .eql, .neq, .lss, .leq, .gtr, .geq => {
+                // Union variant tag comparison: union == .variant / union == Union.Variant
+                // @safe auto-deref: *Union treated as Union for comparison
+                if (bin.op == .eql or bin.op == .neq) {
+                    const left_u = if (left == .pointer and self.types.get(left.pointer.elem) == .union_type) self.types.get(left.pointer.elem) else left;
+                    const right_u = if (right == .pointer and self.types.get(right.pointer.elem) == .union_type) self.types.get(right.pointer.elem) else right;
+                    if (left_u == .union_type and self.isUnionVariantRef(bin.right, left_u.union_type)) return TypeRegistry.BOOL;
+                    if (right_u == .union_type and self.isUnionVariantRef(bin.left, right_u.union_type)) return TypeRegistry.BOOL;
+                }
+                if (!self.isComparable(left_type, right_type)) { self.err.errorWithCode(bin.span.start, .e300, "invalid operation"); return invalid_type; }
+                return TypeRegistry.BOOL;
+            },
+            .kw_and, .kw_or => {
+                if (!types.isBool(left) or !types.isBool(right)) { self.err.errorWithCode(bin.span.start, .e300, "invalid operation"); return invalid_type; }
+                return TypeRegistry.BOOL;
+            },
+            .@"and", .@"or", .xor, .shl, .shr => {
+                if (!types.isInteger(left) or !types.isInteger(right)) { self.err.errorWithCode(bin.span.start, .e300, "invalid operation"); return invalid_type; }
+                return TypeRegistry.commonType(left_type, right_type);
+            },
+            .land => {
+                if (!types.isBool(left) or !types.isBool(right)) { self.err.errorWithCode(bin.span.start, .e300, "invalid operation"); return invalid_type; }
+                return TypeRegistry.BOOL;
+            },
+            .lor => {
+                // Error set merge: FileError || NetError — Zig Sema.zig:8299
+                if (left == .error_set and right == .error_set) {
+                    return try self.mergeErrorSets(left.error_set, right.error_set);
+                }
+                // Bool logical OR
+                if (types.isBool(left) and types.isBool(right)) return TypeRegistry.BOOL;
+                self.err.errorWithCode(bin.span.start, .e300, "invalid operation");
+                return invalid_type;
+            },
+            else => return invalid_type,
+        }
+    }
+
+    /// Merge two error sets into a new error set with deduplicated variants.
+    /// Zig Sema.zig:8299 — union variant names, anyerror absorbs.
+    fn mergeErrorSets(self: *Checker, a: types.ErrorSetType, b: types.ErrorSetType) !TypeIndex {
+        var merged = std.ArrayListUnmanaged([]const u8){};
+        defer merged.deinit(self.allocator);
+        // Add all from a
+        for (a.variants) |v| try merged.append(self.allocator, v);
+        // Add from b, dedup
+        for (b.variants) |v| {
+            var found = false;
+            for (a.variants) |av| {
+                if (std.mem.eql(u8, av, v)) { found = true; break; }
+            }
+            if (!found) try merged.append(self.allocator, v);
+        }
+        const name = try std.fmt.allocPrint(self.allocator, "{s}||{s}", .{ a.name, b.name });
+        return self.types.add(.{ .error_set = .{ .name = name, .variants = try self.allocator.dupe([]const u8, merged.items) } });
+    }
+
+    fn checkUnary(self: *Checker, un: ast.Unary) CheckError!TypeIndex {
+        const operand_type = try self.checkExpr(un.operand);
+        const operand = self.types.get(operand_type);
+        switch (un.op) {
+            .sub => { if (!types.isNumeric(operand)) { self.err.errorWithCode(un.span.start, .e303, "unary '-' requires numeric operand"); return invalid_type; } return operand_type; },
+            .lnot, .kw_not => { if (!types.isBool(operand)) { self.err.errorWithCode(un.span.start, .e303, "unary '!' requires bool operand"); return invalid_type; } return TypeRegistry.BOOL; },
+            .not => { if (!types.isInteger(operand)) { self.err.errorWithCode(un.span.start, .e303, "unary '~' requires integer operand"); return invalid_type; } return operand_type; },
+            .question => { if (operand == .optional) return operand.optional.elem; self.err.errorWithCode(un.span.start, .e303, "'.?' requires optional operand"); return invalid_type; },
+            else => return invalid_type,
+        }
+    }
+
+    fn checkClosureExpr(self: *Checker, ce: ast.ClosureExpr) CheckError!TypeIndex {
+        // Build function type from params + return type
+        const func_type = try self.buildFuncType(ce.params, ce.return_type);
+        // Check body in a child scope with params defined
+        var func_scope = Scope.init(self.allocator, self.scope);
+        defer func_scope.deinit();
+        for (ce.params) |param| {
+            const param_type = try self.resolveTypeExpr(param.type_expr);
+            try func_scope.define(Symbol.init(param.name, .parameter, param_type, null_node, false));
+        }
+        const old_scope = self.scope;
+        const old_return = self.current_return_type;
+        self.scope = &func_scope;
+        const ret_type = if (self.types.get(func_type) == .func) self.types.get(func_type).func.return_type else TypeRegistry.VOID;
+        self.current_return_type = ret_type;
+        if (ce.body != null_node) try self.checkBlockExpr(ce.body);
+        self.scope = old_scope;
+        self.current_return_type = old_return;
+
+        // @Sendable closures: verify all captured variables are Sendable.
+        // Swift reference: TypeCheckConcurrency.cpp:2971-3098 checkLocalCaptures
+        // A captured variable is any identifier in the body that resolves to the
+        // PARENT scope (not the closure's own scope or params).
+        if (ce.is_sendable and ce.body != null_node) {
+            try self.checkSendableCaptures(ce.body, &func_scope, ce.span);
+        }
+
+        // Async closures: wrap in task type so await is valid on the call result.
+        // Swift reference: async closure call returns Task<T>.
+        if (ce.is_async) {
+            const inner_ret = if (self.types.get(func_type) == .func) self.types.get(func_type).func.return_type else TypeRegistry.VOID;
+            const task_type = try self.types.add(.{ .task = .{ .result_type = inner_ret } });
+            // Build a new func type with task return for type inference on call sites.
+            const async_func_params = if (self.types.get(func_type) == .func) self.types.get(func_type).func.params else &.{};
+            return try self.types.add(.{ .func = .{ .params = async_func_params, .return_type = task_type } });
+        }
+
+        return func_type;
+    }
+
+    /// Check that all variables captured by a @Sendable closure are Sendable.
+    /// Swift reference: TypeCheckConcurrency.cpp:2971-3098 checkLocalCaptures.
+    /// Walks the closure body AST, finds identifiers that resolve to the enclosing
+    /// scope (not the closure's own params), and verifies each is Sendable.
+    fn checkSendableCaptures(self: *Checker, body: NodeIndex, closure_scope: *Scope, span: Span) CheckError!void {
+        const node = self.tree.getNode(body) orelse return;
+
+        // Check expressions for captured identifiers
+        if (node.asExpr()) |expr| {
+            switch (expr) {
+                .ident => |id| {
+                    // If this ident resolves in the closure's own scope (params), skip.
+                    // If it resolves in the PARENT scope, it's a capture.
+                    if (closure_scope.lookupLocal(id.name) != null) return; // param, not capture
+                    if (self.scope.lookup(id.name)) |sym| {
+                        if (sym.kind == .parameter or sym.kind == .variable or sym.kind == .constant) {
+                            if (!self.isSendable(sym.type_idx)) {
+                                self.err.errorWithCode(span.start, .e300,
+                                    "capture of non-Sendable type in @Sendable closure");
+                            }
+                        }
+                    }
+                },
+                .call => |c| {
+                    try self.checkSendableCaptures(c.callee, closure_scope, span);
+                    for (c.args) |arg| try self.checkSendableCaptures(arg, closure_scope, span);
+                },
+                .binary => |b| {
+                    try self.checkSendableCaptures(b.left, closure_scope, span);
+                    try self.checkSendableCaptures(b.right, closure_scope, span);
+                },
+                .unary => |u| try self.checkSendableCaptures(u.operand, closure_scope, span),
+                .field_access => |f| try self.checkSendableCaptures(f.base, closure_scope, span),
+                .index => |i| {
+                    try self.checkSendableCaptures(i.base, closure_scope, span);
+                    try self.checkSendableCaptures(i.idx, closure_scope, span);
+                },
+                .block_expr => |b| {
+                    for (b.stmts) |s| try self.checkSendableCaptures(s, closure_scope, span);
+                    if (b.expr != null_node) try self.checkSendableCaptures(b.expr, closure_scope, span);
+                },
+                else => {},
+            }
+        }
+
+        // Check statements
+        if (node.asStmt()) |stmt| {
+            switch (stmt) {
+                .return_stmt => |r| {
+                    if (r.value != null_node) try self.checkSendableCaptures(r.value, closure_scope, span);
+                },
+                .var_stmt => |v| {
+                    if (v.value != null_node) try self.checkSendableCaptures(v.value, closure_scope, span);
+                },
+                .expr_stmt => |e| try self.checkSendableCaptures(e.expr, closure_scope, span),
+                .if_stmt => |i| {
+                    try self.checkSendableCaptures(i.condition, closure_scope, span);
+                    if (i.then_branch != null_node) try self.checkSendableCaptures(i.then_branch, closure_scope, span);
+                    if (i.else_branch != null_node) try self.checkSendableCaptures(i.else_branch, closure_scope, span);
+                },
+                .block_stmt => |b| {
+                    for (b.stmts) |s| try self.checkSendableCaptures(s, closure_scope, span);
+                },
+                else => {},
+            }
+        }
+    }
+
+    fn checkCall(self: *Checker, c: ast.Call) CheckError!TypeIndex {
+        if (self.tree.getNode(c.callee)) |cn| if (cn.asExpr()) |ce| if (ce == .ident) {
+            const name = ce.ident.name;
+            if (std.mem.eql(u8, name, "len")) return self.checkBuiltinLen(c);
+            if (std.mem.eql(u8, name, "append")) return self.checkBuiltinAppend(c);
+            if (std.mem.eql(u8, name, "print") or std.mem.eql(u8, name, "println") or std.mem.eql(u8, name, "eprint") or std.mem.eql(u8, name, "eprintln")) {
+                if (c.args.len == 1) _ = try self.checkExpr(c.args[0]);
+                return TypeRegistry.VOID;
+            }
+            if (std.mem.eql(u8, name, "__string_make")) {
+                if (c.args.len != 2) { self.err.errorWithCode(c.span.start, .e300, "__string_make() expects 2 arguments"); return invalid_type; }
+                _ = try self.checkExpr(c.args[0]);
+                _ = try self.checkExpr(c.args[1]);
+                return TypeRegistry.STRING;
+            }
+            // Distinct type constructor: RawPtr(expr) — Go reference: type conversion T(expr)
+            if (self.types.lookupByName(name)) |type_idx| {
+                const t = self.types.get(type_idx);
+                if (t == .distinct) {
+                    if (c.args.len != 1) { self.err.errorWithCode(c.span.start, .e300, "type conversion requires exactly 1 argument"); return invalid_type; }
+                    const arg_type = try self.checkExpr(c.args[0]);
+                    // Go conversions.go:153 — allow conversion when underlying types are identical:
+                    //   underlying → distinct, same distinct → distinct, cross-distinct with same underlying
+                    const arg_underlying = self.types.resolveDistinct(arg_type);
+                    if (!self.types.isAssignable(arg_underlying, t.distinct.underlying) and !self.types.equal(arg_type, type_idx)) {
+                        self.err.errorWithCode(c.span.start, .e300, "cannot convert to distinct type");
+                        return invalid_type;
+                    }
+                    try self.expr_types.put(c.callee, type_idx);
+                    return type_idx;
+                }
+            }
+            // Generic function instantiation: max(i64) where max is generic
+            if (self.generics.generic_functions.get(name)) |gen_info| {
+                return try self.instantiateGenericFunc(c, gen_info, name);
+            }
+
+            // Swift SE-0316: global actor isolation check for direct function calls.
+            // If the called function is @MainActor and the caller is in a different
+            // (or no) global actor context, require await.
+            // Reference: TypeCheckConcurrency.cpp:3954 tryMarkImplicitlyAsync
+            if (self.global_actor_fns.get(name)) |callee_actor| {
+                const is_same_actor = if (self.current_global_actor) |cga|
+                    std.mem.eql(u8, cga, callee_actor)
+                else
+                    false;
+                if (!is_same_actor and !self.in_await) {
+                    self.err.errorWithCode(c.span.start, .e300,
+                        "call to global actor-isolated function requires 'await'");
+                }
+            }
+        };
+
+        const callee_type = try self.checkExpr(c.callee);
+        var callee = self.types.get(callee_type);
+        const method_info = self.resolveMethodCall(c.callee);
+        const is_method = method_info != null;
+
+        // When a struct field shadows a method name, prefer the method in call position.
+        // e.g. struct has field "keys: i64" AND impl has method "keys()" — m.keys() calls the method.
+        if (callee != .func) {
+            if (method_info) |mi| {
+                callee = self.types.get(mi.func_type);
+            } else {
+                self.err.errorWithCode(c.span.start, .e300, "cannot call non-function");
+                return invalid_type;
+            }
+        }
+        if (callee != .func) { self.err.errorWithCode(c.span.start, .e300, "cannot call non-function"); return invalid_type; }
+        const ft = callee.func;
+        const is_instance_method = is_method and (method_info == null or !method_info.?.is_static);
+        const expected_args = if (is_instance_method and ft.params.len > 0) ft.params.len - 1 else ft.params.len;
+        if (c.args.len != expected_args) { self.err.errorWithCode(c.span.start, .e300, "wrong number of arguments"); return invalid_type; }
+        const param_offset: usize = if (is_instance_method) 1 else 0;
+        for (c.args, 0..) |arg_idx, i| {
+            // Zig Sema pattern: set expected_type from parameter type for result location inference
+            const saved_expected = self.expected_type;
+            self.expected_type = ft.params[i + param_offset].type_idx;
+            const arg_type = try self.checkExpr(arg_idx);
+            self.expected_type = saved_expected;
+            if (!self.types.isAssignable(arg_type, ft.params[i + param_offset].type_idx)) {
+                // @safe coercion: Struct arg → *Struct param (safeWrapType wraps struct params)
+                const param_tidx = ft.params[i + param_offset].type_idx;
+                const pt = self.types.get(param_tidx);
+                const is_safe_struct = self.safe_mode and pt == .pointer and
+                    (self.types.get(pt.pointer.elem) == .struct_type or self.types.get(pt.pointer.elem) == .union_type) and
+                    self.types.isAssignable(arg_type, pt.pointer.elem);
+                // @safe reverse coercion: *Struct/Union arg → Struct/Union param (generic methods keep T as value)
+                // When a generic method has param T=Struct (not wrapped because is_substituted),
+                // but the arg is *Struct (auto-ref'd by @safe), allow the deref coercion.
+                const at = self.types.get(arg_type);
+                const is_safe_deref = self.safe_mode and at == .pointer and
+                    (self.types.get(at.pointer.elem) == .struct_type or self.types.get(at.pointer.elem) == .union_type) and
+                    self.types.isAssignable(at.pointer.elem, param_tidx);
+                if (!is_safe_struct and !is_safe_deref) {
+                    self.err.errorWithCode(c.span.start, .e300, "type mismatch");
+                }
+            }
+        }
+
+        // Swift SE-0430: mark sending parameter arguments as "sent".
+        // Swift reference: RegionAnalysis.cpp PartitionOpKind::Send
+        //   When a non-Sendable value is passed to a sending parameter,
+        //   the value's region is marked as sent. Any subsequent use is
+        //   a use-after-send error (PartitionOpKind::Require → LocalUseAfterSendError).
+        // Cot Phase 1: track sent variable names in sent_variables map.
+        for (c.args, 0..) |arg_idx, i| {
+            const param_idx = i + param_offset;
+            if (param_idx < ft.params.len and ft.params[param_idx].is_sending) {
+                // Extract the argument's variable name (if it's a simple identifier)
+                if (self.tree.getNode(arg_idx)) |arg_node| {
+                    if (arg_node.asExpr()) |arg_expr| {
+                        if (arg_expr == .ident) {
+                            self.sent_variables.put(arg_expr.ident.name, {}) catch {};
+                        }
+                    }
+                }
+            }
+        }
+
+        // Swift actor isolation: cross-actor method calls require `await`.
+        // Reference: Swift TypeCheckConcurrency.cpp:8253 forReference(),
+        //            SILGenApply.cpp:6155-6240 (hop_to_executor emission).
+        // The call itself returns the method's actual return type — no Task wrapping.
+        // The `await` is enforced by the caller context check, not by type wrapping.
+        // Cot tracks cross-actor calls via is_cross_actor_call flag on the expression.
+        if (is_method and method_info != null and !method_info.?.is_static) {
+            const mi_check = method_info.?;
+            const receiver_name = self.getCallReceiverActorName(c.callee);
+            if (receiver_name) |rn| {
+                if (self.actor_types.contains(rn)) {
+                    const is_same_actor = if (self.current_actor_type) |cat| std.mem.eql(u8, cat, rn) else false;
+                    // nonisolated methods can be called without await (Swift SE-0313)
+                    if (!is_same_actor and !self.in_await and !mi_check.is_nonisolated) {
+                        // Cross-actor call without await — error!
+                        // Swift: "actor-isolated instance method 'X' can not be
+                        // referenced from a nonisolated context"
+                        self.err.errorWithCode(c.span.start, .e300,
+                            "cross-actor call requires 'await'");
+                    }
+                }
+            }
+        }
+
+        return ft.return_type;
+    }
+
+    fn resolveMethodCall(self: *Checker, callee_idx: NodeIndex) ?types.MethodInfo {
+        const ce = (self.tree.getNode(callee_idx) orelse return null).asExpr() orelse return null;
+        if (ce != .field_access) return null;
+        const fa = ce.field_access;
+        const base_type_idx = self.expr_types.get(fa.base) orelse return null;
+        const base_type = self.types.get(base_type_idx);
+        const struct_name = switch (base_type) {
+            .struct_type => |st| st.name,
+            .pointer => |ptr| blk: {
+                const inner = self.types.get(ptr.elem);
+                break :blk switch (inner) {
+                    .struct_type => |st| st.name,
+                    .enum_type => |et| et.name,
+                    else => return null,
+                };
+            },
+            .basic => |bk| bk.name(),
+            .enum_type => |et| et.name,
+            // string is stored as slice(u8) — look up methods registered under "string"
+            .slice => if (base_type_idx == TypeRegistry.STRING) "string" else return null,
+            else => return null,
+        };
+        return self.lookupMethod(struct_name, fa.field);
+    }
+
+    fn checkBuiltinLen(self: *Checker, c: ast.Call) CheckError!TypeIndex {
+        if (c.args.len != 1) { self.err.errorWithCode(c.span.start, .e300, "len() expects one argument"); return invalid_type; }
+        const arg_type = try self.checkExpr(c.args[0]);
+        if (arg_type == TypeRegistry.STRING) return TypeRegistry.INT;
+        const arg = self.types.get(arg_type);
+        return switch (arg) { .array, .slice, .list => TypeRegistry.INT, else => blk: { self.err.errorWithCode(c.span.start, .e300, "len() argument must be string, array, slice, or list"); break :blk invalid_type; } };
+    }
+
+    fn checkBuiltinAppend(self: *Checker, c: ast.Call) CheckError!TypeIndex {
+        if (c.args.len != 2) { self.err.errorWithCode(c.span.start, .e300, "append() expects two arguments"); return invalid_type; }
+        const slice_type = try self.checkExpr(c.args[0]);
+        const elem_type = try self.checkExpr(c.args[1]);
+        const slice = self.types.get(slice_type);
+        const expected_elem = switch (slice) {
+            .array => |a| a.elem,
+            .slice => |s| s.elem,
+            else => { self.err.errorWithCode(c.span.start, .e300, "append() first argument must be array or slice"); return invalid_type; },
+        };
+        if (!self.types.isAssignable(elem_type, expected_elem))
+            self.err.errorWithCode(c.span.start, .e300, "append() element type mismatch");
+        return self.types.makeSlice(expected_elem) catch invalid_type;
+    }
+
+    fn checkBuiltinCall(self: *Checker, bc: ast.BuiltinCall) CheckError!TypeIndex {
+        switch (bc.kind) {
+            .size_of, .align_of => {
+                const type_idx = try self.resolveTypeExpr(bc.type_arg);
+                if (type_idx == invalid_type) { self.err.errorWithCode(bc.span.start, .e300, "requires valid type"); return invalid_type; }
+                return TypeRegistry.I64;
+            },
+            .enum_len => {
+                // Ref: Zig @typeInfo(.Enum).fields.len — returns number of enum variants
+                const type_idx = try self.resolveTypeExpr(bc.type_arg);
+                if (type_idx == invalid_type) { self.err.errorWithCode(bc.span.start, .e300, "@enumLen requires valid type"); return invalid_type; }
+                const info = self.types.get(type_idx);
+                if (info != .enum_type) { self.err.errorWithCode(bc.span.start, .e300, "@enumLen requires enum type"); return invalid_type; }
+                return TypeRegistry.I64;
+            },
+            .string => {
+                _ = try self.checkExpr(bc.args[0]);
+                _ = try self.checkExpr(bc.args[1]);
+                return TypeRegistry.STRING;
+            },
+            .int_cast => {
+                const target_type = try self.resolveTypeExpr(bc.type_arg);
+                // Ref: Zig zirIntCast (Sema.zig:9867) — only accepts integer targets (use @floatFromInt for floats)
+                if (!types.isInteger(self.types.get(target_type))) { self.err.errorWithCode(bc.span.start, .e300, "@intCast target must be integer type"); return invalid_type; }
+                _ = try self.checkExpr(bc.args[0]);
+                return target_type;
+            },
+            .float_cast => {
+                // Ref: Zig @floatCast (Sema.zig:9820) — converts float to float (f64→f32 or f32→f64)
+                const target_type = try self.resolveTypeExpr(bc.type_arg);
+                const target_info = self.types.get(target_type);
+                if (target_info != .basic or !target_info.basic.isFloat()) {
+                    self.err.errorWithCode(bc.span.start, .e300, "@floatCast target must be float type");
+                    return invalid_type;
+                }
+                _ = try self.checkExpr(bc.args[0]);
+                return target_type;
+            },
+            .float_from_int => {
+                // Ref: Zig @floatFromInt — converts integer to float type
+                const target_type = try self.resolveTypeExpr(bc.type_arg);
+                _ = try self.checkExpr(bc.args[0]);
+                return target_type;
+            },
+            .int_from_float => {
+                // Ref: Zig @intFromFloat — converts float to integer (truncates toward zero)
+                const arg_type = try self.checkExpr(bc.args[0]);
+                const info = self.types.get(arg_type);
+                if (info != .basic or !info.basic.isFloat()) {
+                    self.err.errorWithCode(bc.span.start, .e300, "@intFromFloat operand must be a float type");
+                }
+                return TypeRegistry.I64;
+            },
+            .ptr_cast => {
+                const target_type = try self.resolveTypeExpr(bc.type_arg);
+                if (self.types.get(target_type) != .pointer) { self.err.errorWithCode(bc.span.start, .e300, "@ptrCast target must be pointer"); return invalid_type; }
+                _ = try self.checkExpr(bc.args[0]);
+                return target_type;
+            },
+            .ptr_to_int => {
+                // Ref: Zig zirPtrToInt — validate operand is pointer type
+                const arg_type = try self.checkExpr(bc.args[0]);
+                const arg_info = self.types.get(arg_type);
+                if (arg_info != .pointer and arg_info != .func and arg_type != TypeRegistry.I64) {
+                    self.err.errorWithCode(bc.span.start, .e300, "@ptrToInt operand must be a pointer");
+                    return invalid_type;
+                }
+                return TypeRegistry.I64;
+            },
+            .int_to_ptr => {
+                const target_type = try self.resolveTypeExpr(bc.type_arg);
+                if (self.types.get(target_type) != .pointer) { self.err.errorWithCode(bc.span.start, .e300, "@intToPtr target must be pointer"); return invalid_type; }
+                _ = try self.checkExpr(bc.args[0]);
+                // @intToPtr creates raw (unmanaged) pointers — no ARC.
+                // Swift: UnsafePointer vs class reference distinction.
+                const elem = self.types.get(target_type).pointer.elem;
+                return self.types.makeRawPointer(elem) catch invalid_type;
+            },
+            .assert => {
+                _ = try self.checkExpr(bc.args[0]);
+                return TypeRegistry.VOID;
+            },
+            .assert_eq => {
+                _ = try self.checkExpr(bc.args[0]);
+                _ = try self.checkExpr(bc.args[1]);
+                return TypeRegistry.VOID;
+            },
+            .ptr_of => {
+                const arg_type = try self.checkExpr(bc.args[0]);
+                if (arg_type != TypeRegistry.STRING) { self.err.errorWithCode(bc.span.start, .e300, "@ptrOf requires string argument"); return invalid_type; }
+                return TypeRegistry.I64;
+            },
+            .len_of => {
+                const arg_type = try self.checkExpr(bc.args[0]);
+                if (arg_type != TypeRegistry.STRING) { self.err.errorWithCode(bc.span.start, .e300, "@lenOf requires string argument"); return invalid_type; }
+                return TypeRegistry.I64;
+            },
+            .trap => return TypeRegistry.NORETURN,
+            .target_os, .target_arch, .target => return TypeRegistry.STRING,
+            .compile_error => {
+                const msg = self.evalConstString(bc.args[0]) orelse "compile error";
+                self.err.errorWithCode(bc.span.start, .e300, msg);
+                return TypeRegistry.NORETURN;
+            },
+            .embed_file => {
+                // Validate argument is a string literal
+                const arg_node = self.tree.getNode(bc.args[0]);
+                if (arg_node) |n| {
+                    if (n.asExpr()) |e| {
+                        if (e != .literal or e.literal.kind != .string) {
+                            self.err.errorWithCode(bc.span.start, .e300, "@embedFile requires a string literal path");
+                        }
+                    }
+                }
+                return TypeRegistry.STRING;
+            },
+            .abs, .ceil, .floor, .trunc, .round, .sqrt => {
+                const arg_type = try self.checkExpr(bc.args[0]);
+                if (arg_type != TypeRegistry.F64 and arg_type != TypeRegistry.F32 and arg_type != TypeRegistry.UNTYPED_FLOAT) {
+                    self.err.errorWithCode(bc.span.start, .e300, "math builtin requires float argument");
+                    return invalid_type;
+                }
+                return TypeRegistry.F64;
+            },
+            .fmin, .fmax => {
+                const arg1_type = try self.checkExpr(bc.args[0]);
+                const arg2_type = try self.checkExpr(bc.args[1]);
+                const a1_float = arg1_type == TypeRegistry.F64 or arg1_type == TypeRegistry.F32 or arg1_type == TypeRegistry.UNTYPED_FLOAT;
+                const a2_float = arg2_type == TypeRegistry.F64 or arg2_type == TypeRegistry.F32 or arg2_type == TypeRegistry.UNTYPED_FLOAT;
+                if (!a1_float or !a2_float) {
+                    self.err.errorWithCode(bc.span.start, .e300, "@fmin/@fmax require float arguments");
+                    return invalid_type;
+                }
+                return TypeRegistry.F64;
+            },
+            .has_field => {
+                // @hasField(T, "name") — comptime bool, Zig Sema.zig:13785
+                const type_idx = try self.resolveTypeExpr(bc.type_arg);
+                if (type_idx == invalid_type) {
+                    self.err.errorWithCode(bc.span.start, .e300, "@hasField requires valid type");
+                    return invalid_type;
+                }
+                // Validate second arg is a string literal
+                const name_str = self.evalConstString(bc.args[0]) orelse {
+                    self.err.errorWithCode(bc.span.start, .e300, "@hasField requires string literal field name");
+                    return invalid_type;
+                };
+                _ = name_str;
+                return TypeRegistry.BOOL;
+            },
+            .type_of => {
+                // @TypeOf(expr) — resolve operand type, return it
+                // In expression position, just check the arg and return its type
+                return try self.checkExpr(bc.args[0]);
+            },
+            .field => {
+                // @field(value, "name") — comptime field access, Zig Sema.zig:26769
+                var base_type = try self.checkExpr(bc.args[0]);
+                // Auto-deref pointers (Zig pattern)
+                while (self.types.get(base_type) == .pointer) base_type = self.types.get(base_type).pointer.elem;
+                const name_str = self.evalConstString(bc.args[1]) orelse {
+                    self.err.errorWithCode(bc.span.start, .e300, "@field requires string literal field name");
+                    return invalid_type;
+                };
+                const info = self.types.get(base_type);
+                if (info == .struct_type) {
+                    for (info.struct_type.fields) |sf| {
+                        if (std.mem.eql(u8, sf.name, name_str)) return sf.type_idx;
+                    }
+                    if (findSimilarField(name_str, info.struct_type.fields)) |suggestion| {
+                        const msg = std.fmt.allocPrint(self.allocator, "struct has no field with this name; did you mean '{s}'?", .{suggestion}) catch "struct has no field with this name";
+                        self.err.errorWithCode(bc.span.start, .e300, msg);
+                    } else {
+                        self.err.errorWithCode(bc.span.start, .e300, "struct has no field with this name");
+                    }
+                    return invalid_type;
+                }
+                self.err.errorWithCode(bc.span.start, .e300, "@field requires struct type");
+                return invalid_type;
+            },
+            // @intFromEnum(e) — Zig Sema.zig:8420: validate operand is enum, return i64
+            .int_from_enum => {
+                const arg_type = try self.checkExpr(bc.args[0]);
+                if (self.types.get(arg_type) != .enum_type) {
+                    self.err.errorWithCode(bc.span.start, .e300, "@intFromEnum requires enum argument");
+                    return invalid_type;
+                }
+                return TypeRegistry.I64;
+            },
+            // @enumFromInt(T, i) or @enumFromInt(i) — Zig Sema.zig:8480: validate T is enum, operand is int
+            .enum_from_int => {
+                const target_type = if (bc.type_arg != null_node)
+                    try self.resolveTypeExpr(bc.type_arg)
+                else if (self.expected_type != invalid_type)
+                    self.expected_type
+                else {
+                    self.err.errorWithCode(bc.span.start, .e300, "@enumFromInt requires type argument or type context (use @as(T, @enumFromInt(val)))");
+                    return invalid_type;
+                };
+                const target_info = self.types.get(target_type);
+                if (target_info != .enum_type) {
+                    self.err.errorWithCode(bc.span.start, .e300, "@enumFromInt target must be enum type");
+                    return invalid_type;
+                }
+                _ = try self.checkExpr(bc.args[0]);
+                // Ref: Zig zirEnumFromInt — comptime range validation
+                if (self.evalConstExpr(bc.args[0])) |val| {
+                    const num_variants: i64 = @intCast(target_info.enum_type.variants.len);
+                    if (val < 0 or val >= num_variants) {
+                        self.err.errorWithCode(bc.span.start, .e300, "@enumFromInt value out of range for enum type");
+                        return invalid_type;
+                    }
+                }
+                return target_type;
+            },
+            // @tagName(val) — Zig Sema.zig:20487: enum or union → string name
+            .tag_name => {
+                const arg_type = try self.checkExpr(bc.args[0]);
+                const info = self.types.get(arg_type);
+                if (info != .enum_type and info != .union_type) {
+                    self.err.errorWithCode(bc.span.start, .e300, "@tagName requires enum or union argument");
+                    return invalid_type;
+                }
+                return TypeRegistry.STRING;
+            },
+            // @errorName(err) — Zig Sema.zig:20375: error value → string name
+            .error_name => {
+                // Ref: Zig zirErrorName — requires error set or error union type
+                const arg_type = try self.checkExpr(bc.args[0]);
+                const arg_info = self.types.get(arg_type);
+                if (arg_info != .error_set and arg_info != .error_union) {
+                    self.err.errorWithCode(bc.span.start, .e300, "@errorName operand must be error type");
+                    return invalid_type;
+                }
+                return TypeRegistry.STRING;
+            },
+            // @intFromBool(b) — Zig Sema.zig:20341: bool → i64 (0 or 1)
+            .int_from_bool => {
+                const arg_type = try self.checkExpr(bc.args[0]);
+                if (arg_type != TypeRegistry.BOOL and arg_type != TypeRegistry.UNTYPED_BOOL) {
+                    self.err.errorWithCode(bc.span.start, .e300, "@intFromBool requires bool argument");
+                    return invalid_type;
+                }
+                return TypeRegistry.I64;
+            },
+            // @bitCast(T, val) — Zig Sema.zig:30554: reinterpret bits as target type
+            .bit_cast => {
+                const target_type = try self.resolveTypeExpr(bc.type_arg);
+                const arg_type = try self.checkExpr(bc.args[0]);
+                // Ref: Zig zirBitCast — reject pointer and enum types
+                const target_info = self.types.get(target_type);
+                const arg_info = self.types.get(arg_type);
+                if (target_info == .pointer or target_info == .enum_type) {
+                    self.err.errorWithCode(bc.span.start, .e300, "@bitCast target cannot be pointer or enum type");
+                    return invalid_type;
+                }
+                if (arg_info == .pointer or arg_info == .enum_type) {
+                    self.err.errorWithCode(bc.span.start, .e300, "@bitCast source cannot be pointer or enum type");
+                    return invalid_type;
+                }
+                // Ref: Zig zirBitCast — enforce equal sizes
+                const target_size = self.types.sizeOf(target_type);
+                const arg_size = self.types.sizeOf(arg_type);
+                if (target_size != arg_size) {
+                    self.err.errorWithCode(bc.span.start, .e300, "@bitCast requires same-size types");
+                    return invalid_type;
+                }
+                return target_type;
+            },
+            // @truncate(T, val) — Zig Sema.zig:22882: narrow integer to smaller type
+            // Ref: Zig zirTruncate returns the target type
+            .truncate => {
+                const target_type = try self.resolveTypeExpr(bc.type_arg);
+                if (!types.isInteger(self.types.get(target_type))) {
+                    self.err.errorWithCode(bc.span.start, .e300, "@truncate target must be integer type");
+                    return invalid_type;
+                }
+                _ = try self.checkExpr(bc.args[0]);
+                return target_type;
+            },
+            // @as(T, val) — Zig Sema.zig:9659: explicit type coercion
+            .as => {
+                const target_type = try self.resolveTypeExpr(bc.type_arg);
+                // Propagate expected type to inner expression (enables 1-arg @enumFromInt)
+                const saved_expected = self.expected_type;
+                self.expected_type = target_type;
+                defer self.expected_type = saved_expected;
+                _ = try self.checkExpr(bc.args[0]);
+                return target_type;
+            },
+            // @offsetOf(T, "field") — Zig Sema.zig:23060: comptime struct field offset
+            .offset_of => {
+                const type_idx = try self.resolveTypeExpr(bc.type_arg);
+                const info = self.types.get(type_idx);
+                if (info != .struct_type) {
+                    self.err.errorWithCode(bc.span.start, .e300, "@offsetOf requires struct type");
+                    return invalid_type;
+                }
+                const name_str = self.evalConstString(bc.args[0]) orelse {
+                    self.err.errorWithCode(bc.span.start, .e300, "@offsetOf requires string literal field name");
+                    return invalid_type;
+                };
+                var found = false;
+                for (info.struct_type.fields) |sf| {
+                    if (std.mem.eql(u8, sf.name, name_str)) { found = true; break; }
+                }
+                if (!found) {
+                    self.err.errorWithCode(bc.span.start, .e300, "struct has no field with this name");
+                    return invalid_type;
+                }
+                return TypeRegistry.I64;
+            },
+            // @min(a, b) / @max(a, b) — Zig Sema.zig:24678: integer min/max
+            // Ref: Zig zirMin/zirMax calls checkNumericType on both args, returns peer type
+            .min, .max => {
+                const a_type = try self.checkExpr(bc.args[0]);
+                const b_type = try self.checkExpr(bc.args[1]);
+                if (!types.isNumeric(self.types.get(a_type))) {
+                    self.err.errorWithCode(bc.span.start, .e300, "@min/@max requires numeric types");
+                    return invalid_type;
+                }
+                if (!types.isNumeric(self.types.get(b_type))) {
+                    self.err.errorWithCode(bc.span.start, .e300, "@min/@max requires numeric types");
+                    return invalid_type;
+                }
+                return TypeRegistry.commonType(a_type, b_type);
+            },
+            // @alignCast(alignment, ptr) — Zig: assert alignment, identity in release
+            .align_cast => {
+                _ = try self.resolveTypeExpr(bc.type_arg);
+                _ = try self.checkExpr(bc.args[0]);
+                return TypeRegistry.I64;
+            },
+            // @constCast(ptr) — Zig: remove const qualifier, type-system only
+            // Ref: Zig zirConstCast returns same type as input (identity)
+            .const_cast => {
+                return try self.checkExpr(bc.args[0]);
+            },
+            // @arcRetain(val), @arcRelease(val) — conditional ARC management
+            // Emits cot_retain/cot_release only when arg type is ARC-managed.
+            // No-op for non-ARC types. Used in generic collections.
+            .arc_retain, .arc_release => {
+                _ = try self.checkExpr(bc.args[0]);
+                return TypeRegistry.VOID;
+            },
+            // @isUnique(ptr) — Swift's isKnownUniquelyReferenced().
+            // Returns true if the refcount of the ARC allocation at ptr is exactly 1.
+            // Used for copy-on-write: if unique, mutate in-place; if shared, copy first.
+            .is_unique => {
+                _ = try self.checkExpr(bc.args[0]);
+                return TypeRegistry.BOOL;
+            },
+            // @panic("message") — Zig @panic: writes message to stderr, then traps
+            .panic => {
+                if (bc.args[0] != null_node) _ = try self.checkExpr(bc.args[0]);
+                return TypeRegistry.NORETURN;
+            },
+            // @ctz(val), @clz(val), @popCount(val) — Wasm i64 bit ops
+            .ctz, .clz, .pop_count => {
+                _ = try self.checkExpr(bc.args[0]);
+                return TypeRegistry.I64;
+            },
+            .type_name => {
+                const type_idx = try self.resolveTypeExpr(bc.type_arg);
+                if (type_idx == invalid_type) { self.err.errorWithCode(bc.span.start, .e300, "@typeName requires valid type"); return invalid_type; }
+                return TypeRegistry.STRING;
+            },
+            .enum_name => {
+                const type_idx = try self.resolveTypeExpr(bc.type_arg);
+                if (type_idx == invalid_type) { self.err.errorWithCode(bc.span.start, .e300, "@enumName requires valid type"); return invalid_type; }
+                const info = self.types.get(type_idx);
+                if (info != .enum_type) { self.err.errorWithCode(bc.span.start, .e300, "@enumName requires enum type"); return invalid_type; }
+                _ = try self.checkExpr(bc.args[0]);
+                return TypeRegistry.STRING;
+            },
+            .type_info => {
+                // @typeInfo(T) returns a comptime-only value — for now, check that type exists.
+                // The result type is used only in comptime context (field access, array iteration).
+                // At the expression level, treat as I64 (it will only be evaluated via evalComptimeValue).
+                const type_idx = try self.resolveTypeExpr(bc.type_arg);
+                if (type_idx == invalid_type) { self.err.errorWithCode(bc.span.start, .e300, "@typeInfo requires valid type"); return invalid_type; }
+                return TypeRegistry.I64;
+            },
+            .atomic_load => {
+                // @atomicLoad(ptr: *i64) → i64
+                const arg_type = try self.checkExpr(bc.args[0]);
+                const arg_info = self.types.get(arg_type);
+                if (arg_info != .pointer) { self.err.errorWithCode(bc.span.start, .e300, "@atomicLoad requires pointer argument"); return invalid_type; }
+                return TypeRegistry.I64;
+            },
+            .atomic_store => {
+                // @atomicStore(ptr: *i64, val: i64) → void
+                const arg_type = try self.checkExpr(bc.args[0]);
+                const arg_info = self.types.get(arg_type);
+                if (arg_info != .pointer) { self.err.errorWithCode(bc.span.start, .e300, "@atomicStore requires pointer argument"); return invalid_type; }
+                _ = try self.checkExpr(bc.args[1]);
+                return TypeRegistry.VOID;
+            },
+            .atomic_add => {
+                // @atomicAdd(ptr: *i64, val: i64) → i64 (returns previous value)
+                const arg_type = try self.checkExpr(bc.args[0]);
+                const arg_info = self.types.get(arg_type);
+                if (arg_info != .pointer) { self.err.errorWithCode(bc.span.start, .e300, "@atomicAdd requires pointer argument"); return invalid_type; }
+                _ = try self.checkExpr(bc.args[1]);
+                return TypeRegistry.I64;
+            },
+            .atomic_cas => {
+                // @atomicCAS(ptr: *i64, expected: i64, new: i64) → i64 (returns actual old value)
+                const arg_type = try self.checkExpr(bc.args[0]);
+                const arg_info = self.types.get(arg_type);
+                if (arg_info != .pointer) { self.err.errorWithCode(bc.span.start, .e300, "@atomicCAS requires pointer argument"); return invalid_type; }
+                _ = try self.checkExpr(bc.args[1]);
+                _ = try self.checkExpr(bc.args[2]);
+                return TypeRegistry.I64;
+            },
+            .atomic_exchange => {
+                // @atomicExchange(ptr: *i64, val: i64) → i64 (returns previous value)
+                const arg_type = try self.checkExpr(bc.args[0]);
+                const arg_info = self.types.get(arg_type);
+                if (arg_info != .pointer) { self.err.errorWithCode(bc.span.start, .e300, "@atomicExchange requires pointer argument"); return invalid_type; }
+                _ = try self.checkExpr(bc.args[1]);
+                return TypeRegistry.I64;
+            },
+        }
+    }
+
+    fn checkIndex(self: *Checker, i: ast.Index) CheckError!TypeIndex {
+        // Check if base is a comptime array — enables @typeInfo(T).fields[0], etc.
+        if (self.evalComptimeValue(i.base)) |base_cv| {
+            if (base_cv == .array) {
+                // Indexing a comptime array — determine element type from first element
+                if (base_cv.array.elements.items.len > 0) {
+                    const first = base_cv.array.elements.items[0];
+                    return switch (first) {
+                        .int => TypeRegistry.I64,
+                        .string => TypeRegistry.STRING,
+                        .boolean => TypeRegistry.BOOL,
+                        .enum_field => TypeRegistry.I64, // Field info accessed via .name/.value
+                        else => TypeRegistry.I64,
+                    };
+                }
+                return TypeRegistry.I64;
+            }
+        }
+        var base_type = try self.checkExpr(i.base);
+        const index_type = try self.checkExpr(i.idx);
+        if (!types.isInteger(self.types.get(index_type))) { self.err.errorWithCode(i.span.start, .e300, "index must be integer"); return invalid_type; }
+        while (self.types.get(base_type) == .pointer) base_type = self.types.get(base_type).pointer.elem;
+        if (base_type == TypeRegistry.STRING) return TypeRegistry.U8;
+        const base = self.types.get(base_type);
+        return switch (base) { .array => |a| a.elem, .slice => |s| s.elem, .list => |l| l.elem, else => blk: { self.err.errorWithCode(i.span.start, .e300, "cannot index this type"); break :blk invalid_type; } };
+    }
+
+    fn checkSliceExpr(self: *Checker, se: ast.SliceExpr) CheckError!TypeIndex {
+        var base_type = try self.checkExpr(se.base);
+        if (se.start != null_node) _ = try self.checkExpr(se.start);
+        if (se.end != null_node) _ = try self.checkExpr(se.end);
+        while (self.types.get(base_type) == .pointer) base_type = self.types.get(base_type).pointer.elem;
+        const base = self.types.get(base_type);
+        if (base_type == TypeRegistry.STRING) return TypeRegistry.STRING;
+        return switch (base) { .array => |a| self.types.makeSlice(a.elem), .slice => base_type, else => blk: { self.err.errorWithCode(se.span.start, .e300, "cannot slice this type"); break :blk invalid_type; } };
+    }
+
+    fn checkFieldAccess(self: *Checker, f: ast.FieldAccess) CheckError!TypeIndex {
+        // Check if base is a comptime value — enables @typeInfo(T).fields, field.name, etc.
+        if (f.base != null_node) {
+            if (self.evalComptimeValue(f.base)) |base_cv| {
+                // Field access on comptime value — determine result type
+                switch (base_cv) {
+                    .type_info => {
+                        if (std.mem.eql(u8, f.field, "fields")) return TypeRegistry.I64; // Comptime array
+                        if (std.mem.eql(u8, f.field, "name")) return TypeRegistry.STRING;
+                        self.err.errorWithCode(f.span.start, .e300, "no such field on type info");
+                        return invalid_type;
+                    },
+                    .enum_field => {
+                        if (std.mem.eql(u8, f.field, "name")) return TypeRegistry.STRING;
+                        if (std.mem.eql(u8, f.field, "value")) return TypeRegistry.I64;
+                        self.err.errorWithCode(f.span.start, .e300, "no such field on enum field");
+                        return invalid_type;
+                    },
+                    .array => {
+                        if (std.mem.eql(u8, f.field, "len")) return TypeRegistry.I64;
+                        self.err.errorWithCode(f.span.start, .e300, "no such field on array");
+                        return invalid_type;
+                    },
+                    else => {},
+                }
+            }
+        }
+        if (f.base == null_node) {
+            // Zig Sema pattern: .variant shorthand in switch/comparison — resolve from context type
+            if (self.current_switch_enum_type != invalid_type) {
+                const enum_info = self.types.get(self.current_switch_enum_type);
+                if (enum_info == .enum_type) {
+                    for (enum_info.enum_type.variants) |v| {
+                        if (std.mem.eql(u8, v.name, f.field)) return self.current_switch_enum_type;
+                    }
+                    self.errWithSuggestion(f.span.start, "undefined variant", findSimilarVariant(f.field, enum_info.enum_type.variants));
+                }
+                if (enum_info == .union_type) {
+                    for (enum_info.union_type.variants) |v| {
+                        if (std.mem.eql(u8, v.name, f.field)) return self.current_switch_enum_type;
+                    }
+                    self.errWithSuggestion(f.span.start, "undefined variant", findSimilarVariant(f.field, enum_info.union_type.variants));
+                }
+            }
+            return invalid_type;
+        }
+
+        // Nested type namespace: TypeName.NestedType (e.g. Parser.Error)
+        // Check if base is a struct type name before calling checkExpr (which would error)
+        // Uses stack buffer to avoid heap allocation for lookups (Zig Sema pattern)
+        if (self.tree.getNode(f.base)) |base_node| {
+            if (base_node.asExpr()) |base_expr| {
+                if (base_expr == .ident) {
+                    const base_name = base_expr.ident.name;
+                    var buf: [512]u8 = undefined;
+                    const qualified = std.fmt.bufPrint(&buf, "{s}_{s}", .{ base_name, f.field }) catch "";
+                    if (qualified.len > 0) {
+                        if (self.resolveTypeByName(qualified)) |nested_type_idx| {
+                            return nested_type_idx;
+                        }
+                        // Also check scope for associated constants and static methods
+                        if (self.scope.lookup(qualified)) |sym| {
+                            if (sym.kind == .constant) {
+                                // If type was resolved during registration, use it directly
+                                if (sym.type_idx != invalid_type) return sym.type_idx;
+                                // Lazy resolution: check the constant's value expr
+                                if (self.tree.getNode(sym.node)) |node| {
+                                    if (node.asDecl()) |decl| {
+                                        if (decl == .var_decl and decl.var_decl.value != null_node) {
+                                            return try self.checkExpr(decl.var_decl.value);
+                                        }
+                                    }
+                                }
+                            }
+                            // Static method: return func_type so call machinery works
+                            // Also store base type in expr_types so lowerer can detect the method call
+                            if (sym.kind == .function and sym.type_idx != invalid_type) {
+                                if (self.lookupMethod(base_name, f.field)) |m| {
+                                    if (m.is_static) {
+                                        if (self.resolveTypeByName(base_name)) |base_type_idx| {
+                                            try self.expr_types.put(f.base, base_type_idx);
+                                        }
+                                        return sym.type_idx;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // Generic static method: GenericType(ConcreteArgs).method
+                // Zig pattern: ArrayList(u8).init(allocator)
+                if (base_expr == .call) {
+                    const gen_call = base_expr.call;
+                    if (self.tree.getNode(gen_call.callee)) |callee_node| {
+                        if (callee_node.asExpr()) |callee_expr| {
+                            if (callee_expr == .ident) {
+                                const gen_name = callee_expr.ident.name;
+                                if (self.generics.generic_structs.contains(gen_name)) {
+                                    const gi = ast.GenericInstance{
+                                        .name = gen_name,
+                                        .type_args = gen_call.args,
+                                    };
+                                    const concrete_type = try self.resolveGenericInstance(gi, gen_call.span);
+                                    if (concrete_type != invalid_type) {
+                                        try self.expr_types.put(f.base, concrete_type);
+                                        const concrete_info = self.types.get(concrete_type);
+                                        if (concrete_info == .struct_type) {
+                                            if (self.lookupMethod(concrete_info.struct_type.name, f.field)) |m| {
+                                                if (m.is_static) return m.func_type;
+                                            }
+                                            // Non-static method on type name — error
+                                            for (concrete_info.struct_type.fields) |field| {
+                                                if (std.mem.eql(u8, field.name, f.field)) return field.type_idx;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        var base_type = try self.checkExpr(f.base);
+
+        // Auto-deref: unwrap pointer(s) before field lookup (Zig pattern)
+        while (true) {
+            switch (self.types.get(base_type)) {
+                .pointer => |ptr| base_type = ptr.elem,
+                else => break,
+            }
+        }
+
+        const base = self.types.get(base_type);
+
+        switch (base) {
+            .struct_type => |st| {
+                for (st.fields) |field| if (std.mem.eql(u8, field.name, f.field)) return field.type_idx;
+                if (self.lookupMethod(st.name, f.field)) |m| return m.func_type;
+                self.errWithSuggestion(f.span.start, "undefined field", findSimilarField(f.field, st.fields));
+                return invalid_type;
+            },
+            .enum_type => |et| {
+                for (et.variants) |v| if (std.mem.eql(u8, v.name, f.field)) return base_type;
+                if (self.lookupMethod(et.name, f.field)) |m| return m.func_type;
+                self.errWithSuggestion(f.span.start, "undefined variant", findSimilarVariant(f.field, et.variants));
+                return invalid_type;
+            },
+            .union_type => |ut| {
+                // .tag pseudo-field returns tag value as i64
+                if (std.mem.eql(u8, f.field, "tag")) return TypeRegistry.I64;
+                // Check if base is a type name (constructor) vs value (extraction)
+                const is_type_access = blk: {
+                    const base_node = self.tree.getNode(f.base);
+                    const base_expr = if (base_node) |n| n.asExpr() else null;
+                    if (base_expr) |e| {
+                        if (e == .ident) {
+                            if (self.scope.lookup(e.ident.name)) |sym| {
+                                break :blk sym.kind == .type_name;
+                            }
+                        }
+                    }
+                    break :blk false;
+                };
+                for (ut.variants) |v| if (std.mem.eql(u8, v.name, f.field)) {
+                    if (v.payload_type == invalid_type) return base_type;
+                    if (!is_type_access) {
+                        // Payload extraction: r.Ok returns the payload
+                        return v.payload_type;
+                    }
+                    // Constructor: Result.Ok returns function type
+                    const params = try self.allocator.alloc(types.FuncParam, 1);
+                    params[0] = .{ .name = "payload", .type_idx = v.payload_type };
+                    return try self.types.add(.{ .func = .{ .params = params, .return_type = base_type } });
+                };
+                self.errWithSuggestion(f.span.start, "undefined variant", findSimilarVariant(f.field, ut.variants));
+                return invalid_type;
+            },
+            .map => |mt| {
+                if (std.mem.eql(u8, f.field, "set")) {
+                    const params = try self.allocator.alloc(types.FuncParam, 2);
+                    params[0] = .{ .name = "key", .type_idx = mt.key };
+                    params[1] = .{ .name = "value", .type_idx = mt.value };
+                    return try self.types.add(.{ .func = .{ .params = params, .return_type = TypeRegistry.VOID } });
+                } else if (std.mem.eql(u8, f.field, "get")) {
+                    const params = try self.allocator.alloc(types.FuncParam, 1);
+                    params[0] = .{ .name = "key", .type_idx = mt.key };
+                    return try self.types.add(.{ .func = .{ .params = params, .return_type = mt.value } });
+                } else if (std.mem.eql(u8, f.field, "has")) {
+                    const params = try self.allocator.alloc(types.FuncParam, 1);
+                    params[0] = .{ .name = "key", .type_idx = mt.key };
+                    return try self.types.add(.{ .func = .{ .params = params, .return_type = TypeRegistry.BOOL } });
+                }
+                self.errWithSuggestion(f.span.start, "undefined field", editDistSuggest(f.field, &.{ "set", "get", "has" }));
+                return invalid_type;
+            },
+            .list => |lt| {
+                if (std.mem.eql(u8, f.field, "push")) {
+                    const params = try self.allocator.alloc(types.FuncParam, 1);
+                    params[0] = .{ .name = "value", .type_idx = lt.elem };
+                    return try self.types.add(.{ .func = .{ .params = params, .return_type = TypeRegistry.VOID } });
+                } else if (std.mem.eql(u8, f.field, "get")) {
+                    const params = try self.allocator.alloc(types.FuncParam, 1);
+                    params[0] = .{ .name = "index", .type_idx = TypeRegistry.INT };
+                    return try self.types.add(.{ .func = .{ .params = params, .return_type = lt.elem } });
+                } else if (std.mem.eql(u8, f.field, "len")) {
+                    return try self.types.add(.{ .func = .{ .params = &.{}, .return_type = TypeRegistry.INT } });
+                }
+                self.errWithSuggestion(f.span.start, "undefined field", editDistSuggest(f.field, &.{ "push", "get", "len" }));
+                return invalid_type;
+            },
+            .slice => |sl| {
+                if (std.mem.eql(u8, f.field, "ptr")) return try self.types.add(.{ .pointer = .{ .elem = sl.elem } })
+                else if (std.mem.eql(u8, f.field, "len")) return TypeRegistry.I64;
+                // string is stored as slice(u8) — check for methods registered on "string" (e.g. trait impls)
+                if (base_type == TypeRegistry.STRING) {
+                    if (self.lookupMethod("string", f.field)) |m| return m.func_type;
+                }
+                self.errWithSuggestion(f.span.start, "undefined field", editDistSuggest(f.field, &.{ "ptr", "len" }));
+                return invalid_type;
+            },
+            .tuple => |tup| {
+                const idx = std.fmt.parseInt(u32, f.field, 10) catch {
+                    self.err.errorWithCode(f.span.start, .e300, "tuple fields must be numeric (e.g. .0, .1)");
+                    return invalid_type;
+                };
+                if (idx >= tup.element_types.len) {
+                    self.err.errorWithCode(f.span.start, .e300, "tuple index out of bounds");
+                    return invalid_type;
+                }
+                return tup.element_types[idx];
+            },
+            .basic => |bk| {
+                if (self.lookupMethod(bk.name(), f.field)) |m| return m.func_type;
+                self.err.errorWithCode(f.span.start, .e300, "cannot access field on this type");
+                return invalid_type;
+            },
+            .existential => |exist| {
+                // Look up method in trait's method list, return func_type from first conformance.
+                // Strip 'self' parameter — existential dispatch handles receiver implicitly.
+                for (exist.method_names) |mn| {
+                    if (std.mem.eql(u8, mn, f.field)) {
+                        if (exist.conforming_types.len > 0) {
+                            if (self.lookupMethod(exist.conforming_types[0], f.field)) |m| {
+                                const ft = self.types.get(m.func_type);
+                                if (ft == .func and ft.func.params.len > 0) {
+                                    // Create new func type without self param
+                                    const new_params = ft.func.params[1..];
+                                    return try self.types.add(.{ .func = .{ .params = new_params, .return_type = ft.func.return_type } });
+                                }
+                                return m.func_type;
+                            }
+                        }
+                        return TypeRegistry.VOID;
+                    }
+                }
+                self.err.errorWithCode(f.span.start, .e300, "trait has no such method");
+                return invalid_type;
+            },
+            else => {
+                self.err.errorWithCode(f.span.start, .e300, "cannot access field on this type");
+                return invalid_type;
+            },
+        }
+    }
+
+    fn checkStructInit(self: *Checker, si: ast.StructInit) CheckError!TypeIndex {
+        const struct_type_idx = if (si.type_name.len == 0) blk: {
+            // Anonymous struct literal: .{ .x = 1, .y = 2 } — resolve from expected type
+            if (self.expected_type != invalid_type and self.types.get(self.expected_type) == .struct_type) {
+                break :blk self.expected_type;
+            }
+            self.err.errorWithCode(si.span.start, .e300, "cannot infer type for anonymous struct literal");
+            return invalid_type;
+        } else if (si.type_args.len > 0)
+            try self.resolveGenericInstance(.{ .name = si.type_name, .type_args = si.type_args }, si.span)
+        else
+            self.resolveTypeByName(si.type_name) orelse {
+                self.errWithSuggestion(si.span.start, "undefined type", self.findSimilarType(si.type_name));
+                return invalid_type;
+            };
+        const struct_type = self.types.get(struct_type_idx);
+        if (struct_type != .struct_type) { self.err.errorWithCode(si.span.start, .e300, "not a struct type"); return invalid_type; }
+        for (si.fields) |fi| {
+            var found = false;
+            for (struct_type.struct_type.fields) |sf| if (std.mem.eql(u8, sf.name, fi.name)) {
+                found = true;
+                // Propagate field type as expected_type (enables .{} inference for Map, List, etc.)
+                const saved_expected = self.expected_type;
+                self.expected_type = sf.type_idx;
+                const vt = try self.checkExpr(fi.value);
+                self.expected_type = saved_expected;
+                if (!self.types.isAssignable(vt, sf.type_idx)) {
+                    // @safe coercion: *Struct → Struct when value is an auto-reffed param
+                    const vt_t = self.types.get(vt);
+                    const is_safe_deref = self.safe_mode and vt_t == .pointer and
+                        self.types.isAssignable(vt_t.pointer.elem, sf.type_idx);
+                    // @safe coercion: Struct → *Struct when field expects a pointer (auto-ref)
+                    const sf_t = self.types.get(sf.type_idx);
+                    const is_safe_ref = self.safe_mode and sf_t == .pointer and
+                        self.types.isAssignable(vt, sf_t.pointer.elem);
+                    if (!is_safe_deref and !is_safe_ref) self.err.errorWithCode(fi.span.start, .e300, "type mismatch in field");
+                }
+                break;
+            };
+            if (!found) self.errWithSuggestion(fi.span.start, "unknown field", findSimilarField(fi.name, struct_type.struct_type.fields));
+        }
+        // Check that all fields without defaults are provided (Zig: Sema structInit)
+        for (struct_type.struct_type.fields) |sf| {
+            if (sf.default_value != null_node) continue; // has default, ok to omit
+            var provided = false;
+            for (si.fields) |fi| if (std.mem.eql(u8, sf.name, fi.name)) { provided = true; break; };
+            if (!provided) self.err.errorWithCode(si.span.start, .e300, "missing field in struct init");
+        }
+        // Actors are reference types — struct init returns *Actor, not Actor.
+        // Swift reference: actor init always returns a reference (ARC heap object).
+        if (self.actor_types.contains(struct_type.struct_type.name)) {
+            return try self.types.makePointer(struct_type_idx);
+        }
+        return struct_type_idx;
+    }
+
+    /// Check heap allocation expression: new Type { field: value, ... }
+    /// Returns a pointer type to the struct.
+    /// Reference: Go's walkNew (walk/builtin.go:601-616)
+    fn checkNewExpr(self: *Checker, ne: ast.NewExpr) CheckError!TypeIndex {
+        const struct_type_idx = if (ne.type_args.len > 0)
+            try self.resolveGenericInstance(.{ .name = ne.type_name, .type_args = ne.type_args }, ne.span)
+        else
+            self.resolveTypeByName(ne.type_name) orelse {
+                self.errWithSuggestion(ne.span.start, "undefined type", self.findSimilarType(ne.type_name));
+                return invalid_type;
+            };
+        const struct_type = self.types.get(struct_type_idx);
+        if (struct_type != .struct_type) {
+            self.err.errorWithCode(ne.span.start, .e300, "new requires a struct type");
+            return invalid_type;
+        }
+        // Constructor sugar: `new Point(10, 20)` calls init() method
+        if (ne.is_constructor) {
+            const type_name = if (ne.type_args.len > 0) struct_type.struct_type.name else ne.type_name;
+            const init_method = self.types.lookupMethod(type_name, "init") orelse {
+                self.err.errorWithCode(ne.span.start, .e301, "no init method for constructor call");
+                return invalid_type;
+            };
+            const func_type = self.types.get(init_method.func_type);
+            if (func_type == .func) {
+                const init_params = func_type.func.params;
+                // init's first param is self, constructor args map to params[1..]
+                const expected_args = if (init_params.len > 0) init_params.len - 1 else 0;
+                if (ne.constructor_args.len != expected_args) {
+                    self.err.errorWithCode(ne.span.start, .e300, "wrong number of constructor arguments");
+                } else {
+                    for (ne.constructor_args, 0..) |arg_idx, i| {
+                        const arg_type = try self.checkExpr(arg_idx);
+                        if (!self.types.isAssignable(arg_type, init_params[i + 1].type_idx)) {
+                            self.err.errorWithCode(ne.span.start, .e300, "type mismatch in constructor argument");
+                        }
+                    }
+                }
+                // Validate init returns void
+                if (func_type.func.return_type != TypeRegistry.VOID) {
+                    self.err.errorWithCode(ne.span.start, .e300, "init method must return void");
+                }
+            }
+            return self.types.makePointer(struct_type_idx) catch invalid_type;
+        }
+        // Validate field initializers (same as StructInit)
+        for (ne.fields) |fi| {
+            var found = false;
+            for (struct_type.struct_type.fields) |sf| if (std.mem.eql(u8, sf.name, fi.name)) {
+                found = true;
+                const saved_expected = self.expected_type;
+                self.expected_type = sf.type_idx;
+                const vt = try self.checkExpr(fi.value);
+                self.expected_type = saved_expected;
+                if (!self.types.isAssignable(vt, sf.type_idx)) {
+                    const vt_t = self.types.get(vt);
+                    const is_safe_deref = self.safe_mode and vt_t == .pointer and
+                        self.types.isAssignable(vt_t.pointer.elem, sf.type_idx);
+                    const sf_t = self.types.get(sf.type_idx);
+                    const is_safe_ref = self.safe_mode and sf_t == .pointer and
+                        self.types.isAssignable(vt, sf_t.pointer.elem);
+                    if (!is_safe_deref and !is_safe_ref) self.err.errorWithCode(fi.span.start, .e300, "type mismatch in field");
+                }
+                break;
+            };
+            if (!found) self.errWithSuggestion(fi.span.start, "unknown field", findSimilarField(fi.name, struct_type.struct_type.fields));
+        }
+        // Check that all fields without defaults are provided (Zig: Sema structInit)
+        for (struct_type.struct_type.fields) |sf| {
+            if (sf.default_value != null_node) continue;
+            var provided = false;
+            for (ne.fields) |fi| if (std.mem.eql(u8, sf.name, fi.name)) { provided = true; break; };
+            if (!provided) self.err.errorWithCode(ne.span.start, .e300, "missing field in struct init");
+        }
+        // Return pointer to struct (heap-allocated object)
+        return self.types.makePointer(struct_type_idx) catch invalid_type;
+    }
+
+    fn checkArrayLiteral(self: *Checker, al: ast.ArrayLiteral) CheckError!TypeIndex {
+        if (al.elements.len == 0) { self.err.errorWithCode(al.span.start, .e300, "cannot infer type of empty array"); return invalid_type; }
+        const first_type = try self.checkExpr(al.elements[0]);
+        if (first_type == invalid_type) return invalid_type;
+        for (al.elements[1..]) |elem_idx| {
+            const elem_type = try self.checkExpr(elem_idx);
+            if (!self.types.equal(first_type, elem_type) and !self.types.isAssignable(elem_type, first_type))
+                self.err.errorWithCode(al.span.start, .e300, "array elements must have same type");
+        }
+        return self.types.makeArray(first_type, al.elements.len) catch invalid_type;
+    }
+
+    fn checkTupleLiteral(self: *Checker, tl: ast.TupleLiteral) CheckError!TypeIndex {
+        if (tl.elements.len < 2) { self.err.errorWithCode(tl.span.start, .e300, "tuple must have at least 2 elements"); return invalid_type; }
+        var elem_types = std.ArrayListUnmanaged(TypeIndex){};
+        defer elem_types.deinit(self.allocator);
+        for (tl.elements) |elem_idx| {
+            const et = try self.checkExpr(elem_idx);
+            elem_types.append(self.allocator, et) catch return invalid_type;
+        }
+        return self.types.makeTuple(elem_types.items) catch invalid_type;
+    }
+
+    fn checkIfExpr(self: *Checker, ie: ast.IfExpr) CheckError!TypeIndex {
+        const cond_type = try self.checkExpr(ie.condition);
+        // Optional unwrap: if expr |val| { ... } — Zig payload capture pattern
+        if (ie.capture.len > 0) {
+            const cond_info = self.types.get(cond_type);
+            if (cond_info != .optional) {
+                self.err.errorWithCode(ie.span.start, .e300, "capture requires optional type");
+                return TypeRegistry.VOID;
+            }
+            const elem_type = cond_info.optional.elem;
+            const capture_type = if (ie.capture_is_ptr)
+                self.types.makePointer(elem_type) catch elem_type
+            else
+                elem_type;
+            // Check then-branch with capture variable in scope
+            var capture_scope = Scope.init(self.allocator, self.scope);
+            defer capture_scope.deinit();
+            const old_scope = self.scope;
+            self.scope = &capture_scope;
+            try capture_scope.define(Symbol.init(ie.capture, .variable, capture_type, ast.null_node, false));
+            const then_type = try self.checkExpr(ie.then_branch);
+            self.scope = old_scope;
+            if (ie.else_branch != null_node) {
+                const else_type = try self.checkExpr(ie.else_branch);
+                if (!self.types.equal(then_type, else_type) and !self.types.isAssignable(else_type, then_type) and !self.types.isAssignable(then_type, else_type))
+                    self.err.errorWithCode(ie.span.start, .e300, "if branches have different types");
+                return then_type;
+            }
+            return TypeRegistry.VOID;
+        }
+        if (!types.isBool(self.types.get(cond_type))) self.err.errorWithCode(ie.span.start, .e300, "condition must be bool");
+        // Comptime dead branch elimination: only check the taken branch when condition is comptime-known.
+        // This allows @compileError in dead branches (Zig Sema pattern).
+        if (self.evalConstExpr(ie.condition)) |cond_val| {
+            if (cond_val != 0) return try self.checkExpr(ie.then_branch);
+            if (ie.else_branch != null_node) return try self.checkExpr(ie.else_branch);
+            return TypeRegistry.VOID;
+        }
+        const then_type = try self.checkExpr(ie.then_branch);
+        if (ie.else_branch != null_node) {
+            const else_type = try self.checkExpr(ie.else_branch);
+            if (!self.types.equal(then_type, else_type) and !self.types.isAssignable(else_type, then_type) and !self.types.isAssignable(then_type, else_type))
+                self.err.errorWithCode(ie.span.start, .e300, "if branches have different types");
+            return then_type;
+        }
+        return TypeRegistry.VOID;
+    }
+
+    fn checkSwitchExpr(self: *Checker, se: ast.SwitchExpr) CheckError!TypeIndex {
+        var subject_type = try self.checkExpr(se.subject);
+        var subject_info = self.types.get(subject_type);
+        // @safe auto-deref: switch on *Union → switch on Union
+        if (self.safe_mode and subject_info == .pointer) {
+            const elem = self.types.get(subject_info.pointer.elem);
+            if (elem == .union_type) {
+                subject_type = subject_info.pointer.elem;
+                subject_info = elem;
+            }
+        }
+        const is_union = subject_info == .union_type;
+        const is_enum = subject_info == .enum_type;
+        // Zig Sema pattern: set current enum type for .variant shorthand resolution in case patterns
+        const old_switch_enum = self.current_switch_enum_type;
+        if (is_enum) self.current_switch_enum_type = subject_type;
+        defer self.current_switch_enum_type = old_switch_enum;
+        // Zig result location: if expected_type is set (e.g. from return type), use it
+        // so untyped literals in arms materialize to the expected type, not i64.
+        var result_type: TypeIndex = if (self.expected_type != invalid_type) self.expected_type else TypeRegistry.VOID;
+        var first = self.expected_type != invalid_type; // skip first-arm inference if expected type is known
+        for (se.cases) |case| {
+            // Range patterns: check both start and end are valid expressions
+            for (case.patterns) |val_idx| _ = try self.checkExpr(val_idx);
+            // Rust: match guard type-checked as bool. Guard expression must be boolean.
+            if (case.guard != ast.null_node) _ = try self.checkExpr(case.guard);
+
+            // If union switch with capture, define capture variable in a new scope
+            if (is_union and case.capture.len > 0) {
+                const payload_type = self.resolveUnionCaptureType(subject_info.union_type, case.patterns);
+                const capture_type = if (case.capture_is_ptr)
+                    self.types.makePointer(payload_type) catch payload_type
+                else
+                    payload_type;
+                var capture_scope = Scope.init(self.allocator, self.scope);
+                defer capture_scope.deinit();
+                const old_scope = self.scope;
+                self.scope = &capture_scope;
+                try capture_scope.define(Symbol.init(case.capture, .variable, capture_type, ast.null_node, false));
+                const body_type = try self.checkExpr(case.body);
+                self.scope = old_scope;
+                if (!first) { result_type = self.materializeType(body_type); first = true; }
+            } else {
+                const body_type = try self.checkExpr(case.body);
+                if (!first) { result_type = self.materializeType(body_type); first = true; }
+            }
+        }
+        if (se.else_body != null_node) _ = try self.checkExpr(se.else_body);
+
+        // Enum switch exhaustiveness check (Zig pattern: switch on enum must be exhaustive or have else)
+        if (is_enum and se.else_body == null_node) {
+            const et = subject_info.enum_type;
+            // Build coverage set: track which variants are covered by unguarded cases
+            var covered = std.StringHashMap(void).init(self.allocator);
+            defer covered.deinit();
+            for (se.cases) |case| {
+                // Cases with guards don't guarantee coverage
+                if (case.guard != ast.null_node) continue;
+                for (case.patterns) |pat_idx| {
+                    const pat_node = self.tree.getNode(pat_idx) orelse continue;
+                    const pat_expr = pat_node.asExpr() orelse continue;
+                    if (pat_expr == .field_access) {
+                        covered.put(pat_expr.field_access.field, {}) catch {};
+                    }
+                }
+            }
+            // Check if all variants are covered
+            if (covered.count() < et.variants.len) {
+                // Build list of missing variant names
+                var missing = std.ArrayListUnmanaged(u8){};
+                defer missing.deinit(self.allocator);
+                var missing_count: usize = 0;
+                for (et.variants) |v| {
+                    if (!covered.contains(v.name)) {
+                        if (missing_count > 0) missing.appendSlice(self.allocator, ", ") catch {};
+                        missing.appendSlice(self.allocator, v.name) catch {};
+                        missing_count += 1;
+                    }
+                }
+                const msg = std.fmt.allocPrint(self.allocator, "switch on enum '{s}' must be exhaustive or have else branch; missing: {s}", .{ et.name, missing.items }) catch "non-exhaustive enum switch";
+                self.err.errorWithCode(se.span.start, .e300, msg);
+            }
+        }
+
+        return result_type;
+    }
+
+    /// Resolve the payload type for a union switch case capture from its patterns.
+    fn resolveUnionCaptureType(self: *Checker, ut: types.UnionType, patterns: []const NodeIndex) TypeIndex {
+        // Use the first pattern to determine the variant
+        if (patterns.len == 0) return TypeRegistry.VOID;
+        // Pattern is typically a field_access like Result.Ok
+        const node = self.tree.getNode(patterns[0]) orelse return TypeRegistry.VOID;
+        const expr = node.asExpr() orelse return TypeRegistry.VOID;
+        const field_name = switch (expr) {
+            .field_access => |fa| fa.field,
+            else => return TypeRegistry.VOID,
+        };
+        for (ut.variants) |v| {
+            if (std.mem.eql(u8, v.name, field_name)) return v.payload_type;
+        }
+        return TypeRegistry.VOID;
+    }
+
+    fn checkBlock(self: *Checker, b: ast.BlockExpr) CheckError!TypeIndex {
+        var block_scope = Scope.init(self.allocator, self.scope);
+        defer block_scope.deinit();
+        const old_scope = self.scope;
+        self.scope = &block_scope;
+        const has_label = b.label != null;
+        if (has_label) self.in_labeled_block += 1;
+        const saved_label_result = self.labeled_block_result_type;
+        if (has_label) self.labeled_block_result_type = invalid_type;
+        defer {
+            if (has_label) {
+                self.in_labeled_block -= 1;
+                self.labeled_block_result_type = saved_label_result;
+            }
+        }
+        // Zig RLS pattern: expected_type flows to the block's result expression,
+        // not to intermediate statements. Clear for stmts, restore for result.
+        const saved_expected = self.expected_type;
+        self.expected_type = invalid_type;
+        self.checkStmtsWithReachability(b.stmts);
+        self.expected_type = saved_expected;
+        const result = blk: {
+            if (b.expr != null_node) break :blk try self.checkExpr(b.expr);
+            // For labeled blocks, infer type from break values
+            if (has_label and self.labeled_block_result_type != invalid_type)
+                break :blk self.labeled_block_result_type;
+            break :blk TypeRegistry.VOID;
+        };
+        if (self.lint_mode) self.checkScopeUnused(&block_scope);
+        self.scope = old_scope;
+        return result;
+    }
+
+    fn checkBlockExpr(self: *Checker, idx: NodeIndex) CheckError!void {
+        const node = self.tree.getNode(idx) orelse return;
+        if (node.asExpr()) |expr| if (expr == .block_expr) { _ = try self.checkBlock(expr.block_expr); return; };
+        if (node.asStmt()) |stmt| if (stmt == .block_stmt) { try self.checkBlockStmt(stmt.block_stmt); return; };
+    }
+
+    fn checkStringInterp(self: *Checker, si: ast.StringInterp) CheckError!TypeIndex {
+        for (si.segments) |seg| {
+            if (seg == .expr) _ = try self.checkExpr(seg.expr);
+        }
+        return TypeRegistry.STRING;
+    }
+
+    /// Swift Sendable checking: determine if a type is safe to transfer across
+    /// concurrency boundaries (actor isolation, Task captures).
+    /// Reference: Swift TypeCheckConcurrency.cpp:7488 deriveImplicitSendableConformance.
+    ///
+    /// Rules:
+    /// - Primitives (int, i32, i64, f64, bool, string): always Sendable
+    /// - Structs: Sendable if ALL fields are Sendable (value semantics)
+    /// - Enums: always Sendable (simple value types)
+    /// - Unions: Sendable if ALL variant payloads are Sendable
+    /// - Optional(?T): Sendable if T is Sendable
+    /// - Error union(E!T): Sendable if T is Sendable
+    /// - List(T): Sendable if T is Sendable (COW — safe to share)
+    /// - Map(K,V): Sendable if K and V are Sendable (COW)
+    /// - Task(T): always Sendable (ARC heap object, safe reference)
+    /// - Actors: always Sendable (they ARE the isolation boundary) — Phase 3
+    /// - Distinct types: Sendable if underlying is Sendable
+    /// - Raw pointers: NOT Sendable (unsafe aliasing)
+    /// - Function types/closures: NOT Sendable (may capture mutable state)
+    /// - Slices: NOT Sendable (borrowed reference, not owned)
+    pub fn isSendable(self: *Checker, ty: TypeIndex) bool {
+        const info = self.types.get(ty);
+        return switch (info) {
+            .basic => true,
+            .struct_type => |s| {
+                // @unchecked Sendable: bypass recursive check
+                if (self.unchecked_sendable_types.contains(s.name)) return true;
+                for (s.fields) |f| {
+                    if (!self.isSendable(f.type_idx)) return false;
+                }
+                return true;
+            },
+            .enum_type => true,
+            .union_type => |u| {
+                for (u.variants) |v| {
+                    if (v.payload_type != types.invalid_type and !self.isSendable(v.payload_type)) return false;
+                }
+                return true;
+            },
+            .optional => |o| self.isSendable(o.elem),
+            .error_union => |eu| self.isSendable(eu.elem),
+            .list => |l| self.isSendable(l.elem),
+            .map => |m| self.isSendable(m.key) and self.isSendable(m.value),
+            .task => true,
+            .tuple => |t| {
+                for (t.element_types) |et| {
+                    if (!self.isSendable(et)) return false;
+                }
+                return true;
+            },
+            .distinct => |d| self.isSendable(d.underlying),
+            // Swift: existential is Sendable if the constraint includes Sendable.
+            // `any Sendable` is Sendable. `any MyProtocol & Sendable` is Sendable.
+            // Reference: TypeCheckConcurrency.cpp:7488 (existential Sendable check)
+            .existential => |e| std.mem.eql(u8, e.trait_name, "Sendable"),
+            .pointer => false,
+            // Swift SE-0302: closures are NOT Sendable by default.
+            // @Sendable closures (which capture only Sendable values) are Sendable.
+            // Cot: all closures are non-Sendable for now. @Sendable annotation
+            // will be added when closure capture checking is implemented.
+            .func => false,
+            // Slices are borrowed references — NOT Sendable.
+            // Exception: string (STRING = slice(u8)) is COW and immutable = Sendable.
+            .slice => ty == TypeRegistry.STRING,
+            .array => |a| self.isSendable(a.elem),
+            .error_set => true,
+        };
+    }
+
+    /// Format a type name for Sendable error messages.
+    fn sendableTypeName(self: *Checker, ty: TypeIndex) []const u8 {
+        return self.types.get(ty).name();
+    }
+
+    fn checkAddrOf(self: *Checker, ao: ast.AddrOf) CheckError!TypeIndex {
+        const operand_type = try self.checkExpr(ao.operand);
+        return try self.types.makePointer(operand_type);
+    }
+
+    fn checkTryExpr(self: *Checker, te: ast.TryExpr) CheckError!TypeIndex {
+        const operand_type = try self.checkExpr(te.operand);
+        const operand_info = self.types.get(operand_type);
+        if (operand_info != .error_union) {
+            self.err.errorWithCode(te.span.start, .e300, "try requires error union type");
+            return invalid_type;
+        }
+        // Enclosing function must return an error union
+        const ret_info = self.types.get(self.current_return_type);
+        if (ret_info != .error_union) {
+            self.err.errorWithCode(te.span.start, .e300, "try in non-error-returning function");
+        }
+        return operand_info.error_union.elem;
+    }
+
+    fn checkAwaitExpr(self: *Checker, ae: ast.AwaitExpr) CheckError!TypeIndex {
+        // Set in_await so cross-actor calls inside this expression are allowed
+        const saved_in_await = self.in_await;
+        self.in_await = true;
+        defer self.in_await = saved_in_await;
+
+        const operand_type = try self.checkExpr(ae.operand);
+
+        // Check if the operand is a cross-actor or global-actor call
+        // (doesn't return Task, just needs await for isolation hop)
+        if (self.isCrossActorCallExpr(ae.operand) or self.isGlobalActorCallExpr(ae.operand)) {
+            return operand_type; // Return the function's actual return type
+        }
+
+        // Otherwise, must be an async function call returning Task(T)
+        const operand_info = self.types.get(operand_type);
+        if (operand_info != .task) {
+            self.err.errorWithCode(ae.span.start, .e300, "cannot await non-task type");
+            return invalid_type;
+        }
+        return operand_info.task.result_type;
+    }
+
+    /// Type-check Task { body } expression (Swift SE-0304).
+    /// The body is a block whose return statements determine the Task's result type.
+    /// Phase 1 (eager): body runs immediately, result wrapped in Task(T).
+    /// Swift reference: Task+init.swift.gyb — Task<Success, Failure>
+    fn checkTaskExpr(self: *Checker, te: ast.TaskExpr) CheckError!TypeIndex {
+        // Check body in a child scope (captures allowed, like closures)
+        var task_scope = Scope.init(self.allocator, self.scope);
+        defer task_scope.deinit();
+        const old_scope = self.scope;
+        const old_return = self.current_return_type;
+        self.scope = &task_scope;
+        // Phase 1: Task body return type defaults to i64.
+        // Future: infer from return statements in body.
+        self.current_return_type = TypeRegistry.I64;
+        if (te.body != null_node) try self.checkBlockExpr(te.body);
+        self.scope = old_scope;
+        self.current_return_type = old_return;
+
+        // Wrap in Task(i64) — Phase 1 all task results are i64
+        return try self.types.makeTask(TypeRegistry.I64);
+    }
+
+    /// Check if an expression is a call to a method on an actor type.
+    fn isCrossActorCallExpr(self: *Checker, operand_idx: NodeIndex) bool {
+        const node = self.tree.getNode(operand_idx) orelse return false;
+        const expr = node.asExpr() orelse return false;
+        if (expr != .call) return false;
+        const receiver_name = self.getCallReceiverActorName(expr.call.callee);
+        if (receiver_name) |rn| return self.actor_types.contains(rn);
+        return false;
+    }
+
+    /// Check if an expression is a call to a @globalActor-isolated function.
+    fn isGlobalActorCallExpr(self: *Checker, operand_idx: NodeIndex) bool {
+        const node = self.tree.getNode(operand_idx) orelse return false;
+        const expr = node.asExpr() orelse return false;
+        if (expr != .call) return false;
+        const callee_node = self.tree.getNode(expr.call.callee) orelse return false;
+        const callee_expr = callee_node.asExpr() orelse return false;
+        if (callee_expr != .ident) return false;
+        return self.global_actor_fns.contains(callee_expr.ident.name);
+    }
+
+    /// Get the actor type name from a method call callee (field_access on an actor instance).
+    fn getCallReceiverActorName(self: *Checker, callee_idx: NodeIndex) ?[]const u8 {
+        const ce = (self.tree.getNode(callee_idx) orelse return null).asExpr() orelse return null;
+        if (ce != .field_access) return null;
+        const base_type_idx = self.expr_types.get(ce.field_access.base) orelse return null;
+        const base_type = self.types.get(base_type_idx);
+        return switch (base_type) {
+            .struct_type => |st| st.name,
+            .pointer => |ptr| switch (self.types.get(ptr.elem)) {
+                .struct_type => |st| st.name,
+                else => null,
+            },
+            else => null,
+        };
+    }
+
+
+    fn checkCatchExpr(self: *Checker, ce: ast.CatchExpr) CheckError!TypeIndex {
+        const operand_type = try self.checkExpr(ce.operand);
+        const operand_info = self.types.get(operand_type);
+        if (operand_info != .error_union) {
+            self.err.errorWithCode(ce.span.start, .e300, "catch requires error union type");
+            return try self.checkExpr(ce.fallback);
+        }
+        const elem_type = operand_info.error_union.elem;
+        // Catch capture: catch |err| { ... } — bind err to error set type
+        var fallback_type: TypeIndex = TypeRegistry.VOID;
+        if (ce.capture.len > 0) {
+            const err_type = if (operand_info.error_union.error_set != types.invalid_type) operand_info.error_union.error_set else TypeRegistry.I64;
+            const capture_type = if (ce.capture_is_ptr)
+                self.types.makePointer(err_type) catch err_type
+            else
+                err_type;
+            var capture_scope = Scope.init(self.allocator, self.scope);
+            defer capture_scope.deinit();
+            const old_scope = self.scope;
+            self.scope = &capture_scope;
+            try capture_scope.define(Symbol.init(ce.capture, .variable, capture_type, ast.null_node, false));
+            fallback_type = try self.checkExpr(ce.fallback);
+            self.scope = old_scope;
+        } else {
+            fallback_type = try self.checkExpr(ce.fallback);
+        }
+        // Zig pattern: when elem_type is void but fallback produces a value,
+        // the catch expression's type is the fallback type.
+        // E.g., `voidErrUnion() catch 99` has type int, not void.
+        if (elem_type == TypeRegistry.VOID and fallback_type != TypeRegistry.VOID) {
+            return fallback_type;
+        }
+        return elem_type;
+    }
+
+    fn checkOrElseExpr(self: *Checker, oe: ast.OrElseExpr) CheckError!TypeIndex {
+        const operand_type = try self.checkExpr(oe.operand);
+        const operand_info = self.types.get(operand_type);
+        if (operand_info != .optional) {
+            self.err.errorWithCode(oe.span.start, .e300, "orelse requires optional type");
+            return operand_type;
+        }
+        const elem_type = operand_info.optional.elem;
+        switch (oe.fallback_kind) {
+            .expr => {
+                _ = try self.checkExpr(oe.fallback);
+                return elem_type;
+            },
+            .return_val => {
+                if (oe.fallback != ast.null_node) _ = try self.checkExpr(oe.fallback);
+                return elem_type;
+            },
+            .return_void, .break_val, .continue_val => return elem_type,
+        }
+    }
+
+    fn checkErrorLiteral(self: *Checker, el: ast.ErrorLiteral) CheckError!TypeIndex {
+        // error.X returns an error set type; the specific set is inferred from context
+        // First check the function's return type for the error set
+        const ret_info = self.types.get(self.current_return_type);
+        if (ret_info == .error_union and ret_info.error_union.error_set != types.invalid_type) {
+            const es_info = self.types.get(ret_info.error_union.error_set);
+            if (es_info == .error_set) {
+                for (es_info.error_set.variants) |v| {
+                    if (std.mem.eql(u8, v, el.error_name)) return ret_info.error_union.error_set;
+                }
+            }
+        }
+        // Check expected_type (for var init context): var e: MyError!i64 = error.Foo
+        if (self.expected_type != invalid_type) {
+            const exp_info = self.types.get(self.expected_type);
+            if (exp_info == .error_union and exp_info.error_union.error_set != types.invalid_type) {
+                const es_info = self.types.get(exp_info.error_union.error_set);
+                if (es_info == .error_set) {
+                    for (es_info.error_set.variants) |v| {
+                        if (std.mem.eql(u8, v, el.error_name)) return exp_info.error_union.error_set;
+                    }
+                }
+            }
+            // expected_type might be an error_set directly
+            if (exp_info == .error_set) {
+                for (exp_info.error_set.variants) |v| {
+                    if (std.mem.eql(u8, v, el.error_name)) return self.expected_type;
+                }
+            }
+        }
+        // Also check all error set types in scope (for switch on caught errors)
+        // This allows error.X in switch patterns when catching from different error sets
+        return self.current_return_type;
+    }
+
+    fn checkDeref(self: *Checker, d: ast.Deref) CheckError!TypeIndex {
+        const operand_type = try self.checkExpr(d.operand);
+        if (self.types.isPointer(operand_type)) return self.types.pointerElem(operand_type);
+        self.err.errorWithCode(d.span.start, .e300, "cannot dereference non-pointer");
+        return invalid_type;
+    }
+
+    fn checkStmt(self: *Checker, idx: NodeIndex) CheckError!void {
+        const stmt = (self.tree.getNode(idx) orelse return).asStmt() orelse return;
+        switch (stmt) {
+            .expr_stmt => |es| _ = try self.checkExpr(es.expr),
+            .return_stmt => |rs| try self.checkReturn(rs),
+            .var_stmt => |vs| try self.checkVarStmt(vs, idx),
+            .assign_stmt => |as_stmt| try self.checkAssign(as_stmt),
+            .if_stmt => |is| try self.checkIfStmt(is),
+            .while_stmt => |ws| try self.checkWhileStmt(ws),
+            .for_stmt => |fs| try self.checkForStmt(fs),
+            .block_stmt => |bs| try self.checkBlockStmt(bs),
+            .break_stmt => |bs| {
+                if (bs.label != null) {
+                    if (self.in_labeled_block == 0 and !self.in_loop)
+                        self.err.errorWithCode(bs.span.start, .e300, "break label does not match any enclosing labeled block or loop");
+                    if (bs.value != null_node) {
+                        const val_type = try self.checkExpr(bs.value);
+                        if (self.labeled_block_result_type == invalid_type)
+                            self.labeled_block_result_type = val_type;
+                    }
+                } else if (!self.in_loop) self.err.errorWithCode(bs.span.start, .e300, "break outside of loop");
+            },
+            .continue_stmt => |cs| if (!self.in_loop) self.err.errorWithCode(cs.span.start, .e300, "continue outside of loop"),
+            .defer_stmt => |ds| _ = try self.checkExpr(ds.expr),
+            .destructure_stmt => |ds| try self.checkDestructureStmt(ds, idx),
+            .async_let => |al| {
+                // async let name = asyncCall() — type-check value, define binding with its type
+                const val_type = try self.checkExpr(al.value);
+                if (!self.scope.isDefined(al.name)) {
+                    try self.scope.define(Symbol.init(al.name, .constant, val_type, idx, false));
+                }
+            },
+            .bad_stmt => {},
+        }
+    }
+
+    fn checkReturn(self: *Checker, rs: ast.ReturnStmt) CheckError!void {
+        if (self.current_return_type == TypeRegistry.NORETURN) {
+            self.err.errorWithCode(rs.span.start, .e300, "noreturn function cannot return");
+            return;
+        }
+        if (rs.value != null_node) {
+            const saved_expected = self.expected_type;
+            self.expected_type = self.current_return_type;
+            defer self.expected_type = saved_expected;
+            const val_type = try self.checkExpr(rs.value);
+            if (self.current_return_type == TypeRegistry.VOID) self.err.errorWithCode(rs.span.start, .e300, "void function should not return a value")
+            else if (!self.types.isAssignable(val_type, self.current_return_type)) self.err.errorWithCode(rs.span.start, .e300, "type mismatch");
+        } else if (self.current_return_type != TypeRegistry.VOID) self.err.errorWithCode(rs.span.start, .e300, "non-void function must return a value");
+    }
+
+    fn checkVarStmt(self: *Checker, vs: ast.VarStmt, idx: NodeIndex) CheckError!void {
+        if (self.scope.isDefined(vs.name)) { self.reportRedefined(vs.span.start, vs.name); return; }
+        // Lint: check for variable shadowing (parent scope has same name)
+        if (self.lint_mode and self.scope.parent != null) {
+            if (self.scope.parent.?.lookup(vs.name) != null) {
+                self.err.warningWithCode(vs.span.start, .w003, vs.name);
+            }
+        }
+        var var_type: TypeIndex = if (vs.type_expr != null_node) try self.resolveTypeExpr(vs.type_expr) else invalid_type;
+        if (vs.value != null_node and !self.isUndefinedLit(vs.value) and !self.isZeroInitLit(vs.value)) {
+            const saved_expected = self.expected_type;
+            if (var_type != invalid_type) self.expected_type = var_type;
+            defer self.expected_type = saved_expected;
+            const val_type = try self.checkExpr(vs.value);
+            if (var_type == invalid_type) var_type = self.materializeType(val_type)
+            else if (!self.types.isAssignable(val_type, var_type)) {
+                // @safe coercion: Foo annotation accepts *Foo value (e.g. var f: Foo = new Foo{...})
+                const vt_info = self.types.get(var_type);
+                const is_composite_var = vt_info == .struct_type or vt_info == .union_type;
+                if (self.safe_mode and is_composite_var and self.types.get(val_type) == .pointer and blk: {
+                    const elem = self.types.get(val_type).pointer.elem;
+                    const elem_info = self.types.get(elem);
+                    break :blk (elem_info == .struct_type or elem_info == .union_type) and self.types.isAssignable(elem, var_type);
+                })
+                {
+                    var_type = val_type; // upgrade to *Foo
+                } else {
+                    self.err.errorWithCode(vs.span.start, .e300, "type mismatch");
+                }
+            }
+        }
+        if (self.isZeroInitLit(vs.value) and var_type == invalid_type) {
+            self.err.errorWithCode(vs.span.start, .e300, "zero init requires type annotation");
+        }
+        // Validate unowned: must target an ARC-managed pointer type
+        if (vs.is_unowned) {
+            if (!self.types.couldBeARC(var_type)) {
+                self.err.errorWithCode(vs.span.start, .e300, "'unowned' can only be used with ARC-managed pointer types");
+            }
+        }
+        // Validate weak: must target an ARC-managed pointer type
+        if (vs.is_weak) {
+            if (!self.types.couldBeARC(var_type)) {
+                self.err.errorWithCode(vs.span.start, .e300, "'weak' can only be used with ARC-managed pointer types");
+            }
+        }
+        // Store const_value for comptime const-folding (Zig Sema pattern: local const propagation)
+        if (vs.is_const and vs.value != null_node) {
+            if (self.evalConstExpr(vs.value)) |cv| {
+                try self.scope.define(Symbol.initConst(vs.name, var_type, idx, cv));
+                return;
+            }
+        }
+        try self.scope.define(Symbol.init(vs.name, if (vs.is_const) .constant else .variable, var_type, idx, !vs.is_const));
+    }
+
+    fn checkDestructureStmt(self: *Checker, ds: ast.DestructureStmt, idx: NodeIndex) CheckError!void {
+        // Check for redefinitions
+        for (ds.bindings) |b| {
+            if (self.scope.isDefined(b.name)) {
+                self.reportRedefined(b.span.start, b.name);
+                return;
+            }
+        }
+
+        // Check the RHS value type
+        const val_type = try self.checkExpr(ds.value);
+        const val_info = self.types.get(val_type);
+
+        // RHS must be a tuple type
+        if (val_info != .tuple) {
+            self.err.errorWithCode(ds.span.start, .e300, "destructuring requires a tuple value");
+            return;
+        }
+        const tup = val_info.tuple;
+
+        // Count must match
+        if (ds.bindings.len != tup.element_types.len) {
+            self.err.errorWithCode(ds.span.start, .e300, "destructuring count mismatch");
+            return;
+        }
+
+        // Define each binding with its element type
+        for (ds.bindings, 0..) |b, i| {
+            var elem_type = tup.element_types[i];
+            if (b.type_expr != null_node) {
+                const annotated = try self.resolveTypeExpr(b.type_expr);
+                if (!self.types.isAssignable(elem_type, annotated)) {
+                    self.err.errorWithCode(b.span.start, .e300, "type mismatch");
+                }
+                elem_type = annotated;
+            } else {
+                elem_type = self.materializeType(elem_type);
+            }
+            try self.scope.define(Symbol.init(b.name, if (ds.is_const) .constant else .variable, elem_type, idx, !ds.is_const));
+        }
+    }
+
+    fn checkAssign(self: *Checker, as_stmt: ast.AssignStmt) CheckError!void {
+        // Discard pattern: `_ = expr;` — evaluate expr for side effects, discard result.
+        // Same semantics as Zig's `_ = foo();` (ignore return value).
+        const target = (self.tree.getNode(as_stmt.target) orelse return).asExpr() orelse return;
+        if (target == .ident and std.mem.eql(u8, target.ident.name, "_")) {
+            _ = try self.checkExpr(as_stmt.value);
+            return;
+        }
+
+        const target_type = try self.checkExpr(as_stmt.target);
+        // Set expected type so `.{}` resolves to the target type (like `var x: T = .{}`)
+        const old_expected = self.expected_type;
+        self.expected_type = target_type;
+        const value_type = try self.checkExpr(as_stmt.value);
+        self.expected_type = old_expected;
+        switch (target) {
+            .ident => |id| if (self.scope.lookup(id.name)) |sym| if (!sym.mutable) { self.err.errorWithCode(as_stmt.span.start, .e300, "cannot assign to constant"); return; },
+            .index, .field_access, .deref => {},
+            else => { self.err.errorWithCode(as_stmt.span.start, .e300, "invalid assignment target"); return; },
+        }
+        // @safe mode auto-ref: if value is *T and target is T, allow (auto-deref assignment).
+        // This handles ptr.* = v where v is auto-ref'd from T to *T.
+        if (!self.types.isAssignable(value_type, target_type)) {
+            const value_info = self.types.get(value_type);
+            if (value_info != .pointer or !self.types.isAssignable(value_info.pointer.elem, target_type)) {
+                self.err.errorWithCode(as_stmt.span.start, .e300, "type mismatch");
+            }
+        }
+    }
+
+    fn checkIfStmt(self: *Checker, is: ast.IfStmt) CheckError!void {
+        const cond_type = try self.checkExpr(is.condition);
+        // Optional unwrap: if expr |val| { ... } — Zig payload capture pattern
+        if (is.capture.len > 0) {
+            const cond_info = self.types.get(cond_type);
+            if (cond_info != .optional) {
+                self.err.errorWithCode(is.span.start, .e300, "capture requires optional type");
+                return;
+            }
+            const elem_type = cond_info.optional.elem;
+            const capture_type = if (is.capture_is_ptr)
+                self.types.makePointer(elem_type) catch elem_type
+            else
+                elem_type;
+            // Check then-branch with capture variable in scope
+            var capture_scope = Scope.init(self.allocator, self.scope);
+            defer capture_scope.deinit();
+            const old_scope = self.scope;
+            self.scope = &capture_scope;
+            try capture_scope.define(Symbol.init(is.capture, .variable, capture_type, ast.null_node, false));
+            try self.checkStmt(is.then_branch);
+            self.scope = old_scope;
+            if (is.else_branch != null_node) try self.checkStmt(is.else_branch);
+            return;
+        }
+        if (!types.isBool(self.types.get(cond_type))) self.err.errorWithCode(is.span.start, .e300, "condition must be bool");
+        // Comptime dead branch elimination: only check the taken branch when condition is comptime-known.
+        // This allows @compileError in dead branches (Zig Sema pattern).
+        if (self.evalConstExpr(is.condition)) |cond_val| {
+            if (cond_val != 0) { try self.checkStmt(is.then_branch); return; }
+            if (is.else_branch != null_node) { try self.checkStmt(is.else_branch); return; }
+            return;
+        }
+        // Lint: empty block detection (W005)
+        if (self.lint_mode and self.isEmptyBlock(is.then_branch)) {
+            self.err.warningWithCode(is.span.start, .w005, "empty if body");
+        }
+        try self.checkStmt(is.then_branch);
+        if (is.else_branch != null_node) {
+            if (self.lint_mode and self.isEmptyBlock(is.else_branch)) {
+                self.err.warningWithCode(is.span.start, .w005, "empty else body");
+            }
+            try self.checkStmt(is.else_branch);
+        }
+    }
+
+    fn checkWhileStmt(self: *Checker, ws: ast.WhileStmt) CheckError!void {
+        const cond_type = try self.checkExpr(ws.condition);
+        // Optional capture: while (expr) |val| { ... } — Zig payload capture pattern
+        if (ws.capture.len > 0) {
+            const cond_info = self.types.get(cond_type);
+            if (cond_info != .optional) {
+                self.err.errorWithCode(ws.span.start, .e300, "capture requires optional type");
+                return;
+            }
+            const elem_type = cond_info.optional.elem;
+            const capture_type = if (ws.capture_is_ptr)
+                self.types.makePointer(elem_type) catch elem_type
+            else
+                elem_type;
+            var capture_scope = Scope.init(self.allocator, self.scope);
+            defer capture_scope.deinit();
+            const old_scope = self.scope;
+            self.scope = &capture_scope;
+            try capture_scope.define(Symbol.init(ws.capture, .variable, capture_type, ast.null_node, false));
+            const old_in_loop = self.in_loop;
+            self.in_loop = true;
+            if (ws.continue_expr != ast.null_node) try self.checkContinueExpr(ws.continue_expr);
+            try self.checkStmt(ws.body);
+            self.in_loop = old_in_loop;
+            self.scope = old_scope;
+            return;
+        }
+        if (!types.isBool(self.types.get(cond_type))) self.err.errorWithCode(ws.span.start, .e300, "condition must be bool");
+        // Lint: empty block detection (W005)
+        if (self.lint_mode and self.isEmptyBlock(ws.body)) {
+            self.err.warningWithCode(ws.span.start, .w005, "empty while body");
+        }
+        const old_in_loop = self.in_loop;
+        self.in_loop = true;
+        if (ws.continue_expr != ast.null_node) try self.checkContinueExpr(ws.continue_expr);
+        try self.checkStmt(ws.body);
+        self.in_loop = old_in_loop;
+    }
+
+    /// Check a while continue expression — may be a statement (assignment) or expression
+    fn checkContinueExpr(self: *Checker, node_idx: ast.NodeIndex) CheckError!void {
+        const node = self.tree.getNode(node_idx) orelse return;
+        if (node.asStmt() != null) {
+            try self.checkStmt(node_idx);
+        } else {
+            _ = try self.checkExpr(node_idx);
+        }
+    }
+
+    fn checkForStmt(self: *Checker, fs: ast.ForStmt) CheckError!void {
+        // Inline for: unroll at compile time — Zig AstGen.zig:6863
+        if (fs.is_inline) {
+            return self.checkInlineFor(fs);
+        }
+
+        // Swift for-await-in: `for await x in sequence { body }`
+        // The sequence must have a next() method returning ?T.
+        // Element type is T (the unwrapped optional payload).
+        // Reference: Swift AsyncSequence.swift, SE-0298.
+        if (fs.is_await) {
+            const iter_type = try self.checkExpr(fs.iterable);
+            // Look up next() method on the iterable type
+            const iter_info = self.types.get(iter_type);
+            const type_name: ?[]const u8 = switch (iter_info) {
+                .struct_type => |st| st.name,
+                .pointer => |ptr| switch (self.types.get(ptr.elem)) {
+                    .struct_type => |st| st.name,
+                    else => null,
+                },
+                else => null,
+            };
+            var elem_type: TypeIndex = TypeRegistry.I64;
+            if (type_name) |tn| {
+                if (self.lookupMethod(tn, "next")) |method| {
+                    const method_info = self.types.get(method.func_type);
+                    if (method_info == .func) {
+                        const ret = self.types.get(method_info.func.return_type);
+                        if (ret == .optional) elem_type = ret.optional.elem;
+                    }
+                }
+            }
+            var loop_scope = Scope.init(self.allocator, self.scope);
+            defer loop_scope.deinit();
+            try loop_scope.define(Symbol.init(fs.binding, .variable, elem_type, null_node, false));
+            const old_scope = self.scope;
+            const old_in_loop = self.in_loop;
+            self.scope = &loop_scope;
+            self.in_loop = true;
+            try self.checkBlockExpr(fs.body);
+            self.scope = old_scope;
+            self.in_loop = old_in_loop;
+            return;
+        }
+
+        var elem_type: TypeIndex = invalid_type;
+        var idx_type: TypeIndex = TypeRegistry.I64;
+        if (fs.isRange()) {
+            const start_type = try self.checkExpr(fs.range_start);
+            const end_type = try self.checkExpr(fs.range_end);
+            if (!types.isInteger(self.types.get(start_type)) or !types.isInteger(self.types.get(end_type))) {
+                self.err.errorWithCode(fs.span.start, .e300, "range bounds must be integers");
+            } else {
+                elem_type = start_type;
+            }
+        } else {
+            const iter_type = try self.checkExpr(fs.iterable);
+            const iter = self.types.get(iter_type);
+            switch (iter) {
+                .array => |a| elem_type = a.elem,
+                .slice => |s| elem_type = s.elem,
+                .map => |ma| {
+                    // for k, v in map — binding=value, index_binding=key
+                    elem_type = ma.value;
+                    idx_type = ma.key;
+                },
+                .struct_type => |st| {
+                    // Check if struct is a Map generic instance (name starts with "Map(")
+                    // Go range.go:241-270: desugars `for k, v := range m` to mapIterStart/mapIterNext
+                    if (std.mem.startsWith(u8, st.name, "Map(")) {
+                        // Parse type args from generic name: "Map(K;V)" where K,V are TypeIndex ints
+                        if (parseMapTypeArgs(st.name)) |args| {
+                            idx_type = args[0]; // K
+                            elem_type = args[1]; // V
+                        } else {
+                            self.err.errorWithCode(fs.span.start, .e300, "cannot iterate over this type");
+                        }
+                    } else {
+                        self.err.errorWithCode(fs.span.start, .e300, "cannot iterate over this type");
+                    }
+                },
+                else => self.err.errorWithCode(fs.span.start, .e300, "cannot iterate over this type"),
+            }
+        }
+        var loop_scope = Scope.init(self.allocator, self.scope);
+        defer loop_scope.deinit();
+        try loop_scope.define(Symbol.init(fs.binding, .variable, elem_type, null_node, false));
+        // Define index/key binding if present (for i, x in arr OR for k, v in map)
+        if (fs.index_binding) |idx_binding| {
+            try loop_scope.define(Symbol.init(idx_binding, .variable, idx_type, null_node, false));
+        }
+        // Lint: empty block detection (W005)
+        if (self.lint_mode and self.isEmptyBlock(fs.body)) {
+            self.err.warningWithCode(fs.span.start, .w005, "empty for body");
+        }
+        const old_scope = self.scope;
+        const old_in_loop = self.in_loop;
+        self.scope = &loop_scope;
+        self.in_loop = true;
+        try self.checkStmt(fs.body);
+        self.scope = old_scope;
+        self.in_loop = old_in_loop;
+    }
+
+    /// Check inline for — unroll at compile time with comptime-known range bounds or comptime arrays.
+    /// Zig AstGen.zig:6863: block_inline tag, Sema materializes each iteration.
+    fn checkInlineFor(self: *Checker, fs: ast.ForStmt) CheckError!void {
+        if (fs.isRange()) {
+            const start_val = self.evalConstExpr(fs.range_start) orelse {
+                self.err.errorWithCode(fs.span.start, .e300, "inline for range start must be comptime-known");
+                return;
+            };
+            const end_val = self.evalConstExpr(fs.range_end) orelse {
+                self.err.errorWithCode(fs.span.start, .e300, "inline for range end must be comptime-known");
+                return;
+            };
+            // Unroll: check body once per iteration with const binding
+            var i = start_val;
+            while (i < end_val) : (i += 1) {
+                var iter_scope = Scope.init(self.allocator, self.scope);
+                defer iter_scope.deinit();
+                try iter_scope.define(Symbol.initConst(fs.binding, TypeRegistry.I64, null_node, i));
+                const old_scope = self.scope;
+                self.scope = &iter_scope;
+                try self.checkStmt(fs.body);
+                self.scope = old_scope;
+            }
+            return;
+        }
+        // Comptime array iteration: inline for field in @typeInfo(T).fields
+        const iter_val = self.evalComptimeValue(fs.iterable) orelse {
+            self.err.errorWithCode(fs.span.start, .e300, "inline for requires comptime-known iterable");
+            return;
+        };
+        if (iter_val != .array) {
+            self.err.errorWithCode(fs.span.start, .e300, "inline for iterable must be comptime array or range");
+            return;
+        }
+        // Unroll: check body once per element with comptime binding
+        for (iter_val.array.elements.items, 0..) |elem, idx| {
+            var iter_scope = Scope.init(self.allocator, self.scope);
+            defer iter_scope.deinit();
+            // Bind loop variable as comptime value
+            var sym = Symbol.init(fs.binding, .constant, TypeRegistry.I64, null_node, false);
+            sym.comptime_val = elem;
+            // For enum fields, also set const_value for integer access
+            if (elem == .int) sym.const_value = elem.int;
+            try iter_scope.define(sym);
+            if (fs.index_binding) |ib| {
+                try iter_scope.define(Symbol.initConst(ib, TypeRegistry.I64, null_node, @intCast(idx)));
+            }
+            const old_scope = self.scope;
+            self.scope = &iter_scope;
+            try self.checkStmt(fs.body);
+            self.scope = old_scope;
+        }
+    }
+
+    fn checkBlockStmt(self: *Checker, bs: ast.BlockStmt) CheckError!void {
+        var block_scope = Scope.init(self.allocator, self.scope);
+        defer block_scope.deinit();
+        const old_scope = self.scope;
+        self.scope = &block_scope;
+        self.checkStmtsWithReachability(bs.stmts);
+        if (self.lint_mode) self.checkScopeUnused(&block_scope);
+        self.scope = old_scope;
+    }
+
+    fn resolveTypeExpr(self: *Checker, idx: NodeIndex) CheckError!TypeIndex {
+        if (idx == null_node) return invalid_type;
+        const expr = (self.tree.getNode(idx) orelse return invalid_type).asExpr() orelse return invalid_type;
+        if (expr == .ident) {
+            // Check type substitution first (active during generic instantiation)
+            if (self.type_substitution) |sub| {
+                if (sub.get(expr.ident.name)) |substituted| return substituted;
+            }
+            if (self.resolveTypeByName(expr.ident.name)) |tidx| return tidx;
+            // Fallback: resolve arbitrary-width integer types (u3, i5, etc.) for packed struct fields
+            if (self.types.lookupBitfieldType(expr.ident.name)) |tidx| return tidx;
+            self.errWithSuggestion(expr.ident.span.start, "undefined type", self.findSimilarType(expr.ident.name));
+            return invalid_type;
+        }
+        // @TypeOf(expr) in type position — Zig Sema.zig:18007
+        if (expr == .builtin_call and expr.builtin_call.kind == .type_of) {
+            return try self.checkExpr(expr.builtin_call.args[0]);
+        }
+        if (expr != .type_expr) return invalid_type;
+        return self.resolveType(expr.type_expr);
+    }
+
+    fn resolveType(self: *Checker, te: ast.TypeExpr) CheckError!TypeIndex {
+        return switch (te.kind) {
+            .named => |n| blk: {
+                // Check type substitution first (active during generic instantiation)
+                if (self.type_substitution) |sub| {
+                    if (sub.get(n)) |substituted| break :blk substituted;
+                }
+                // Go pattern: scope-first, then type registry, then silent invalid
+                // During collectDecl, consts like "const AllErrors = FileErr || NetErr"
+                // exist in scope as .constant (not .type_name) before checkVarDecl runs.
+                // Return invalid_type silently in that case (resolved later during checking).
+                if (self.resolveTypeByName(n)) |tidx| break :blk tidx;
+                if (self.types.lookupBitfieldType(n)) |tidx| break :blk tidx;
+                if (self.scope.lookup(n) != null) break :blk invalid_type;
+                self.errWithSuggestion(te.span.start, "undefined type", self.findSimilarType(n));
+                break :blk invalid_type;
+            },
+            .pointer => |e| self.types.makePointer(try self.resolveTypeExpr(e)),
+            .optional => |e| self.types.makeOptional(try self.resolveTypeExpr(e)),
+            .error_union => |eu| blk: {
+                const elem = try self.resolveTypeExpr(eu.elem);
+                if (eu.error_set != ast.null_node) {
+                    const es_type = try self.resolveTypeExpr(eu.error_set);
+                    break :blk self.types.makeErrorUnionWithSet(elem, es_type);
+                }
+                break :blk self.types.makeErrorUnion(elem);
+            },
+            .slice => |e| self.types.makeSlice(try self.resolveTypeExpr(e)),
+            .array => |a| blk: {
+                const elem = try self.resolveTypeExpr(a.elem);
+                const size_expr = (self.tree.getNode(a.size) orelse break :blk invalid_type).asExpr() orelse break :blk invalid_type;
+                const size: u64 = if (size_expr == .literal and size_expr.literal.kind == .int)
+                    std.fmt.parseInt(u64, size_expr.literal.value, 0) catch 0
+                else if (self.evalConstExpr(a.size)) |v|
+                    if (v > 0) @as(u64, @intCast(v)) else 0
+                else
+                    0;
+                break :blk try self.types.makeArray(elem, size);
+            },
+            .map => |m| self.types.makeMap(try self.resolveTypeExpr(m.key), try self.resolveTypeExpr(m.value)),
+            .list => |e| self.types.makeList(try self.resolveTypeExpr(e)),
+            .function => |f| blk: {
+                var func_params = std.ArrayListUnmanaged(types.FuncParam){};
+                defer func_params.deinit(self.allocator);
+                for (f.params) |pt| {
+                    // Apply safeWrapType to function pointer param types so they match
+                    // actual function definitions (which also get safeWrapType in buildFuncType).
+                    // Without this, fn(T, T) -> i64 with T=Point resolves to fn(Point, Point) -> i64,
+                    // but user comparators become fn(*Point, *Point) -> i64 — type mismatch.
+                    var pt_type = try self.resolveTypeExpr(pt);
+                    pt_type = try self.safeWrapType(pt_type);
+                    try func_params.append(self.allocator, .{ .name = "", .type_idx = pt_type });
+                }
+                const ret_type = if (f.ret != null_node) try self.resolveTypeExpr(f.ret) else TypeRegistry.VOID;
+                break :blk try self.types.makeFunc(func_params.items, ret_type);
+            },
+            .tuple => |elems| blk: {
+                var elem_types = std.ArrayListUnmanaged(TypeIndex){};
+                defer elem_types.deinit(self.allocator);
+                for (elems) |e| try elem_types.append(self.allocator, try self.resolveTypeExpr(e));
+                break :blk try self.types.makeTuple(elem_types.items);
+            },
+            .generic_instance => |gi| try self.resolveGenericInstance(gi, te.span),
+            .existential => |trait_node| blk: {
+                // Resolve trait name from the ident node
+                const trait_ident = self.tree.getNode(trait_node) orelse break :blk invalid_type;
+                const trait_expr = trait_ident.asExpr() orelse break :blk invalid_type;
+                const trait_name = if (trait_expr == .ident) trait_expr.ident.name else break :blk invalid_type;
+                // Look up trait definition
+                const trait_def = self.generics.trait_defs.get(trait_name) orelse {
+                    self.err.errorWithCode(te.span.start, .e301, try std.fmt.allocPrint(self.allocator, "undefined trait '{s}'", .{trait_name}));
+                    break :blk invalid_type;
+                };
+                // Collect conforming types from trait_impls ("Trait:Type" → trait)
+                var conforming = std.ArrayListUnmanaged([]const u8){};
+                var impl_it = self.generics.trait_impls.iterator();
+                while (impl_it.next()) |impl_entry| {
+                    if (std.mem.eql(u8, impl_entry.value_ptr.*, trait_name)) {
+                        const key = impl_entry.key_ptr.*;
+                        if (std.mem.indexOf(u8, key, ":")) |colon| {
+                            try conforming.append(self.allocator, key[colon + 1 ..]);
+                        }
+                    }
+                }
+                const exist_idx = try self.types.makeExistential(trait_name, trait_def.method_names);
+                // Update conforming_types on the existential type
+                var exist_type = &self.types.types.items[@intCast(exist_idx)];
+                exist_type.existential.conforming_types = try self.allocator.dupe([]const u8, conforming.items);
+                break :blk exist_idx;
+            },
+        };
+    }
+
+    /// Go pattern: types2/instantiate.go:87-125 — instance() for named types.
+    /// Creates concrete struct type with substituted fields, deduplicates via cache.
+    fn resolveGenericInstance(self: *Checker, gi: ast.GenericInstance, span: Span) CheckError!TypeIndex {
+        const gen_info = self.generics.generic_structs.get(gi.name) orelse {
+            // Built-in collection types (List, Map) aren't in generic_structs — they're
+            // compiler primitives. When referenced from generic struct fields (e.g.
+            // `results: List(T)` in TaskGroup(T)), resolve them directly via makeList/makeMap.
+            // This only fires as a fallback when the name isn't a user-defined generic.
+            if (std.mem.eql(u8, gi.name, "List") and gi.type_args.len == 1) {
+                const elem_type = try self.resolveTypeExpr(gi.type_args[0]);
+                return try self.types.makeList(elem_type);
+            }
+            if (std.mem.eql(u8, gi.name, "Map") and gi.type_args.len == 2) {
+                const key_type = try self.resolveTypeExpr(gi.type_args[0]);
+                const val_type = try self.resolveTypeExpr(gi.type_args[1]);
+                return try self.types.makeMap(key_type, val_type);
+            }
+            self.errWithSuggestion(span.start, "undefined generic type", self.findSimilarType(gi.name));
+            return invalid_type;
+        };
+
+        // Validate argument count
+        if (gi.type_args.len != gen_info.type_params.len) {
+            self.err.errorWithCode(span.start, .e300, "wrong number of type arguments");
+            return invalid_type;
+        }
+
+        // Resolve each type argument
+        var resolved_args = std.ArrayListUnmanaged(TypeIndex){};
+        defer resolved_args.deinit(self.allocator);
+        for (gi.type_args) |arg_node| {
+            const arg_type = try self.resolveTypeExpr(arg_node);
+            try resolved_args.append(self.allocator, arg_type);
+        }
+
+        // Build cache key for dedup: "Pair(5,17)" (TypeIndex values)
+        const cache_key = try self.buildGenericCacheKey(gi.name, resolved_args.items);
+
+        // Check instantiation cache
+        if (self.generics.instantiation_cache.get(cache_key)) |cached| return cached;
+
+        // Create type substitution map
+        var sub_map = std.StringHashMap(TypeIndex).init(self.allocator);
+        defer sub_map.deinit();
+        for (gen_info.type_params, 0..) |param_name, i| {
+            try sub_map.put(param_name, resolved_args.items[i]);
+        }
+
+        // Swap to the defining file's AST, safe_mode, and scope for cross-file generic resolution.
+        // Go resolver.go pattern: generic instantiation uses the declaring file's environment.
+        const saved_tree = self.tree;
+        const saved_safe_mode = self.safe_mode;
+        const saved_scope = self.scope;
+        self.tree = gen_info.tree;
+        if (gen_info.tree.file) |file| self.safe_mode = file.safe_mode;
+        if (gen_info.scope) |s| self.scope = s;
+        defer {
+            self.tree = saved_tree;
+            self.safe_mode = saved_safe_mode;
+            self.scope = saved_scope;
+        }
+
+        // Get the struct declaration AST node
+        const struct_decl = (self.tree.getNode(gen_info.node_idx) orelse return invalid_type).asDecl() orelse return invalid_type;
+        const s = struct_decl.struct_decl;
+
+        // Build concrete struct type with substituted fields
+        const old_sub = self.type_substitution;
+        self.type_substitution = sub_map;
+        const concrete_type = try self.buildStructType(cache_key, s.fields);
+        self.type_substitution = old_sub;
+
+        // Register and cache
+        try self.types.registerNamed(cache_key, concrete_type);
+        try self.generics.instantiation_cache.put(cache_key, concrete_type);
+
+        // Instantiate generic impl block methods for this concrete struct
+        try self.instantiateGenericImplMethods(gi.name, cache_key, resolved_args.items);
+
+        return concrete_type;
+    }
+
+    /// Instantiate all methods from generic impl blocks for a concrete struct type.
+    /// Called from resolveGenericInstance after creating concrete struct "List(5)".
+    /// Go 1.18 pattern: methods on Stack[T] are generic per concrete type.
+    ///
+    /// Two-pass approach (matches non-generic impl flow: collectDecl then checkDecl):
+    ///   Pass 1: Register all method signatures in scope + method registry
+    ///   Pass 2: Check all method bodies (sibling methods already visible)
+    /// Go reference: named.go expandMethod() uses lazy expansion which naturally
+    /// handles forward references; our eager approach needs explicit two-pass.
+    fn instantiateGenericImplMethods(
+        self: *Checker,
+        base_name: []const u8,
+        concrete_name: []const u8,
+        resolved_args: []const TypeIndex,
+    ) CheckError!void {
+        const impl_list = self.generics.generic_impl_blocks.get(base_name) orelse return;
+        for (impl_list.items) |impl_info| {
+            // Validate type param count matches (Go: named.go:489 checks RecvTypeParams.Len == targs.Len)
+            if (impl_info.type_params.len != resolved_args.len) continue;
+
+            // Swap to the defining file's AST, safe_mode, and scope for cross-file generic resolution.
+            // Go resolver.go pattern: generic instantiation uses the declaring file's environment.
+            const saved_tree = self.tree;
+            const saved_safe_mode = self.safe_mode;
+            const saved_scope = self.scope;
+            self.tree = impl_info.tree;
+            if (impl_info.tree.file) |file| self.safe_mode = file.safe_mode;
+            if (impl_info.scope) |s| self.scope = s;
+            defer {
+                self.tree = saved_tree;
+                self.safe_mode = saved_safe_mode;
+                self.scope = saved_scope;
+            }
+
+            // Build type substitution map: T -> concrete type
+            var sub_map = std.StringHashMap(TypeIndex).init(self.allocator);
+            defer sub_map.deinit();
+            for (impl_info.type_params, 0..) |param_name, i| {
+                try sub_map.put(param_name, resolved_args[i]);
+            }
+
+            const old_sub = self.type_substitution;
+            self.type_substitution = sub_map;
+            defer self.type_substitution = old_sub;
+
+            // @safe generic self injection: resolve the concrete struct's pointer type once.
+            // Non-generic @safe methods get self injected by the parser (parser.zig:291-301).
+            // Generic methods skip parser injection (current_impl_is_generic=true), so we
+            // replicate it here during instantiation — same pattern, different stage.
+            const safe_self_type: ?TypeIndex = if (self.safe_mode) blk: {
+                const concrete_type = self.generics.instantiation_cache.get(concrete_name) orelse break :blk null;
+                break :blk self.types.makePointer(concrete_type) catch null;
+            } else null;
+
+            // Pass 1: Register all method signatures (like collectDecl for non-generic impl)
+            for (impl_info.methods) |method_idx| {
+                const method_decl = (self.tree.getNode(method_idx) orelse continue).asDecl() orelse continue;
+                if (method_decl != .fn_decl) continue;
+                const f = method_decl.fn_decl;
+
+                const synth_name = try std.fmt.allocPrint(self.allocator, "{s}_{s}", .{ concrete_name, f.name });
+                // @safe generic: prepend self param to function type (mirrors parser injection)
+                const func_type = if (safe_self_type != null and !f.is_static) blk: {
+                    const base_type = try self.buildFuncType(f.params, f.return_type);
+                    const base_info = self.types.get(base_type);
+                    if (base_info != .func) break :blk base_type;
+                    var new_params = std.ArrayListUnmanaged(types.FuncParam){};
+                    defer new_params.deinit(self.allocator);
+                    try new_params.append(self.allocator, .{ .name = "self", .type_idx = safe_self_type.? });
+                    for (base_info.func.params) |p| try new_params.append(self.allocator, p);
+                    break :blk try self.types.makeFunc(new_params.items, base_info.func.return_type);
+                } else try self.buildFuncType(f.params, f.return_type);
+
+                if (!self.global_scope.isDefined(synth_name)) {
+                    try self.global_scope.define(Symbol.init(synth_name, .function, func_type, method_idx, false));
+                }
+                const effective_static_g = f.is_static or (!self.safe_mode and (f.params.len == 0 or !std.mem.eql(u8, f.params[0].name, "self")));
+                try self.types.registerMethod(concrete_name, types.MethodInfo{
+                    .name = f.name,
+                    .func_name = synth_name,
+                    .func_type = func_type,
+                    .receiver_is_ptr = !effective_static_g,
+                    .is_static = effective_static_g,
+                    .source_tree = self.tree,
+                });
+
+                // Swift ResultConvention: check if return type is a type parameter.
+                // Determined here at type-checking time, stored in GenericInstInfo,
+                // read by lowerer and call sites. Never recomputed.
+                const indirect_result = self.isTypeParamName(f.return_type, impl_info.type_params);
+
+                // Add to generic_inst_by_name so the lowerer can find and lower it
+                const inst = GenericInstInfo{
+                    .concrete_name = synth_name,
+                    .generic_node = method_idx,
+                    .type_args = try self.allocator.dupe(TypeIndex, resolved_args),
+                    .type_param_names = impl_info.type_params,
+                    .tree = impl_info.tree,
+                    .scope = impl_info.scope,
+                    .has_indirect_result = indirect_result,
+                };
+                try self.generics.generic_inst_by_name.put(synth_name, inst);
+            }
+
+            // Pass 2: Check all method bodies and PRESERVE expr_types for Phase 3 lowering.
+            // Go pattern: check body with fresh expr_types, preserve in GenericInstInfo.
+            // This eliminates Phase 3 re-checking (which would fail for @safe generic
+            // methods because self injection only happens here, not in the lowerer).
+            for (impl_info.methods) |method_idx| {
+                const method_decl = (self.tree.getNode(method_idx) orelse continue).asDecl() orelse continue;
+                if (method_decl != .fn_decl) continue;
+                const f = method_decl.fn_decl;
+
+                const synth_name = try std.fmt.allocPrint(self.allocator, "{s}_{s}", .{ concrete_name, f.name });
+
+                // Fresh expr_types per method — preserved in GenericInstInfo for lowerer
+                var inst_expr_types = std.AutoHashMap(NodeIndex, TypeIndex).init(self.allocator);
+                {
+                    const saved_et = self.expr_types;
+                    self.expr_types = inst_expr_types;
+                    defer {
+                        inst_expr_types = self.expr_types; // capture populated map
+                        self.expr_types = saved_et;
+                    }
+                    // @safe generic: inject self into scope for body checking.
+                    // Mirrors parser injection (parser.zig:291-301) for non-generic @safe methods.
+                    if (safe_self_type != null and !f.is_static) {
+                        var self_scope = Scope.init(self.allocator, self.scope);
+                        defer self_scope.deinit();
+                        try self_scope.define(Symbol.init("self", .parameter, safe_self_type.?, method_idx, true));
+                        const old_scope_2 = self.scope;
+                        self.scope = &self_scope;
+                        defer self.scope = old_scope_2;
+                        try self.checkFnDeclWithName(f, method_idx, synth_name);
+                    } else {
+                        try self.checkFnDeclWithName(f, method_idx, synth_name);
+                    }
+                }
+
+                // Update GenericInstInfo with preserved expr_types
+                if (self.generics.generic_inst_by_name.getPtr(synth_name)) |ptr| {
+                    ptr.expr_types = inst_expr_types;
+                }
+            }
+        }
+    }
+
+    /// Go pattern: types2/instantiate.go:87-125 — instance() creates concrete func,
+    /// then types2/call.go:152-166 — check.later() defers body verification.
+    /// We eagerly check the body here (simpler than Go's deferred queue for single-threaded).
+    fn instantiateGenericFunc(self: *Checker, c: ast.Call, gen_info: GenericInfo, name: []const u8) CheckError!TypeIndex {
+        // Validate argument count matches type params
+        if (c.args.len != gen_info.type_params.len) {
+            self.err.errorWithCode(c.span.start, .e300, "wrong number of type arguments");
+            return invalid_type;
+        }
+
+        // Resolve each type argument (Go: types2/call.go:46-82 resolves IndexExpr type args)
+        var resolved_args = std.ArrayListUnmanaged(TypeIndex){};
+        defer resolved_args.deinit(self.allocator);
+        for (c.args) |arg_node| {
+            const arg_type = try self.resolveTypeExpr(arg_node);
+            if (arg_type == invalid_type) {
+                const expr = (self.tree.getNode(arg_node) orelse return invalid_type).asExpr() orelse return invalid_type;
+                if (expr == .ident) {
+                    if (self.resolveTypeByName(expr.ident.name)) |tidx| {
+                        try resolved_args.append(self.allocator, tidx);
+                        continue;
+                    }
+                }
+                self.err.errorWithCode(c.span.start, .e300, "expected type argument");
+                return invalid_type;
+            }
+            try resolved_args.append(self.allocator, arg_type);
+        }
+
+        // Rust: rustc_hir_analysis/src/check/wfcheck.rs — validate trait bounds at instantiation.
+        // Go 1.18: types2/instantiate.go:115-125 — check.implements(TypeArg, Constraint).
+        if (gen_info.type_param_bounds.len > 0) {
+            for (gen_info.type_param_bounds, 0..) |bound, i| {
+                if (bound) |trait_name| {
+                    const type_name = self.types.typeName(resolved_args.items[i]);
+                    const impl_key = try std.fmt.allocPrint(self.allocator, "{s}:{s}", .{ trait_name, type_name });
+                    defer self.allocator.free(impl_key);
+                    if (self.generics.trait_impls.get(impl_key) == null) {
+                        self.err.errorWithCode(c.span.start, .e300, "type does not satisfy trait bound");
+                        return invalid_type;
+                    }
+                }
+            }
+        }
+
+        // Go pattern: context.go:87-102 — hash-based dedup with identity verification
+        const cache_key = try self.buildGenericCacheKey(name, resolved_args.items);
+
+        // Swap to the defining file's AST, safe_mode, and scope for cross-file generic resolution.
+        // Go resolver.go pattern: generic instantiation uses the declaring file's environment.
+        const saved_tree = self.tree;
+        const saved_safe_mode = self.safe_mode;
+        const saved_scope = self.scope;
+        self.tree = gen_info.tree;
+        if (gen_info.tree.file) |file| self.safe_mode = file.safe_mode;
+        if (gen_info.scope) |s| self.scope = s;
+        defer {
+            self.tree = saved_tree;
+            self.safe_mode = saved_safe_mode;
+            self.scope = saved_scope;
+        }
+
+        // Get the fn_decl AST node
+        const fn_node = (self.tree.getNode(gen_info.node_idx) orelse return invalid_type).asDecl() orelse return invalid_type;
+        const f = fn_node.fn_decl;
+
+        // Go pattern: subst.go:13-24 — create substMap mapping TypeParam → concrete Type
+        var sub_map = std.StringHashMap(TypeIndex).init(self.allocator);
+        defer sub_map.deinit();
+        for (gen_info.type_params, 0..) |param_name, i| {
+            try sub_map.put(param_name, resolved_args.items[i]);
+        }
+
+        // Build concrete function type with substituted params and return type
+        const old_sub = self.type_substitution;
+        self.type_substitution = sub_map;
+        const func_type = try self.buildFuncType(f.params, f.return_type);
+
+        // Zig pattern: generic instances belong in the global namespace (not function-local scope)
+        if (!self.global_scope.isDefined(cache_key)) {
+            try self.global_scope.define(Symbol.init(cache_key, .function, func_type, gen_info.node_idx, false));
+        }
+
+        // Go pattern: check body with fresh expr_types and PRESERVE them for Phase 3 lowering.
+        // Go's type checker fully resolves all types during checking; codegen reads the results.
+        // This eliminates Phase 3 re-checking (checkFnDeclBody) which causes stack overflow.
+        var inst_expr_types = std.AutoHashMap(NodeIndex, TypeIndex).init(self.allocator);
+        {
+            const saved_et = self.expr_types;
+            self.expr_types = inst_expr_types;
+            defer {
+                inst_expr_types = self.expr_types; // capture the populated map
+                self.expr_types = saved_et;
+            }
+            try self.checkFnDeclWithName(f, gen_info.node_idx, cache_key);
+        }
+        self.type_substitution = old_sub;
+
+        // Record for the lowerer: this call node is a generic instantiation
+        const inst = GenericInstInfo{
+            .concrete_name = cache_key,
+            .generic_node = gen_info.node_idx,
+            .type_args = try self.allocator.dupe(TypeIndex, resolved_args.items),
+            .tree = gen_info.tree,
+            .scope = gen_info.scope,
+            .expr_types = inst_expr_types, // preserved from Phase 2
+            .has_indirect_result = self.isTypeParamName(f.return_type, f.type_params),
+        };
+        try self.generic_instantiations.put(c.callee, inst);
+        // Also store by concrete name (never overwritten, for nested generic calls)
+        try self.generics.generic_inst_by_name.put(cache_key, inst);
+
+        return func_type;
+    }
+
+    /// Go pattern: types2/context.go:65-83 — compute deterministic hash from origin + type args.
+    /// Go uses typeHasher with '#' separator; we use explicit delimiters to avoid collision.
+    /// Format: "Name(5;17)" — semicolons separate TypeIndex values (integers can't contain ';').
+    fn buildGenericCacheKey(self: *Checker, name: []const u8, type_args: []const TypeIndex) CheckError![]const u8 {
+        var buf = std.ArrayListUnmanaged(u8){};
+        defer buf.deinit(self.allocator);
+        const writer = buf.writer(self.allocator);
+        writer.writeAll(name) catch return error.OutOfMemory;
+        writer.writeByte('(') catch return error.OutOfMemory;
+        for (type_args, 0..) |arg, i| {
+            if (i > 0) writer.writeByte(';') catch return error.OutOfMemory;
+            std.fmt.format(writer, "{d}", .{arg}) catch return error.OutOfMemory;
+        }
+        writer.writeByte(')') catch return error.OutOfMemory;
+        return try self.allocator.dupe(u8, buf.items);
+    }
+
+    /// In @safe mode, wrap struct types with pointer (C#-style reference semantics).
+    /// Handles: Foo → *Foo, Error!Foo → Error!*Foo. Leaves non-struct types unchanged.
+    pub fn safeWrapType(self: *Checker, type_idx: TypeIndex) !TypeIndex {
+        // Swift IndirectTypeInfo: existentials are ALWAYS passed by pointer,
+        // regardless of @safe mode. 40-byte container passed as 8-byte pointer.
+        // Reference: swift/lib/IRGen/GenExistential.cpp:899-905
+        const t_pre = self.types.get(type_idx);
+        if (t_pre == .existential) return try self.types.makePointer(type_idx);
+        // Actors always pass self by pointer (regardless of @safe mode)
+        if (t_pre == .struct_type and self.actor_types.contains(t_pre.struct_type.name))
+            return try self.types.makePointer(type_idx);
+        if (!self.safe_mode) return type_idx;
+        const t = t_pre;
+        // Structs and unions are passed by pointer in @safe mode (like TypeScript objects)
+        if (t == .struct_type or t == .union_type) return try self.types.makePointer(type_idx);
+        if (t == .error_union) {
+            const elem = self.types.get(t.error_union.elem);
+            if (elem == .struct_type or elem == .union_type) {
+                const wrapped = try self.types.makePointer(t.error_union.elem);
+                return try self.types.makeErrorUnionWithSet(wrapped, t.error_union.error_set);
+            }
+        }
+        return type_idx;
+    }
+
+    fn buildFuncType(self: *Checker, params: []const ast.Field, return_type_idx: NodeIndex) CheckError!TypeIndex {
+        var func_params = std.ArrayListUnmanaged(types.FuncParam){};
+        defer func_params.deinit(self.allocator);
+        for (params) |param| {
+            var type_idx = try self.resolveTypeExpr(param.type_expr);
+            // Don't auto-ref parameters whose type is a generic type parameter.
+            // Generic functions are written with value semantics for T; wrapping T to *T
+            // when T=struct would break body code (e.g. `ptr.* = value` expects T, not *T).
+            // Only auto-ref parameters with statically-known struct types.
+            const is_substituted = if (self.type_substitution) |sub| blk: {
+                if (param.type_expr != null_node) {
+                    if (self.tree.getNode(param.type_expr)) |node| {
+                        if (node.asExpr()) |expr| {
+                            // Type params can appear as either .ident or .type_expr(.named)
+                            if (expr == .ident) {
+                                break :blk sub.contains(expr.ident.name);
+                            } else if (expr == .type_expr and expr.type_expr.kind == .named) {
+                                break :blk sub.contains(expr.type_expr.kind.named);
+                            }
+                        }
+                    }
+                }
+                break :blk false;
+            } else false;
+
+            if (!is_substituted) type_idx = try self.safeWrapType(type_idx);
+            // Swift SE-0430: propagate is_sending from AST to type system.
+            // This enables use-after-send detection in checkCall().
+            try func_params.append(self.allocator, .{ .name = param.name, .type_idx = type_idx, .is_sending = param.is_sending });
+        }
+        const ret_type = if (return_type_idx != null_node) try self.resolveTypeExpr(return_type_idx) else TypeRegistry.VOID;
+        return try self.types.add(.{ .func = .{ .params = try self.allocator.dupe(types.FuncParam, func_params.items), .return_type = ret_type } });
+    }
+
+    fn buildStructType(self: *Checker, name: []const u8, fields: []const ast.Field) CheckError!TypeIndex {
+        return self.buildStructTypeWithLayout(name, fields, .auto);
+    }
+
+    fn buildStructTypeWithLayout(self: *Checker, name: []const u8, fields: []const ast.Field, layout: ast.StructLayout) CheckError!TypeIndex {
+        var struct_fields = std.ArrayListUnmanaged(types.StructField){};
+        defer struct_fields.deinit(self.allocator);
+        var offset: u32 = 0;
+        var max_align: u32 = 1;
+        for (fields) |field| {
+            const field_type = try self.resolveTypeExpr(field.type_expr);
+            switch (layout) {
+                .@"packed" => {
+                    // Packed: no alignment, contiguous fields.
+                    // Check for sub-byte bitfield types (u1-u7, u9-u15, u17-u31, u33-u63).
+                    // These resolve to the containing standard type (u8/u16/u32/u64)
+                    // but carry a bit_width for packed struct layout.
+                    var bit_width: u8 = 0;
+                    if (self.tree.getNode(field.type_expr)) |type_node| {
+                        if (type_node.asExpr()) |expr| {
+                            if (expr == .type_expr and expr.type_expr.kind == .named) {
+                                if (types.TypeRegistry.parseBitWidth(expr.type_expr.kind.named)) |bw| {
+                                    if (bw != 8 and bw != 16 and bw != 32 and bw != 64) {
+                                        bit_width = bw;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    try struct_fields.append(self.allocator, .{
+                        .name = field.name,
+                        .type_idx = field_type,
+                        .offset = offset,
+                        .bit_offset = 0,
+                        .bit_width = bit_width,
+                        .default_value = field.default_value,
+                    });
+                    if (bit_width > 0) {
+                        // Bitfield: don't advance byte offset (handled by bit packing below)
+                    } else {
+                        offset += self.types.sizeOf(field_type);
+                    }
+                },
+                .@"extern" => {
+                    // Extern: C ABI layout, align each field to its natural alignment
+                    const field_align = self.types.alignmentOf(field_type);
+                    if (field_align > max_align) max_align = field_align;
+                    if (field_align > 0) offset = (offset + field_align - 1) & ~(field_align - 1);
+                    try struct_fields.append(self.allocator, .{ .name = field.name, .type_idx = field_type, .offset = offset, .default_value = field.default_value });
+                    offset += self.types.sizeOf(field_type);
+                },
+                .auto => {
+                    // Auto: existing behavior (align each field, 8-byte struct alignment)
+                    const field_align = self.types.alignmentOf(field_type);
+                    if (field_align > 0) offset = (offset + field_align - 1) & ~(field_align - 1);
+                    try struct_fields.append(self.allocator, .{ .name = field.name, .type_idx = field_type, .offset = offset, .default_value = field.default_value });
+                    offset += self.types.sizeOf(field_type);
+                },
+            }
+        }
+        // Check if any field has bitfield width — if so, recompute as bit-packed layout
+        // Zig reference: Type.zig:3550-3578 — packed struct bit layout computation
+        var has_bitfields = false;
+        for (struct_fields.items) |f| {
+            if (f.bit_width > 0) { has_bitfields = true; break; }
+        }
+        var backing_int: TypeIndex = 0;
+        if (has_bitfields and layout == .@"packed") {
+            // Bit-packed mode: recompute all field offsets in bits
+            var bit_pos: u32 = 0;
+            for (struct_fields.items) |*f| {
+                f.bit_offset = @intCast(bit_pos);
+                if (f.bit_width > 0) {
+                    bit_pos += f.bit_width;
+                } else {
+                    // Standard-width field in bitfield struct: use full type bit size
+                    f.bit_width = @intCast(self.types.sizeOf(f.type_idx) * 8);
+                    bit_pos += f.bit_width;
+                }
+                f.offset = 0; // All fields at byte offset 0 (single backing integer)
+            }
+            // Determine backing integer from total bit width
+            if (bit_pos <= 8) {
+                offset = 1; backing_int = TypeRegistry.U8;
+            } else if (bit_pos <= 16) {
+                offset = 2; backing_int = TypeRegistry.U16;
+            } else if (bit_pos <= 32) {
+                offset = 4; backing_int = TypeRegistry.U32;
+            } else if (bit_pos <= 64) {
+                offset = 8; backing_int = TypeRegistry.U64;
+            } else {
+                self.err.errorWithCode(fields[0].span.start, .e302, "packed struct total bit width exceeds 64");
+                offset = 8; backing_int = TypeRegistry.U64;
+            }
+        }
+
+        // Final padding: packed = none, extern = align to max field alignment, auto = 8-byte
+        const alignment: u8 = switch (layout) {
+            .@"packed" => if (has_bitfields) @intCast(offset) else 1,
+            .@"extern" => @intCast(max_align),
+            .auto => 8,
+        };
+        if (layout != .@"packed" and alignment > 1) {
+            const a = @as(u32, alignment);
+            offset = (offset + a - 1) & ~(a - 1);
+        }
+        return try self.types.add(.{ .struct_type = .{
+            .name = name,
+            .fields = try self.allocator.dupe(types.StructField, struct_fields.items),
+            .size = offset,
+            .alignment = alignment,
+            .layout = layout,
+            .backing_int = backing_int,
+        } });
+    }
+
+    fn buildEnumType(self: *Checker, e: ast.EnumDecl) CheckError!TypeIndex {
+        var backing_type: TypeIndex = TypeRegistry.I32;
+        if (e.backing_type != null_node) backing_type = try self.resolveTypeExpr(e.backing_type);
+        var enum_variants = std.ArrayListUnmanaged(types.EnumVariant){};
+        defer enum_variants.deinit(self.allocator);
+        var next_value: i64 = 0;
+        for (e.variants) |variant| {
+            var value = next_value;
+            if (variant.value != null_node) {
+                if (self.tree.getNode(variant.value)) |n| {
+                    if (n.asExpr()) |ex| {
+                        if (ex == .literal and ex.literal.kind == .int)
+                            value = std.fmt.parseInt(i64, ex.literal.value, 0) catch 0;
+                    }
+                }
+            }
+            try enum_variants.append(self.allocator, .{ .name = variant.name, .value = value });
+            next_value = value + 1;
+        }
+        return try self.types.add(.{ .enum_type = .{ .name = e.name, .backing_type = backing_type, .variants = try self.allocator.dupe(types.EnumVariant, enum_variants.items) } });
+    }
+
+    fn buildUnionType(self: *Checker, u: ast.UnionDecl) CheckError!TypeIndex {
+        var union_variants = std.ArrayListUnmanaged(types.UnionVariant){};
+        defer union_variants.deinit(self.allocator);
+        for (u.variants) |variant| {
+            const payload_type = if (variant.type_expr != null_node) try self.resolveTypeExpr(variant.type_expr) else invalid_type;
+            try union_variants.append(self.allocator, .{ .name = variant.name, .payload_type = payload_type });
+        }
+        const tag_type: TypeIndex = if (u.variants.len <= 256) TypeRegistry.U8 else TypeRegistry.U16;
+        return try self.types.add(.{ .union_type = .{ .name = u.name, .variants = try self.allocator.dupe(types.UnionVariant, union_variants.items), .tag_type = tag_type } });
+    }
+
+    fn materializeType(self: *Checker, idx: TypeIndex) TypeIndex {
+        const t = self.types.get(idx);
+        return switch (t) {
+            .basic => |k| switch (k) { .untyped_int => TypeRegistry.INT, .untyped_float => TypeRegistry.FLOAT, .untyped_bool => TypeRegistry.BOOL, else => idx },
+            .array => |arr| blk: { const me = self.materializeType(arr.elem); if (me == arr.elem) break :blk idx; break :blk self.types.makeArray(me, arr.length) catch idx; },
+            .slice => |sl| blk: { const me = self.materializeType(sl.elem); if (me == sl.elem) break :blk idx; break :blk self.types.makeSlice(me) catch idx; },
+            else => idx,
+        };
+    }
+
+    /// Check if an AST expression is a reference to a variant of the given union type.
+    /// Handles both qualified (Union.Variant) and shorthand (.Variant) forms.
+    fn isUnionVariantRef(self: *Checker, expr_idx: ast.NodeIndex, ut: types.UnionType) bool {
+        const node = self.tree.getNode(expr_idx) orelse return false;
+        const expr = node.asExpr() orelse return false;
+        if (expr != .field_access) return false;
+        const fa = expr.field_access;
+        for (ut.variants) |v| {
+            if (std.mem.eql(u8, v.name, fa.field)) return true;
+        }
+        return false;
+    }
+
+    fn isComparable(self: *Checker, a: TypeIndex, b: TypeIndex) bool {
+        if (self.types.equal(a, b)) return true;
+        const ta = self.types.get(a);
+        const tb = self.types.get(b);
+        if (types.isNumeric(ta) and types.isNumeric(tb)) return true;
+        if (types.isBool(ta) and types.isBool(tb)) return true;
+        if (ta == .slice and tb == .slice and ta.slice.elem == TypeRegistry.U8 and tb.slice.elem == TypeRegistry.U8) return true;
+        if (ta == .optional and tb == .basic and tb.basic == .untyped_null) return true;
+        if (tb == .optional and ta == .basic and ta.basic == .untyped_null) return true;
+        if (ta == .pointer and tb == .basic and tb.basic == .untyped_null) return true;
+        if (tb == .pointer and ta == .basic and ta.basic == .untyped_null) return true;
+        // Enum values are comparable to their backing type (integer) — Zig: @intFromEnum
+        if (ta == .enum_type and types.isInteger(tb)) return true;
+        if (tb == .enum_type and types.isInteger(ta)) return true;
+        // Optional-to-value comparison — Zig Sema.zig:analyzeCmp resolvePeerTypes coerces
+        // T to ?T then compares. In Cot, null sentinel means raw value compare works directly.
+        if (ta == .optional and self.isComparable(ta.optional.elem, b)) return true;
+        if (tb == .optional and self.isComparable(a, tb.optional.elem)) return true;
+        return false;
+    }
+
+    // ========================================================================
+    // "Did you mean X?" — Levenshtein edit distance suggestions
+    // Zig heuristic: distance <= 2 AND distance <= len/2
+    // ========================================================================
+
+    const MAX_EDIT_LEN = 64;
+
+    /// Levenshtein edit distance. Stack-allocated, O(min(m,n)) space.
+    /// Returns maxInt for names longer than MAX_EDIT_LEN.
+    fn editDistance(a: []const u8, b: []const u8) usize {
+        if (a.len > MAX_EDIT_LEN or b.len > MAX_EDIT_LEN) return std.math.maxInt(usize);
+        if (a.len == 0) return b.len;
+        if (b.len == 0) return a.len;
+        if (std.mem.eql(u8, a, b)) return 0;
+
+        // Use shorter string for the row to minimize stack usage
+        const s1 = if (a.len <= b.len) a else b;
+        const s2 = if (a.len <= b.len) b else a;
+
+        var prev: [MAX_EDIT_LEN + 1]usize = undefined;
+        var curr: [MAX_EDIT_LEN + 1]usize = undefined;
+
+        for (0..s1.len + 1) |i| prev[i] = i;
+
+        for (s2, 0..) |c2, j| {
+            curr[0] = j + 1;
+            for (s1, 0..) |c1, i| {
+                const cost: usize = if (c1 == c2) 0 else 1;
+                curr[i + 1] = @min(@min(curr[i] + 1, prev[i + 1] + 1), prev[i] + cost);
+            }
+            @memcpy(prev[0 .. s1.len + 1], curr[0 .. s1.len + 1]);
+        }
+        return prev[s1.len];
+    }
+
+    /// Check if a name is a valid suggestion candidate (not internal/generated).
+    fn isUserVisibleName(name: []const u8) bool {
+        if (name.len == 0) return false;
+        // Skip generic instantiation names like "List_append(5)"
+        if (std.mem.indexOfScalar(u8, name, '(') != null) return false;
+        // Skip names starting with __ (internal)
+        if (name.len >= 2 and name[0] == '_' and name[1] == '_') return false;
+        return true;
+    }
+
+    /// Search scope chain + global scope for the closest match to `name`.
+    fn findSimilarName(self: *Checker, name: []const u8) ?[]const u8 {
+        var best: ?[]const u8 = null;
+        var best_dist: usize = std.math.maxInt(usize);
+
+        // Walk scope chain
+        var scope: ?*const Scope = self.scope;
+        while (scope) |s| {
+            var it = s.symbols.iterator();
+            while (it.next()) |entry| {
+                const candidate = entry.key_ptr.*;
+                if (std.mem.eql(u8, candidate, name)) continue;
+                if (!isUserVisibleName(candidate)) continue;
+                const d = editDistance(name, candidate);
+                if (d < best_dist and d <= 2 and d * 2 <= name.len) {
+                    best_dist = d;
+                    best = candidate;
+                }
+            }
+            scope = s.parent;
+        }
+
+        // Also check global scope (may not be in chain if we're in a nested scope)
+        {
+            var it = self.global_scope.symbols.iterator();
+            while (it.next()) |entry| {
+                const candidate = entry.key_ptr.*;
+                if (std.mem.eql(u8, candidate, name)) continue;
+                if (!isUserVisibleName(candidate)) continue;
+                const d = editDistance(name, candidate);
+                if (d < best_dist and d <= 2 and d * 2 <= name.len) {
+                    best_dist = d;
+                    best = candidate;
+                }
+            }
+        }
+
+        // Check builtin function names
+        const builtins = [_][]const u8{
+            "print", "println", "eprint", "eprintln", "len", "append",
+        };
+        for (builtins) |candidate| {
+            if (std.mem.eql(u8, candidate, name)) continue;
+            const d = editDistance(name, candidate);
+            if (d < best_dist and d <= 2 and d * 2 <= name.len) {
+                best_dist = d;
+                best = candidate;
+            }
+        }
+
+        return best;
+    }
+
+    /// Search struct fields for the closest match to `name`.
+    fn findSimilarField(name: []const u8, fields: []const types.StructField) ?[]const u8 {
+        var best: ?[]const u8 = null;
+        var best_dist: usize = std.math.maxInt(usize);
+        for (fields) |field| {
+            if (std.mem.eql(u8, field.name, name)) continue;
+            const d = editDistance(name, field.name);
+            if (d < best_dist and d <= 2 and d * 2 <= name.len) {
+                best_dist = d;
+                best = field.name;
+            }
+        }
+        return best;
+    }
+
+    /// Search enum/union variants for the closest match to `name`.
+    fn findSimilarVariant(name: []const u8, variants: anytype) ?[]const u8 {
+        var best: ?[]const u8 = null;
+        var best_dist: usize = std.math.maxInt(usize);
+        for (variants) |v| {
+            if (std.mem.eql(u8, v.name, name)) continue;
+            const d = editDistance(name, v.name);
+            if (d < best_dist and d <= 2 and d * 2 <= name.len) {
+                best_dist = d;
+                best = v.name;
+            }
+        }
+        return best;
+    }
+
+    /// Search type names for the closest match.
+    fn findSimilarType(self: *Checker, name: []const u8) ?[]const u8 {
+        var best: ?[]const u8 = null;
+        var best_dist: usize = std.math.maxInt(usize);
+
+        var it = self.types.name_map.iterator();
+        while (it.next()) |entry| {
+            const candidate = entry.key_ptr.*;
+            if (std.mem.eql(u8, candidate, name)) continue;
+            if (!isUserVisibleName(candidate)) continue;
+            const d = editDistance(name, candidate);
+            if (d < best_dist and d <= 2 and d * 2 <= name.len) {
+                best_dist = d;
+                best = candidate;
+            }
+        }
+
+        // Also check generic struct names
+        var git = self.generics.generic_structs.iterator();
+        while (git.next()) |entry| {
+            const candidate = entry.key_ptr.*;
+            if (std.mem.eql(u8, candidate, name)) continue;
+            const d = editDistance(name, candidate);
+            if (d < best_dist and d <= 2 and d * 2 <= name.len) {
+                best_dist = d;
+                best = candidate;
+            }
+        }
+
+        return best;
+    }
+
+    /// Search trait names for the closest match.
+    fn findSimilarTrait(self: *Checker, name: []const u8) ?[]const u8 {
+        var best: ?[]const u8 = null;
+        var best_dist: usize = std.math.maxInt(usize);
+        var it = self.generics.trait_defs.iterator();
+        while (it.next()) |entry| {
+            const candidate = entry.key_ptr.*;
+            if (std.mem.eql(u8, candidate, name)) continue;
+            const d = editDistance(name, candidate);
+            if (d < best_dist and d <= 2 and d * 2 <= name.len) {
+                best_dist = d;
+                best = candidate;
+            }
+        }
+        return best;
+    }
+
+    /// Search a static list of names for the closest match.
+    fn editDistSuggest(name: []const u8, candidates: []const []const u8) ?[]const u8 {
+        var best: ?[]const u8 = null;
+        var best_dist: usize = std.math.maxInt(usize);
+        for (candidates) |c| {
+            if (std.mem.eql(u8, c, name)) continue;
+            const d = editDistance(name, c);
+            if (d < best_dist and d <= 2 and d * 2 <= name.len) {
+                best_dist = d;
+                best = c;
+            }
+        }
+        return best;
+    }
+
+    /// Format an error message with a "did you mean" suggestion.
+    fn errWithSuggestion(self: *Checker, pos: Pos, msg: []const u8, suggestion: ?[]const u8) void {
+        if (suggestion) |s| {
+            const full_msg = std.fmt.allocPrint(self.allocator, "{s}; did you mean '{s}'?", .{ msg, s }) catch {
+                self.err.errorWithCode(pos, .e301, msg);
+                return;
+            };
+            self.err.errorWithCode(pos, .e301, full_msg);
+        } else {
+            self.err.errorWithCode(pos, .e301, msg);
+        }
+    }
+};
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+test "Scope define and lookup" {
+    var scope = Scope.init(std.testing.allocator, null);
+    defer scope.deinit();
+    try scope.define(Symbol.init("x", .variable, TypeRegistry.INT, 0, true));
+    const sym = scope.lookup("x");
+    try std.testing.expect(sym != null);
+    try std.testing.expectEqualStrings("x", sym.?.name);
+}
+
+test "Scope parent lookup" {
+    var parent = Scope.init(std.testing.allocator, null);
+    defer parent.deinit();
+    try parent.define(Symbol.init("x", .variable, TypeRegistry.INT, 0, true));
+    var child = Scope.init(std.testing.allocator, &parent);
+    defer child.deinit();
+    try child.define(Symbol.init("y", .variable, TypeRegistry.BOOL, 1, false));
+    try std.testing.expect(child.lookup("y") != null);
+    try std.testing.expect(child.lookup("x") != null);
+    try std.testing.expect(parent.lookup("y") == null);
+}
+
+test "Scope isDefined only checks local" {
+    var parent = Scope.init(std.testing.allocator, null);
+    defer parent.deinit();
+    try parent.define(Symbol.init("x", .variable, TypeRegistry.INT, 0, true));
+    var child = Scope.init(std.testing.allocator, &parent);
+    defer child.deinit();
+    try std.testing.expect(!child.isDefined("x"));
+    try std.testing.expect(child.lookup("x") != null);
+}
+
+test "Symbol init" {
+    const sym = Symbol.init("foo", .function, TypeRegistry.VOID, 42, false);
+    try std.testing.expectEqualStrings("foo", sym.name);
+    try std.testing.expectEqual(SymbolKind.function, sym.kind);
+}
+
+test "checker type registry lookup" {
+    var type_reg = try TypeRegistry.init(std.testing.allocator);
+    defer type_reg.deinit();
+    try std.testing.expectEqual(TypeRegistry.INT, type_reg.lookupByName("int").?);
+    try std.testing.expectEqual(TypeRegistry.BOOL, type_reg.lookupByName("bool").?);
+}
+
+test "editDistance: basic cases" {
+    try std.testing.expectEqual(@as(usize, 0), Checker.editDistance("hello", "hello"));
+    try std.testing.expectEqual(@as(usize, 1), Checker.editDistance("hello", "helo"));
+    try std.testing.expectEqual(@as(usize, 1), Checker.editDistance("hello", "hullo"));
+    try std.testing.expectEqual(@as(usize, 1), Checker.editDistance("hello", "hllo"));
+    try std.testing.expectEqual(@as(usize, 2), Checker.editDistance("pritnln", "println"));
+    try std.testing.expectEqual(@as(usize, 4), Checker.editDistance("hello", "world"));
+}
+
+test "editDistance: edge cases" {
+    try std.testing.expectEqual(@as(usize, 0), Checker.editDistance("", ""));
+    try std.testing.expectEqual(@as(usize, 3), Checker.editDistance("", "abc"));
+    try std.testing.expectEqual(@as(usize, 3), Checker.editDistance("abc", ""));
+    try std.testing.expectEqual(@as(usize, 1), Checker.editDistance("a", "b"));
+}
+
+test "editDistSuggest: finds closest match" {
+    const result = Checker.editDistSuggest("pritnln", &.{ "print", "println", "eprint" });
+    try std.testing.expect(result != null);
+    try std.testing.expectEqualStrings("println", result.?);
+}
+
+test "editDistSuggest: no match when too distant" {
+    const result = Checker.editDistSuggest("xyz", &.{ "print", "println" });
+    try std.testing.expect(result == null);
+}
+
+test "editDistSuggest: no match for short names with distant candidates" {
+    // "ab" vs "xy" = distance 2, but 2 * 2 > 2 (len), so rejected by threshold
+    const result = Checker.editDistSuggest("ab", &.{ "xy", "zz" });
+    try std.testing.expect(result == null);
+}
