@@ -1,9 +1,9 @@
 # Concurrency — Status, Architecture, and Gap 9 Plan
 
-**Date:** 2026-03-28
+**Date:** 2026-03-30 (updated)
 **Tests:** 618, all green (native + Wasm)
 **Parity:** 46/50 Swift features at 1:1. 3 Phase 1 (simplified internals). 1 deliberate divergence (Channel).
-**Remaining:** Gap 9 (native state machines) — deferred to post-restructuring.
+**Remaining:** Gap 9 (native state machines) — **UNBLOCKED** by real Cranelift backend (rust/libclif).
 
 ---
 
@@ -54,72 +54,40 @@ See `claude/CONCURRENCY_SWIFT_PORT.md` for the complete test inventory.
 
 Native async functions use eager evaluation. The constructor/poll split and async_split state machine only work on Wasm. On native, async function bodies run inline — no suspension, no cooperative scheduling.
 
-### Why It's Deferred to Post-Restructuring
+### Why This Is Now Unblocked (v0.4.1)
 
-The `src/` restructuring introduces three independent libraries with C ABI boundaries:
+The blocker was: the hand-ported Cranelift backend (`zig/libclif`) couldn't handle `Switch::emit()` or cross-block SSA from `async_split`'s dispatch blocks.
 
-```
-libcot (frontend) → CIR → libcir (IR + passes) → libclif (native backend)
-```
+**Real Cranelift (`rust/libclif`) solves this.** The `Variable` system in `cranelift_frontend` automatically handles values that cross block boundaries. `Switch::emit()` generates efficient `br_table` or binary search dispatch. This is the exact code path that Rust's `cg_clif` uses for async.
 
-Gap 9 should be implemented within this architecture for three reasons:
+The async_split pass produces a normal function with a switch on `self.state`. Real Cranelift compiles it like any other function. No LLVM coroutines needed.
 
-**1. CIR has explicit async primitives.**
-`cir.h` defines `cir_build_await`, `cir_build_async_suspend`, `cir_build_async_resume`, `cir_build_task_create`. Native async dispatch should be expressed as CIR operations, not as ad-hoc SSA pass transformations. The current `async_split.zig` generates raw SSA ops (`.arg`, `.off_ptr`, `.load`, `.eq`, `.if_`) that must be handled by each backend — CIR abstracts this properly.
+### Implementation Plan
 
-**2. libclif enables backend swapping.**
-The `clif.h` contract allows multiple native backends:
-- `libclif-zig` (current Cranelift port)
-- `libclif-rs` (Rust Cranelift crate — direct access to `Switch::emit()` which handles coroutine dispatch natively)
-- `libllvm-c` (LLVM backend)
+See `claude/RELEASE_0_4_1.md` Step 3 for the detailed phased plan.
 
-The native state machine problem (Cot's CLIF port can't handle dispatch across blocks) is trivially solved by `libclif-rs` — real Cranelift's `Switch::emit()` generates correct binary search trees and `br_table` sequences. No need to debug SSA dominance issues in the Zig port.
+**Phase 9.1: Verify async_split output compiles through CIR** (2 days)
+- Enable async_split for native target (currently Wasm-only gate in driver.zig)
+- The state machine is a normal function with switch dispatch → CIR handles `OP_BR_TABLE`
+- Test with `test/e2e/cooperative_await.cot`
 
-**3. The restructuring changes where async_split lives.**
-Currently `compiler/ssa/passes/async_split.zig`. In the new structure, the Wasm state machine belongs in `libcir` (since it transforms CIR), while native dispatch belongs in `libclif` (since it's target-specific). Implementing Gap 9 now would put the code in the wrong place.
+**Phase 9.2: Frame allocation and local save/restore** (3 days)
+- Heap-allocated frame: state discriminant + saved locals + return value
+- Constructor allocates frame, stores args, returns frame pointer as task
+- Poll receives frame pointer and dispatches
+- `async_split.zig` already does this for Wasm — replicate for native
 
-### Root Cause Analysis (from deep audit)
+**Phase 9.3: Cooperative scheduling on native** (2 days)
+- `lower.zig`: generate `run_until_task_done` calls at native await sites
+- `driver.zig`: auto-import `std/executor` + `std/task_queue` for async files on native
+- Executor stdlib code is target-independent — already passes tests
 
-The native dispatch failure was traced through three reference implementations:
+**Phase 9.4: Test parity** (2 days)
+- All 24 concurrency test files (618 tests) must pass on native
 
-**Rust (coroutine.rs → rustc_codegen_cranelift → Cranelift):**
-- MIR `SwitchInt` on discriminant → `cranelift_frontend::Switch::emit()` → binary search tree + `br_table`
-- The discriminant is loaded ONCE as a scalar Value, compared inline — no block parameters for the discriminant
-- Cranelift's SSA builder (`def_var`/`use_var`) handles cross-block value flow automatically
+### Future: LLVM Backend (libllvm)
 
-**Kotlin (AbstractSuspendFunctionsLowering → StateMachineBuilder):**
-- Suspension points → state graph with DFS topological sort → `when(this.label)` dispatch
-- Each local live across suspension points → coroutine class field (spilled/restored)
-- No LLVM coroutines — pure IR-level state machine (exactly like Cot needs)
-- `$completion: Continuation<T>` parameter added to every suspend function
-- `COROUTINE_SUSPENDED` sentinel value returned when task suspends
-
-**Cot's specific blocker (async_split.zig → ssa_to_clif.zig):**
-- async_split creates NEW if/else check blocks with `.arg` ops in each
-- `.arg` handler in `ssa_to_clif.zig` looks up entry block params by index
-- After async_split changes `f.entry` to the first check block, the entry HAS the params
-- BUT: subsequent check blocks' `.arg` ops also reference entry params — these values cross block boundaries without phi nodes
-- This is an SSA dominance issue: the CLIF builder rejects values from non-dominating blocks
-- Fix requires either: (a) phi-based frame pointer flow, (b) Cranelift Variable system for cross-block values, or (c) use real Cranelift via `libclif-rs`
-
-### Implementation Plan (for when src/ is ready)
-
-**Phase 1: CIR async primitives (libcir)**
-1. `cir_build_async_suspend(state_index)` — save state discriminant + spill locals to frame, return PENDING
-2. `cir_build_async_resume(state_index)` — dispatch entry: load discriminant, branch to resume point, restore locals
-3. `cir_build_await(type, future)` — poll future, if PENDING suspend, if READY extract result
-4. Wasm emit: translate to current constructor/poll + async_split pattern (already working)
-5. Native emit: translate to Cranelift Switch dispatch (via libclif)
-
-**Phase 2: libclif native dispatch**
-Option A (recommended): Use `libclif-rs` (Rust Cranelift crate). `Switch::emit()` handles coroutine dispatch out of the box. Zero custom code needed.
-Option B: Fix `libclif-zig`. Implement Cranelift Variable system for frame pointer flow across dispatch blocks. Port `Switch::emit()` binary search tree + `br_table` from `wasmtime/cranelift/frontend/src/switch.rs`.
-Option C: Use LLVM via `libllvm-c` for optimized builds. LLVM has native coroutine support.
-
-**Phase 3: Native cooperative scheduling**
-1. Native await site calls poll function by name (direct call, not call_indirect)
-2. Between polls, process other tasks from global queue (same as Wasm cooperative path)
-3. Reuse `run_until_task_done` pattern — compile executor.cot for native target
+When an LLVM backend is added (`--backend=llvm`), it can use LLVM's native coroutine intrinsics (`llvm.coro.begin/suspend/end`) for the state machine transform instead of doing it at the SSA level. This is how Swift works. The CIR async operations would map directly to LLVM coroutine calls.
 
 ### Swift/Rust/Kotlin References
 
