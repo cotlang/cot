@@ -48,7 +48,13 @@ The hand-ported Cranelift backend is retained ONLY for the runtime .o (ARC, I/O,
 
 ---
 
-## Step 1: Move Native Codegen to zig/libclif (1 day)
+## Step 1: Move Native Codegen to zig/libclif (DEFERRED)
+
+**Status:** Blocked by circular dependency. Zig 0.15 doesn't allow `@import("../")` outside the module root. libcot and libclif have a circular dependency: libcot calls libclif for codegen, libclif imports libcot's SSA/frontend types. Fixing this requires extracting shared types (SSA, frontend, pipeline_debug) into a standalone `zig/libcot_types/` module. This is a prerequisite refactor.
+
+**For now:** Native codegen stays in `zig/libcot/codegen/native/`. The logical separation exists (all native codegen is in one directory), and the CIR→Cranelift path is already wired. The physical move happens after the shared types are extracted.
+
+### Original Plan (for when the prerequisite is done)
 
 ### What moves
 
