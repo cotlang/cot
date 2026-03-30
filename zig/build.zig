@@ -51,7 +51,7 @@ pub fn build(b: *std.Build) void {
 
     // Link against rust/libclif (Cranelift native backend)
     exe.addLibraryPath(.{ .cwd_relative = "../rust/libclif/target/release" });
-    exe.linkSystemLibrary("libclif");
+    exe.linkSystemLibrary("clif");
     exe.linkLibC();
     if (native_os == .macos) {
         exe.linkFramework("CoreFoundation");

@@ -30,6 +30,11 @@ jobs:
         with:
           version: 0.15.2
 
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build rust/libclif (Cranelift backend)
+        run: cd rust/libclif && cargo build --release
+
       - name: Build
         run: zig build -Doptimize=ReleaseFast
 
@@ -38,7 +43,7 @@ jobs:
 
       - name: Cot tests (native)
         if: matrix.os == 'macos-14'
-        run: ./test/run_all.sh
+        run: COT="./zig-out/bin/cot" ./test/run_all.sh
 
       - name: Package
         run: |

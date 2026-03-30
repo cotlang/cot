@@ -20,14 +20,19 @@ jobs:
         with:
           version: 0.15.2
 
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build rust/libclif (Cranelift backend)
+        run: cd rust/libclif && cargo build --release
+
       - name: Compiler unit tests
         run: zig build test
 
       - name: Build compiler
         run: zig build
 
-      - name: Cot tests (native)
-        run: ./test/run_all.sh
+      - name: Cot tests (native — zig backend)
+        run: COT="./zig-out/bin/cot" ./test/run_all.sh
 
       - name: Install wasmtime
         if: always()
@@ -36,16 +41,16 @@ jobs:
           mv wasmtime-v${WASMTIME_VERSION}-aarch64-macos/wasmtime /usr/local/bin/
           wasmtime --version
 
-      - name: Cot tests (wasm - features)
+      - name: Cot tests (wasm — features)
         if: always()
         continue-on-error: true
-        run: ./zig-out/bin/cot test test/e2e/features.cot --target=wasm
+        run: ./zig-out/bin/cot test test/e2e/features.cot --target=wasm --backend=zig
 
-      - name: Cot tests (wasm - full suite)
+      - name: Cot tests (wasm — full suite)
         if: always()
         continue-on-error: true
         timeout-minutes: 5
-        run: ./test/run_all.sh --target=wasm
+        run: COT="./zig-out/bin/cot" ./test/run_all.sh --target=wasm
 
   test-linux:
     runs-on: ubuntu-latest
@@ -58,6 +63,11 @@ jobs:
         with:
           version: 0.15.2
 
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build rust/libclif (Cranelift backend)
+        run: cd rust/libclif && cargo build --release
+
       - name: Compiler unit tests
         run: zig build test
 
@@ -65,7 +75,6 @@ jobs:
         run: zig build
 
       # Native tests skipped on Linux x64 — native backend targets ARM64 macOS only.
-      # x64 ELF support (entry point naming, kevent→epoll) is not yet implemented.
 
       - name: Install wasmtime
         run: |
@@ -73,10 +82,10 @@ jobs:
           sudo mv wasmtime-v${WASMTIME_VERSION}-x86_64-linux/wasmtime /usr/local/bin/
           wasmtime --version
 
-      - name: Cot tests (wasm - features)
+      - name: Cot tests (wasm — features)
         continue-on-error: true
-        run: ./zig-out/bin/cot test test/e2e/features.cot --target=wasm
+        run: ./zig-out/bin/cot test test/e2e/features.cot --target=wasm --backend=zig
 
-      - name: Cot tests (wasm - full suite)
+      - name: Cot tests (wasm — full suite)
         continue-on-error: true
-        run: ./test/run_all.sh --target=wasm
+        run: COT="./zig-out/bin/cot" ./test/run_all.sh --target=wasm
