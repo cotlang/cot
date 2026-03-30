@@ -87,6 +87,13 @@ pub fn build(b: *std.Build) void {
     tests.root_module.addAnonymousImport("dwarf_reader_native_o", .{
         .root_source_file = dwarf_obj.getEmittedBin(),
     });
+    tests.addLibraryPath(.{ .cwd_relative = "rust/libclif/target/release" });
+    tests.linkSystemLibrary("clif");
+    tests.linkLibC();
+    if (native_os == .macos) {
+        tests.linkFramework("CoreFoundation");
+        tests.linkFramework("Security");
+    }
     const run_tests = b.addRunArtifact(tests);
     if (b.args) |args| run_tests.addArgs(args);
     b.step("test", "Run unit tests").dependOn(&run_tests.step);
