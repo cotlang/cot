@@ -1,0 +1,7349 @@
+//! Compilation Driver - Orchestrates the full pipeline from source to object code.
+
+const std = @import("std");
+const scanner_mod = @import("frontend/scanner.zig");
+const ast_mod = @import("frontend/ast.zig");
+const parser_mod = @import("frontend/parser.zig");
+const errors_mod = @import("frontend/errors.zig");
+const types_mod = @import("frontend/types.zig");
+const checker_mod = @import("frontend/checker.zig");
+const lower_mod = @import("frontend/lower.zig");
+const ir_mod = @import("frontend/ir.zig");
+const vwt_gen_mod = @import("frontend/vwt_gen.zig");
+const ssa_builder_mod = @import("frontend/ssa_builder.zig");
+const source_mod = @import("frontend/source.zig");
+// Native codegen imports (AOT compiler path)
+// NOTE: Native codegen is being rewritten with Cranelift architecture.
+// See CRANELIFT_PORT_MASTER_PLAN.md for status and progress.
+const schedule = @import("ssa/passes/schedule.zig");
+const layout = @import("ssa/passes/layout.zig");
+const rewritegeneric = @import("ssa/passes/rewritegeneric.zig");
+const decompose_builtin = @import("ssa/passes/decompose.zig");
+const rewritedec = @import("ssa/passes/rewritedec.zig");
+const lower_wasm = @import("ssa/passes/lower_wasm.zig");
+const lower_native = @import("ssa/passes/lower_native.zig");
+const deadcode = @import("ssa/passes/deadcode.zig");
+const copyelim = @import("ssa/passes/copyelim.zig");
+const async_split = @import("ssa/passes/async_split.zig");
+const phielim = @import("ssa/passes/phielim.zig");
+const cse_pass = @import("ssa/passes/cse.zig");
+const ssa_to_clif = @import("codegen/native/ssa_to_clif.zig");
+const arc_native = @import("codegen/native/arc_native.zig");
+const io_native = @import("codegen/native/io_native.zig");
+const print_native = @import("codegen/native/print_native.zig");
+const test_native_rt = @import("codegen/native/test_native.zig");
+const signal_native = @import("codegen/native/signal_native.zig");
+const target_mod = @import("frontend/target.zig");
+const debug = @import("pipeline_debug.zig");
+
+// Wasm codegen
+const wasm_old = @import("codegen/wasm.zig"); // CodeBuilder for runtime function emission
+const wasm = @import("codegen/wasm/wasm.zig"); // Go-style SSA codegen + Linker
+const arc = @import("codegen/arc.zig"); // ARC runtime (Swift)
+const mem_runtime = @import("codegen/mem_runtime.zig"); // Memory utils (memcpy, string_eq, etc.)
+const slice_runtime = @import("codegen/slice_runtime.zig"); // Slice runtime (Go)
+const print_runtime = @import("codegen/print_runtime.zig"); // Print runtime (Go)
+const wasi_runtime = @import("codegen/wasi_runtime.zig"); // WASI runtime (fd_write)
+const test_runtime = @import("codegen/test_runtime.zig"); // Test runtime (Zig)
+const bench_runtime = @import("codegen/bench_runtime.zig"); // Bench runtime (Go testing.B)
+const executor_runtime = @import("codegen/executor_runtime.zig"); // Executor runtime (Swift CooperativeExecutor)
+
+// Native codegen modules (Cranelift-style AOT compiler)
+const native_compile = @import("codegen/native/compile.zig");
+const wasm_parser = @import("codegen/native/wasm_parser.zig"); // Used by legacy MachO/ELF generators
+const clif = @import("ir/clif/mod.zig");
+const macho = @import("codegen/native/macho.zig");
+const elf = @import("codegen/native/elf.zig");
+const object_module = @import("codegen/native/object_module.zig");
+const dwarf_mod = @import("codegen/native/dwarf.zig");
+const buffer_mod = @import("codegen/native/machinst/buffer.zig");
+
+const project_mod = @import("project.zig");
+
+const Allocator = std.mem.Allocator;
+const Target = target_mod.Target;
+
+const ParsedFile = struct {
+    path: []const u8,
+    source_text: []const u8,
+    source: source_mod.Source,
+    tree: ast_mod.Ast,
+};
+
+const CheckedFileEntry = struct {
+    scope: *checker_mod.Scope,
+    tree: *const ast_mod.Ast,
+};
+
+pub const Driver = struct {
+    allocator: Allocator,
+    target: Target = Target.native(),
+    test_mode: bool = false,
+    test_filter: ?[]const u8 = null,
+    fail_fast: bool = false,
+    bench_mode: bool = false,
+    bench_filter: ?[]const u8 = null,
+    bench_n: ?i64 = null,
+    release_mode: bool = false,
+    debug_mode: bool = false, // --debug / -g: emit full DWARF for lldb + DWARF-based crash traces
+    lib_mode: bool = false,
+    project_safe: ?bool = null, // cached cot.json "safe" field, loaded lazily
+    // Debug info: source file/text and IR funcs for DWARF generation
+    debug_source_file: []const u8 = "",
+    debug_source_text: []const u8 = "",
+    debug_ir_funcs: []const ir_mod.Func = &.{},
+    debug_type_reg: ?*const types_mod.TypeRegistry = null,
+    // Multi-file source map: per-file paths/texts and func→file mapping.
+    // Reference: Go runtime/symtab.go:funcfile() — per-CU file tables via cutab.
+    // Reference: Zig Dwarf.zig:SrcLocCache — per-CU file arrays.
+    parsed_file_paths: []const []const u8 = &.{},
+    parsed_file_texts: []const []const u8 = &.{},
+    func_file_indices: []const u16 = &.{},
+    // User-declared extern fn names (from imported modules like std/sqlite).
+    // Collected from checker scopes after type checking.
+    // Registered in func_index_map so native backend can resolve calls.
+    user_extern_fns: std.ArrayListUnmanaged([]const u8) = .{},
+    // Extern fn signatures — parallel arrays with user_extern_fns.
+    // Wasm-level param count (strings decomposed to ptr+len = 2 params).
+    user_extern_param_counts: std.ArrayListUnmanaged(u32) = .{},
+    user_extern_has_result: std.ArrayListUnmanaged(bool) = .{},
+    /// COT_SSA: function name to generate interactive HTML visualizer for.
+    /// Set via COT_SSA env var or --ssa=funcname CLI flag.
+    /// Reference: Go GOSSAFUNC env var (ssagen/ssa.go lines 44-77)
+    ssa_html_func: ?[]const u8 = null,
+    /// Use rust/libclif (real Cranelift) for native codegen instead of hand-ported backend.
+    use_libclif: bool = true,
+    /// Extra .o file path (runtime functions) produced by CIR path. Linked alongside user .o.
+    cir_runtime_obj_path: ?[]const u8 = null,
+
+    pub fn init(allocator: Allocator) Driver {
+        var d = Driver{ .allocator = allocator };
+        // Read COT_SSA env var for HTML visualizer
+        d.ssa_html_func = std.posix.getenv("COT_SSA");
+        return d;
+    }
+
+    pub fn setTarget(self: *Driver, t: Target) void {
+        self.target = t;
+    }
+
+    pub fn setTestMode(self: *Driver, enabled: bool) void {
+        self.test_mode = enabled;
+    }
+
+    pub fn setTestFilter(self: *Driver, filter: []const u8) void {
+        self.test_filter = filter;
+    }
+
+    pub fn setFailFast(self: *Driver, enabled: bool) void {
+        self.fail_fast = enabled;
+    }
+
+    pub fn setBenchMode(self: *Driver, enabled: bool) void {
+        self.bench_mode = enabled;
+    }
+
+    pub fn setBenchFilter(self: *Driver, filter: []const u8) void {
+        self.bench_filter = filter;
+    }
+
+    pub fn setBenchN(self: *Driver, n: i64) void {
+        self.bench_n = n;
+    }
+
+    /// Lazily load and cache the project-level @safe flag from cot.json.
+    /// Walks up from the input file's directory (like npm's package.json resolution)
+    /// so nested files (e.g. self/frontend/scanner.cot) find self/cot.json.
+    fn isProjectSafe(self: *Driver, file_path: ?[]const u8) bool {
+        if (self.project_safe) |s| return s;
+        // Try CWD first
+        const maybe_loaded = project_mod.loadConfig(self.allocator, null) catch null;
+        if (maybe_loaded) |loaded_val| {
+            var loaded = loaded_val;
+            defer loaded.deinit();
+            const safe = loaded.value().safe orelse false;
+            self.project_safe = safe;
+            return safe;
+        }
+        // Walk up from the input file's directory looking for cot.json
+        if (file_path) |fp| {
+            var dir: ?[]const u8 = std.fs.path.dirname(fp);
+            var depth: usize = 0;
+            while (dir != null and depth < 10) : (depth += 1) {
+                const d = dir.?;
+                const maybe_file_loaded = project_mod.loadConfig(self.allocator, d) catch null;
+                if (maybe_file_loaded) |loaded_val| {
+                    var loaded = loaded_val;
+                    defer loaded.deinit();
+                    const safe = loaded.value().safe orelse false;
+                    self.project_safe = safe;
+                    return safe;
+                }
+                // Go up one level
+                const parent = std.fs.path.dirname(d);
+                if (parent != null and std.mem.eql(u8, parent.?, d)) break; // reached root
+                dir = parent;
+            }
+        }
+        self.project_safe = false;
+        return false;
+    }
+
+    /// Type-check a source file without compiling (supports imports).
+    /// Runs Phase 1 (parse) and Phase 2 (type check), then stops.
+    /// On error: errors already printed by ErrorReporter.
+    pub fn checkFile(self: *Driver, path: []const u8) !void {
+        var seen_files = std.StringHashMap(void).init(self.allocator);
+        defer seen_files.deinit();
+
+        // Phase 1: Parse all files recursively
+        var parsed_files = std.ArrayListUnmanaged(ParsedFile){};
+        defer {
+            for (parsed_files.items) |*pf| {
+                pf.tree.deinit();
+                pf.source.deinit();
+                self.allocator.free(pf.source_text);
+                self.allocator.free(pf.path);
+            }
+            parsed_files.deinit(self.allocator);
+        }
+        var in_progress = std.StringHashMap(void).init(self.allocator);
+        defer in_progress.deinit();
+        try self.parseFileRecursive(path, &parsed_files, &seen_files, &in_progress);
+
+        // Apply project-level @safe mode from cot.json (search CWD + file's dir)
+        if (self.isProjectSafe(path)) {
+            for (parsed_files.items) |*pf| {
+                if (pf.tree.file) |*file| {
+                    // Don't override stdlib files — they control their own safe mode
+                    if (!std.mem.containsAtLeast(u8, file.filename, 1, "stdlib/")) {
+                        file.safe_mode = true;
+                    }
+                }
+            }
+        }
+
+        // Phase 2: Type check all files with shared symbol table
+        var type_reg = try types_mod.TypeRegistry.init(self.allocator);
+        defer type_reg.deinit();
+        var global_scope = checker_mod.Scope.init(self.allocator, null);
+        defer global_scope.deinit();
+        var generic_ctx = checker_mod.SharedGenericContext.init(self.allocator);
+        defer generic_ctx.deinit(self.allocator);
+
+        // Incremental per-file scopes: create scope → copy imports → check → store
+        var checked_scopes = std.StringHashMap(CheckedFileEntry).init(self.allocator);
+        defer checked_scopes.deinit();
+        var file_scopes = std.ArrayListUnmanaged(*checker_mod.Scope){};
+        defer {
+            for (file_scopes.items) |fs| {
+                fs.deinit();
+                self.allocator.destroy(fs);
+            }
+            file_scopes.deinit(self.allocator);
+        }
+
+        for (parsed_files.items) |*pf| {
+            const file_scope = try self.createFileScope(pf, &global_scope, &checked_scopes);
+            try file_scopes.append(self.allocator, file_scope);
+
+            var err_reporter = errors_mod.ErrorReporter.init(&pf.source, null);
+            var chk = checker_mod.Checker.init(self.allocator, &pf.tree, &type_reg, &err_reporter, file_scope, &global_scope, &generic_ctx, self.target);
+            defer chk.deinit();
+            chk.checkFile() catch |e| {
+                return e;
+            };
+            if (err_reporter.hasErrors()) {
+                return error.TypeCheckError;
+            }
+
+            // Store checked scope for later files to import from
+            try checked_scopes.put(pf.path, .{ .scope = file_scope, .tree = &pf.tree });
+        }
+        // Success — no errors found
+    }
+
+    /// Lint a source file: type-check + run lint rules. Returns warning count.
+    pub fn lintFile(self: *Driver, path: []const u8) !u32 {
+        var seen_files = std.StringHashMap(void).init(self.allocator);
+        defer seen_files.deinit();
+
+        // Phase 1: Parse all files recursively
+        var parsed_files = std.ArrayListUnmanaged(ParsedFile){};
+        defer {
+            for (parsed_files.items) |*pf| {
+                pf.tree.deinit();
+                pf.source.deinit();
+                self.allocator.free(pf.source_text);
+                self.allocator.free(pf.path);
+            }
+            parsed_files.deinit(self.allocator);
+        }
+        var in_progress = std.StringHashMap(void).init(self.allocator);
+        defer in_progress.deinit();
+        try self.parseFileRecursive(path, &parsed_files, &seen_files, &in_progress);
+
+        // Apply project-level @safe mode from cot.json (search CWD + file's dir)
+        if (self.isProjectSafe(path)) {
+            for (parsed_files.items) |*pf| {
+                if (pf.tree.file) |*file| {
+                    // Don't override stdlib files — they control their own safe mode
+                    if (!std.mem.containsAtLeast(u8, file.filename, 1, "stdlib/")) {
+                        file.safe_mode = true;
+                    }
+                }
+            }
+        }
+
+        // Phase 2: Type check all files with shared symbol table + lint
+        var type_reg = try types_mod.TypeRegistry.init(self.allocator);
+        defer type_reg.deinit();
+        var global_scope = checker_mod.Scope.init(self.allocator, null);
+        defer global_scope.deinit();
+        var generic_ctx = checker_mod.SharedGenericContext.init(self.allocator);
+        defer generic_ctx.deinit(self.allocator);
+
+        // Incremental per-file scopes: create scope → copy imports → check → store
+        var checked_scopes = std.StringHashMap(CheckedFileEntry).init(self.allocator);
+        defer checked_scopes.deinit();
+        var file_scopes = std.ArrayListUnmanaged(*checker_mod.Scope){};
+        defer {
+            for (file_scopes.items) |fs| {
+                fs.deinit();
+                self.allocator.destroy(fs);
+            }
+            file_scopes.deinit(self.allocator);
+        }
+
+        var total_warnings: u32 = 0;
+        for (parsed_files.items) |*pf| {
+            const file_scope = try self.createFileScope(pf, &global_scope, &checked_scopes);
+            try file_scopes.append(self.allocator, file_scope);
+
+            var err_reporter = errors_mod.ErrorReporter.init(&pf.source, null);
+            var chk = checker_mod.Checker.init(self.allocator, &pf.tree, &type_reg, &err_reporter, file_scope, &global_scope, &generic_ctx, self.target);
+            chk.lint_mode = true;
+            chk.checkFile() catch |e| {
+                chk.deinit();
+                return e;
+            };
+            if (err_reporter.hasErrors()) {
+                chk.deinit();
+                return error.TypeCheckError;
+            }
+            chk.runLintChecks();
+            total_warnings += err_reporter.warning_count;
+            chk.deinit();
+
+            // Store checked scope for later files to import from
+            try checked_scopes.put(pf.path, .{ .scope = file_scope, .tree = &pf.tree });
+        }
+        return total_warnings;
+    }
+
+    /// Compile source code to machine code (single file, no imports).
+    pub fn compileSource(self: *Driver, source_text: []const u8) ![]u8 {
+        var src = source_mod.Source.init(self.allocator, "<input>", source_text);
+        defer src.deinit();
+        var err_reporter = errors_mod.ErrorReporter.init(&src, null);
+
+        // Parse
+        var tree = ast_mod.Ast.init(self.allocator);
+        defer tree.deinit();
+        var scan = scanner_mod.Scanner.initWithErrors(&src, &err_reporter);
+        var parser = parser_mod.Parser.init(self.allocator, &scan, &tree, &err_reporter);
+        try parser.parseFile();
+        if (err_reporter.hasErrors()) return error.ParseError;
+
+        // Type check
+        var type_reg = try types_mod.TypeRegistry.init(self.allocator);
+        defer type_reg.deinit();
+        var global_scope = checker_mod.Scope.init(self.allocator, null);
+        defer global_scope.deinit();
+        var generic_ctx = checker_mod.SharedGenericContext.init(self.allocator);
+        defer generic_ctx.deinit(self.allocator);
+        var chk = checker_mod.Checker.init(self.allocator, &tree, &type_reg, &err_reporter, &global_scope, &global_scope, &generic_ctx, self.target);
+        defer chk.deinit();
+        try chk.checkFile();
+        if (err_reporter.hasErrors()) return error.TypeCheckError;
+
+        // Collect user-declared extern fn names for native func_index_map
+        self.collectExternFns(&global_scope, &type_reg);
+
+        // Lower to IR
+        var lowerer = lower_mod.Lowerer.init(self.allocator, &tree, &type_reg, &err_reporter, &chk, self.target);
+        defer lowerer.deinit();
+        lowerer.release_mode = self.release_mode;
+        if (self.test_mode) lowerer.setTestMode(true);
+        if (self.fail_fast) lowerer.setFailFast(true);
+        // Pre-allocate metadata globals for all generic type args BEFORE lowering.
+        // This ensures emitTypeMetadataRef can find the global during call site lowering.
+        // The globals are populated later by emitTrivialTypeMetadata / emitVWTWitnesses.
+        debug.log(.codegen, "generic_inst_by_name has {d} entries before prealloc (compileSource path)", .{generic_ctx.generic_inst_by_name.count()});
+        try self.preallocateTypeMetadataGlobals(&lowerer.builder, &type_reg, &generic_ctx);
+
+        try lowerer.lowerToBuilder();
+        // ARC Phase 4: Generate synthetic deinit functions for structs with ARC fields
+        try lowerer.emitPendingAutoDeinits();
+        if (err_reporter.hasErrors()) return error.LowerError;
+
+        // Go init function pattern: emit __cot_init_globals after all decls are lowered
+        try lowerer.generateGlobalInits();
+
+        // Generate test runner if in test mode
+        if (self.test_mode and lowerer.test_names.items.len > 0) {
+            try lowerer.generateTestRunner();
+        }
+
+        try self.emitVWTWitnesses(&lowerer.builder, &type_reg);
+        try self.emitTrivialTypeMetadata(&lowerer.builder, &type_reg, &generic_ctx);
+        try self.emitProtocolWitnessTables(&lowerer.builder, &generic_ctx);
+        try self.emitMetadataInitMaster(&lowerer.builder);
+
+        var ir_result = try lowerer.builder.getIR();
+        defer ir_result.deinit();
+
+        return self.generateCode(ir_result.funcs, ir_result.globals, &type_reg, "<input>", source_text);
+    }
+
+    /// Emit VWT witness functions for all non-trivial concrete types in the registry.
+    /// Witnesses are emitted as IR functions into the builder and flow through the
+    /// standard SSA → codegen pipeline alongside user functions.
+    fn emitVWTWitnesses(self: *Driver, builder: *ir_mod.Builder, type_reg: *types_mod.TypeRegistry) !void {
+        if (self.target.isWasm()) return;
+        var gen = vwt_gen_mod.VWTGenerator.init(builder.allocator, type_reg);
+        defer gen.deinit();
+
+        var vwt_emitted: usize = 0;
+        // Swift pattern: emit VWT for EVERY non-trivial concrete type.
+        // Every type that participates in generic code gets its own VWT table.
+        // Reference: apple/swift lib/IRGen/GenValueWitness.cpp emitValueWitnessTable()
+        for (type_reg.types.items, 0..) |t, i| {
+            const type_idx: types_mod.TypeIndex = @intCast(i);
+            if (type_reg.isTrivial(type_idx)) continue;
+
+            const type_name = switch (t) {
+                .struct_type => |s| s.name,
+                .union_type => |u| u.name,
+                .enum_type => |e| e.name,
+                .pointer => "pointer",
+                .list => "list",
+                .map => "map",
+                .optional => "optional",
+                .error_union => "error_union",
+                .slice => "slice",
+                .array => "array",
+                .tuple => "tuple",
+                .distinct => |d| d.name,
+                else => continue,
+            };
+
+            _ = gen.emitWitnesses(builder, type_idx, type_name) catch |err| switch (err) {
+                error.MissingVWTEntry => continue,
+                else => return err,
+            };
+            vwt_emitted += 1;
+        }
+        if (vwt_emitted > 0) std.debug.print("VWT: {d} types emitted, {d} unique witnesses, total funcs: {d}\n", .{ vwt_emitted, gen.emitted.count(), builder.funcs.items.len });
+    }
+
+    /// Emit lightweight TypeMetadata globals for trivial types (i64, i32, bool, f64, etc.)
+    /// used as generic type arguments. Non-trivial types already get metadata via emitVWTWitnesses.
+    /// Swift ref: every type has metadata — BuiltinIntegers.swift, Metadata.h.
+    /// Layout: [vwt_ptr=0, size, stride, kind=0x100 (trivial)]
+    fn emitTrivialTypeMetadata(self: *Driver, builder: *ir_mod.Builder, type_reg: *types_mod.TypeRegistry, generic_ctx: *checker_mod.SharedGenericContext) !void {
+        _ = self;
+        const Span = @import("frontend/source.zig").Span;
+        var count: usize = 0;
+
+        // Collect all type args from all generic instantiations
+        var it = generic_ctx.generic_inst_by_name.valueIterator();
+        while (it.next()) |inst_info| {
+            for (inst_info.type_args) |type_arg| {
+                const type_name = type_reg.typeName(type_arg);
+                const meta_name = try std.fmt.allocPrint(builder.allocator, "__type_metadata_{s}", .{type_name});
+
+                // Skip if a VWT init function already handles this type's metadata
+                const vwt_init_name = try std.fmt.allocPrint(builder.allocator, "__vwt_init_{s}", .{type_name});
+                if (builder.hasFunc(vwt_init_name)) continue;
+
+                // Skip if trivial init already emitted for this type (dedup)
+                const init_name_check = try std.fmt.allocPrint(builder.allocator, "__trivial_meta_init_{s}", .{type_name});
+                if (builder.hasFunc(init_name_check)) continue;
+
+                // Trivial type — emit lightweight metadata (no VWT witnesses needed)
+                const size = type_reg.sizeOf(type_arg);
+                const stride = size;
+                // Global already pre-allocated by preallocateTypeMetadataGlobals
+
+                // Emit init function
+                const init_name = try std.fmt.allocPrint(builder.allocator, "__trivial_meta_init_{s}", .{type_name});
+                builder.startFunc(init_name, types_mod.TypeRegistry.VOID, types_mod.TypeRegistry.VOID, Span.zero);
+                if (builder.func()) |fb| {
+                    const meta_info = builder.lookupGlobal(meta_name) orelse continue;
+                    const meta_addr = try fb.emitAddrGlobal(meta_info.idx, meta_name, types_mod.TypeRegistry.I64, Span.zero);
+
+                    // [0] vwt_ptr = 0 (no VWT for trivial types)
+                    const zero = try fb.emitConstInt(0, types_mod.TypeRegistry.I64, Span.zero);
+                    _ = try fb.emitPtrStoreValue(meta_addr, zero, Span.zero);
+
+                    // [1] size
+                    const eight = try fb.emitConstInt(8, types_mod.TypeRegistry.I64, Span.zero);
+                    const size_addr = try fb.emitBinary(.add, meta_addr, eight, types_mod.TypeRegistry.I64, Span.zero);
+                    const size_val = try fb.emitConstInt(@intCast(size), types_mod.TypeRegistry.I64, Span.zero);
+                    _ = try fb.emitPtrStoreValue(size_addr, size_val, Span.zero);
+
+                    // [2] stride
+                    const sixteen = try fb.emitConstInt(16, types_mod.TypeRegistry.I64, Span.zero);
+                    const stride_addr = try fb.emitBinary(.add, meta_addr, sixteen, types_mod.TypeRegistry.I64, Span.zero);
+                    const stride_val = try fb.emitConstInt(@intCast(stride), types_mod.TypeRegistry.I64, Span.zero);
+                    _ = try fb.emitPtrStoreValue(stride_addr, stride_val, Span.zero);
+
+                    // [3] type_idx — store actual TypeIndex for runtime dispatch
+                    // Swift: metadata stores type identity. Cot: stores TypeIndex.
+                    const twentyfour = try fb.emitConstInt(24, types_mod.TypeRegistry.I64, Span.zero);
+                    const kind_addr = try fb.emitBinary(.add, meta_addr, twentyfour, types_mod.TypeRegistry.I64, Span.zero);
+                    const kind_val = try fb.emitConstInt(@intCast(type_arg), types_mod.TypeRegistry.I64, Span.zero);
+                    _ = try fb.emitPtrStoreValue(kind_addr, kind_val, Span.zero);
+
+                    // [4] hash_fn_ptr — Swift PWT pattern: protocol witness in metadata.
+                    // Only store if the hash function exists in the program (Map imported).
+                    const thirtytwo = try fb.emitConstInt(32, types_mod.TypeRegistry.I64, Span.zero);
+                    const hash_addr = try fb.emitBinary(.add, meta_addr, thirtytwo, types_mod.TypeRegistry.I64, Span.zero);
+                    const hash_fn: ?[]const u8 = if (type_arg == types_mod.TypeRegistry.STRING)
+                        "std.map.string_hash"
+                    else if (type_arg == types_mod.TypeRegistry.I64 or type_arg == types_mod.TypeRegistry.I32 or
+                        type_arg == types_mod.TypeRegistry.I16 or type_arg == types_mod.TypeRegistry.I8 or
+                        type_arg == types_mod.TypeRegistry.U64 or type_arg == types_mod.TypeRegistry.U32 or
+                        type_arg == types_mod.TypeRegistry.U16 or type_arg == types_mod.TypeRegistry.U8)
+                        "std.map.i64_hash"
+                    else
+                        null;
+                    if (hash_fn) |hfn| {
+                        if (builder.hasFunc(hfn)) {
+                            const fn_addr = try fb.emitFuncAddr(hfn, types_mod.TypeRegistry.I64, Span.zero);
+                            _ = try fb.emitPtrStoreValue(hash_addr, fn_addr, Span.zero);
+                        } else {
+                            _ = try fb.emitPtrStoreValue(hash_addr, zero, Span.zero);
+                        }
+                    } else {
+                        _ = try fb.emitPtrStoreValue(hash_addr, zero, Span.zero);
+                    }
+
+                    _ = try fb.emitRet(null, Span.zero);
+                }
+                try builder.endFunc();
+                count += 1;
+            }
+        }
+
+        // Register all trivial metadata init functions in __cot_init_globals
+        if (count > 0) {
+            debug.log(.codegen, "Trivial metadata: {d} types emitted", .{count});
+        }
+    }
+
+    /// Pre-allocate __type_metadata_{Type} globals for ALL types used as generic
+    /// type arguments. Called BEFORE lowering so emitTypeMetadataRef can find them.
+    /// The globals are empty (zeroed) — populated later by emitVWTWitnesses /
+    /// emitTrivialTypeMetadata init functions.
+    fn preallocateTypeMetadataGlobals(self: *Driver, builder: *ir_mod.Builder, type_reg: *types_mod.TypeRegistry, generic_ctx: *checker_mod.SharedGenericContext) !void {
+        _ = self;
+        const Span = @import("frontend/source.zig").Span;
+        var count: usize = 0;
+        var it = generic_ctx.generic_inst_by_name.valueIterator();
+        while (it.next()) |inst_info| {
+            for (inst_info.type_args) |type_arg| {
+                const type_name = type_reg.typeName(type_arg);
+                const meta_name = try std.fmt.allocPrint(builder.allocator, "__type_metadata_{s}", .{type_name});
+                if (builder.lookupGlobal(meta_name) != null) continue;
+                // 40 bytes = 5 i64 slots: [vwt_ptr, size, stride, kind, hash_fn_ptr]
+                try builder.addGlobal(ir_mod.Global.initWithSize(meta_name, types_mod.TypeRegistry.I64, false, Span.zero, 40));
+                debug.log(.codegen, "preallocate metadata: '{s}' size={d}", .{ meta_name, type_reg.sizeOf(type_arg) });
+                count += 1;
+            }
+        }
+        if (count > 0) debug.log(.codegen, "pre-allocated {d} type metadata globals", .{count});
+    }
+
+    /// Generate __cot_init_metadata master function that calls ALL VWT init,
+    /// trivial metadata init, and PWT init functions.
+    /// Called from main() / test runner before any user code runs.
+    /// Swift ref: metadata is static constants, but Cot uses init functions
+    /// because our Global struct doesn't yet support initial data values.
+    fn emitMetadataInitMaster(self: *Driver, builder: *ir_mod.Builder) !void {
+        _ = self;
+        const Span = @import("frontend/source.zig").Span;
+        builder.startFunc("__cot_init_metadata", types_mod.TypeRegistry.VOID, types_mod.TypeRegistry.VOID, Span.zero);
+        if (builder.func()) |fb| {
+            // Call every __vwt_init_*, __trivial_meta_init_*, and __pwt_init_* function
+            for (builder.funcs.items) |func| {
+                if (std.mem.startsWith(u8, func.name, "__vwt_init_") or
+                    std.mem.startsWith(u8, func.name, "__trivial_meta_init_") or
+                    std.mem.startsWith(u8, func.name, "__pwt_init_"))
+                {
+                    var no_args = [_]ir_mod.NodeIndex{};
+                    _ = try fb.emitCall(func.name, &no_args, false, types_mod.TypeRegistry.VOID, Span.zero);
+                }
+            }
+            _ = try fb.emitRet(null, Span.zero);
+        }
+        try builder.endFunc();
+    }
+
+    /// Emit Protocol Witness Tables for each `impl Trait for Type` conformance.
+    /// Each PWT is a global array of function pointers, one per trait method.
+    /// Swift ref: GenProto.cpp emitWitnessTable()
+    fn emitProtocolWitnessTables(self: *Driver, builder: *ir_mod.Builder, generic_ctx: *checker_mod.SharedGenericContext) !void {
+        _ = self;
+        const Span = @import("frontend/source.zig").Span;
+        var pwt_count: usize = 0;
+
+        // Iterate all trait implementations: key="Trait:Type", value=trait_name
+        var it = generic_ctx.trait_impls.iterator();
+        while (it.next()) |entry| {
+            const impl_key = entry.key_ptr.*;
+            const trait_name = entry.value_ptr.*;
+
+            // Parse target type from impl_key "Trait:Type"
+            const colon_pos = std.mem.indexOf(u8, impl_key, ":") orelse continue;
+            const target_type = impl_key[colon_pos + 1 ..];
+            debug.log(.codegen, "PWT: impl_key='{s}' trait='{s}' target='{s}'", .{ impl_key, trait_name, target_type });
+
+            // Look up trait definition for method names
+            const trait_def = generic_ctx.trait_defs.get(trait_name) orelse continue;
+            const method_count = trait_def.method_names.len;
+            if (method_count == 0) continue;
+
+            // Global name: __pwt_{Trait}_{Type}
+            const pwt_name = try std.fmt.allocPrint(builder.allocator, "__pwt_{s}_{s}", .{ trait_name, target_type });
+
+            // Skip if already emitted (multi-file builds)
+            if (builder.lookupGlobal(pwt_name) != null) continue;
+
+            // Allocate global: method_count * 8 bytes (one function pointer per method)
+            const pwt_size: u32 = @intCast(method_count * 8);
+            try builder.addGlobal(ir_mod.Global.initWithSize(pwt_name, types_mod.TypeRegistry.I64, false, Span.zero, pwt_size));
+
+            // Emit init function: __pwt_init_{Trait}_{Type}
+            const init_name = try std.fmt.allocPrint(builder.allocator, "__pwt_init_{s}_{s}", .{ trait_name, target_type });
+            builder.startFunc(init_name, types_mod.TypeRegistry.VOID, types_mod.TypeRegistry.VOID, Span.zero);
+            if (builder.func()) |fb| {
+                const pwt_info = builder.lookupGlobal(pwt_name) orelse continue;
+                const pwt_addr = try fb.emitAddrGlobal(pwt_info.idx, pwt_name, types_mod.TypeRegistry.I64, Span.zero);
+
+                // Store function pointers for each trait method
+                for (trait_def.method_names, 0..) |method_name, i| {
+                    // Concrete method name: "{Type}_{method}" (e.g., "Dog_speak")
+                    // May be module-qualified: "{module}.{Type}_{method}"
+                    const bare_fn = try std.fmt.allocPrint(builder.allocator, "{s}_{s}", .{ target_type, method_name });
+                    // Search builder for the actual function name (may be module-qualified)
+                    const concrete_fn = if (builder.hasFunc(bare_fn))
+                        bare_fn
+                    else blk: {
+                        // Search all functions for a suffix match
+                        var found_name: []const u8 = bare_fn;
+                        for (builder.funcs.items) |func| {
+                            if (std.mem.endsWith(u8, func.name, bare_fn)) {
+                                // Verify it ends with ".{bare_fn}" (module-qualified)
+                                if (func.name.len > bare_fn.len and func.name[func.name.len - bare_fn.len - 1] == '.') {
+                                    found_name = func.name;
+                                    break;
+                                }
+                            }
+                        }
+                        break :blk found_name;
+                    };
+                    const fn_addr = try fb.emitFuncAddr(concrete_fn, types_mod.TypeRegistry.I64, Span.zero);
+                    const offset = try fb.emitConstInt(@intCast(i * 8), types_mod.TypeRegistry.I64, Span.zero);
+                    const slot_addr = try fb.emitBinary(.add, pwt_addr, offset, types_mod.TypeRegistry.I64, Span.zero);
+                    _ = try fb.emitPtrStoreValue(slot_addr, fn_addr, Span.zero);
+                }
+
+                _ = try fb.emitRet(null, Span.zero);
+            }
+            try builder.endFunc();
+            pwt_count += 1;
+        }
+        if (pwt_count > 0) std.debug.print("PWT: {d} conformances emitted\n", .{pwt_count});
+    }
+
+    /// Compile a source file (supports imports).
+    pub fn compileFile(self: *Driver, path: []const u8) ![]u8 {
+        var seen_files = std.StringHashMap(void).init(self.allocator);
+        defer seen_files.deinit();
+
+        // Phase 1: Parse all files recursively
+        var parsed_files = std.ArrayListUnmanaged(ParsedFile){};
+        defer {
+            for (parsed_files.items) |*pf| {
+                pf.tree.deinit();
+                pf.source.deinit();
+                self.allocator.free(pf.source_text);
+                self.allocator.free(pf.path);
+            }
+            parsed_files.deinit(self.allocator);
+        }
+        var in_progress = std.StringHashMap(void).init(self.allocator);
+        defer in_progress.deinit();
+        try self.parseFileRecursive(path, &parsed_files, &seen_files, &in_progress);
+
+        // Apply project-level @safe mode from cot.json (search CWD + file's dir)
+        if (self.isProjectSafe(path)) {
+            for (parsed_files.items) |*pf| {
+                if (pf.tree.file) |*file| {
+                    // Don't override stdlib files — they control their own safe mode
+                    if (!std.mem.containsAtLeast(u8, file.filename, 1, "stdlib/")) {
+                        file.safe_mode = true;
+                    }
+                }
+            }
+        }
+
+        // Phase 2: Type check all files with shared symbol table
+        var type_reg = try types_mod.TypeRegistry.init(self.allocator);
+        defer type_reg.deinit();
+        var global_scope = checker_mod.Scope.init(self.allocator, null);
+        defer global_scope.deinit();
+        var generic_ctx = checker_mod.SharedGenericContext.init(self.allocator);
+        defer generic_ctx.deinit(self.allocator);
+
+        var checkers = std.ArrayListUnmanaged(checker_mod.Checker){};
+        defer {
+            for (checkers.items) |*chk| chk.deinit();
+            checkers.deinit(self.allocator);
+        }
+
+        // Incremental per-file scopes: create scope → copy imports → check → store
+        var checked_scopes = std.StringHashMap(CheckedFileEntry).init(self.allocator);
+        defer checked_scopes.deinit();
+        var file_scopes = std.ArrayListUnmanaged(*checker_mod.Scope){};
+        defer {
+            for (file_scopes.items) |fs| {
+                fs.deinit();
+                self.allocator.destroy(fs);
+            }
+            file_scopes.deinit(self.allocator);
+        }
+
+        for (parsed_files.items) |*pf| {
+            const file_scope = try self.createFileScope(pf, &global_scope, &checked_scopes);
+            try file_scopes.append(self.allocator, file_scope);
+
+            var err_reporter = errors_mod.ErrorReporter.init(&pf.source, null);
+            var chk = checker_mod.Checker.init(self.allocator, &pf.tree, &type_reg, &err_reporter, file_scope, &global_scope, &generic_ctx, self.target);
+            chk.checkFile() catch |e| {
+                chk.deinit();
+                return e;
+            };
+            if (err_reporter.hasErrors()) {
+                chk.deinit();
+                return error.TypeCheckError;
+            }
+            try checkers.append(self.allocator, chk);
+
+            // Store checked scope for later files to import from
+            try checked_scopes.put(pf.path, .{ .scope = file_scope, .tree = &pf.tree });
+        }
+
+        // Collect user-declared extern fn names for native func_index_map
+        for (file_scopes.items) |fs| {
+            self.collectExternFns(fs, &type_reg);
+        }
+        self.collectExternFns(&global_scope, &type_reg);
+
+        // Go LinkFuncName pattern: build module name map for qualified IR function names.
+        // This prevents name collisions when two modules export functions with the same name
+        // (e.g., std/json.parse vs std/semver.parse). Each function gets a module-qualified
+        // IR name: "std.json.parse" vs "std.semver.parse".
+        var canonical_path_to_module = std.StringHashMap([]const u8).init(self.allocator);
+        defer canonical_path_to_module.deinit();
+
+        // Main file (last in parsed_files — dependencies first) gets basename as module name
+        {
+            const main_pf = &parsed_files.items[parsed_files.items.len - 1];
+            const main_base = std.fs.path.basename(main_pf.path);
+            const main_module = if (std.mem.endsWith(u8, main_base, ".cot"))
+                try self.allocator.dupe(u8, main_base[0 .. main_base.len - 4])
+            else
+                try self.allocator.dupe(u8, main_base);
+            try canonical_path_to_module.put(main_pf.path, main_module);
+        }
+
+        // Derive module names from import paths for all imported files
+        for (parsed_files.items) |*pf| {
+            const imports = try pf.tree.getImports(self.allocator);
+            defer self.allocator.free(imports);
+            const file_dir = std.fs.path.dirname(pf.path) orelse ".";
+            for (imports) |import_path| {
+                const full_path = if (std.mem.startsWith(u8, import_path, "std/"))
+                    try self.resolveStdImport(import_path, file_dir)
+                else blk: {
+                    const name = if (std.mem.endsWith(u8, import_path, ".cot"))
+                        import_path
+                    else
+                        try std.fmt.allocPrint(self.allocator, "{s}.cot", .{import_path});
+                    defer if (!std.mem.endsWith(u8, import_path, ".cot")) self.allocator.free(name);
+                    break :blk try std.fs.path.join(self.allocator, &.{ file_dir, name });
+                };
+                defer self.allocator.free(full_path);
+                const canonical = try self.normalizePath(full_path);
+                if (!canonical_path_to_module.contains(canonical)) {
+                    const mod_name = try self.deriveModuleName(import_path);
+                    try canonical_path_to_module.put(canonical, mod_name);
+                } else {
+                    self.allocator.free(canonical);
+                }
+            }
+        }
+
+        // Register module names for auto-imported async infrastructure (Wasm only).
+        for (parsed_files.items) |*pf| {
+            if (pf.tree.hasAsyncFunctions() and self.target.isWasm()) {
+                const async_deps = [_][]const u8{ "std/task_queue", "std/executor" };
+                const pf_dir = std.fs.path.dirname(pf.path) orelse ".";
+                for (&async_deps) |dep| {
+                    const dep_path = try self.resolveStdImport(dep, pf_dir);
+                    defer self.allocator.free(dep_path);
+                    const canonical = try self.normalizePath(dep_path);
+                    if (!canonical_path_to_module.contains(canonical)) {
+                        const mod_name = try self.deriveModuleName(dep);
+                        try canonical_path_to_module.put(canonical, mod_name);
+                    } else {
+                        self.allocator.free(canonical);
+                    }
+                }
+            }
+        }
+
+        // Build tree→module map for cross-module call resolution in lowerer
+        var tree_module_map = std.AutoHashMap(*const ast_mod.Ast, []const u8).init(self.allocator);
+        defer tree_module_map.deinit();
+        for (parsed_files.items) |*pf| {
+            if (canonical_path_to_module.get(pf.path)) |mod_name| {
+                try tree_module_map.put(&pf.tree, mod_name);
+            }
+        }
+
+        // Phase 3: Lower all files to IR with shared builder
+        var shared_builder = ir_mod.Builder.init(self.allocator, &type_reg);
+        defer shared_builder.deinit();
+
+        // Share lowered_generics across files to prevent duplicate generic instantiations.
+        // Same pattern as shared_builder — each Lowerer inherits and returns it.
+        var shared_lowered_generics = std.StringHashMap(void).init(self.allocator);
+        defer shared_lowered_generics.deinit();
+
+        var all_test_names = std.ArrayListUnmanaged([]const u8){};
+        defer all_test_names.deinit(self.allocator);
+        var all_test_display_names = std.ArrayListUnmanaged([]const u8){};
+        defer all_test_display_names.deinit(self.allocator);
+        var all_bench_names = std.ArrayListUnmanaged([]const u8){};
+        defer all_bench_names.deinit(self.allocator);
+        var all_bench_display_names = std.ArrayListUnmanaged([]const u8){};
+        defer all_bench_display_names.deinit(self.allocator);
+        // Go init function pattern: track per-file init function names for multi-file builds.
+        // Each file with globals gets __cot_init_file_N; master __cot_init_globals calls them all.
+        var init_func_names = std.ArrayListUnmanaged([]const u8){};
+        defer init_func_names.deinit(self.allocator);
+
+        // Multi-file source map: track per-file paths/texts and func→file mapping.
+        // Reference: Go runtime/symtab.go:funcfile() — per-CU file tables via cutab.
+        var file_paths_list = std.ArrayListUnmanaged([]const u8){};
+        defer file_paths_list.deinit(self.allocator);
+        var file_texts_list = std.ArrayListUnmanaged([]const u8){};
+        defer file_texts_list.deinit(self.allocator);
+        var func_file_idx_list = std.ArrayListUnmanaged(u16){};
+        defer func_file_idx_list.deinit(self.allocator);
+        for (parsed_files.items) |*pf| {
+            try file_paths_list.append(self.allocator, pf.path);
+            try file_texts_list.append(self.allocator, pf.source_text);
+        }
+
+        // Pre-allocate metadata globals for all generic type args BEFORE lowering.
+        // This ensures emitTypeMetadataRef can find the global during call site lowering.
+        try self.preallocateTypeMetadataGlobals(&shared_builder, &type_reg, &generic_ctx);
+
+        for (parsed_files.items, 0..) |*pf, i| {
+            const func_count_before = shared_builder.funcs.items.len;
+
+            var lower_err = errors_mod.ErrorReporter.init(&pf.source, null);
+            var lowerer = lower_mod.Lowerer.initWithBuilder(self.allocator, &pf.tree, &type_reg, &lower_err, &checkers.items[i], shared_builder, self.target);
+            lowerer.lowered_generics = shared_lowered_generics;
+            lowerer.module_name = canonical_path_to_module.get(pf.path) orelse "";
+            lowerer.tree_module_map = &tree_module_map;
+            lowerer.release_mode = self.release_mode;
+            if (self.test_mode) lowerer.setTestMode(true);
+            if (self.fail_fast) lowerer.setFailFast(true);
+            if (self.bench_mode) lowerer.setBenchMode(true);
+
+            lowerer.lowerToBuilder() catch |e| {
+                shared_lowered_generics = lowerer.lowered_generics;
+                lowerer.deinitWithoutBuilder();
+                return e;
+            };
+            // ARC Phase 4: Generate synthetic deinit functions for structs with ARC fields
+            lowerer.emitPendingAutoDeinits() catch |e| {
+                shared_lowered_generics = lowerer.lowered_generics;
+                lowerer.deinitWithoutBuilder();
+                return e;
+            };
+            if (lower_err.hasErrors()) {
+                shared_lowered_generics = lowerer.lowered_generics;
+                lowerer.deinitWithoutBuilder();
+                return error.LowerError;
+            }
+
+            // Go init function pattern: generate per-file init function for this file's globals.
+            if (lowerer.pending_global_inits.items.len > 0) {
+                const init_name = try std.fmt.allocPrint(self.allocator, "__cot_init_file_{d}", .{i});
+                lowerer.generateGlobalInitsNamed(init_name) catch |e| {
+                    shared_lowered_generics = lowerer.lowered_generics;
+                    lowerer.deinitWithoutBuilder();
+                    return e;
+                };
+                try init_func_names.append(self.allocator, init_name);
+            }
+
+            if (self.test_mode) {
+                for (lowerer.getTestNames()) |n| try all_test_names.append(self.allocator, n);
+                for (lowerer.getTestDisplayNames()) |n| try all_test_display_names.append(self.allocator, n);
+            }
+            if (self.bench_mode) {
+                for (lowerer.getBenchNames()) |n| try all_bench_names.append(self.allocator, n);
+                for (lowerer.getBenchDisplayNames()) |n| try all_bench_display_names.append(self.allocator, n);
+            }
+            shared_builder = lowerer.builder;
+            shared_lowered_generics = lowerer.lowered_generics;
+
+            // Track func→file mapping: all functions added by this file's lowering
+            const func_count_after = shared_builder.funcs.items.len;
+            for (func_count_before..func_count_after) |_| {
+                try func_file_idx_list.append(self.allocator, @intCast(i));
+            }
+
+            lowerer.deinitWithoutBuilder();
+        }
+
+        // Go init function pattern: generate master __cot_init_globals that calls all per-file inits.
+        // Uses shared_builder directly (no Lowerer needed — just emitting call + ret IR nodes).
+        {
+            const span = source_mod.Span.init(source_mod.Pos.zero, source_mod.Pos.zero);
+            shared_builder.startFunc("__cot_init_globals", types_mod.TypeRegistry.VOID, types_mod.TypeRegistry.VOID, span);
+            if (shared_builder.func()) |fb| {
+                // Install signal handlers first (before any user code)
+                if (!self.target.isWasm()) {
+                    var no_sig_args = [_]ir_mod.NodeIndex{};
+                    _ = try fb.emitCall("__cot_install_signals", &no_sig_args, false, types_mod.TypeRegistry.VOID, span);
+                }
+                for (init_func_names.items) |init_name| {
+                    var no_args = [_]ir_mod.NodeIndex{};
+                    _ = try fb.emitCall(init_name, &no_args, false, types_mod.TypeRegistry.VOID, span);
+                }
+                _ = try fb.emitRet(null, span);
+            }
+            try shared_builder.endFunc();
+        }
+
+        // Filter tests if --filter is specified
+        if (self.test_filter) |filter| {
+            var filtered_names = std.ArrayListUnmanaged([]const u8){};
+            defer filtered_names.deinit(self.allocator);
+            var filtered_display = std.ArrayListUnmanaged([]const u8){};
+            defer filtered_display.deinit(self.allocator);
+
+            for (all_test_names.items, all_test_display_names.items) |name, display| {
+                if (std.mem.indexOf(u8, display, filter) != null) {
+                    try filtered_names.append(self.allocator, name);
+                    try filtered_display.append(self.allocator, display);
+                }
+            }
+
+            all_test_names.clearRetainingCapacity();
+            all_test_display_names.clearRetainingCapacity();
+            for (filtered_names.items) |n| try all_test_names.append(self.allocator, n);
+            for (filtered_display.items) |n| try all_test_display_names.append(self.allocator, n);
+
+            if (all_test_names.items.len == 0) {
+                std.debug.print("0 tests matched filter \"{s}\"\n", .{filter});
+                return error.NoTestsMatched;
+            }
+        }
+
+        // Filter benchmarks if --filter is specified
+        if (self.bench_filter) |filter| {
+            var filtered_names = std.ArrayListUnmanaged([]const u8){};
+            defer filtered_names.deinit(self.allocator);
+            var filtered_display = std.ArrayListUnmanaged([]const u8){};
+            defer filtered_display.deinit(self.allocator);
+
+            for (all_bench_names.items, all_bench_display_names.items) |name, display| {
+                if (std.mem.indexOf(u8, display, filter) != null) {
+                    try filtered_names.append(self.allocator, name);
+                    try filtered_display.append(self.allocator, display);
+                }
+            }
+
+            all_bench_names.clearRetainingCapacity();
+            all_bench_display_names.clearRetainingCapacity();
+            for (filtered_names.items) |n| try all_bench_names.append(self.allocator, n);
+            for (filtered_display.items) |n| try all_bench_display_names.append(self.allocator, n);
+
+            if (all_bench_names.items.len == 0) {
+                std.debug.print("0 benchmarks matched filter \"{s}\"\n", .{filter});
+                return error.NoBenchesMatched;
+            }
+        }
+
+        // Generate test runner if in test mode
+        if (self.test_mode and all_test_names.items.len > 0) {
+            var dummy_err = errors_mod.ErrorReporter.init(&parsed_files.items[0].source, null);
+            var runner = lower_mod.Lowerer.initWithBuilder(self.allocator, &parsed_files.items[0].tree, &type_reg, &dummy_err, &checkers.items[0], shared_builder, self.target);
+            if (self.fail_fast) runner.setFailFast(true);
+            for (all_test_names.items) |n| try runner.addTestName(n);
+            for (all_test_display_names.items) |n| try runner.addTestDisplayName(n);
+            try runner.generateTestRunner();
+            shared_builder = runner.builder;
+            runner.deinitWithoutBuilder();
+        }
+
+        // Generate bench runner if in bench mode
+        if (self.bench_mode and all_bench_names.items.len > 0) {
+            var dummy_err = errors_mod.ErrorReporter.init(&parsed_files.items[0].source, null);
+            var runner = lower_mod.Lowerer.initWithBuilder(self.allocator, &parsed_files.items[0].tree, &type_reg, &dummy_err, &checkers.items[0], shared_builder, self.target);
+            for (all_bench_names.items) |n| try runner.addBenchName(n);
+            for (all_bench_display_names.items) |n| try runner.addBenchDisplayName(n);
+            try runner.generateBenchRunner();
+            shared_builder = runner.builder;
+            runner.deinitWithoutBuilder();
+        }
+
+        try self.emitVWTWitnesses(&shared_builder, &type_reg);
+        try self.emitTrivialTypeMetadata(&shared_builder, &type_reg, &generic_ctx);
+        try self.emitProtocolWitnessTables(&shared_builder, &generic_ctx);
+        try self.emitMetadataInitMaster(&shared_builder);
+
+        var final_ir = try shared_builder.getIR();
+        defer final_ir.deinit();
+
+        // Multi-file source map: store per-file data for pctab encoder
+        self.parsed_file_paths = file_paths_list.items;
+        self.parsed_file_texts = file_texts_list.items;
+        self.func_file_indices = func_file_idx_list.items;
+
+        const main_file = if (parsed_files.items.len > 0) parsed_files.items[parsed_files.items.len - 1] else ParsedFile{
+            .path = path,
+            .source_text = "",
+            .source = undefined,
+            .tree = undefined,
+        };
+        return self.generateCode(final_ir.funcs, final_ir.globals, &type_reg, main_file.path, main_file.source_text);
+    }
+
+    /// Collect user-declared extern fn names and signatures from a checker scope.
+    /// These are functions declared with `extern fn` in user code (e.g. sqlite3_open).
+    /// They need func_index_map entries so the native backend can emit calls to them.
+    /// For --target=js, param counts are used to generate Wasm import entries.
+    /// Reference: cg_clif abi/mod.rs:97-115 — Linkage::Import pattern for external symbols
+    fn collectExternFns(self: *Driver, scope: *const checker_mod.Scope, type_reg: *types_mod.TypeRegistry) void {
+        var iter = scope.symbols.iterator();
+        while (iter.next()) |entry| {
+            const sym = entry.value_ptr.*;
+            if (sym.is_extern and sym.kind == .function) {
+                // Dupe name — sym.name points into parser arena which may be freed before JS glue generation
+                self.user_extern_fns.append(self.allocator, self.allocator.dupe(u8, sym.name) catch sym.name) catch {};
+
+                // Resolve param count and return type from the type registry.
+                // Cot's Wasm ABI: all params are i64, strings decompose to (ptr, len).
+                var param_count: u32 = 0;
+                var has_result: bool = false;
+                const ti = sym.type_idx;
+                if (ti < type_reg.types.items.len) {
+                    const t = type_reg.types.items[ti];
+                    if (t == .func) {
+                        // Count Wasm-level params: strings/slices = 2 params (ptr+len), everything else = 1
+                        for (t.func.params) |p| {
+                            const pt = p.type_idx;
+                            if (pt < type_reg.types.items.len) {
+                                const pt_info = type_reg.types.items[pt];
+                                if (pt_info == .slice or pt == types_mod.TypeRegistry.STRING) {
+                                    param_count += 2; // ptr + len
+                                } else {
+                                    param_count += 1;
+                                }
+                            } else {
+                                param_count += 1;
+                            }
+                        }
+                        has_result = t.func.return_type != types_mod.TypeRegistry.VOID;
+                    }
+                }
+                self.user_extern_param_counts.append(self.allocator, param_count) catch {};
+                self.user_extern_has_result.append(self.allocator, has_result) catch {};
+            }
+        }
+    }
+
+    fn normalizePath(self: *Driver, path: []const u8) ![]const u8 {
+        return std.fs.cwd().realpathAlloc(self.allocator, path) catch try self.allocator.dupe(u8, path);
+    }
+
+    /// Go PathToPrefix pattern: derive module name from import path.
+    /// "std/json" → "std.json", "frontend/parser" → "frontend.parser"
+    /// Note: Go's PathToPrefix also escapes dots in the final segment (`.` → `%2e`)
+    /// and special characters. Currently not needed since Cot import paths don't contain
+    /// dots (file extensions are stripped). If import paths with dots are ever supported,
+    /// add Go-style escaping to avoid ambiguity with the `module.funcName` separator.
+    fn deriveModuleName(self: *Driver, import_path: []const u8) ![]const u8 {
+        // Strip .cot extension if present
+        const path = if (std.mem.endsWith(u8, import_path, ".cot"))
+            import_path[0 .. import_path.len - 4]
+        else
+            import_path;
+        // Replace '/' with '.'
+        const buf = try self.allocator.dupe(u8, path);
+        for (buf) |*c| {
+            if (c.* == '/') c.* = '.';
+        }
+        return buf;
+    }
+
+    /// Go resolver.go pattern: create a per-file scope and copy imported symbols.
+    fn createFileScope(self: *Driver, pf: *ParsedFile, global_scope: *checker_mod.Scope, checked_scopes: *std.StringHashMap(CheckedFileEntry)) !*checker_mod.Scope {
+        const file_scope = try self.allocator.create(checker_mod.Scope);
+        file_scope.* = checker_mod.Scope.init(self.allocator, global_scope);
+
+        // Copy direct imports' OWN symbols into this file's scope
+        const imports = try pf.tree.getImports(self.allocator);
+        defer self.allocator.free(imports);
+        const file_dir = std.fs.path.dirname(pf.path) orelse ".";
+
+        for (imports) |import_path| {
+            // Resolve import path to canonical path (same logic as parseFileRecursive)
+            const full_path = if (std.mem.startsWith(u8, import_path, "std/"))
+                try self.resolveStdImport(import_path, file_dir)
+            else blk: {
+                const name = if (std.mem.endsWith(u8, import_path, ".cot"))
+                    import_path
+                else
+                    try std.fmt.allocPrint(self.allocator, "{s}.cot", .{import_path});
+                defer if (!std.mem.endsWith(u8, import_path, ".cot")) self.allocator.free(name);
+                break :blk try std.fs.path.join(self.allocator, &.{ file_dir, name });
+            };
+            defer self.allocator.free(full_path);
+            const canonical = try self.normalizePath(full_path);
+            defer self.allocator.free(canonical);
+
+            // Find imported file's scope (already checked) and copy its OWN symbols
+            if (checked_scopes.get(canonical)) |imported| {
+                var it = imported.scope.symbols.iterator();
+                while (it.next()) |entry| {
+                    const sym = entry.value_ptr.*;
+                    // Only copy symbols defined in the imported file (not its transitive imports)
+                    if (sym.source_tree) |st| {
+                        if (st == imported.tree) {
+                            try file_scope.define(sym);
+                        }
+                    } else {
+                        // No source_tree (e.g., stdlib extern fns) — copy all
+                        try file_scope.define(sym);
+                    }
+                }
+            }
+        }
+
+        return file_scope;
+    }
+
+    fn parseFileRecursive(self: *Driver, path: []const u8, parsed_files: *std.ArrayListUnmanaged(ParsedFile), seen_files: *std.StringHashMap(void), in_progress: *std.StringHashMap(void)) !void {
+        const canonical_path = try self.normalizePath(path);
+        defer self.allocator.free(canonical_path);
+
+        // Circular import detection: file is on the recursion stack but not yet finished
+        if (in_progress.contains(canonical_path)) {
+            std.debug.print("error: circular import detected: {s}\n", .{canonical_path});
+            return error.CircularImport;
+        }
+
+        if (seen_files.contains(canonical_path)) return;
+
+        const path_copy = try self.allocator.dupe(u8, canonical_path);
+        errdefer self.allocator.free(path_copy);
+        try seen_files.put(path_copy, {});
+
+        // Mark file as in-progress (on recursion stack)
+        try in_progress.put(path_copy, {});
+
+        const source_text = std.fs.cwd().readFileAlloc(self.allocator, canonical_path, 1024 * 1024) catch |e| {
+            std.debug.print("Failed to read file: {s}: {any}\n", .{ canonical_path, e });
+            return e;
+        };
+        errdefer self.allocator.free(source_text);
+
+        var src = source_mod.Source.init(self.allocator, path_copy, source_text);
+        errdefer src.deinit();
+        var err_reporter = errors_mod.ErrorReporter.init(&src, null);
+
+        var tree = ast_mod.Ast.init(self.allocator);
+        errdefer tree.deinit();
+        var scan = scanner_mod.Scanner.initWithErrors(&src, &err_reporter);
+        var parser = parser_mod.Parser.init(self.allocator, &scan, &tree, &err_reporter);
+        // Project-level @safe: set parser safe_mode BEFORE parsing so syntax features work
+        if (self.isProjectSafe(canonical_path)) parser.safe_mode = true;
+        try parser.parseFile();
+        if (err_reporter.hasErrors()) return error.ParseError;
+
+        // Parse imports first (dependencies before dependents)
+        const imports = try tree.getImports(self.allocator);
+        defer self.allocator.free(imports);
+        const file_dir = std.fs.path.dirname(canonical_path) orelse ".";
+        for (imports) |import_path| {
+            const full_path = if (std.mem.startsWith(u8, import_path, "std/"))
+                try self.resolveStdImport(import_path, file_dir)
+            else blk: {
+                // Auto-append .cot extension if not present (like std/ imports do)
+                const name = if (std.mem.endsWith(u8, import_path, ".cot"))
+                    import_path
+                else
+                    try std.fmt.allocPrint(self.allocator, "{s}.cot", .{import_path});
+                defer if (!std.mem.endsWith(u8, import_path, ".cot")) self.allocator.free(name);
+                break :blk try std.fs.path.join(self.allocator, &.{ file_dir, name });
+            };
+            defer self.allocator.free(full_path);
+            try self.parseFileRecursive(full_path, parsed_files, seen_files, in_progress);
+        }
+
+        // Auto-import cooperative executor for async files targeting Wasm.
+        // Wasm await sites call run_until_task_done() for cooperative scheduling
+        // (Rust poll model: coroutine.rs block_on pattern).
+        // Native uses eager evaluation and doesn't need the executor.
+        if (tree.hasAsyncFunctions() and self.target.isWasm()) {
+            const async_deps = [_][]const u8{ "std/task_queue", "std/executor" };
+            for (&async_deps) |dep| {
+                const dep_path = try self.resolveStdImport(dep, file_dir);
+                defer self.allocator.free(dep_path);
+                try self.parseFileRecursive(dep_path, parsed_files, seen_files, in_progress);
+            }
+        }
+
+        // Remove from in-progress stack (file fully processed)
+        _ = in_progress.remove(canonical_path);
+
+        try parsed_files.append(self.allocator, .{ .path = path_copy, .source_text = source_text, .source = src, .tree = tree });
+    }
+
+    /// Resolve stdlib imports: "std/list" → "<stdlib_dir>/list.cot"
+    /// Discovery order (like Zig's findZigLibDirFromSelfExe):
+    /// 1. COT_STDLIB env var (explicit override)
+    /// 2. Walk up from source file looking for stdlib/ directory
+    /// 3. Relative to compiler binary (<exe_dir>/../lib/std/)
+    /// 4. CWD fallback (./stdlib/)
+    fn resolveStdImport(self: *Driver, import_path: []const u8, source_dir: []const u8) ![]const u8 {
+        const module = import_path["std/".len..];
+        const filename = try std.fmt.allocPrint(self.allocator, "{s}.cot", .{module});
+        defer self.allocator.free(filename);
+
+        // Tier 1: COT_STDLIB env var
+        if (std.posix.getenv("COT_STDLIB")) |stdlib_dir| {
+            return std.fs.path.join(self.allocator, &.{ stdlib_dir, filename });
+        }
+
+        // Tier 2: Walk up from source directory looking for stdlib/
+        var dir: []const u8 = source_dir;
+        while (true) {
+            const candidate = try std.fs.path.join(self.allocator, &.{ dir, "stdlib", filename });
+            if (std.fs.cwd().access(candidate, .{})) |_| {
+                return candidate;
+            } else |_| {}
+            self.allocator.free(candidate);
+            dir = std.fs.path.dirname(dir) orelse break;
+        }
+
+        // Tier 3: Relative to compiler binary (Zig findZigLibDirFromSelfExe pattern)
+        // Installed layout: ~/.cot/bin/cot + ~/.cot/lib/std/*.cot
+        var exe_dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+        if (std.fs.selfExeDirPath(&exe_dir_buf)) |exe_dir| {
+            const candidate = try std.fs.path.join(self.allocator, &.{ exe_dir, "..", "lib", "std", filename });
+            if (std.fs.cwd().access(candidate, .{})) |_| {
+                return candidate;
+            } else |_| {}
+            self.allocator.free(candidate);
+        } else |_| {}
+
+        // Tier 4: CWD fallback
+        return std.fs.path.join(self.allocator, &.{ "stdlib", filename });
+    }
+
+    /// Unified code generation for all architectures.
+    fn generateCode(self: *Driver, funcs: []const ir_mod.Func, globals: []const ir_mod.Global, type_reg: *types_mod.TypeRegistry, source_file: []const u8, source_text: []const u8) ![]u8 {
+
+        // Wasm target: use Wasm codegen pipeline
+        if (self.target.isWasm()) {
+            return self.generateWasmCode(funcs, globals, type_reg);
+        }
+
+        // Store source info for DWARF debug generation in generateMachO/generateElf
+        self.debug_source_file = source_file;
+        self.debug_source_text = source_text;
+        self.debug_ir_funcs = funcs;
+        self.debug_type_reg = type_reg;
+
+        // Native path: SSA → CLIF → native
+        // use_libclif: use CIR serialization → rust/libclif (real Cranelift) instead of hand-ported backend
+        if (self.use_libclif) {
+            return self.generateNativeCodeViaCIR(funcs, globals, type_reg);
+        }
+        return self.generateNativeCode(funcs, globals, type_reg);
+    }
+
+    /// SSA → CLIF → native code generation.
+    ///
+    /// Pipeline: IR funcs → SSA → passes → lower_native → ssa_to_clif → CLIF →
+    ///           compile.zig → CompiledCode → object file
+    fn generateNativeCode(self: *Driver, funcs: []const ir_mod.Func, globals: []const ir_mod.Global, type_reg: *types_mod.TypeRegistry) ![]u8 {
+        debug.log(.codegen, "driver: direct native path for {d} functions", .{funcs.len});
+
+        // Select ISA based on target
+        const isa = switch (self.target.arch) {
+            .arm64 => native_compile.TargetIsa{ .aarch64 = native_compile.AArch64Backend.default },
+            .amd64 => native_compile.TargetIsa{ .x64 = native_compile.X64Backend.default },
+            .wasm32 => return error.InvalidTargetForNative,
+        };
+
+        var ctrl_plane = native_compile.ControlPlane.init();
+
+        // Compiled functions list
+        var compiled_funcs = std.ArrayListUnmanaged(native_compile.CompiledCode){};
+        defer {
+            for (compiled_funcs.items) |*cf| cf.deinit();
+            compiled_funcs.deinit(self.allocator);
+        }
+
+        // Function names for object file generation
+        var func_names = std.ArrayListUnmanaged([]const u8){};
+        defer func_names.deinit(self.allocator);
+
+        // Track main function index and whether it returns void
+        var main_func_index: ?usize = null;
+        var main_returns_void: bool = false;
+
+        // String offsets (for rewritegeneric pass) and string data blob
+        var string_offsets = std.StringHashMap(i32).init(self.allocator);
+        defer string_offsets.deinit();
+        var string_data = std.ArrayListUnmanaged(u8){};
+        defer string_data.deinit(self.allocator);
+
+        // Phase 1: Collect string literals — build actual data blob with proper byte offsets
+        for (funcs) |*ir_func| {
+            for (ir_func.string_literals) |str| {
+                if (!string_offsets.contains(str)) {
+                    const offset: i32 = @intCast(string_data.items.len);
+                    try string_offsets.put(str, offset);
+                    try string_data.appendSlice(self.allocator, str);
+                    // Align to 8 bytes for next string
+                    const padding = (8 - (str.len % 8)) % 8;
+                    for (0..padding) |_| {
+                        try string_data.append(self.allocator, 0);
+                    }
+                }
+            }
+        }
+
+        // Build function name → index map for call relocations
+        // Indices: 0..N-1 = user functions, N..N+R-1 = runtime functions
+        var func_index_map = std.StringHashMapUnmanaged(u32){};
+        defer func_index_map.deinit(self.allocator);
+        for (funcs, 0..) |*ir_func, idx| {
+            try func_index_map.put(self.allocator, ir_func.name, @intCast(idx));
+        }
+
+        // Pre-register runtime function names so ssa_to_clif can emit calls to them.
+        // These will be defined later as CLIF IR functions compiled to native code.
+        // Reference: cg_clif abi/mod.rs:97-115 — import_function for runtime symbols
+        // IMPORTANT: Order must match the order functions are appended to compiled_funcs.
+        // Compiled functions: arc → io → print → test.
+        // Uncompiled runtime stubs and libc externals come after.
+        const runtime_func_names = [_][]const u8{
+            // ARC runtime (arc_native.generate order — order MUST match generate())
+            "alloc",         "dealloc",
+            "alloc_raw",     "realloc_raw",   "dealloc_raw",
+            "retain",        "release",
+            "cot_realloc",   "string_concat",  "string_eq",
+            "unowned_retain", "unowned_release", "unowned_load_strong",
+            "weak_form_reference", "weak_retain", "weak_release", "weak_load_strong",
+            // I/O runtime (io_native.generate order)
+            "fd_write",      "fd_read",        "fd_close",      "exit",
+            "fd_seek",       "memset_zero",    "fd_open",       "time",
+            "random",        "growslice",      "nextslicecap",
+            "args_count",    "arg_len",        "arg_ptr",
+            "environ_count", "environ_len",    "environ_ptr",
+            // Directory runtime (cot_mkdir avoids linker collision with libc _mkdir)
+            "cot_mkdir",     "dir_open",       "dir_next",      "dir_close",
+            // Filesystem metadata (cot_unlink avoids collision with libc _unlink)
+            "stat_type",     "cot_unlink",
+            // Network runtime
+            "net_socket",    "net_bind",       "net_listen",
+            "net_accept",    "net_connect",    "net_set_reuse_addr",
+            "set_nonblocking", "poll_read",
+            // Event loop runtime (kqueue on macOS)
+            "kqueue_create", "kevent_add",     "kevent_del",    "kevent_wait",
+            // Epoll stubs (return -1 on macOS)
+            "epoll_create",  "epoll_add",      "epoll_del",     "epoll_wait",
+            // Process runtime (waitpid/pipe need wrappers with different linker names
+            // to avoid collision with libc symbols; fork/dup2/execve are libc-only)
+            "cot_waitpid",   "cot_pipe",
+            // Terminal PTY runtime (openpty/ioctl need wrappers)
+            "cot_openpty",   "cot_ioctl_winsize", "cot_ioctl_set_ctty",
+            // Print runtime (print_native.generate order)
+            "print_int",     "eprint_int",       "int_to_string",
+            "print_float",   "eprint_float",     "float_to_string",
+            // Signal handler runtime (signal_native.generate order)
+            "__cot_print_hex", "__cot_signal_handler", "__cot_install_signals", "__cot_print_backtrace", "__cot_print_source_loc",
+            // Test runtime (test_native.generate order)
+            "__test_begin",  "__test_print_name", "__test_pass",
+            "__test_fail",   "__test_summary",    "__test_store_fail_values",
+            // libc symbols — external references resolved by linker (-lSystem/-lc)
+            // "memcpy" is here because the Cot signature (dst,src,len)→void is
+            // ABI-compatible with libc memcpy(dst,src,n)→void* (return ignored).
+            "snprintf",
+            "write",         "malloc",         "free",          "realloc",   "memset",
+            "memcmp",        "memcpy",         "read",          "close",
+            "__open",        "lseek",          "_exit",         "gettimeofday",
+            "getentropy",    "isatty",         "strlen",        "__error",
+            "socket",        "bind",           "listen",        "accept",
+            "connect",       "setsockopt",     "kqueue",        "kevent",
+            "fcntl",         "fork",           "c_waitpid",     "c_pipe",
+            "dup2",          "execve",        "kill",
+            "c_openpty",     "setsid",        "ioctl",
+            "c_mkdir",       "opendir",       "readdir",       "closedir",
+            "c_stat",        "c_unlink",      "signal",
+            "sigaction",     "sigaltstack",
+            "backtrace",     "backtrace_symbols_fd",
+            // dladdr — used by signal handler for source map lookup
+            "dladdr",
+            // poll — used by poll_read to wait on non-blocking fd
+            "poll",
+            // usleep — POSIX sleep in microseconds (for Task.sleep on native)
+            "usleep",
+        };
+        const runtime_start_idx: u32 = @intCast(funcs.len);
+        for (runtime_func_names, 0..) |name, i| {
+            if (!func_index_map.contains(name)) {
+                try func_index_map.put(self.allocator, name, runtime_start_idx + @as(u32, @intCast(i)));
+            }
+        }
+        // Aliases: user code calls "waitpid"/"pipe" but compiled wrappers are "cot_waitpid"/"cot_pipe"
+        // (different linker names to avoid collision with libc symbols of the same name)
+        if (func_index_map.get("cot_waitpid")) |idx| {
+            try func_index_map.put(self.allocator, "waitpid", idx);
+        }
+        if (func_index_map.get("cot_pipe")) |idx| {
+            try func_index_map.put(self.allocator, "pipe", idx);
+        }
+        // Debug mode: register DWARF resolver (linked from pre-compiled dwarf_reader.o)
+        // Index 9999 is a sentinel — the linker resolves the symbol by name, not index.
+        if (self.debug_mode) {
+            try func_index_map.put(self.allocator, "__cot_dwarf_resolve", 9999);
+        }
+        if (func_index_map.get("cot_openpty")) |idx| {
+            try func_index_map.put(self.allocator, "openpty", idx);
+        }
+        if (func_index_map.get("cot_ioctl_winsize")) |idx| {
+            try func_index_map.put(self.allocator, "ioctl_winsize", idx);
+        }
+        if (func_index_map.get("cot_ioctl_set_ctty")) |idx| {
+            try func_index_map.put(self.allocator, "ioctl_set_ctty", idx);
+        }
+        if (func_index_map.get("cot_mkdir")) |idx| {
+            try func_index_map.put(self.allocator, "mkdir", idx);
+        }
+        if (func_index_map.get("cot_unlink")) |idx| {
+            try func_index_map.put(self.allocator, "unlink", idx);
+        }
+        // Alias: user code calls "realloc" → maps to "cot_realloc" (ARC wrapper).
+        // Swift pattern: swift_allocObject vs malloc — prefixed runtime names.
+        if (func_index_map.get("cot_realloc")) |idx| {
+            try func_index_map.put(self.allocator, "realloc", idx);
+        }
+
+        // User-declared extern fn names (from imported modules like std/sqlite).
+        // Same pattern as libc symbols above — linker resolves from -l flags.
+        // Reference: cg_clif abi/mod.rs:97-115 — import_function with Linkage::Import
+        var user_extern_count: u32 = 0;
+        for (self.user_extern_fns.items) |name| {
+            if (!func_index_map.contains(name)) {
+                try func_index_map.put(self.allocator, name, runtime_start_idx + @as(u32, @intCast(runtime_func_names.len)) + user_extern_count);
+                user_extern_count += 1;
+            }
+        }
+
+        // String data symbol index — used by ssa_to_clif for globalValue references
+        // This index is registered in external_names in generateMachODirect
+        const string_data_symbol_idx: ?u32 = if (string_data.items.len > 0)
+            runtime_start_idx + @as(u32, @intCast(runtime_func_names.len)) + user_extern_count
+        else
+            null;
+
+        // CTXT global symbol index — used by closure calls to pass context pointer.
+        // Mirrors Wasm's CTXT global (index 1). Native uses a data section variable.
+        const ctxt_base_idx = runtime_start_idx + @as(u32, @intCast(runtime_func_names.len)) + user_extern_count + @as(u32, if (string_data.items.len > 0) 1 else 0);
+        const ctxt_symbol_idx: u32 = ctxt_base_idx;
+
+        // Argc/argv/envp global symbol indices — used by args and environ runtime functions.
+        // _main stores argc, argv, envp to these data section variables before calling __cot_main.
+        const argc_symbol_idx: u32 = ctxt_symbol_idx + 1;
+        const argv_symbol_idx: u32 = argc_symbol_idx + 1;
+        const envp_symbol_idx: u32 = argv_symbol_idx + 1;
+
+        // PC→line table symbol indices — Go-style pctab/functab for crash source lines.
+        // Pre-allocated here so signal_native can reference them in CLIF globalValue instructions.
+        const pctab_symbol_idx: u32 = envp_symbol_idx + 1;
+        const functab_symbol_idx: u32 = pctab_symbol_idx + 1;
+        const functab_count_symbol_idx: u32 = functab_symbol_idx + 1;
+        const filetab_symbol_idx: u32 = functab_count_symbol_idx + 1;
+        const funcnames_symbol_idx: u32 = filetab_symbol_idx + 1;
+
+        // Global variable symbol indices — each module-level var gets a data section entry.
+        // Maps global name → external name index for globalValue references in ssa_to_clif.
+        var global_symbol_map = std.StringHashMapUnmanaged(u32){};
+        defer global_symbol_map.deinit(self.allocator);
+        const globals_base_idx: u32 = funcnames_symbol_idx + 1;
+        for (globals, 0..) |g, i| {
+            try global_symbol_map.put(self.allocator, g.name, globals_base_idx + @as(u32, @intCast(i)));
+        }
+
+        // Phase 2: For each function, build SSA → run passes → translate → compile
+        debug.log(.codegen, "driver: Phase 2 start — compile {d} user functions", .{funcs.len});
+        for (funcs, 0..) |*ir_func, func_idx| {
+            debug.log(.codegen, "driver: direct native: compiling '{s}' ({d}/{d})", .{
+                ir_func.name, func_idx + 1, funcs.len,
+            });
+
+            if (std.mem.eql(u8, ir_func.name, "main")) {
+                main_func_index = func_idx;
+                main_returns_void = (ir_func.return_type == types_mod.TypeRegistry.VOID);
+            }
+            try func_names.append(self.allocator, ir_func.name);
+
+            // Per-function arena: all SSA data allocated here, freed at once after codegen
+            var func_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer func_arena.deinit();
+            const func_alloc = func_arena.allocator();
+
+            // Build SSA from IR
+            var ssa_builder = try ssa_builder_mod.SSABuilder.init(func_alloc, ir_func, globals, type_reg, self.target);
+            errdefer ssa_builder.deinit();
+
+            const ssa_func = try ssa_builder.build();
+            // No need for individual deinit — arena frees everything at once
+            ssa_builder.deinit();
+
+            // Set function type for CLIF signature building (not set by SSA builder)
+            ssa_func.type_idx = ir_func.type_idx;
+
+            // COT_SSA: interactive HTML visualizer (native path)
+            const ssa_html = @import("ssa/html.zig");
+            var html_writer_native: ?ssa_html.HTMLWriter = null;
+            if (self.ssa_html_func) |target_name| {
+                if (std.mem.eql(u8, ir_func.name, target_name) or
+                    std.mem.eql(u8, target_name, "*"))
+                {
+                    const html_path = std.fmt.allocPrint(self.allocator, "{s}.ssa.html", .{ir_func.name}) catch ir_func.name;
+                    html_writer_native = ssa_html.HTMLWriter.init(self.allocator, ir_func.name, html_path, type_reg);
+                    if (self.parsed_file_texts.len > 0) {
+                        html_writer_native.?.writeSources(self.parsed_file_texts[0], if (self.parsed_file_paths.len > 0) self.parsed_file_paths[0] else "unknown");
+                    }
+                    html_writer_native.?.writePhase("start", "start", ssa_func);
+                }
+            }
+
+            // Run SSA passes (native path)
+            // Skip async state machine splitting on native — CLIF can't handle jump_table dispatch.
+            // Native async functions use eager evaluation (body runs inline).
+            // async_split only runs on the Wasm path where br_table dispatch works.
+
+            try rewritegeneric.rewrite(func_alloc, ssa_func, &string_offsets);
+            if (html_writer_native != null) html_writer_native.?.writePhase("rewritegeneric", "rewritegeneric", ssa_func);
+
+            try decompose_builtin.decompose(func_alloc, ssa_func, type_reg);
+            if (html_writer_native != null) html_writer_native.?.writePhase("decompose", "decompose", ssa_func);
+
+            try rewritedec.rewrite(func_alloc, ssa_func);
+            if (html_writer_native != null) html_writer_native.?.writePhase("rewritedec", "rewritedec", ssa_func);
+
+            // Go compile.go + Swift GenericCloner.cpp: remove unreachable blocks
+            // before schedule. Lighter than full deadcode — only removes blocks,
+            // not values, to avoid use-count issues in the native pipeline.
+            try deadcode.removeUnreachableBlocksOnly(ssa_func);
+            if (html_writer_native != null) html_writer_native.?.writePhase("deadcode", "deadcode", ssa_func);
+
+            schedule.schedule(ssa_func) catch |err| {
+                std.debug.print("SCHEDULE FAIL: func '{s}' err={s} blocks={d}\n", .{ ir_func.name, @errorName(err), ssa_func.blocks.items.len });
+                // Dump block info for debugging
+                for (ssa_func.blocks.items, 0..) |blk, bi| {
+                    std.debug.print("  block {d}: values={d} preds={d} succs={d} kind={s}\n", .{
+                        bi, blk.values.items.len, blk.preds.len, blk.succs.len, @tagName(blk.kind),
+                    });
+                }
+                return err;
+            };
+            if (html_writer_native != null) html_writer_native.?.writePhase("schedule", "schedule", ssa_func);
+
+            try layout.layout(ssa_func);
+            if (html_writer_native != null) html_writer_native.?.writePhase("layout", "layout", ssa_func);
+
+            try lower_native.lower(ssa_func);
+            if (html_writer_native != null) {
+                html_writer_native.?.writePhase("lower_native", "lower_native", ssa_func);
+                html_writer_native.?.flushPhases(ssa_func);
+                html_writer_native.?.close();
+                html_writer_native.?.deinit();
+                html_writer_native = null;
+            }
+
+            // SSA dump via pipeline debug (replaces COT_SSA_DUMP env var)
+            if (debug.isEnabled(.ssa)) {
+                debug.log(.ssa, "\n=== SSA for '{s}' (locals: {d}, params: {d}) ===", .{ ir_func.name, ssa_func.local_sizes.len, ir_func.params.len });
+                for (ssa_func.blocks.items) |blk| {
+                    debug.log(.ssa, "  Block b{d} (kind={s}, succs={d}, preds={d}):", .{
+                        blk.id, @tagName(blk.kind), blk.succs.len, blk.preds.len,
+                    });
+                    for (blk.values.items) |val| {
+                        debug.log(.ssa, "    v{d}: {s} aux={d} type={d} uses={d}", .{
+                            val.id, @tagName(val.op), val.aux_int, val.type_idx, val.uses,
+                        });
+                    }
+                }
+            }
+
+            // Translate SSA → CLIF IR
+            var clif_func = clif.Function.init(self.allocator);
+            defer clif_func.deinit();
+
+            ssa_to_clif.translate(ssa_func, &clif_func, type_reg, ir_func.params, ir_func.return_type, &func_index_map, funcs, self.allocator, string_data_symbol_idx, ctxt_symbol_idx, &global_symbol_map) catch |e| {
+                debug.log(.codegen, "driver: SSA→CLIF translation error for '{s}': {any}", .{ ir_func.name, e });
+                return error.SsaToClifError;
+            };
+
+            const num_blocks = clif_func.dfg.blocks.items.len;
+            const num_insts = clif_func.dfg.insts.items.len;
+            debug.log(.codegen, "driver: translated '{s}' to CLIF ({d} blocks, {d} insts)", .{ ir_func.name, num_blocks, num_insts });
+
+            // Compile CLIF → native machine code
+            const compiled = native_compile.compile(self.allocator, &clif_func, isa, &ctrl_plane) catch |e| {
+                debug.log(.codegen, "driver: compile error for '{s}': {any}", .{ ir_func.name, e });
+                return error.NativeCompileError;
+            };
+
+            try compiled_funcs.append(self.allocator, compiled);
+            debug.log(.codegen, "driver: compiled '{s}': {d} bytes", .{
+                ir_func.name, compiled.codeSize(),
+            });
+        }
+
+        debug.log(.codegen, "driver: Phase 2 done — {d} functions compiled", .{compiled_funcs.items.len});
+        // Phase 3: Generate runtime functions as CLIF IR
+        // Reference: cg_clif abi/mod.rs (lib_call pattern), Swift HeapObject.cpp (ARC semantics)
+        {
+            // ARC runtime: alloc, dealloc, retain, release
+            var arc_funcs = try arc_native.generate(self.allocator, isa, &ctrl_plane, &func_index_map);
+            defer arc_funcs.deinit(self.allocator);
+            for (arc_funcs.items) |rf| {
+                try compiled_funcs.append(self.allocator, rf.compiled);
+                try func_names.append(self.allocator, rf.name);
+            }
+
+            // I/O runtime: fd_write, fd_read, fd_close, exit, fd_seek, memcpy, memset_zero
+            var io_funcs = try io_native.generate(self.allocator, isa, &ctrl_plane, &func_index_map, argc_symbol_idx, argv_symbol_idx, envp_symbol_idx, self.lib_mode, self.target.os);
+            defer io_funcs.deinit(self.allocator);
+            for (io_funcs.items) |rf| {
+                try compiled_funcs.append(self.allocator, rf.compiled);
+                try func_names.append(self.allocator, rf.name);
+            }
+
+            // Print runtime: print_int, eprint_int
+            var print_funcs = try print_native.generate(self.allocator, isa, &ctrl_plane, &func_index_map);
+            defer print_funcs.deinit(self.allocator);
+            for (print_funcs.items) |rf| {
+                try compiled_funcs.append(self.allocator, rf.compiled);
+                try func_names.append(self.allocator, rf.name);
+            }
+
+
+            // Signal handler runtime: __cot_signal_handler, __cot_install_signals, __cot_print_source_loc
+            var signal_funcs = try signal_native.generate(self.allocator, isa, &ctrl_plane, &func_index_map, self.target.os, pctab_symbol_idx, functab_symbol_idx, functab_count_symbol_idx, filetab_symbol_idx, funcnames_symbol_idx);
+            defer signal_funcs.deinit(self.allocator);
+            for (signal_funcs.items) |rf| {
+                try compiled_funcs.append(self.allocator, rf.compiled);
+                try func_names.append(self.allocator, rf.name);
+            }
+
+            // Test runtime: __test_begin, __test_print_name, __test_pass, __test_fail, __test_summary
+            if (self.test_mode) {
+                var test_funcs = try test_native_rt.generate(self.allocator, isa, &ctrl_plane, &func_index_map);
+                defer test_funcs.deinit(self.allocator);
+                for (test_funcs.items) |rf| {
+                    try compiled_funcs.append(self.allocator, rf.compiled);
+                    try func_names.append(self.allocator, rf.name);
+                }
+            }
+
+            debug.log(.codegen, "driver: compiled {d} total functions (user + runtime)", .{compiled_funcs.items.len});
+        }
+
+        debug.log(.codegen, "driver: Phase 3 done — runtime compiled, total {d} functions", .{compiled_funcs.items.len});
+        // Phase 4: Generate object file
+        debug.log(.codegen, "driver: generating object file for {d} direct-native functions", .{compiled_funcs.items.len});
+
+        debug.log(.codegen, "driver: Phase 4 start — generate object file", .{});
+        const object_bytes = try self.generateMachODirect(
+            compiled_funcs.items,
+            func_names.items,
+            main_func_index,
+            main_returns_void,
+            string_data.items,
+            string_data_symbol_idx,
+            ctxt_symbol_idx,
+            argc_symbol_idx,
+            argv_symbol_idx,
+            envp_symbol_idx,
+            pctab_symbol_idx,
+            functab_symbol_idx,
+            functab_count_symbol_idx,
+            filetab_symbol_idx,
+            funcnames_symbol_idx,
+            &func_index_map,
+            globals,
+            globals_base_idx,
+        );
+        debug.log(.codegen, "driver: Phase 4 done — object file generated ({d} bytes)", .{object_bytes.len});
+        return object_bytes;
+    }
+
+    /// Native codegen via CIR → rust/libclif (real Cranelift).
+    /// Same SSA pipeline as generateNativeCode, but replaces compile+package with CIR→libclif.
+    fn generateNativeCodeViaCIR(self: *Driver, funcs: []const ir_mod.Func, globals: []const ir_mod.Global, type_reg: *types_mod.TypeRegistry) ![]u8 {
+        const cir_write = @import("codegen/native/cir_write.zig");
+        const libclif = @import("codegen/native/libclif.zig");
+
+        debug.log(.codegen, "driver: CIR native path for {d} functions", .{funcs.len});
+
+        // --- Identical to generateNativeCode: string collection + func_index_map ---
+        var string_offsets = std.StringHashMap(i32).init(self.allocator);
+        defer string_offsets.deinit();
+        var string_data = std.ArrayListUnmanaged(u8){};
+        defer string_data.deinit(self.allocator);
+
+        for (funcs) |*ir_func| {
+            for (ir_func.string_literals) |str| {
+                if (!string_offsets.contains(str)) {
+                    const offset: i32 = @intCast(string_data.items.len);
+                    try string_offsets.put(str, offset);
+                    try string_data.appendSlice(self.allocator, str);
+                    const padding = (8 - (str.len % 8)) % 8;
+                    for (0..padding) |_| try string_data.append(self.allocator, 0);
+                }
+            }
+        }
+
+        var func_index_map = std.StringHashMapUnmanaged(u32){};
+        defer func_index_map.deinit(self.allocator);
+        for (funcs, 0..) |*ir_func, idx| {
+            try func_index_map.put(self.allocator, ir_func.name, @intCast(idx));
+        }
+
+        // Register runtime function names — identical to generateNativeCode.
+        // ssa_to_clif needs these to resolve call targets.
+        const runtime_func_names = [_][]const u8{
+            "alloc",         "dealloc",
+            "alloc_raw",     "realloc_raw",   "dealloc_raw",
+            "retain",        "release",
+            "cot_realloc",   "string_concat",  "string_eq",
+            "unowned_retain", "unowned_release", "unowned_load_strong",
+            "weak_form_reference", "weak_retain", "weak_release", "weak_load_strong",
+            "fd_write",      "fd_read",        "fd_close",      "exit",
+            "fd_seek",       "memset_zero",    "fd_open",       "time",
+            "random",        "growslice",      "nextslicecap",
+            "args_count",    "arg_len",        "arg_ptr",
+            "environ_count", "environ_len",    "environ_ptr",
+            "cot_mkdir",     "dir_open",       "dir_next",      "dir_close",
+            "stat_type",     "cot_unlink",
+            "net_socket",    "net_bind",       "net_listen",
+            "net_accept",    "net_connect",    "net_set_reuse_addr",
+            "set_nonblocking", "poll_read",
+            "kqueue_create", "kevent_add",     "kevent_del",    "kevent_wait",
+            "epoll_create",  "epoll_add",      "epoll_del",     "epoll_wait",
+            "cot_waitpid",   "cot_pipe",
+            "cot_openpty",   "cot_ioctl_winsize", "cot_ioctl_set_ctty",
+            "print_int",     "eprint_int",       "int_to_string",
+            "print_float",   "eprint_float",     "float_to_string",
+            "__cot_print_hex", "__cot_signal_handler", "__cot_install_signals", "__cot_print_backtrace", "__cot_print_source_loc",
+            "__test_begin",  "__test_print_name", "__test_pass",
+            "__test_fail",   "__test_summary",    "__test_store_fail_values",
+            "snprintf",
+            "write",         "malloc",         "free",          "realloc",   "memset",
+            "memcmp",        "memcpy",         "read",          "close",
+            "__open",        "lseek",          "_exit",         "gettimeofday",
+            "getentropy",    "isatty",         "strlen",        "__error",
+            "socket",        "bind",           "listen",        "accept",
+            "connect",       "setsockopt",     "kqueue",        "kevent",
+            "fcntl",         "fork",           "c_waitpid",     "c_pipe",
+            "dup2",          "execve",        "kill",
+            "c_openpty",     "setsid",        "ioctl",
+            "c_mkdir",       "opendir",       "readdir",       "closedir",
+            "c_stat",        "c_unlink",      "signal",
+            "sigaction",     "sigaltstack",
+            "backtrace",     "backtrace_symbols_fd",
+            "dladdr",        "poll",           "usleep",
+        };
+        const runtime_start_idx: u32 = @intCast(funcs.len);
+        for (runtime_func_names, 0..) |name, i| {
+            if (!func_index_map.contains(name)) {
+                try func_index_map.put(self.allocator, name, runtime_start_idx + @as(u32, @intCast(i)));
+            }
+        }
+        // Aliases (identical to generateNativeCode)
+        if (func_index_map.get("cot_waitpid")) |idx| try func_index_map.put(self.allocator, "waitpid", idx);
+        if (func_index_map.get("cot_pipe")) |idx| try func_index_map.put(self.allocator, "pipe", idx);
+        if (func_index_map.get("cot_openpty")) |idx| try func_index_map.put(self.allocator, "openpty", idx);
+        if (func_index_map.get("cot_ioctl_winsize")) |idx| try func_index_map.put(self.allocator, "ioctl_winsize", idx);
+        if (func_index_map.get("cot_ioctl_set_ctty")) |idx| try func_index_map.put(self.allocator, "ioctl_set_ctty", idx);
+        if (func_index_map.get("cot_mkdir")) |idx| try func_index_map.put(self.allocator, "mkdir", idx);
+        if (func_index_map.get("cot_unlink")) |idx| try func_index_map.put(self.allocator, "unlink", idx);
+        if (func_index_map.get("cot_realloc")) |idx| try func_index_map.put(self.allocator, "realloc", idx);
+
+        var user_extern_count: u32 = 0;
+        for (self.user_extern_fns.items) |name| {
+            if (!func_index_map.contains(name)) {
+                try func_index_map.put(self.allocator, name, runtime_start_idx + @as(u32, @intCast(runtime_func_names.len)) + user_extern_count);
+                user_extern_count += 1;
+            }
+        }
+
+        const string_data_symbol_idx: ?u32 = if (string_data.items.len > 0)
+            runtime_start_idx + @as(u32, @intCast(runtime_func_names.len)) + user_extern_count
+        else
+            null;
+        const ctxt_base_idx = runtime_start_idx + @as(u32, @intCast(runtime_func_names.len)) + user_extern_count + @as(u32, if (string_data.items.len > 0) 1 else 0);
+        const ctxt_symbol_idx: u32 = ctxt_base_idx;
+
+        var global_symbol_map = std.StringHashMapUnmanaged(u32){};
+        defer global_symbol_map.deinit(self.allocator);
+        const globals_base_idx: u32 = ctxt_symbol_idx + 9; // skip argc/argv/envp/pctab/functab/etc
+        for (globals, 0..) |g, i| {
+            try global_symbol_map.put(self.allocator, g.name, globals_base_idx + @as(u32, @intCast(i)));
+        }
+
+        // --- CIR writer ---
+        var writer = cir_write.CirWriter.init(self.allocator);
+        defer writer.deinit();
+
+        // Build reverse name resolver for call resolution AND data symbol resolution
+        // First, register data symbols in the func_index_map so the resolver can find them
+        if (string_data_symbol_idx) |idx| {
+            try func_index_map.put(self.allocator, "cot_string_data", idx);
+        }
+        try func_index_map.put(self.allocator, "cot_ctxt", ctxt_symbol_idx);
+        {
+            const ctxt_base = ctxt_symbol_idx;
+            try func_index_map.put(self.allocator, "cot_argc", ctxt_base + 1);
+            try func_index_map.put(self.allocator, "cot_argv", ctxt_base + 2);
+            try func_index_map.put(self.allocator, "cot_envp", ctxt_base + 3);
+            try func_index_map.put(self.allocator, "cot_pctab", ctxt_base + 4);
+            try func_index_map.put(self.allocator, "cot_functab", ctxt_base + 5);
+            try func_index_map.put(self.allocator, "cot_functab_count", ctxt_base + 6);
+            try func_index_map.put(self.allocator, "cot_filetab", ctxt_base + 7);
+            try func_index_map.put(self.allocator, "cot_funcnames", ctxt_base + 8);
+        }
+        for (globals, 0..) |g, i| {
+            // globals_base_idx already in global_symbol_map, add to func_index_map too
+            if (!func_index_map.contains(g.name)) {
+                try func_index_map.put(self.allocator, g.name, globals_base_idx + @as(u32, @intCast(i)));
+            }
+        }
+
+        var resolver = cir_write.FuncNameResolver.init(self.allocator, &func_index_map);
+        defer resolver.deinit();
+
+        // --- Phase 1: For each function, build SSA → passes → CLIF → serialize to CIR ---
+        // String heap is assembled at finish() time — no need to pre-intern names.
+        // All strings interned during function serialization are automatically included.
+        writer.beginFuncDefs();
+
+        for (funcs) |*ir_func| {
+            debug.log(.codegen, "driver: CIR compiling '{s}'", .{ir_func.name});
+
+            // Per-function arena
+            var func_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer func_arena.deinit();
+            const func_alloc = func_arena.allocator();
+
+            // Build SSA from IR (identical to generateNativeCode)
+            var ssa_builder = try ssa_builder_mod.SSABuilder.init(func_alloc, ir_func, globals, type_reg, self.target);
+            const ssa_func = try ssa_builder.build();
+            ssa_builder.deinit();
+            ssa_func.type_idx = ir_func.type_idx;
+
+            // Run SSA passes (identical to generateNativeCode)
+            try rewritegeneric.rewrite(func_alloc, ssa_func, &string_offsets);
+            try decompose_builtin.decompose(func_alloc, ssa_func, type_reg);
+            try rewritedec.rewrite(func_alloc, ssa_func);
+            try deadcode.removeUnreachableBlocksOnly(ssa_func);
+            try schedule.schedule(ssa_func);
+            try layout.layout(ssa_func);
+            try lower_native.lower(ssa_func);
+
+            // Translate SSA → CLIF IR (identical to generateNativeCode)
+            var clif_func = clif.Function.init(self.allocator);
+            defer clif_func.deinit();
+
+            ssa_to_clif.translate(ssa_func, &clif_func, type_reg, ir_func.params, ir_func.return_type, &func_index_map, funcs, self.allocator, string_data_symbol_idx, ctxt_symbol_idx, &global_symbol_map) catch |e| {
+                debug.log(.codegen, "driver: SSA→CLIF error for '{s}': {any}", .{ ir_func.name, e });
+                return error.SsaToClifError;
+            };
+
+            // --- NEW: serialize CLIF IR → CIR (instead of native_compile.compile) ---
+            const name_off = writer.internString(ir_func.name);
+            const is_export: u32 = if (std.mem.eql(u8, ir_func.name, "main")) 0x02 else 0x00;
+
+            // Build param and return type arrays from CLIF signature
+            var param_types_buf: [64]u32 = undefined;
+            for (clif_func.signature.params.items, 0..) |p, pi| {
+                param_types_buf[pi] = cir_write.mapClifType(p.value_type);
+            }
+            var return_types_buf: [16]u32 = undefined;
+            for (clif_func.signature.returns.items, 0..) |r, ri| {
+                return_types_buf[ri] = cir_write.mapClifType(r.value_type);
+            }
+
+            // Count blocks
+            var block_count: u32 = 0;
+            {
+                var bit = clif_func.layout.blocks();
+                while (bit.next()) |_| block_count += 1;
+            }
+
+            writer.beginFuncWithSig(
+                name_off,
+                param_types_buf[0..clif_func.signature.params.items.len],
+                return_types_buf[0..clif_func.signature.returns.items.len],
+                block_count,
+                is_export,
+            );
+
+            // Serialize each block and its instructions
+            try cir_write.serializeClifFunction(&writer, &clif_func, &resolver);
+
+            writer.endFunc();
+        }
+
+        const cir_bytes = writer.finish();
+        debug.log(.codegen, "driver: CIR serialized ({d} bytes, {d} functions)", .{ cir_bytes.len, funcs.len });
+
+        // --- Phase 2: Call libclif to compile CIR → .o (user functions only) ---
+        const target_str: []const u8 = switch (self.target.os) {
+            .macos => "arm64-macos",
+            .linux => "x64-linux",
+            else => "native",
+        };
+        const obj_bytes = try libclif.compileToObject(cir_bytes, target_str);
+        debug.log(.codegen, "driver: libclif produced user .o ({d} bytes)", .{obj_bytes.len});
+
+        const result = try self.allocator.alloc(u8, obj_bytes.len);
+        @memcpy(result, obj_bytes);
+        libclif.freeObjectBytes(obj_bytes);
+
+        // --- Phase 3: Generate runtime .o using old native path ---
+        // Runtime functions (ARC, I/O, print, signal, test) are compiled via the Zig native
+        // compiler and packaged into a separate .o file linked alongside the CIR .o.
+        const isa = switch (self.target.arch) {
+            .arm64 => native_compile.TargetIsa{ .aarch64 = native_compile.AArch64Backend.default },
+            .amd64 => native_compile.TargetIsa{ .x64 = native_compile.X64Backend.default },
+            .wasm32 => return error.InvalidTargetForNative,
+        };
+
+        var ctrl_plane = native_compile.ControlPlane.init();
+
+        var compiled_rt_funcs = std.ArrayListUnmanaged(native_compile.CompiledCode){};
+        defer {
+            for (compiled_rt_funcs.items) |*cf| cf.deinit();
+            compiled_rt_funcs.deinit(self.allocator);
+        }
+        var rt_func_names = std.ArrayListUnmanaged([]const u8){};
+        defer rt_func_names.deinit(self.allocator);
+
+        // Symbol indices for argc/argv/envp (needed by io_native and signal_native)
+        const rt_argc_symbol_idx: u32 = ctxt_symbol_idx + 1;
+        const rt_argv_symbol_idx: u32 = ctxt_symbol_idx + 2;
+        const rt_envp_symbol_idx: u32 = ctxt_symbol_idx + 3;
+        const pctab_symbol_idx: u32 = ctxt_symbol_idx + 4;
+        const functab_symbol_idx: u32 = ctxt_symbol_idx + 5;
+        const functab_count_symbol_idx: u32 = ctxt_symbol_idx + 6;
+        const filetab_symbol_idx: u32 = ctxt_symbol_idx + 7;
+        const funcnames_symbol_idx: u32 = ctxt_symbol_idx + 8;
+
+        {
+            // ARC runtime
+            var arc_funcs = try arc_native.generate(self.allocator, isa, &ctrl_plane, &func_index_map);
+            defer arc_funcs.deinit(self.allocator);
+            for (arc_funcs.items) |rf| {
+                try compiled_rt_funcs.append(self.allocator, rf.compiled);
+                try rt_func_names.append(self.allocator, rf.name);
+            }
+
+            // I/O runtime
+            var io_funcs = try io_native.generate(self.allocator, isa, &ctrl_plane, &func_index_map, rt_argc_symbol_idx, rt_argv_symbol_idx, rt_envp_symbol_idx, self.lib_mode, self.target.os);
+            defer io_funcs.deinit(self.allocator);
+            for (io_funcs.items) |rf| {
+                try compiled_rt_funcs.append(self.allocator, rf.compiled);
+                try rt_func_names.append(self.allocator, rf.name);
+            }
+
+            // Print runtime
+            var print_funcs = try print_native.generate(self.allocator, isa, &ctrl_plane, &func_index_map);
+            defer print_funcs.deinit(self.allocator);
+            for (print_funcs.items) |rf| {
+                try compiled_rt_funcs.append(self.allocator, rf.compiled);
+                try rt_func_names.append(self.allocator, rf.name);
+            }
+
+            // Signal handler runtime
+            var signal_funcs = try signal_native.generate(self.allocator, isa, &ctrl_plane, &func_index_map, self.target.os, pctab_symbol_idx, functab_symbol_idx, functab_count_symbol_idx, filetab_symbol_idx, funcnames_symbol_idx);
+            defer signal_funcs.deinit(self.allocator);
+            for (signal_funcs.items) |rf| {
+                try compiled_rt_funcs.append(self.allocator, rf.compiled);
+                try rt_func_names.append(self.allocator, rf.name);
+            }
+
+            // Test runtime (conditional)
+            if (self.test_mode) {
+                var test_funcs = try test_native_rt.generate(self.allocator, isa, &ctrl_plane, &func_index_map);
+                defer test_funcs.deinit(self.allocator);
+                for (test_funcs.items) |rf| {
+                    try compiled_rt_funcs.append(self.allocator, rf.compiled);
+                    try rt_func_names.append(self.allocator, rf.name);
+                }
+            }
+        }
+
+        debug.log(.codegen, "driver: compiled {d} runtime functions", .{compiled_rt_funcs.items.len});
+
+        // Track main function for entry wrapper
+        var main_func_index: ?usize = null;
+        var main_returns_void: bool = false;
+        for (funcs, 0..) |*ir_func, i| {
+            if (std.mem.eql(u8, ir_func.name, "main")) {
+                main_func_index = i;
+                main_returns_void = (ir_func.return_type == 12); // TYPE_VOID
+                break;
+            }
+        }
+
+        // Package runtime into .o using generateCIRRuntimeObj
+        const runtime_obj = try self.generateCIRRuntimeObj(
+            compiled_rt_funcs.items,
+            rt_func_names.items,
+            funcs,
+            main_returns_void,
+            string_data.items,
+            string_data_symbol_idx,
+            ctxt_symbol_idx,
+            rt_argc_symbol_idx,
+            rt_argv_symbol_idx,
+            rt_envp_symbol_idx,
+            pctab_symbol_idx,
+            functab_symbol_idx,
+            functab_count_symbol_idx,
+            filetab_symbol_idx,
+            funcnames_symbol_idx,
+            &func_index_map,
+            globals,
+            globals_base_idx,
+        );
+
+        // Write runtime .o to temp file
+        const runtime_obj_path = "/tmp/cot_cir_runtime.o";
+        std.fs.cwd().writeFile(.{ .sub_path = runtime_obj_path, .data = runtime_obj }) catch |e| {
+            debug.log(.codegen, "driver: failed to write runtime .o: {any}", .{e});
+            return error.RuntimeObjWriteFailed;
+        };
+        self.cir_runtime_obj_path = runtime_obj_path;
+        debug.log(.codegen, "driver: runtime .o written ({d} bytes) to {s}", .{ runtime_obj.len, runtime_obj_path });
+
+        return result;
+    }
+
+    /// Generate runtime .o for CIR path.
+    /// Contains: runtime functions (exported), entry wrapper, data sections, globals.
+    /// User functions (__cot_main, __cot_init_globals, __cot_init_metadata) are Import symbols.
+    fn generateCIRRuntimeObj(
+        self: *Driver,
+        compiled_rt_funcs: []const native_compile.CompiledCode,
+        rt_func_names: []const []const u8,
+        user_funcs: []const ir_mod.Func,
+        main_returns_void: bool,
+        string_data: []const u8,
+        string_data_symbol_idx: ?u32,
+        ctxt_symbol_idx: u32,
+        argc_symbol_idx: u32,
+        argv_symbol_idx: u32,
+        envp_symbol_idx: u32,
+        pctab_symbol_idx: u32,
+        functab_symbol_idx: u32,
+        functab_count_symbol_idx: u32,
+        filetab_symbol_idx: u32,
+        funcnames_symbol_idx: u32,
+        func_index_map: *const std.StringHashMapUnmanaged(u32),
+        globals: []const ir_mod.Global,
+        globals_base_idx: u32,
+    ) ![]u8 {
+        const arch: object_module.TargetArch = switch (self.target.arch) {
+            .arm64 => .aarch64,
+            .amd64 => .x86_64,
+            .wasm32 => return error.InvalidTargetForNative,
+        };
+        const os_fmt: object_module.TargetOS = switch (self.target.os) {
+            .macos => .macos,
+            .linux => .linux,
+            else => return error.UnsupportedObjectFormat,
+        };
+        var module = object_module.ObjectModule.initWithTarget(self.allocator, os_fmt, arch);
+        defer module.deinit();
+
+        const is_macos = self.target.os == .macos;
+
+        // Pass 1: Declare user functions as Import (they're in the CIR .o)
+        for (user_funcs, 0..) |*ir_func, i| {
+            const is_main = std.mem.eql(u8, ir_func.name, "main");
+            const mangled = if (is_main)
+                try self.allocator.dupe(u8, "__cot_main")
+            else if (is_macos)
+                try std.fmt.allocPrint(self.allocator, "_{s}", .{ir_func.name})
+            else
+                try self.allocator.dupe(u8, ir_func.name);
+            defer self.allocator.free(mangled);
+
+            // Declare as Import — linker will resolve from CIR .o
+            _ = try module.declareFunction(mangled, .Import);
+            try module.declareExternalName(@intCast(i), mangled);
+        }
+
+        // Pass 2: Declare + define runtime functions
+        const rt_base = @as(u32, @intCast(user_funcs.len));
+        var rt_func_ids = try self.allocator.alloc(object_module.FuncId, compiled_rt_funcs.len);
+        defer self.allocator.free(rt_func_ids);
+
+        for (rt_func_names, 0..) |name, i| {
+            const mangled = if (is_macos)
+                try std.fmt.allocPrint(self.allocator, "_{s}", .{name})
+            else
+                try self.allocator.dupe(u8, name);
+            defer self.allocator.free(mangled);
+
+            rt_func_ids[i] = try module.declareFunction(mangled, .Export);
+            try module.declareExternalName(rt_base + @as(u32, @intCast(i)), mangled);
+        }
+
+        for (compiled_rt_funcs, 0..) |*cf, i| {
+            try module.defineFunctionBytes(rt_func_ids[i], cf.code(), cf.relocations());
+        }
+
+        // Pass 3: Data sections — string data, ctxt, argc/argv/envp, globals
+        if (string_data.len > 0) {
+            const sym_name: []const u8 = if (is_macos) "_cot_string_data" else "cot_string_data";
+            const did = try module.declareData(sym_name, .Export, false);
+            try module.defineData(did, string_data);
+            if (string_data_symbol_idx) |idx| try module.declareExternalName(idx, sym_name);
+        }
+
+        // Context global
+        {
+            const ctxt_name: []const u8 = if (is_macos) "_cot_ctxt" else "cot_ctxt";
+            const did = try module.declareData(ctxt_name, .Export, true);
+            try module.defineData(did, &[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0 });
+            try module.declareExternalName(ctxt_symbol_idx, ctxt_name);
+        }
+
+        // argc/argv/envp globals
+        {
+            const argc_name: []const u8 = if (is_macos) "_cot_argc" else "cot_argc";
+            const argv_name: []const u8 = if (is_macos) "_cot_argv" else "cot_argv";
+            const envp_name: []const u8 = if (is_macos) "_cot_envp" else "cot_envp";
+            const did_a = try module.declareData(argc_name, .Export, true);
+            try module.defineData(did_a, &[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0 });
+            const did_v = try module.declareData(argv_name, .Export, true);
+            try module.defineData(did_v, &[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0 });
+            const did_e = try module.declareData(envp_name, .Export, true);
+            try module.defineData(did_e, &[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0 });
+            try module.declareExternalName(argc_symbol_idx, argc_name);
+            try module.declareExternalName(argv_symbol_idx, argv_name);
+            try module.declareExternalName(envp_symbol_idx, envp_name);
+        }
+
+        // Source map placeholders (needed by signal handler)
+        {
+            const pctab_name: []const u8 = if (is_macos) "_cot_pctab" else "cot_pctab";
+            const functab_name: []const u8 = if (is_macos) "_cot_functab" else "cot_functab";
+            const functab_count_name: []const u8 = if (is_macos) "_cot_functab_count" else "cot_functab_count";
+            const filetab_name: []const u8 = if (is_macos) "_cot_filetab" else "cot_filetab";
+            const funcnames_name: []const u8 = if (is_macos) "_cot_funcnames" else "cot_funcnames";
+            inline for (.{ .{ pctab_name, pctab_symbol_idx }, .{ functab_name, functab_symbol_idx }, .{ filetab_name, filetab_symbol_idx }, .{ funcnames_name, funcnames_symbol_idx } }) |pair| {
+                const did = try module.declareData(pair[0], .Export, false);
+                try module.defineData(did, &[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0 });
+                try module.declareExternalName(pair[1], pair[0]);
+            }
+            const did_fc = try module.declareData(functab_count_name, .Export, false);
+            try module.defineData(did_fc, &[_]u8{ 0, 0, 0, 0 });
+            try module.declareExternalName(functab_count_symbol_idx, functab_count_name);
+        }
+
+        // User globals
+        for (globals, 0..) |g, i| {
+            const gname = if (is_macos)
+                try std.fmt.allocPrint(self.allocator, "_{s}", .{g.name})
+            else
+                try self.allocator.dupe(u8, g.name);
+            defer self.allocator.free(gname);
+
+            const size = @max(g.size, 8);
+            const zeroes = try self.allocator.alloc(u8, size);
+            defer self.allocator.free(zeroes);
+            @memset(zeroes, 0);
+            const did = try module.declareData(gname, .Export, true);
+            try module.defineData(did, zeroes);
+            try module.declareExternalName(globals_base_idx + @as(u32, @intCast(i)), gname);
+        }
+
+        // Register external names for libc symbols
+        {
+            var it = func_index_map.iterator();
+            while (it.next()) |entry| {
+                const name = entry.key_ptr.*;
+                const idx = entry.value_ptr.*;
+
+                // Skip symbols we've already declared
+                if (idx < rt_base + @as(u32, @intCast(compiled_rt_funcs.len))) continue;
+
+                // Mangle libc names
+                var mangled_name: []const u8 = undefined;
+                var needs_free = false;
+                if (std.mem.startsWith(u8, name, "c_")) {
+                    // c_waitpid → _waitpid (macOS) or waitpid (Linux)
+                    if (is_macos) {
+                        mangled_name = try std.fmt.allocPrint(self.allocator, "_{s}", .{name[2..]});
+                        needs_free = true;
+                    } else {
+                        mangled_name = name[2..];
+                    }
+                } else if (is_macos) {
+                    mangled_name = try std.fmt.allocPrint(self.allocator, "_{s}", .{name});
+                    needs_free = true;
+                } else {
+                    mangled_name = name;
+                }
+                defer if (needs_free) self.allocator.free(mangled_name);
+
+                module.declareExternalName(idx, mangled_name) catch {};
+            }
+        }
+
+        // Entry point wrapper (_main)
+        var has_main = false;
+        var main_idx: u32 = 0;
+        for (user_funcs, 0..) |*ir_func, i| {
+            if (std.mem.eql(u8, ir_func.name, "main")) {
+                has_main = true;
+                main_idx = @intCast(i);
+                break;
+            }
+        }
+
+        if (has_main) {
+            const entry_name = if (is_macos) "_main" else "main";
+            const main_wrapper_id = try module.declareFunction(entry_name, .Export);
+
+            if (self.target.arch == .arm64) {
+                if (main_returns_void) {
+                    const wrapper = [_]u8{
+                        0xFD, 0x7B, 0xBF, 0xA9, //  0: stp x29, x30, [sp, #-16]!
+                        0xFD, 0x03, 0x00, 0x91, //  4: mov x29, sp
+                        0x08, 0x00, 0x00, 0x90, //  8: adrp x8, _cot_argc@PAGE
+                        0x08, 0x01, 0x00, 0x91, // 12: add x8, x8, _cot_argc@PAGEOFF
+                        0x00, 0x01, 0x00, 0xF9, // 16: str x0, [x8]
+                        0x08, 0x00, 0x00, 0x90, // 20: adrp x8, _cot_argv@PAGE
+                        0x08, 0x01, 0x00, 0x91, // 24: add x8, x8, _cot_argv@PAGEOFF
+                        0x01, 0x01, 0x00, 0xF9, // 28: str x1, [x8]
+                        0x08, 0x00, 0x00, 0x90, // 32: adrp x8, _cot_envp@PAGE
+                        0x08, 0x01, 0x00, 0x91, // 36: add x8, x8, _cot_envp@PAGEOFF
+                        0x02, 0x01, 0x00, 0xF9, // 40: str x2, [x8]
+                        0x00, 0x00, 0x00, 0x94, // 44: bl __cot_main
+                        0x00, 0x00, 0x80, 0xD2, // 48: mov x0, #0
+                        0xFD, 0x7B, 0xC1, 0xA8, // 52: ldp x29, x30, [sp], #16
+                        0xC0, 0x03, 0x5F, 0xD6, // 56: ret
+                    };
+                    const relocs = [_]buffer_mod.FinalizedMachReloc{
+                        .{ .offset = 8, .kind = .Aarch64AdrPrelPgHi21, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = argc_symbol_idx } } }, .addend = 0 },
+                        .{ .offset = 12, .kind = .Aarch64AddAbsLo12Nc, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = argc_symbol_idx } } }, .addend = 0 },
+                        .{ .offset = 20, .kind = .Aarch64AdrPrelPgHi21, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = argv_symbol_idx } } }, .addend = 0 },
+                        .{ .offset = 24, .kind = .Aarch64AddAbsLo12Nc, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = argv_symbol_idx } } }, .addend = 0 },
+                        .{ .offset = 32, .kind = .Aarch64AdrPrelPgHi21, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = envp_symbol_idx } } }, .addend = 0 },
+                        .{ .offset = 36, .kind = .Aarch64AddAbsLo12Nc, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = envp_symbol_idx } } }, .addend = 0 },
+                        .{ .offset = 44, .kind = .Arm64Call, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = main_idx } } }, .addend = 0 },
+                    };
+                    try module.defineFunctionBytes(main_wrapper_id, &wrapper, &relocs);
+                } else {
+                    const wrapper = [_]u8{
+                        0xFD, 0x7B, 0xBF, 0xA9,
+                        0xFD, 0x03, 0x00, 0x91,
+                        0x08, 0x00, 0x00, 0x90,
+                        0x08, 0x01, 0x00, 0x91,
+                        0x00, 0x01, 0x00, 0xF9,
+                        0x08, 0x00, 0x00, 0x90,
+                        0x08, 0x01, 0x00, 0x91,
+                        0x01, 0x01, 0x00, 0xF9,
+                        0x08, 0x00, 0x00, 0x90,
+                        0x08, 0x01, 0x00, 0x91,
+                        0x02, 0x01, 0x00, 0xF9,
+                        0x00, 0x00, 0x00, 0x94, // bl __cot_main
+                        0xFD, 0x7B, 0xC1, 0xA8,
+                        0xC0, 0x03, 0x5F, 0xD6,
+                    };
+                    const relocs = [_]buffer_mod.FinalizedMachReloc{
+                        .{ .offset = 8, .kind = .Aarch64AdrPrelPgHi21, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = argc_symbol_idx } } }, .addend = 0 },
+                        .{ .offset = 12, .kind = .Aarch64AddAbsLo12Nc, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = argc_symbol_idx } } }, .addend = 0 },
+                        .{ .offset = 20, .kind = .Aarch64AdrPrelPgHi21, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = argv_symbol_idx } } }, .addend = 0 },
+                        .{ .offset = 24, .kind = .Aarch64AddAbsLo12Nc, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = argv_symbol_idx } } }, .addend = 0 },
+                        .{ .offset = 32, .kind = .Aarch64AdrPrelPgHi21, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = envp_symbol_idx } } }, .addend = 0 },
+                        .{ .offset = 36, .kind = .Aarch64AddAbsLo12Nc, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = envp_symbol_idx } } }, .addend = 0 },
+                        .{ .offset = 44, .kind = .Arm64Call, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = main_idx } } }, .addend = 0 },
+                    };
+                    try module.defineFunctionBytes(main_wrapper_id, &wrapper, &relocs);
+                }
+            }
+        }
+
+        var output = std.ArrayListUnmanaged(u8){};
+        defer output.deinit(self.allocator);
+        try module.finish(output.writer(self.allocator));
+        const obj_result = try self.allocator.alloc(u8, output.items.len);
+        @memcpy(obj_result, output.items);
+        return obj_result;
+    }
+
+    /// Generate Mach-O/ELF object file from direct-native compiled functions.
+    /// Includes data section for string literals and external name registration
+    /// for runtime functions and libc symbols.
+    fn generateMachODirect(
+        self: *Driver,
+        compiled_funcs: []const native_compile.CompiledCode,
+        func_names: []const []const u8,
+        main_func_index: ?usize,
+        main_returns_void: bool,
+        string_data: []const u8,
+        string_data_symbol_idx: ?u32,
+        ctxt_symbol_idx: u32,
+        argc_symbol_idx: u32,
+        argv_symbol_idx: u32,
+        envp_symbol_idx: u32,
+        pctab_symbol_idx: u32,
+        functab_symbol_idx: u32,
+        functab_count_symbol_idx: u32,
+        filetab_symbol_idx: u32,
+        funcnames_symbol_idx: u32,
+        func_index_map: *const std.StringHashMapUnmanaged(u32),
+        globals: []const ir_mod.Global,
+        globals_base_idx: u32,
+    ) ![]u8 {
+        const arch: object_module.TargetArch = switch (self.target.arch) {
+            .arm64 => .aarch64,
+            .amd64 => .x86_64,
+            .wasm32 => return error.InvalidTargetForNative,
+        };
+        const os_fmt: object_module.TargetOS = switch (self.target.os) {
+            .macos => .macos,
+            .linux => .linux,
+            else => return error.UnsupportedObjectFormat,
+        };
+        var module = object_module.ObjectModule.initWithTarget(self.allocator, os_fmt, arch);
+        defer module.deinit();
+
+        debug.log(.codegen, "generateMachODirect: start", .{});
+        // Pass 1: Declare all functions
+        const is_macos_obj = self.target.os == .macos;
+        var func_ids = try self.allocator.alloc(object_module.FuncId, compiled_funcs.len);
+        defer self.allocator.free(func_ids);
+
+        for (func_names, 0..) |name, i| {
+            const is_main = std.mem.eql(u8, name, "main");
+            const is_export = blk: {
+                for (self.debug_ir_funcs) |ir_func| {
+                    if (std.mem.eql(u8, ir_func.name, name) and ir_func.is_export) break :blk true;
+                }
+                break :blk false;
+            };
+
+            // MachO C ABI: symbols get _ prefix. ELF/Linux: no prefix.
+            const mangled_name = if (is_main)
+                try self.allocator.dupe(u8, "__cot_main")
+            else if (is_macos_obj)
+                try std.fmt.allocPrint(self.allocator, "_{s}", .{name})
+            else
+                try self.allocator.dupe(u8, name);
+            defer self.allocator.free(mangled_name);
+
+            const linkage: object_module.Linkage = if (is_main)
+                .Local
+            else if (is_export)
+                .Export
+            else if (self.use_libclif)
+                .Export // CIR path: runtime .o is separate, all functions must be visible
+            else
+                .Local;
+
+            func_ids[i] = try module.declareFunction(mangled_name, linkage);
+            try module.declareExternalName(@intCast(i), mangled_name);
+        }
+
+        debug.log(.codegen, "generateMachODirect: pass 1 done (declare {d} funcs)", .{func_names.len});
+        // Pass 2: Define all functions
+        for (compiled_funcs, 0..) |*cf, i| {
+            try module.defineFunction(func_ids[i], cf);
+        }
+
+        debug.log(.codegen, "generateMachODirect: pass 2 done (define {d} funcs)", .{compiled_funcs.len});
+        // Pass 3: Add string data section
+        // Reference: cg_clif constant.rs:461 — data.define(bytes)
+        if (string_data.len > 0) {
+            const data_sym_name = "_cot_string_data";
+            const data_id = try module.declareData(data_sym_name, .Local, false);
+            try module.defineData(data_id, string_data);
+
+            // Register string data symbol for relocations from code
+            if (string_data_symbol_idx) |idx| {
+                try module.declareExternalName(idx, data_sym_name);
+            }
+        }
+
+        // Pass 3b: Add CTXT global variable (8 bytes, for closure context pointer)
+        // Mirrors Wasm global 1 (CTXT). Used by closure_call to pass captured environment.
+        {
+            const ctxt_sym_name = "_cot_ctxt";
+            const ctxt_data_id = try module.declareData(ctxt_sym_name, .Local, true);
+            const ctxt_data = &[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0 }; // 8 bytes, zero-initialized
+            try module.defineData(ctxt_data_id, ctxt_data);
+            try module.declareExternalName(ctxt_symbol_idx, ctxt_sym_name);
+        }
+
+        // Pass 3b2: Add _cot_argc and _cot_argv globals (8 bytes each).
+        // _main stores argc/argv here; args_count/arg_len/arg_ptr read from them.
+        {
+            const argc_sym_name = "_cot_argc";
+            const argc_data_id = try module.declareData(argc_sym_name, .Local, true);
+            const argc_data = &[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0 };
+            try module.defineData(argc_data_id, argc_data);
+            try module.declareExternalName(argc_symbol_idx, argc_sym_name);
+
+            const argv_sym_name = "_cot_argv";
+            const argv_data_id = try module.declareData(argv_sym_name, .Local, true);
+            const argv_data = &[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0 };
+            try module.defineData(argv_data_id, argv_data);
+            try module.declareExternalName(argv_symbol_idx, argv_sym_name);
+
+            if (self.lib_mode) {
+                // In lib mode, map envp_symbol_idx to _environ (POSIX libc global: extern char **environ).
+                // environ_count/len/ptr CLIF functions use globalValue(envp_symbol_idx) + load to get envp.
+                // For _cot_envp (colocated), ADRP+ADD gives address → load gives envp value.
+                // For _environ (external), linker auto-transforms ADRP+ADD to GOT access → same semantics.
+                // No _main wrapper in lib mode, so _cot_envp would never be initialized.
+                const is_macos = self.target.os == .macos;
+                const environ_sym = if (is_macos) "_environ" else "environ";
+                try module.declareExternalName(envp_symbol_idx, environ_sym);
+            } else {
+                const envp_sym_name = "_cot_envp";
+                const envp_data_id = try module.declareData(envp_sym_name, .Local, true);
+                const envp_data = &[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0 };
+                try module.defineData(envp_data_id, envp_data);
+                try module.declareExternalName(envp_symbol_idx, envp_sym_name);
+            }
+        }
+
+        // Pass 3b3: Pre-register pctab/functab external names so signal handler CLIF code
+        // can reference them via globalValue. The actual data is emitted in Phase 5.
+        {
+            try module.declareExternalName(pctab_symbol_idx, "_cot_pctab");
+            try module.declareExternalName(functab_symbol_idx, "_cot_functab");
+            try module.declareExternalName(functab_count_symbol_idx, "_cot_functab_count");
+            try module.declareExternalName(filetab_symbol_idx, "_cot_filetab");
+            try module.declareExternalName(funcnames_symbol_idx, "_cot_funcnames");
+        }
+
+        // Pass 3c: Add global variable data section entries.
+        // Each module-level var gets an 8-byte zero-initialized data section entry.
+        for (globals, 0..) |g, i| {
+            const is_macos = self.target.os == .macos;
+            const sym_name = if (is_macos)
+                try std.fmt.allocPrint(self.allocator, "_{s}", .{g.name})
+            else
+                try std.fmt.allocPrint(self.allocator, "{s}", .{g.name});
+            defer self.allocator.free(sym_name);
+            const global_size = @max(g.size, 8);
+            const zero_data = try self.allocator.alloc(u8, global_size);
+            defer self.allocator.free(zero_data);
+            @memset(zero_data, 0);
+            const data_id = try module.declareData(sym_name, .Local, true);
+            try module.defineData(data_id, zero_data);
+            try module.declareExternalName(globals_base_idx + @as(u32, @intCast(i)), sym_name);
+        }
+
+        // Pass 4: Register external names for runtime functions and libc symbols.
+        // Any index used by CLIF code (via ExternalName.User{.index=N}) must have
+        // a corresponding entry in external_names so relocations resolve correctly.
+        // Reference: cg_clif abi/mod.rs:97-115 — import_function pattern
+        {
+            const is_macos = self.target.os == .macos;
+            var iter = func_index_map.iterator();
+            while (iter.next()) |entry| {
+                const name = entry.key_ptr.*;
+                const idx = entry.value_ptr.*;
+                // Skip user functions (already registered in Pass 1)
+                if (idx < func_names.len) continue;
+                // Skip string data symbol (already registered above)
+                if (string_data_symbol_idx != null and idx == string_data_symbol_idx.?) continue;
+                // Skip CTXT symbol (already registered above)
+                if (idx == ctxt_symbol_idx) continue;
+                // Skip argc/argv/envp symbols (already registered in Pass 3b2)
+                if (idx == argc_symbol_idx or idx == argv_symbol_idx or idx == envp_symbol_idx) continue;
+                // Skip source map symbols (already registered in Pass 3b3)
+                if (idx == pctab_symbol_idx or idx == functab_symbol_idx or idx == functab_count_symbol_idx or idx == filetab_symbol_idx or idx == funcnames_symbol_idx) continue;
+                // Skip global variable symbols (already registered in Pass 3c)
+                if (globals.len > 0 and idx >= globals_base_idx and idx < globals_base_idx + @as(u32, @intCast(globals.len))) continue;
+
+                // Runtime/libc functions: mangle with platform-appropriate prefix.
+                // Names prefixed with "c_" are libc aliases (e.g. c_waitpid → _waitpid)
+                // to avoid collision with same-named compiled wrappers.
+                const actual_name = if (std.mem.startsWith(u8, name, "c_"))
+                    name[2..]
+                else
+                    name;
+                // Platform-specific symbol remapping:
+                // __error → __errno_location on Linux (macOS-internal errno accessor)
+                // __open → open on Linux (macOS non-variadic wrapper)
+                const platform_name = if (!is_macos and std.mem.eql(u8, actual_name, "__error"))
+                    "__errno_location"
+                else if (!is_macos and std.mem.eql(u8, actual_name, "__open"))
+                    "open"
+                else
+                    actual_name;
+                const mangled = if (is_macos)
+                    try std.fmt.allocPrint(self.allocator, "_{s}", .{platform_name})
+                else
+                    try self.allocator.dupe(u8, platform_name);
+                defer self.allocator.free(mangled);
+                try module.declareExternalName(idx, mangled);
+            }
+        }
+
+        debug.log(.codegen, "generateMachODirect: pass 3+4 done (data + externals)", .{});
+        // Generate _main entry point if we have a main function
+        if (main_func_index != null) {
+            const entry_name = if (self.target.os == .macos) "_main" else "main";
+            const main_wrapper_id = try module.declareFunction(entry_name, .Export);
+
+            // ARM64 _main wrapper: store argc/argv/envp to globals, call __cot_main, return
+            // C runtime passes: x0=argc, x1=argv, x2=envp (Apple extension)
+            if (self.target.arch == .arm64) {
+                const main_idx: u32 = @intCast(main_func_index.?);
+
+                if (main_returns_void) {
+                    // main() void — set x0=0 after call so process exits with code 0
+                    const wrapper = [_]u8{
+                        0xFD, 0x7B, 0xBF, 0xA9, //  0: stp x29, x30, [sp, #-16]!
+                        0xFD, 0x03, 0x00, 0x91, //  4: mov x29, sp
+                        0x08, 0x00, 0x00, 0x90, //  8: adrp x8, _cot_argc@PAGE
+                        0x08, 0x01, 0x00, 0x91, // 12: add x8, x8, _cot_argc@PAGEOFF
+                        0x00, 0x01, 0x00, 0xF9, // 16: str x0, [x8]
+                        0x08, 0x00, 0x00, 0x90, // 20: adrp x8, _cot_argv@PAGE
+                        0x08, 0x01, 0x00, 0x91, // 24: add x8, x8, _cot_argv@PAGEOFF
+                        0x01, 0x01, 0x00, 0xF9, // 28: str x1, [x8]
+                        0x08, 0x00, 0x00, 0x90, // 32: adrp x8, _cot_envp@PAGE
+                        0x08, 0x01, 0x00, 0x91, // 36: add x8, x8, _cot_envp@PAGEOFF
+                        0x02, 0x01, 0x00, 0xF9, // 40: str x2, [x8]
+                        0x00, 0x00, 0x00, 0x94, // 44: bl __cot_main
+                        0x00, 0x00, 0x80, 0xD2, // 48: mov x0, #0
+                        0xFD, 0x7B, 0xC1, 0xA8, // 52: ldp x29, x30, [sp], #16
+                        0xC0, 0x03, 0x5F, 0xD6, // 56: ret
+                    };
+                    const relocs = [_]buffer_mod.FinalizedMachReloc{
+                        .{ .offset = 8, .kind = .Aarch64AdrPrelPgHi21, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = argc_symbol_idx } } }, .addend = 0 },
+                        .{ .offset = 12, .kind = .Aarch64AddAbsLo12Nc, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = argc_symbol_idx } } }, .addend = 0 },
+                        .{ .offset = 20, .kind = .Aarch64AdrPrelPgHi21, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = argv_symbol_idx } } }, .addend = 0 },
+                        .{ .offset = 24, .kind = .Aarch64AddAbsLo12Nc, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = argv_symbol_idx } } }, .addend = 0 },
+                        .{ .offset = 32, .kind = .Aarch64AdrPrelPgHi21, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = envp_symbol_idx } } }, .addend = 0 },
+                        .{ .offset = 36, .kind = .Aarch64AddAbsLo12Nc, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = envp_symbol_idx } } }, .addend = 0 },
+                        .{ .offset = 44, .kind = .Arm64Call, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = main_idx } } }, .addend = 0 },
+                    };
+                    try module.defineFunctionBytes(main_wrapper_id, &wrapper, &relocs);
+                } else {
+                    // main() i64 — return value in x0 is the exit code
+                    const wrapper = [_]u8{
+                        0xFD, 0x7B, 0xBF, 0xA9, //  0: stp x29, x30, [sp, #-16]!
+                        0xFD, 0x03, 0x00, 0x91, //  4: mov x29, sp
+                        0x08, 0x00, 0x00, 0x90, //  8: adrp x8, _cot_argc@PAGE
+                        0x08, 0x01, 0x00, 0x91, // 12: add x8, x8, _cot_argc@PAGEOFF
+                        0x00, 0x01, 0x00, 0xF9, // 16: str x0, [x8]
+                        0x08, 0x00, 0x00, 0x90, // 20: adrp x8, _cot_argv@PAGE
+                        0x08, 0x01, 0x00, 0x91, // 24: add x8, x8, _cot_argv@PAGEOFF
+                        0x01, 0x01, 0x00, 0xF9, // 28: str x1, [x8]
+                        0x08, 0x00, 0x00, 0x90, // 32: adrp x8, _cot_envp@PAGE
+                        0x08, 0x01, 0x00, 0x91, // 36: add x8, x8, _cot_envp@PAGEOFF
+                        0x02, 0x01, 0x00, 0xF9, // 40: str x2, [x8]
+                        0x00, 0x00, 0x00, 0x94, // 44: bl __cot_main
+                        0xFD, 0x7B, 0xC1, 0xA8, // 48: ldp x29, x30, [sp], #16
+                        0xC0, 0x03, 0x5F, 0xD6, // 52: ret
+                    };
+                    const relocs = [_]buffer_mod.FinalizedMachReloc{
+                        .{ .offset = 8, .kind = .Aarch64AdrPrelPgHi21, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = argc_symbol_idx } } }, .addend = 0 },
+                        .{ .offset = 12, .kind = .Aarch64AddAbsLo12Nc, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = argc_symbol_idx } } }, .addend = 0 },
+                        .{ .offset = 20, .kind = .Aarch64AdrPrelPgHi21, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = argv_symbol_idx } } }, .addend = 0 },
+                        .{ .offset = 24, .kind = .Aarch64AddAbsLo12Nc, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = argv_symbol_idx } } }, .addend = 0 },
+                        .{ .offset = 32, .kind = .Aarch64AdrPrelPgHi21, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = envp_symbol_idx } } }, .addend = 0 },
+                        .{ .offset = 36, .kind = .Aarch64AddAbsLo12Nc, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = envp_symbol_idx } } }, .addend = 0 },
+                        .{ .offset = 44, .kind = .Arm64Call, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = main_idx } } }, .addend = 0 },
+                    };
+                    try module.defineFunctionBytes(main_wrapper_id, &wrapper, &relocs);
+                }
+            } else {
+                // x64 _main wrapper: store argc/argv/envp to globals, call __cot_main, return
+                // System V ABI: edi=argc, rsi=argv, rdx=envp
+                const main_idx: u32 = @intCast(main_func_index.?);
+
+                if (main_returns_void) {
+                    // main() void — set eax=0 after call so process exits with code 0
+                    const wrapper = [_]u8{
+                        0x55, //  0: push rbp
+                        0x48, 0x89, 0xE5, //  1: mov rbp, rsp
+                        0x48, 0x63, 0xC7, //  4: movsxd rax, edi (sign-extend argc)
+                        0x48, 0x89, 0x05, 0x00, 0x00, 0x00, 0x00, //  7: mov [rip+disp32], rax (_cot_argc)
+                        0x48, 0x89, 0x35, 0x00, 0x00, 0x00, 0x00, // 14: mov [rip+disp32], rsi (_cot_argv)
+                        0x48, 0x89, 0x15, 0x00, 0x00, 0x00, 0x00, // 21: mov [rip+disp32], rdx (_cot_envp)
+                        0xE8, 0x00, 0x00, 0x00, 0x00, // 28: call __cot_main
+                        0x31, 0xC0, // 33: xor eax, eax
+                        0x5D, // 35: pop rbp
+                        0xC3, // 36: ret
+                    };
+                    const relocs = [_]buffer_mod.FinalizedMachReloc{
+                        .{ .offset = 10, .kind = .X86PCRel4, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = argc_symbol_idx } } }, .addend = -4 },
+                        .{ .offset = 17, .kind = .X86PCRel4, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = argv_symbol_idx } } }, .addend = -4 },
+                        .{ .offset = 24, .kind = .X86PCRel4, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = envp_symbol_idx } } }, .addend = -4 },
+                        .{ .offset = 29, .kind = .X86CallPCRel4, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = main_idx } } }, .addend = -4 },
+                    };
+                    try module.defineFunctionBytes(main_wrapper_id, &wrapper, &relocs);
+                } else {
+                    // main() i64 — return value in rax is the exit code
+                    const wrapper = [_]u8{
+                        0x55, //  0: push rbp
+                        0x48, 0x89, 0xE5, //  1: mov rbp, rsp
+                        0x48, 0x63, 0xC7, //  4: movsxd rax, edi (sign-extend argc)
+                        0x48, 0x89, 0x05, 0x00, 0x00, 0x00, 0x00, //  7: mov [rip+disp32], rax (_cot_argc)
+                        0x48, 0x89, 0x35, 0x00, 0x00, 0x00, 0x00, // 14: mov [rip+disp32], rsi (_cot_argv)
+                        0x48, 0x89, 0x15, 0x00, 0x00, 0x00, 0x00, // 21: mov [rip+disp32], rdx (_cot_envp)
+                        0xE8, 0x00, 0x00, 0x00, 0x00, // 28: call __cot_main
+                        0x5D, // 33: pop rbp
+                        0xC3, // 34: ret
+                    };
+                    const relocs = [_]buffer_mod.FinalizedMachReloc{
+                        .{ .offset = 10, .kind = .X86PCRel4, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = argc_symbol_idx } } }, .addend = -4 },
+                        .{ .offset = 17, .kind = .X86PCRel4, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = argv_symbol_idx } } }, .addend = -4 },
+                        .{ .offset = 24, .kind = .X86PCRel4, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = envp_symbol_idx } } }, .addend = -4 },
+                        .{ .offset = 29, .kind = .X86CallPCRel4, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = main_idx } } }, .addend = -4 },
+                    };
+                    try module.defineFunctionBytes(main_wrapper_id, &wrapper, &relocs);
+                }
+            }
+        }
+
+        debug.log(.codegen, "generateMachODirect: main wrapper done, starting Phase 5 (DWARF)", .{});
+        // Phase 5: Generate DWARF debug line info + runtime source map
+        // Wire srclocs from compiled user functions into DWARF .debug_line entries.
+        // Also build a runtime source map data section for the signal handler.
+        {
+            if (self.debug_source_file.len > 0 and self.debug_source_text.len > 0) {
+                module.setDebugInfo(self.debug_source_file, self.debug_source_text);
+            }
+
+            // Build line tables for O(log n) line lookups (replaces O(n) lineFromByteOffset).
+            // One table per source file. Binary search instead of scanning from byte 0.
+            var line_tables = std.ArrayListUnmanaged(LineTable){};
+            defer {
+                for (line_tables.items) |*lt| lt.deinit();
+                line_tables.deinit(self.allocator);
+            }
+            for (self.parsed_file_texts) |text| {
+                try line_tables.append(self.allocator, try LineTable.build(self.allocator, text));
+            }
+            // Fallback table for single-file builds
+            var fallback_table = if (self.debug_source_text.len > 0)
+                try LineTable.build(self.allocator, self.debug_source_text)
+            else
+                LineTable{ .line_starts = &.{}, .allocator = self.allocator };
+            defer if (self.debug_source_text.len > 0) fallback_table.deinit();
+
+            // Collect function debug info for DWARF DW_TAG_subprogram DIEs
+            if (self.debug_source_text.len > 0) {
+                var debug_func_infos = std.ArrayListUnmanaged(dwarf_mod.DebugFuncInfo){};
+                defer debug_func_infos.deinit(self.allocator);
+
+                for (compiled_funcs, 0..) |*cf, func_idx| {
+                    if (func_idx >= func_names.len) continue;
+                    const func_code_offset = module.getFuncCodeOffset(func_ids[func_idx]);
+                    const func_code_size: u32 = @intCast(cf.buffer.data.items.len);
+
+                    // Multi-file: resolve correct file index for this function
+                    const dwarf_file_idx: u16 = if (func_idx < self.func_file_indices.len) self.func_file_indices[func_idx] else 0;
+
+                    // Find declaration line from first srcloc (O(log n) via line table)
+                    var decl_line: u32 = 0;
+                    if (cf.buffer.srclocs.items.len > 0) {
+                        const first_src = cf.buffer.srclocs.items[0].loc.offset;
+                        if (first_src > 0) {
+                            const lt = if (dwarf_file_idx < line_tables.items.len) &line_tables.items[dwarf_file_idx] else &fallback_table;
+                            decl_line = lt.lineFromOffset(first_src);
+                        }
+                    }
+
+                    // Collect locals from IR function for DWARF variable/parameter DIEs
+                    var debug_locals = std.ArrayListUnmanaged(dwarf_mod.DebugLocalInfo){};
+                    defer debug_locals.deinit(self.allocator);
+
+                    if (func_idx < self.debug_ir_funcs.len and func_idx < func_names.len) {
+                        const ir_func = &self.debug_ir_funcs[func_idx];
+                        // Collect parameters
+                        for (ir_func.params) |param| {
+                            if (param.name.len == 0) continue;
+                            try debug_locals.append(self.allocator, .{
+                                .name = param.name,
+                                .type_name = if (self.debug_type_reg) |tr| tr.typeName(param.type_idx) else "i64",
+                                .frame_offset = param.offset,
+                                .size = param.size,
+                                .is_param = true,
+                            });
+                        }
+                        // Collect locals (skip compiler temporaries)
+                        for (ir_func.locals) |local| {
+                            if (local.name.len == 0) continue;
+                            if (local.name.len >= 2 and local.name[0] == '_' and local.name[1] == '_') continue;
+                            if (local.is_param) continue; // already collected above
+                            try debug_locals.append(self.allocator, .{
+                                .name = local.name,
+                                .type_name = if (self.debug_type_reg) |tr| tr.typeName(local.type_idx) else "i64",
+                                .frame_offset = local.offset,
+                                .size = local.size,
+                                .is_param = false,
+                            });
+                        }
+                    }
+
+                    const owned_locals = try self.allocator.dupe(dwarf_mod.DebugLocalInfo, debug_locals.items);
+                    try module.addOwnedDebugLocals(owned_locals);
+
+                    try debug_func_infos.append(self.allocator, .{
+                        .name = func_names[func_idx],
+                        .code_offset = func_code_offset,
+                        .code_size = func_code_size,
+                        .source_line = decl_line,
+                        .locals = owned_locals,
+                        .frame_size = cf.frame_size,
+                    });
+                }
+
+                try module.setFuncInfos(debug_func_infos.items);
+                if (self.debug_type_reg) |tr| module.setTypeRegistry(tr);
+            }
+
+            // Build Go-style PC→line tables (reference: Go cmd/internal/obj/pcln.go:funcpctab).
+            // Per-function varint-encoded PC→line delta streams in _cot_pctab.
+            // Functab: {name_hash:u32, pctab_off:u32, file_idx:u16, pad:u16, pad2:u32} = 16 bytes per entry.
+            var pctab_data = std.ArrayListUnmanaged(u8){};
+            defer pctab_data.deinit(self.allocator);
+            var functab_data = std.ArrayListUnmanaged(u8){};
+            defer functab_data.deinit(self.allocator);
+            var functab_count: u32 = 0;
+
+            if (self.debug_source_text.len > 0 or self.parsed_file_texts.len > 0) {
+                for (compiled_funcs, 0..) |*cf, func_idx| {
+                    if (func_idx >= func_names.len) continue;
+                    const func_code_offset = module.getFuncCodeOffset(func_ids[func_idx]);
+
+                    const file_idx: u16 = if (func_idx < self.func_file_indices.len) self.func_file_indices[func_idx] else 0;
+
+                    // Collect (pc_offset, line) pairs sorted by pc_offset for this function.
+                    // Also emit DWARF line entries.
+                    const PcLine = struct { pc: u32, line: u32 };
+                    var pc_lines = std.ArrayListUnmanaged(PcLine){};
+                    defer pc_lines.deinit(self.allocator);
+
+                    const srcloc_lt = if (file_idx < line_tables.items.len) &line_tables.items[file_idx] else &fallback_table;
+                    for (cf.buffer.srclocs.items) |srcloc| {
+                        const src_byte_offset = srcloc.loc.offset;
+                        if (src_byte_offset == 0) continue;
+                        const line = srcloc_lt.lineFromOffset(src_byte_offset);
+                        if (line == 0) continue;
+
+                        // DWARF: absolute code offset in text section
+                        const abs_code_offset = func_code_offset + srcloc.start;
+                        try module.addLineEntry(abs_code_offset, src_byte_offset);
+
+                        try pc_lines.append(self.allocator, .{ .pc = srcloc.start, .line = line });
+                    }
+
+                    if (pc_lines.items.len == 0) continue;
+
+                    // Sort by pc offset (srclocs should already be sorted, but ensure)
+                    std.sort.insertion(PcLine, pc_lines.items, {}, struct {
+                        fn lessThan(_: void, a: PcLine, b: PcLine) bool {
+                            return a.pc < b.pc;
+                        }
+                    }.lessThan);
+
+                    // Record pctab offset for this function's stream
+                    const pctab_off: u32 = @intCast(pctab_data.items.len);
+
+                    // Go-style encoding: alternating (value_delta_zigzag, pc_delta) varint pairs.
+                    // Initial value: -1 (Go pcln.go line 37: val = -1)
+                    var prev_line: i32 = -1;
+                    var prev_pc: u32 = 0;
+
+                    const func_code_size: u32 = @intCast(cf.buffer.data.items.len);
+                    // Deduplicate: only emit entries where the line actually changes.
+                    // Go's pctab never emits delta=0 entries because zigzag(0)=0 is
+                    // the stream terminator (reference: cmd/internal/obj/pcln.go).
+                    var deduped = std.ArrayListUnmanaged(PcLine){};
+                    defer deduped.deinit(self.allocator);
+                    for (pc_lines.items) |entry| {
+                        const line_i32: i32 = @intCast(entry.line);
+                        if (line_i32 != prev_line or prev_line == -1) {
+                            try deduped.append(self.allocator, entry);
+                            prev_line = line_i32;
+                        }
+                    }
+                    // Reset for actual encoding
+                    prev_line = -1;
+                    for (deduped.items, 0..) |entry, idx| {
+                        const line_i32: i32 = @intCast(entry.line);
+                        const delta = line_i32 - prev_line;
+                        // Zigzag encode: (delta << 1) ^ (delta >> 31)
+                        const zigzag: u32 = @bitCast((delta << 1) ^ (delta >> 31));
+                        try appendUvarint(&pctab_data, self.allocator, zigzag);
+                        // For the last entry, extend PC to end of function so the line covers
+                        // all remaining instructions (Go pcln.go pattern: full coverage).
+                        const is_last = (idx == deduped.items.len - 1);
+                        const pc_end = if (is_last) func_code_size else entry.pc;
+                        const pc_delta = pc_end - prev_pc;
+                        try appendUvarint(&pctab_data, self.allocator, pc_delta);
+                        prev_line = line_i32;
+                        prev_pc = pc_end;
+                    }
+                    // Terminator: 0 byte (Go pcln.go: terminated by a 0 value delta)
+                    try pctab_data.append(self.allocator, 0);
+
+                    // Functab entry: {name_hash:u32, pctab_off:u32, file_idx:u16, pad:u16, pad2:u32}
+                    const name = func_names[func_idx];
+                    const name_hash = fnvHash(name);
+                    try functab_data.appendSlice(self.allocator, std.mem.asBytes(&name_hash));
+                    try functab_data.appendSlice(self.allocator, std.mem.asBytes(&pctab_off));
+                    try functab_data.appendSlice(self.allocator, std.mem.asBytes(&file_idx));
+                    const pad: u16 = 0;
+                    try functab_data.appendSlice(self.allocator, std.mem.asBytes(&pad));
+                    const pad2: u32 = 0;
+                    try functab_data.appendSlice(self.allocator, std.mem.asBytes(&pad2));
+                    functab_count += 1;
+                }
+            }
+
+            // Always emit pctab data sections (signal handler references them).
+            {
+                // _cot_pctab: varint-encoded PC→line streams
+                const pctab_id = try module.declareData("_cot_pctab", .Local, false);
+                if (pctab_data.items.len > 0) {
+                    try module.defineData(pctab_id, pctab_data.items);
+                } else {
+                    const zero8 = &[_]u8{0} ** 8;
+                    try module.defineData(pctab_id, zero8);
+                }
+
+                // _cot_functab: array of functab entries (16 bytes each)
+                const functab_id = try module.declareData("_cot_functab", .Local, false);
+                if (functab_data.items.len > 0) {
+                    try module.defineData(functab_id, functab_data.items);
+                } else {
+                    const zero16 = &[_]u8{0} ** 16;
+                    try module.defineData(functab_id, zero16);
+                }
+
+                // _cot_functab_count: u32
+                const ftcount_id = try module.declareData("_cot_functab_count", .Local, false);
+                try module.defineData(ftcount_id, std.mem.asBytes(&functab_count));
+
+                // _cot_filetab: concatenated null-terminated file paths.
+                // Multi-file: each file path is null-terminated, concatenated.
+                // file_idx in functab indexes by ordinal (0th path, 1st path, ...).
+                // Reference: Go runtime/symtab.go:funcfile() — per-CU file tables via cutab.
+                const filetab_id = try module.declareData("_cot_filetab", .Local, false);
+                if (self.parsed_file_paths.len > 0) {
+                    var file_data = std.ArrayListUnmanaged(u8){};
+                    defer file_data.deinit(self.allocator);
+                    for (self.parsed_file_paths) |fpath| {
+                        try file_data.appendSlice(self.allocator, fpath);
+                        try file_data.append(self.allocator, 0);
+                    }
+                    while (file_data.items.len % 8 != 0) try file_data.append(self.allocator, 0);
+                    try module.defineData(filetab_id, file_data.items);
+                } else if (self.debug_source_file.len > 0) {
+                    var file_data = std.ArrayListUnmanaged(u8){};
+                    defer file_data.deinit(self.allocator);
+                    try file_data.appendSlice(self.allocator, self.debug_source_file);
+                    try file_data.append(self.allocator, 0);
+                    while (file_data.items.len % 8 != 0) try file_data.append(self.allocator, 0);
+                    try module.defineData(filetab_id, file_data.items);
+                } else {
+                    const zero8 = &[_]u8{0} ** 8;
+                    try module.defineData(filetab_id, zero8);
+                }
+
+                // _cot_funcnames: placeholder (not used yet, reserved for future name lookup)
+                const funcnames_id = try module.declareData("_cot_funcnames", .Local, false);
+                const zero8 = &[_]u8{0} ** 8;
+                try module.defineData(funcnames_id, zero8);
+            }
+        }
+
+        debug.log(.codegen, "generateMachODirect: Phase 5 done (DWARF + pctab)", .{});
+        // Serialize object file to bytes
+        var output = std.ArrayListUnmanaged(u8){};
+        defer output.deinit(self.allocator);
+        try module.finish(output.writer(self.allocator));
+        debug.log(.codegen, "generateMachODirect: serialized {d} bytes", .{output.items.len});
+        return try output.toOwnedSlice(self.allocator);
+    }
+
+    /// Append a u32 as an unsigned varint (LEB128-style, 7 bits per byte, high bit = continuation).
+    /// Reference: Go encoding/binary PutUvarint / runtime readvarint.
+    fn appendUvarint(list: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, value: u32) !void {
+        var v = value;
+        while (v >= 0x80) {
+            try list.append(allocator, @as(u8, @truncate(v)) | 0x80);
+            v >>= 7;
+        }
+        try list.append(allocator, @as(u8, @truncate(v)));
+    }
+
+    /// Convert a source byte offset to a 1-based line number by counting newlines.
+    fn lineFromByteOffset(source_text: []const u8, byte_offset: u32) u32 {
+        if (byte_offset >= source_text.len) return 0;
+        var line: u32 = 1;
+        for (source_text[0..byte_offset]) |c| {
+            if (c == '\n') line += 1;
+        }
+        return line;
+    }
+
+    /// Precomputed line offset table for O(log n) line lookups.
+    /// Build once per source file, then binary search for any byte offset.
+    const LineTable = struct {
+        line_starts: []const u32, // byte offset of each line start
+        allocator: std.mem.Allocator,
+
+        fn build(allocator: std.mem.Allocator, source: []const u8) !LineTable {
+            var starts = std.ArrayListUnmanaged(u32){};
+            try starts.append(allocator, 0); // line 1 starts at byte 0
+            for (source, 0..) |c, i| {
+                if (c == '\n' and i + 1 < source.len) {
+                    try starts.append(allocator, @intCast(i + 1));
+                }
+            }
+            return .{ .line_starts = try starts.toOwnedSlice(allocator), .allocator = allocator };
+        }
+
+        fn deinit(self: *LineTable) void {
+            self.allocator.free(self.line_starts);
+        }
+
+        fn lineFromOffset(self: *const LineTable, byte_offset: u32) u32 {
+            // Binary search: find the last line_start <= byte_offset
+            var lo: usize = 0;
+            var hi: usize = self.line_starts.len;
+            while (lo < hi) {
+                const mid = lo + (hi - lo) / 2;
+                if (self.line_starts[mid] <= byte_offset) {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            return @intCast(lo); // 1-based line number
+        }
+    };
+
+    /// FNV-1a hash for function name matching in the source map.
+    /// Used by both the compiler (to build the map) and the signal handler (to look up).
+    fn fnvHash(name: []const u8) u32 {
+        var h: u32 = 0x811c9dc5;
+        for (name) |c| {
+            h ^= c;
+            h *%= 0x01000193;
+        }
+        return h;
+    }
+
+    /// Generate Mach-O object file from compiled functions.
+    /// Uses ObjectModule to bridge CompiledCode to Mach-O format.
+    fn generateMachO(self: *Driver, compiled_funcs: []const native_compile.CompiledCode, exports: []const wasm_parser.Export, data_segments: []const wasm_parser.DataSegment, globals: []const wasm_parser.GlobalType, func_to_type: []const u32, types: []const wasm_parser.FuncType) ![]u8 {
+        var module = object_module.ObjectModule.initWithTarget(
+            self.allocator,
+            .macos,
+            .aarch64,
+        );
+        defer module.deinit();
+
+        // Build export name map for function lookup
+        var export_names = std.StringHashMap(u32).init(self.allocator);
+        defer export_names.deinit();
+        for (exports, 0..) |exp, i| {
+            if (exp.kind == .func) {
+                try export_names.put(exp.name, @intCast(i));
+            }
+        }
+
+        // Track if we need to generate a main wrapper
+        var main_func_index: ?usize = null;
+
+        // Pass 1: Declare all functions and external names (Cranelift pattern:
+        // separate declaration from definition so forward references resolve)
+        var func_ids = try self.allocator.alloc(object_module.FuncId, compiled_funcs.len);
+        defer self.allocator.free(func_ids);
+
+        for (compiled_funcs, 0..) |_, i| {
+            // Determine function name from exports, or generate one
+            var func_name: []const u8 = "";
+            var func_name_allocated = false;
+            for (exports) |exp| {
+                if (exp.kind == .func and exp.index == i) {
+                    func_name = exp.name;
+                    break;
+                }
+            }
+            if (func_name.len == 0) {
+                func_name = try std.fmt.allocPrint(self.allocator, "_func_{d}", .{i});
+                func_name_allocated = true;
+            }
+            defer if (func_name_allocated) self.allocator.free(func_name);
+
+            const is_main = std.mem.eql(u8, func_name, "main");
+            if (is_main) {
+                main_func_index = i;
+            }
+
+            // MachO C ABI: all symbols get _ prefix (Zig convention: _funcname in Mach-O)
+            // export fn functions use standard C naming — the _ is the platform convention, not mangling.
+            // In lib mode, exported functions get __wasm suffix (the C-ABI wrapper gets the real name).
+            const is_export_fn = blk: {
+                for (self.debug_ir_funcs) |ir_func| {
+                    if (std.mem.eql(u8, ir_func.name, func_name) and ir_func.is_export) break :blk true;
+                }
+                break :blk false;
+            };
+            const mangled_name = if (is_main)
+                try self.allocator.dupe(u8, "__wasm_main")
+            else if (self.lib_mode and is_export_fn)
+                try std.fmt.allocPrint(self.allocator, "_{s}__wasm", .{func_name})
+            else
+                try std.fmt.allocPrint(self.allocator, "_{s}", .{func_name});
+            defer self.allocator.free(mangled_name);
+
+            // Zig pattern: export fn → Export linkage (global visibility), internal fn → Local
+            // In lib mode, all wasm functions are Local — export wrappers provide the public API.
+            const linkage: object_module.Linkage = if (is_main)
+                .Local
+            else if (func_name_allocated)
+                .Local
+            else if (self.lib_mode)
+                .Local
+            else
+                .Export;
+
+            func_ids[i] = try module.declareFunction(mangled_name, linkage);
+            try module.declareExternalName(@intCast(i), mangled_name);
+        }
+
+        // Pass 2: Define all functions (relocations can now resolve forward references)
+        for (compiled_funcs, 0..) |*cf, i| {
+            // Check for native overrides (exported runtime stubs replaced with ARM64 syscalls)
+            var override_name: ?[]const u8 = null;
+            for (exports) |exp| {
+                if (exp.kind == .func and exp.index == i) {
+                    if (std.mem.eql(u8, exp.name, "write") or
+                        std.mem.eql(u8, exp.name, "fd_write") or
+                        std.mem.eql(u8, exp.name, "fd_read") or
+                        std.mem.eql(u8, exp.name, "fd_close") or
+                        std.mem.eql(u8, exp.name, "fd_seek") or
+                        std.mem.eql(u8, exp.name, "fd_open") or
+                        std.mem.eql(u8, exp.name, "time") or
+                        std.mem.eql(u8, exp.name, "random") or
+                        std.mem.eql(u8, exp.name, "exit") or
+                        std.mem.eql(u8, exp.name, "wasi_fd_write") or
+                        std.mem.eql(u8, exp.name, "args_count") or
+                        std.mem.eql(u8, exp.name, "arg_len") or
+                        std.mem.eql(u8, exp.name, "arg_ptr") or
+                        std.mem.eql(u8, exp.name, "environ_count") or
+                        std.mem.eql(u8, exp.name, "environ_len") or
+                        std.mem.eql(u8, exp.name, "environ_ptr") or
+                        std.mem.eql(u8, exp.name, "net_socket") or
+                        std.mem.eql(u8, exp.name, "net_bind") or
+                        std.mem.eql(u8, exp.name, "net_listen") or
+                        std.mem.eql(u8, exp.name, "net_accept") or
+                        std.mem.eql(u8, exp.name, "net_connect") or
+                        std.mem.eql(u8, exp.name, "net_set_reuse_addr") or
+                        std.mem.eql(u8, exp.name, "kqueue_create") or
+                        std.mem.eql(u8, exp.name, "kevent_add") or
+                        std.mem.eql(u8, exp.name, "kevent_del") or
+                        std.mem.eql(u8, exp.name, "kevent_wait") or
+                        std.mem.eql(u8, exp.name, "epoll_create") or
+                        std.mem.eql(u8, exp.name, "epoll_add") or
+                        std.mem.eql(u8, exp.name, "epoll_del") or
+                        std.mem.eql(u8, exp.name, "epoll_wait") or
+                        std.mem.eql(u8, exp.name, "set_nonblocking") or
+                        std.mem.eql(u8, exp.name, "fork") or
+                        std.mem.eql(u8, exp.name, "execve") or
+                        std.mem.eql(u8, exp.name, "waitpid") or
+                        std.mem.eql(u8, exp.name, "pipe") or
+                        std.mem.eql(u8, exp.name, "dup2") or
+                        std.mem.eql(u8, exp.name, "isatty"))
+                    {
+                        override_name = exp.name;
+                        break;
+                    }
+                }
+            }
+            if (override_name) |name| {
+                if (std.mem.eql(u8, name, "write") or std.mem.eql(u8, name, "fd_write")) {
+                    // ARM64 macOS syscall for write(fd, ptr, len)
+                    // Cranelift CC: x0=vmctx, x1=caller_vmctx, x2=fd, x3=ptr, x4=len
+                    // Reference: Go syscall1 on Darwin ARM64 — BCC/NEG pattern for error handling
+                    // On success: x0 = bytes written. On error: x0 = -errno (negative).
+                    const arm64_write = [_]u8{
+                        0xFD, 0x7B, 0xBF, 0xA9, // stp x29, x30, [sp, #-16]!
+                        0xFD, 0x03, 0x00, 0x91, // mov x29, sp
+                        0x08, 0x00, 0x41, 0x91, // add x8, x0, #0x40, lsl #12  (vmctx + 0x40000)
+                        0x01, 0x01, 0x03, 0x8B, // add x1, x8, x3  (real_ptr = linmem + wasm_ptr)
+                        0xE0, 0x03, 0x02, 0xAA, // mov x0, x2  (fd)
+                        0xE2, 0x03, 0x04, 0xAA, // mov x2, x4  (len)
+                        0x90, 0x00, 0x80, 0xD2, // mov x16, #4  (SYS_write)
+                        0x01, 0x10, 0x00, 0xD4, // svc #0x80
+                        0x43, 0x00, 0x00, 0x54, // b.cc +2     (carry clear = success, skip neg)
+                        0xE0, 0x03, 0x00, 0xCB, // neg x0, x0  (error: negate errno)
+                        0xFD, 0x7B, 0xC1, 0xA8, // ldp x29, x30, [sp], #16
+                        0xC0, 0x03, 0x5F, 0xD6, // ret
+                    };
+                    try module.defineFunctionBytes(func_ids[i], &arm64_write, &.{});
+                } else if (std.mem.eql(u8, name, "fd_read")) {
+                    // ARM64 macOS syscall for read(fd, buf, len)
+                    // Cranelift CC: x0=vmctx, x1=caller_vmctx, x2=fd, x3=buf, x4=len
+                    // Reference: Go syscall1 on Darwin ARM64 — BCC/NEG pattern
+                    // On success: x0 = bytes read (0 = EOF). On error: x0 = -errno.
+                    const arm64_read = [_]u8{
+                        0xFD, 0x7B, 0xBF, 0xA9, // stp x29, x30, [sp, #-16]!
+                        0xFD, 0x03, 0x00, 0x91, // mov x29, sp
+                        0x08, 0x00, 0x41, 0x91, // add x8, x0, #0x40, lsl #12  (vmctx + 0x40000)
+                        0x01, 0x01, 0x03, 0x8B, // add x1, x8, x3  (real_buf = linmem + wasm_ptr)
+                        0xE0, 0x03, 0x02, 0xAA, // mov x0, x2  (fd)
+                        0xE2, 0x03, 0x04, 0xAA, // mov x2, x4  (len)
+                        0x70, 0x00, 0x80, 0xD2, // mov x16, #3  (SYS_read)
+                        0x01, 0x10, 0x00, 0xD4, // svc #0x80
+                        0x43, 0x00, 0x00, 0x54, // b.cc +2     (carry clear = success, skip neg)
+                        0xE0, 0x03, 0x00, 0xCB, // neg x0, x0  (error: negate errno)
+                        0xFD, 0x7B, 0xC1, 0xA8, // ldp x29, x30, [sp], #16
+                        0xC0, 0x03, 0x5F, 0xD6, // ret
+                    };
+                    try module.defineFunctionBytes(func_ids[i], &arm64_read, &.{});
+                } else if (std.mem.eql(u8, name, "fd_close")) {
+                    // ARM64 macOS syscall for close(fd)
+                    // Cranelift CC: x0=vmctx, x1=caller_vmctx, x2=fd
+                    // Reference: Go syscall1 on Darwin ARM64 — BCC/NEG pattern
+                    // On success: x0 = 0. On error: x0 = -errno.
+                    const arm64_close = [_]u8{
+                        0xFD, 0x7B, 0xBF, 0xA9, // stp x29, x30, [sp, #-16]!
+                        0xFD, 0x03, 0x00, 0x91, // mov x29, sp
+                        0xE0, 0x03, 0x02, 0xAA, // mov x0, x2  (fd)
+                        0xD0, 0x00, 0x80, 0xD2, // mov x16, #6  (SYS_close)
+                        0x01, 0x10, 0x00, 0xD4, // svc #0x80
+                        0x43, 0x00, 0x00, 0x54, // b.cc +2     (carry clear = success, skip neg)
+                        0xE0, 0x03, 0x00, 0xCB, // neg x0, x0  (error: negate errno)
+                        0xFD, 0x7B, 0xC1, 0xA8, // ldp x29, x30, [sp], #16
+                        0xC0, 0x03, 0x5F, 0xD6, // ret
+                    };
+                    try module.defineFunctionBytes(func_ids[i], &arm64_close, &.{});
+                } else if (std.mem.eql(u8, name, "fd_seek")) {
+                    // ARM64 macOS syscall for lseek(fd, offset, whence)
+                    // Cranelift CC: x0=vmctx, x1=caller_vmctx, x2=fd, x3=offset, x4=whence
+                    // Reference: Go syscall1 on Darwin ARM64 — BCC/NEG pattern
+                    // On success: x0 = new offset. On error: x0 = -errno.
+                    const arm64_seek = [_]u8{
+                        0xFD, 0x7B, 0xBF, 0xA9, // stp x29, x30, [sp, #-16]!
+                        0xFD, 0x03, 0x00, 0x91, // mov x29, sp
+                        0xE0, 0x03, 0x02, 0xAA, // mov x0, x2  (fd)
+                        0xE1, 0x03, 0x03, 0xAA, // mov x1, x3  (offset, i64)
+                        0xE2, 0x03, 0x04, 0xAA, // mov x2, x4  (whence)
+                        0xF0, 0x18, 0x80, 0xD2, // mov x16, #199  (SYS_lseek)
+                        0x01, 0x10, 0x00, 0xD4, // svc #0x80
+                        0x43, 0x00, 0x00, 0x54, // b.cc +2     (carry clear = success, skip neg)
+                        0xE0, 0x03, 0x00, 0xCB, // neg x0, x0  (error: negate errno)
+                        0xFD, 0x7B, 0xC1, 0xA8, // ldp x29, x30, [sp], #16
+                        0xC0, 0x03, 0x5F, 0xD6, // ret
+                    };
+                    try module.defineFunctionBytes(func_ids[i], &arm64_seek, &.{});
+                } else if (std.mem.eql(u8, name, "fd_open")) {
+                    // ARM64 macOS syscall for openat(AT_FDCWD, path, flags, mode)
+                    // Cranelift CC: x0=vmctx, x1=caller_vmctx, x2=path_ptr, x3=path_len, x4=flags
+                    // Reference: Go zsyscall_darwin_arm64.go openat() + BCC/NEG pattern
+                    // On success: x0 = fd. On error: x0 = -errno.
+                    // Must null-terminate path: copy to stack buffer, append \0
+                    const arm64_open = [_]u8{
+                        0xFD, 0x7B, 0xBF, 0xA9, // stp x29, x30, [sp, #-16]!
+                        0xFD, 0x03, 0x00, 0x91, // mov x29, sp
+                        0x08, 0x00, 0x41, 0x91, // add x8, x0, #0x40, lsl #12  (linmem base)
+                        0x09, 0x01, 0x02, 0x8B, // add x9, x8, x2  (real path = linmem + path_ptr)
+                        0xE5, 0x03, 0x04, 0xAA, // mov x5, x4  (save flags before clobbering)
+                        // Bounds check: reject paths > 1024 bytes with -ENAMETOOLONG
+                        0x7F, 0x00, 0x10, 0xF1, // cmp x3, #1024  (path_len vs PATH_MAX)
+                        0x89, 0x00, 0x00, 0x54, // b.ls +4  (path_len <= 1024 → .copy_start)
+                        0xC0, 0x07, 0x80, 0x92, // movn x0, #62  (x0 = -63 = -ENAMETOOLONG on macOS)
+                        0xFD, 0x7B, 0xC1, 0xA8, // ldp x29, x30, [sp], #16
+                        0xC0, 0x03, 0x5F, 0xD6, // ret
+                        // .copy_start:
+                        0xFF, 0x43, 0x10, 0xD1, // sub sp, sp, #1040  (stack buf: 1024 + 16 align)
+                        0xEB, 0x03, 0x00, 0x91, // mov x11, sp  (dst = stack buffer)
+                        0xEC, 0x03, 0x03, 0xAA, // mov x12, x3  (counter = path_len)
+                        // .copy_loop:
+                        0xAC, 0x00, 0x00, 0xB4, // cbz x12, +5  (skip to null-term if empty)
+                        0x2D, 0x15, 0x40, 0x38, // ldrb w13, [x9], #1  (load byte, post-inc)
+                        0x6D, 0x15, 0x00, 0x38, // strb w13, [x11], #1  (store byte, post-inc)
+                        0x8C, 0x05, 0x00, 0xD1, // sub x12, x12, #1
+                        0xFC, 0xFF, 0xFF, 0x17, // b -4  (back to cbz)
+                        // .copy_done:
+                        0x7F, 0x01, 0x00, 0x39, // strb wzr, [x11]  (null terminate)
+                        // openat(AT_FDCWD, path, flags, mode)
+                        0x60, 0x0C, 0x80, 0x92, // movn x0, #99  (AT_FDCWD = -100)
+                        0xE1, 0x03, 0x00, 0x91, // mov x1, sp  (null-terminated path on stack)
+                        0xE2, 0x03, 0x05, 0xAA, // mov x2, x5  (flags, saved earlier)
+                        0x83, 0x34, 0x80, 0xD2, // movz x3, #420  (mode = 0644)
+                        0xF0, 0x39, 0x80, 0xD2, // movz x16, #463  (SYS_openat)
+                        0x01, 0x10, 0x00, 0xD4, // svc #0x80
+                        0x43, 0x00, 0x00, 0x54, // b.cc +2     (carry clear = success, skip neg)
+                        0xE0, 0x03, 0x00, 0xCB, // neg x0, x0  (error: negate errno)
+                        // Restore stack
+                        0xBF, 0x03, 0x00, 0x91, // mov sp, x29  (restore from frame pointer)
+                        0xFD, 0x7B, 0xC1, 0xA8, // ldp x29, x30, [sp], #16
+                        0xC0, 0x03, 0x5F, 0xD6, // ret
+                    };
+                    try module.defineFunctionBytes(func_ids[i], &arm64_open, &.{});
+                } else if (std.mem.eql(u8, name, "time")) {
+                    // ARM64 macOS: monotonic nanoseconds via CNTVCT_EL0
+                    // Cranelift CC: x0=vmctx, x1=caller_vmctx (no user args)
+                    // Returns: i64 nanoseconds = CNTVCT_EL0 * 125 / 3
+                    // Reference: Go runtime/sys_darwin_arm64.s uses libSystem trampolines,
+                    // NOT raw SVC #0x80. macOS gettimeofday uses commpage internally.
+                    // Raw SVC #0x80 corrupts vmctx memory on Apple Silicon — confirmed bug.
+                    // Apple Silicon timebase: 24MHz → numer=125, denom=3 → ns = ticks * 125 / 3
+                    const arm64_time = [_]u8{
+                        0xDF, 0x3F, 0x03, 0xD5, // isb  (barrier before CNTVCT read)
+                        0x40, 0xE0, 0x3B, 0xD5, // mrs x0, CNTVCT_EL0
+                        0xA1, 0x0F, 0x80, 0xD2, // movz x1, #125
+                        0x00, 0x7C, 0x01, 0x9B, // mul x0, x0, x1
+                        0x61, 0x00, 0x80, 0xD2, // movz x1, #3
+                        0x00, 0x0C, 0xC1, 0x9A, // udiv x0, x0, x1
+                        0xC0, 0x03, 0x5F, 0xD6, // ret
+                    };
+                    try module.defineFunctionBytes(func_ids[i], &arm64_time, &.{});
+                } else if (std.mem.eql(u8, name, "random")) {
+                    // ARM64 macOS: getentropy(buf, len) — fill buffer with random bytes
+                    // Cranelift CC: x0=vmctx, x1=caller_vmctx, x2=buf(wasm ptr), x3=len
+                    // Reference: Go rand_getrandom.go chunk loop pattern
+                    // getentropy has 256-byte kernel limit; loop in chunks
+                    // On success: x0 = 0. On error: x0 = -errno.
+                    const arm64_random = [_]u8{
+                        0xFD, 0x7B, 0xBF, 0xA9, // stp x29, x30, [sp, #-16]!
+                        0xFD, 0x03, 0x00, 0x91, // mov x29, sp
+                        0x08, 0x00, 0x41, 0x91, // add x8, x0, #0x40, lsl #12  (linmem base)
+                        0x09, 0x01, 0x02, 0x8B, // add x9, x8, x2              (real buf = linmem + wasm_ptr)
+                        0xEA, 0x03, 0x03, 0xAA, // mov x10, x3                 (remaining = len)
+                        0x0B, 0x20, 0x80, 0xD2, // movz x11, #256              (chunk size constant)
+                        // .loop:
+                        0x6A, 0x01, 0x00, 0xB4, // cbz x10, +11  (remaining == 0 → .success)
+                        0x5F, 0x01, 0x04, 0xF1, // cmp x10, #256
+                        0x4C, 0x31, 0x8B, 0x9A, // csel x12, x10, x11, lo  (x12 = min(remaining, 256))
+                        0xE0, 0x03, 0x09, 0xAA, // mov x0, x9               (buf arg)
+                        0xE1, 0x03, 0x0C, 0xAA, // mov x1, x12              (len arg)
+                        0x90, 0x3E, 0x80, 0xD2, // movz x16, #500           (SYS_getentropy)
+                        0x01, 0x10, 0x00, 0xD4, // svc #0x80
+                        0xE2, 0x00, 0x00, 0x54, // b.cs +7   (carry set → .error)
+                        0x29, 0x01, 0x0C, 0x8B, // add x9, x9, x12          (buf += chunk)
+                        0x4A, 0x01, 0x0C, 0xCB, // sub x10, x10, x12        (remaining -= chunk)
+                        0xF6, 0xFF, 0xFF, 0x17, // b -10                    (→ .loop)
+                        // .success:
+                        0xE0, 0x03, 0x1F, 0xAA, // mov x0, xzr              (return 0)
+                        0xFD, 0x7B, 0xC1, 0xA8, // ldp x29, x30, [sp], #16
+                        0xC0, 0x03, 0x5F, 0xD6, // ret
+                        // .error:
+                        0xE0, 0x03, 0x00, 0xCB, // neg x0, x0               (negate errno)
+                        0xFD, 0x7B, 0xC1, 0xA8, // ldp x29, x30, [sp], #16
+                        0xC0, 0x03, 0x5F, 0xD6, // ret
+                    };
+                    try module.defineFunctionBytes(func_ids[i], &arm64_random, &.{});
+                } else if (std.mem.eql(u8, name, "exit")) {
+                    // ARM64 macOS: exit(code) — never returns
+                    // Cranelift CC: x0=vmctx, x1=caller_vmctx, x2=code
+                    // Reference: WASI proc_exit, Go runtime/sys_darwin_arm64.s exit_trampoline
+                    const arm64_exit = [_]u8{
+                        0xE0, 0x03, 0x02, 0xAA, // mov x0, x2              (exit code)
+                        0x30, 0x00, 0x80, 0xD2, // movz x16, #1            (SYS_exit)
+                        0x01, 0x10, 0x00, 0xD4, // svc #0x80
+                    };
+                    try module.defineFunctionBytes(func_ids[i], &arm64_exit, &.{});
+                } else if (std.mem.eql(u8, name, "wasi_fd_write")) {
+                    // ARM64 macOS syscall for WASI fd_write(fd, iovs, iovs_len, nwritten)
+                    // Cranelift CC: x0=vmctx, x1=caller_vmctx, x2=fd, x3=iovs, x4=iovs_len, x5=nwritten
+                    // Reference: Go syscall1 BCC pattern. On error, skip nwritten store, return errno.
+                    const arm64_fd_write = [_]u8{
+                        0xFD, 0x7B, 0xBF, 0xA9, // stp x29, x30, [sp, #-16]!
+                        0xFD, 0x03, 0x00, 0x91, // mov x29, sp
+                        0x08, 0x00, 0x41, 0x91, // add x8, x0, #0x40, lsl #12  (x8 = linmem base)
+                        // Read iovec[0] from linmem (fast path: adapter always sends 1 iovec)
+                        0x09, 0x01, 0x23, 0x8B, // add x9, x8, w3, uxtw  (x9 = linmem + iovs)
+                        0x2A, 0x01, 0x40, 0xB9, // ldr w10, [x9]         (w10 = iovec.buf)
+                        0x2B, 0x05, 0x40, 0xB9, // ldr w11, [x9, #4]     (w11 = iovec.buf_len)
+                        // SYS_write(fd, real_ptr, len)
+                        0xE0, 0x03, 0x02, 0x2A, // mov w0, w2            (fd, truncate to i32)
+                        0x01, 0x01, 0x2A, 0x8B, // add x1, x8, w10, uxtw (real_ptr = linmem + buf)
+                        0xE2, 0x03, 0x0B, 0x2A, // mov w2, w11           (len = buf_len, zero-ext)
+                        0x90, 0x00, 0x80, 0xD2, // mov x16, #4           (SYS_write)
+                        0x01, 0x10, 0x00, 0xD4, // svc #0x80
+                        0xA2, 0x00, 0x00, 0x54, // b.cs +5     (carry set = error, skip to .error)
+                        // Success: store bytes_written, return ESUCCESS
+                        0x09, 0x01, 0x25, 0x8B, // add x9, x8, w5, uxtw  (linmem + nwritten)
+                        0x20, 0x01, 0x00, 0xB9, // str w0, [x9]          (store result as i32)
+                        0xE0, 0x03, 0x1F, 0xAA, // mov x0, xzr           (return 0)
+                        0x02, 0x00, 0x00, 0x14, // b +2                   (skip to .done)
+                        // .error: negate errno (Go NEG R0,R0 pattern)
+                        0xE0, 0x03, 0x00, 0xCB, // neg x0, x0
+                        // .done:
+                        0xFD, 0x7B, 0xC1, 0xA8, // ldp x29, x30, [sp], #16
+                        0xC0, 0x03, 0x5F, 0xD6, // ret
+                    };
+                    try module.defineFunctionBytes(func_ids[i], &arm64_fd_write, &.{});
+                } else if (std.mem.eql(u8, name, "args_count")) {
+                    // ARM64: read argc from vmctx+0x30000
+                    // Cranelift CC: x0=vmctx, x1=caller_vmctx (no user args)
+                    // vmctx+0x30000 = argc (stored by _main wrapper)
+                    const arm64_args_count = [_]u8{
+                        0x08, 0xC0, 0x40, 0x91, // add x8, x0, #0x30, lsl #12  (vmctx + 0x30000)
+                        0x00, 0x01, 0x40, 0xF9, // ldr x0, [x8]                (x0 = argc)
+                        0xC0, 0x03, 0x5F, 0xD6, // ret
+                    };
+                    try module.defineFunctionBytes(func_ids[i], &arm64_args_count, &.{});
+                } else if (std.mem.eql(u8, name, "arg_len")) {
+                    // ARM64: strlen(argv[n]) with bounds check
+                    // Cranelift CC: x0=vmctx, x1=caller_vmctx, x2=n
+                    // Reference: Go goenvs() validates argc before accessing argv
+                    // Returns 0 if n >= argc (out of bounds).
+                    const arm64_arg_len = [_]u8{
+                        0x08, 0xC0, 0x40, 0x91, // add x8, x0, #0x30, lsl #12  (vmctx + 0x30000)
+                        0x09, 0x01, 0x40, 0xF9, // ldr x9, [x8]                (x9 = argc)
+                        0x5F, 0x00, 0x09, 0xEB, // cmp x2, x9                  (n vs argc)
+                        0x63, 0x00, 0x00, 0x54, // b.lo +3                     (n < argc → .valid)
+                        0x00, 0x00, 0x80, 0xD2, // movz x0, #0                 (out of bounds)
+                        0xC0, 0x03, 0x5F, 0xD6, // ret
+                        // .valid:
+                        0x09, 0x05, 0x40, 0xF9, // ldr x9, [x8, #8]            (x9 = argv)
+                        0x29, 0x79, 0x62, 0xF8, // ldr x9, [x9, x2, lsl #3]    (x9 = argv[n])
+                        0x00, 0x00, 0x80, 0xD2, // movz x0, #0                 (len = 0)
+                        // .strlen_loop:
+                        0x2A, 0x69, 0x60, 0x38, // ldrb w10, [x9, x0]          (byte at argv[n][len])
+                        0x6A, 0x00, 0x00, 0x34, // cbz w10, +3                 (if null → ret)
+                        0x00, 0x04, 0x00, 0x91, // add x0, x0, #1              (len++)
+                        0xFD, 0xFF, 0xFF, 0x17, // b -3                        (→ .strlen_loop)
+                        // .done:
+                        0xC0, 0x03, 0x5F, 0xD6, // ret                         (x0 = strlen)
+                    };
+                    try module.defineFunctionBytes(func_ids[i], &arm64_arg_len, &.{});
+                } else if (std.mem.eql(u8, name, "arg_ptr")) {
+                    // ARM64: copy argv[n] into linear memory at wasm offset 0xAF000 + n*4096
+                    // Cranelift CC: x0=vmctx, x1=caller_vmctx, x2=n
+                    // Reference: Go goenvs() validates argc; Wasmtime uses caller-allocated buffers
+                    // Each arg gets a 4096-byte slot; copy limited to 4095 bytes + NUL
+                    // Returns 0 if n >= argc (out of bounds).
+                    const arm64_arg_ptr = [_]u8{
+                        0xFD, 0x7B, 0xBF, 0xA9, // stp x29, x30, [sp, #-16]!
+                        0xFD, 0x03, 0x00, 0x91, // mov x29, sp
+                        0x08, 0xC0, 0x40, 0x91, // add x8, x0, #0x30, lsl #12  (vmctx + 0x30000)
+                        0x09, 0x01, 0x40, 0xF9, // ldr x9, [x8]                (x9 = argc)
+                        0x5F, 0x00, 0x09, 0xEB, // cmp x2, x9                  (n vs argc)
+                        0x83, 0x00, 0x00, 0x54, // b.lo +4                     (n < argc → .valid)
+                        0x00, 0x00, 0x80, 0xD2, // movz x0, #0                 (out of bounds)
+                        0xFD, 0x7B, 0xC1, 0xA8, // ldp x29, x30, [sp], #16
+                        0xC0, 0x03, 0x5F, 0xD6, // ret
+                        // .valid:
+                        0x09, 0x05, 0x40, 0xF9, // ldr x9, [x8, #8]            (x9 = argv)
+                        0x29, 0x79, 0x62, 0xF8, // ldr x9, [x9, x2, lsl #3]    (x9 = argv[n], src)
+                        0x4C, 0xCC, 0x74, 0xD3, // lsl x12, x2, #12            (x12 = n * 4096)
+                        0x0A, 0x00, 0x41, 0x91, // add x10, x0, #0x40, lsl #12 (linmem base)
+                        0x4A, 0xBD, 0x42, 0x91, // add x10, x10, #0xAF, lsl #12 (+ 0xAF000)
+                        0x4A, 0x01, 0x0C, 0x8B, // add x10, x10, x12           (+ n*4096 = dest)
+                        0xED, 0xFF, 0x81, 0xD2, // movz x13, #4095             (max copy bytes)
+                        // .copy_loop:
+                        0xCD, 0x00, 0x00, 0xB4, // cbz x13, +6                 (limit hit → .truncate)
+                        0x2B, 0x15, 0x40, 0x38, // ldrb w11, [x9], #1          (load byte, post-inc)
+                        0x4B, 0x15, 0x00, 0x38, // strb w11, [x10], #1         (store byte, post-inc)
+                        0x8B, 0x00, 0x00, 0x34, // cbz w11, +4                 (NUL found → .done)
+                        0xAD, 0x05, 0x00, 0xD1, // sub x13, x13, #1            (remaining--)
+                        0xFB, 0xFF, 0xFF, 0x17, // b -5                         (→ .copy_loop)
+                        // .truncate:
+                        0x5F, 0x01, 0x00, 0x39, // strb wzr, [x10]             (NUL-terminate at limit)
+                        // .done: return wasm offset 0xAF000 + n*4096
+                        0x00, 0x00, 0x9E, 0xD2, // movz x0, #0xF000
+                        0x40, 0x01, 0xA0, 0xF2, // movk x0, #0xA, lsl #16     (x0 = 0xAF000)
+                        0x00, 0x00, 0x0C, 0x8B, // add x0, x0, x12             (+ n*4096)
+                        0xFD, 0x7B, 0xC1, 0xA8, // ldp x29, x30, [sp], #16
+                        0xC0, 0x03, 0x5F, 0xD6, // ret
+                    };
+                    try module.defineFunctionBytes(func_ids[i], &arm64_arg_ptr, &.{});
+                } else if (std.mem.eql(u8, name, "environ_count")) {
+                    // ARM64: walk envp array counting until NULL pointer
+                    // Cranelift CC: x0=vmctx, x1=caller_vmctx (no user args)
+                    // envp at vmctx+0x30010
+                    // Null-check: return 0 if envp is NULL (dylib mode)
+                    const arm64_environ_count = [_]u8{
+                        0x08, 0xC0, 0x40, 0x91, // 0: add x8, x0, #0x30, lsl #12  (vmctx + 0x30000)
+                        0x09, 0x09, 0x40, 0xF9, // 1: ldr x9, [x8, #16]           (x9 = envp)
+                        0x00, 0x00, 0x80, 0xD2, // 2: movz x0, #0                 (count = 0)
+                        0xA9, 0x00, 0x00, 0xB4, // 3: cbz x9, +5 → 8              (NULL envp → ret 0)
+                        // .loop:
+                        0x2A, 0x79, 0x60, 0xF8, // 4: ldr x10, [x9, x0, lsl #3]   (x10 = envp[count])
+                        0x6A, 0x00, 0x00, 0xB4, // 5: cbz x10, +3 → 8             (NULL → .done)
+                        0x00, 0x04, 0x00, 0x91, // 6: add x0, x0, #1              (count++)
+                        0xFD, 0xFF, 0xFF, 0x17, // 7: b -3                         (→ .loop)
+                        // .done:
+                        0xC0, 0x03, 0x5F, 0xD6, // 8: ret                         (return count in x0)
+                    };
+                    try module.defineFunctionBytes(func_ids[i], &arm64_environ_count, &.{});
+                } else if (std.mem.eql(u8, name, "environ_len")) {
+                    // ARM64: strlen(envp[n])
+                    // Cranelift CC: x0=vmctx, x1=caller_vmctx, x2=n
+                    // Null-check: return 0 if envp is NULL (dylib mode)
+                    const arm64_environ_len = [_]u8{
+                        0x08, 0xC0, 0x40, 0x91, //  0: add x8, x0, #0x30, lsl #12  (vmctx + 0x30000)
+                        0x09, 0x09, 0x40, 0xF9, //  1: ldr x9, [x8, #16]           (x9 = envp)
+                        0x29, 0x01, 0x00, 0xB4, //  2: cbz x9, +9 → 11             (NULL envp → .null)
+                        0x29, 0x79, 0x62, 0xF8, //  3: ldr x9, [x9, x2, lsl #3]    (x9 = envp[n])
+                        0xE9, 0x00, 0x00, 0xB4, //  4: cbz x9, +7 → 11             (NULL → .null)
+                        0x00, 0x00, 0x80, 0xD2, //  5: movz x0, #0                 (len = 0)
+                        // .loop:
+                        0x2A, 0x69, 0x60, 0x38, //  6: ldrb w10, [x9, x0]          (byte = envp[n][len])
+                        0x6A, 0x00, 0x00, 0x34, //  7: cbz w10, +3 → 10            (NUL → .done)
+                        0x00, 0x04, 0x00, 0x91, //  8: add x0, x0, #1              (len++)
+                        0xFD, 0xFF, 0xFF, 0x17, //  9: b -3                         (→ .loop)
+                        // .done:
+                        0xC0, 0x03, 0x5F, 0xD6, // 10: ret                         (return len in x0)
+                        // .null:
+                        0x00, 0x00, 0x80, 0xD2, // 11: movz x0, #0
+                        0xC0, 0x03, 0x5F, 0xD6, // 12: ret
+                    };
+                    try module.defineFunctionBytes(func_ids[i], &arm64_environ_len, &.{});
+                } else if (std.mem.eql(u8, name, "environ_ptr")) {
+                    // ARM64: copy envp[n] into linmem at 0x7F000 + n*4096, return wasm offset
+                    // Reference: arm64_arg_ptr (same pattern, offset 0xAF000→0x7F000, argv→envp)
+                    // Null-check: return 0 if envp is NULL (dylib mode)
+                    const arm64_environ_ptr = [_]u8{
+                        0xFD, 0x7B, 0xBF, 0xA9, //  0: stp x29, x30, [sp, #-16]!
+                        0xFD, 0x03, 0x00, 0x91, //  1: mov x29, sp
+                        0x08, 0xC0, 0x40, 0x91, //  2: add x8, x0, #0x30, lsl #12  (vmctx + 0x30000)
+                        0x09, 0x09, 0x40, 0xF9, //  3: ldr x9, [x8, #16]           (x9 = envp)
+                        0x89, 0x02, 0x00, 0xB4, //  4: cbz x9, +20 → 24            (NULL envp → .null)
+                        0x29, 0x79, 0x62, 0xF8, //  5: ldr x9, [x9, x2, lsl #3]    (x9 = envp[n], src)
+                        0x49, 0x02, 0x00, 0xB4, //  6: cbz x9, +18 → 24            (NULL → .null)
+                        0x4C, 0xCC, 0x74, 0xD3, //  7: lsl x12, x2, #12            (x12 = n * 4096)
+                        0x0A, 0x00, 0x41, 0x91, //  8: add x10, x0, #0x40, lsl #12 (linmem base)
+                        0x4A, 0xFD, 0x41, 0x91, //  9: add x10, x10, #0x7F, lsl #12 (+ 0x7F000)
+                        0x4A, 0x01, 0x0C, 0x8B, // 10: add x10, x10, x12           (+ n*4096 = dest)
+                        0xED, 0xFF, 0x81, 0xD2, // 11: movz x13, #4095             (max copy bytes)
+                        // .copy_loop:
+                        0xCD, 0x00, 0x00, 0xB4, // 12: cbz x13, +6 → 18           (limit → .truncate)
+                        0x2B, 0x15, 0x40, 0x38, // 13: ldrb w11, [x9], #1          (load byte, post-inc)
+                        0x4B, 0x15, 0x00, 0x38, // 14: strb w11, [x10], #1         (store byte, post-inc)
+                        0x8B, 0x00, 0x00, 0x34, // 15: cbz w11, +4 → 19            (NUL found → .done)
+                        0xAD, 0x05, 0x00, 0xD1, // 16: sub x13, x13, #1            (remaining--)
+                        0xFB, 0xFF, 0xFF, 0x17, // 17: b -5                         (→ .copy_loop)
+                        // .truncate:
+                        0x5F, 0x01, 0x00, 0x39, // 18: strb wzr, [x10]             (NUL-terminate)
+                        // .done: return wasm offset 0x7F000 + n*4096
+                        0x00, 0x00, 0x9E, 0xD2, // 19: movz x0, #0xF000
+                        0xE0, 0x00, 0xA0, 0xF2, // 20: movk x0, #0x7, lsl #16     (x0 = 0x7F000)
+                        0x00, 0x00, 0x0C, 0x8B, // 21: add x0, x0, x12             (+ n*4096)
+                        0xFD, 0x7B, 0xC1, 0xA8, // 22: ldp x29, x30, [sp], #16
+                        0xC0, 0x03, 0x5F, 0xD6, // 23: ret
+                        // .null: return 0
+                        0x00, 0x00, 0x80, 0xD2, // 24: movz x0, #0
+                        0xFD, 0x7B, 0xC1, 0xA8, // 25: ldp x29, x30, [sp], #16
+                        0xC0, 0x03, 0x5F, 0xD6, // 26: ret
+                    };
+                    try module.defineFunctionBytes(func_ids[i], &arm64_environ_ptr, &.{});
+                } else if (std.mem.eql(u8, name, "net_socket")) {
+                    // ARM64 macOS syscall for socket(domain, type, protocol)
+                    // Cranelift CC: x0=vmctx, x1=caller_vmctx, x2=domain, x3=type, x4=protocol
+                    // macOS SYS_socket = 97
+                    // Returns fd on success, -errno on error.
+                    const arm64_socket = [_]u8{
+                        0xFD, 0x7B, 0xBF, 0xA9, // stp x29, x30, [sp, #-16]!
+                        0xFD, 0x03, 0x00, 0x91, // mov x29, sp
+                        0xE0, 0x03, 0x02, 0xAA, // mov x0, x2  (domain)
+                        0xE1, 0x03, 0x03, 0xAA, // mov x1, x3  (type)
+                        0xE2, 0x03, 0x04, 0xAA, // mov x2, x4  (protocol)
+                        0x30, 0x0C, 0x80, 0xD2, // mov x16, #97  (SYS_socket)
+                        0x01, 0x10, 0x00, 0xD4, // svc #0x80
+                        0x43, 0x00, 0x00, 0x54, // b.cc +2  (success)
+                        0xE0, 0x03, 0x00, 0xCB, // neg x0, x0  (error)
+                        0xFD, 0x7B, 0xC1, 0xA8, // ldp x29, x30, [sp], #16
+                        0xC0, 0x03, 0x5F, 0xD6, // ret
+                    };
+                    try module.defineFunctionBytes(func_ids[i], &arm64_socket, &.{});
+                } else if (std.mem.eql(u8, name, "net_bind")) {
+                    // ARM64 macOS syscall for bind(fd, addr_ptr, addr_len)
+                    // Cranelift CC: x0=vmctx, x1=caller_vmctx, x2=fd, x3=addr_ptr(wasm), x4=addr_len
+                    // addr_ptr is a wasm pointer into linear memory
+                    // macOS SYS_bind = 104
+                    const arm64_bind = [_]u8{
+                        0xFD, 0x7B, 0xBF, 0xA9, // stp x29, x30, [sp, #-16]!
+                        0xFD, 0x03, 0x00, 0x91, // mov x29, sp
+                        0x08, 0x00, 0x41, 0x91, // add x8, x0, #0x40, lsl #12  (linmem base)
+                        0xE0, 0x03, 0x02, 0xAA, // mov x0, x2  (fd)
+                        0x01, 0x01, 0x03, 0x8B, // add x1, x8, x3  (real addr = linmem + wasm_ptr)
+                        0xE2, 0x03, 0x04, 0xAA, // mov x2, x4  (addr_len)
+                        0x10, 0x0D, 0x80, 0xD2, // mov x16, #104  (SYS_bind)
+                        0x01, 0x10, 0x00, 0xD4, // svc #0x80
+                        0x43, 0x00, 0x00, 0x54, // b.cc +2  (success)
+                        0xE0, 0x03, 0x00, 0xCB, // neg x0, x0  (error)
+                        0xFD, 0x7B, 0xC1, 0xA8, // ldp x29, x30, [sp], #16
+                        0xC0, 0x03, 0x5F, 0xD6, // ret
+                    };
+                    try module.defineFunctionBytes(func_ids[i], &arm64_bind, &.{});
+                } else if (std.mem.eql(u8, name, "net_listen")) {
+                    // ARM64 macOS syscall for listen(fd, backlog)
+                    // Cranelift CC: x0=vmctx, x1=caller_vmctx, x2=fd, x3=backlog
+                    // macOS SYS_listen = 106
+                    const arm64_listen = [_]u8{
+                        0xFD, 0x7B, 0xBF, 0xA9, // stp x29, x30, [sp, #-16]!
+                        0xFD, 0x03, 0x00, 0x91, // mov x29, sp
+                        0xE0, 0x03, 0x02, 0xAA, // mov x0, x2  (fd)
+                        0xE1, 0x03, 0x03, 0xAA, // mov x1, x3  (backlog)
+                        0x50, 0x0D, 0x80, 0xD2, // mov x16, #106  (SYS_listen)
+                        0x01, 0x10, 0x00, 0xD4, // svc #0x80
+                        0x43, 0x00, 0x00, 0x54, // b.cc +2  (success)
+                        0xE0, 0x03, 0x00, 0xCB, // neg x0, x0  (error)
+                        0xFD, 0x7B, 0xC1, 0xA8, // ldp x29, x30, [sp], #16
+                        0xC0, 0x03, 0x5F, 0xD6, // ret
+                    };
+                    try module.defineFunctionBytes(func_ids[i], &arm64_listen, &.{});
+                } else if (std.mem.eql(u8, name, "net_accept")) {
+                    // ARM64 macOS syscall for accept(fd, NULL, NULL)
+                    // Cranelift CC: x0=vmctx, x1=caller_vmctx, x2=fd
+                    // We pass NULL for addr and addrlen (don't need peer info)
+                    // macOS SYS_accept = 30
+                    const arm64_accept = [_]u8{
+                        0xFD, 0x7B, 0xBF, 0xA9, // stp x29, x30, [sp, #-16]!
+                        0xFD, 0x03, 0x00, 0x91, // mov x29, sp
+                        0xE0, 0x03, 0x02, 0xAA, // mov x0, x2  (fd)
+                        0xE1, 0x03, 0x1F, 0xAA, // mov x1, xzr  (addr = NULL)
+                        0xE2, 0x03, 0x1F, 0xAA, // mov x2, xzr  (addrlen = NULL)
+                        0xD0, 0x03, 0x80, 0xD2, // mov x16, #30  (SYS_accept)
+                        0x01, 0x10, 0x00, 0xD4, // svc #0x80
+                        0x43, 0x00, 0x00, 0x54, // b.cc +2  (success)
+                        0xE0, 0x03, 0x00, 0xCB, // neg x0, x0  (error)
+                        0xFD, 0x7B, 0xC1, 0xA8, // ldp x29, x30, [sp], #16
+                        0xC0, 0x03, 0x5F, 0xD6, // ret
+                    };
+                    try module.defineFunctionBytes(func_ids[i], &arm64_accept, &.{});
+                } else if (std.mem.eql(u8, name, "net_connect")) {
+                    // ARM64 macOS syscall for connect(fd, addr_ptr, addr_len)
+                    // Cranelift CC: x0=vmctx, x1=caller_vmctx, x2=fd, x3=addr_ptr(wasm), x4=addr_len
+                    // macOS SYS_connect = 98
+                    const arm64_connect = [_]u8{
+                        0xFD, 0x7B, 0xBF, 0xA9, // stp x29, x30, [sp, #-16]!
+                        0xFD, 0x03, 0x00, 0x91, // mov x29, sp
+                        0x08, 0x00, 0x41, 0x91, // add x8, x0, #0x40, lsl #12  (linmem base)
+                        0xE0, 0x03, 0x02, 0xAA, // mov x0, x2  (fd)
+                        0x01, 0x01, 0x03, 0x8B, // add x1, x8, x3  (real addr = linmem + wasm_ptr)
+                        0xE2, 0x03, 0x04, 0xAA, // mov x2, x4  (addr_len)
+                        0x50, 0x0C, 0x80, 0xD2, // mov x16, #98  (SYS_connect)
+                        0x01, 0x10, 0x00, 0xD4, // svc #0x80
+                        0x43, 0x00, 0x00, 0x54, // b.cc +2  (success)
+                        0xE0, 0x03, 0x00, 0xCB, // neg x0, x0  (error)
+                        0xFD, 0x7B, 0xC1, 0xA8, // ldp x29, x30, [sp], #16
+                        0xC0, 0x03, 0x5F, 0xD6, // ret
+                    };
+                    try module.defineFunctionBytes(func_ids[i], &arm64_connect, &.{});
+                } else if (std.mem.eql(u8, name, "net_set_reuse_addr")) {
+                    // ARM64 macOS syscall for setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &val, 4)
+                    // Cranelift CC: x0=vmctx, x1=caller_vmctx, x2=fd
+                    // SOL_SOCKET=0xFFFF, SO_REUSEADDR=0x0004 on macOS
+                    // macOS SYS_setsockopt = 105
+                    // We store the value 1 on the stack and pass a pointer to it
+                    const arm64_reuse = [_]u8{
+                        0xFD, 0x7B, 0xBF, 0xA9, // stp x29, x30, [sp, #-16]!
+                        0xFD, 0x03, 0x00, 0x91, // mov x29, sp
+                        0x28, 0x00, 0x80, 0xD2, // mov x8, #1  (optval = 1)
+                        0xFF, 0x43, 0x00, 0xD1, // sub sp, sp, #16
+                        0xE8, 0x03, 0x00, 0xB9, // str w8, [sp]  (store optval on stack)
+                        0xE0, 0x03, 0x02, 0xAA, // mov x0, x2  (fd)
+                        0xE1, 0xFF, 0x9F, 0xD2, // mov x1, #0xFFFF  (SOL_SOCKET)
+                        0x82, 0x00, 0x80, 0xD2, // mov x2, #4  (SO_REUSEADDR)
+                        0xE3, 0x03, 0x00, 0x91, // mov x3, sp  (&optval)
+                        0x84, 0x00, 0x80, 0xD2, // mov x4, #4  (optlen)
+                        0x30, 0x0D, 0x80, 0xD2, // mov x16, #105  (SYS_setsockopt)
+                        0x01, 0x10, 0x00, 0xD4, // svc #0x80
+                        0x43, 0x00, 0x00, 0x54, // b.cc +2  (success)
+                        0xE0, 0x03, 0x00, 0xCB, // neg x0, x0  (error)
+                        0xBF, 0x03, 0x00, 0x91, // mov sp, x29  (restore stack)
+                        0xFD, 0x7B, 0xC1, 0xA8, // ldp x29, x30, [sp], #16
+                        0xC0, 0x03, 0x5F, 0xD6, // ret
+                    };
+                    try module.defineFunctionBytes(func_ids[i], &arm64_reuse, &.{});
+                } else if (std.mem.eql(u8, name, "kqueue_create")) {
+                    // ARM64 macOS syscall for kqueue()
+                    // No user args. Returns kqueue fd.
+                    // macOS SYS_kqueue = 362
+                    const arm64_kqueue_create = [_]u8{
+                        0xFD, 0x7B, 0xBF, 0xA9, // stp x29, x30, [sp, #-16]!
+                        0xFD, 0x03, 0x00, 0x91, // mov x29, sp
+                        0x50, 0x2D, 0x80, 0xD2, // movz x16, #362 (SYS_kqueue)
+                        0x01, 0x10, 0x00, 0xD4, // svc #0x80
+                        0x43, 0x00, 0x00, 0x54, // b.cc +2
+                        0xE0, 0x03, 0x00, 0xCB, // neg x0, x0
+                        0xFD, 0x7B, 0xC1, 0xA8, // ldp x29, x30, [sp], #16
+                        0xC0, 0x03, 0x5F, 0xD6, // ret
+                    };
+                    try module.defineFunctionBytes(func_ids[i], &arm64_kqueue_create, &.{});
+                } else if (std.mem.eql(u8, name, "kevent_add")) {
+                    // ARM64 macOS: kevent(kq, changelist, 1, NULL, 0, NULL)
+                    // Builds kevent struct on stack with EV_ADD|EV_CLEAR (0x0021)
+                    // x2=kq, x3=fd, x4=filter. macOS SYS_kevent = 363
+                    const arm64_kevent_add = [_]u8{
+                        0xFD, 0x7B, 0xBF, 0xA9, // stp x29, x30, [sp, #-16]!
+                        0xFD, 0x03, 0x00, 0x91, // mov x29, sp
+                        0xFF, 0x83, 0x00, 0xD1, // sub sp, sp, #32
+                        0xE3, 0x03, 0x00, 0xF9, // str x3, [sp, #0]   (ident = fd)
+                        0xE4, 0x13, 0x00, 0x79, // strh w4, [sp, #8]  (filter)
+                        0x28, 0x04, 0x80, 0x52, // movz w8, #0x0021   (EV_ADD|EV_CLEAR)
+                        0xE8, 0x17, 0x00, 0x79, // strh w8, [sp, #10] (flags)
+                        0xFF, 0x0F, 0x00, 0xB9, // str wzr, [sp, #12] (fflags = 0)
+                        0xFF, 0x0B, 0x00, 0xF9, // str xzr, [sp, #16] (data = 0)
+                        0xFF, 0x0F, 0x00, 0xF9, // str xzr, [sp, #24] (udata = 0)
+                        0xE0, 0x03, 0x02, 0xAA, // mov x0, x2  (kq)
+                        0xE1, 0x03, 0x00, 0x91, // mov x1, sp  (changelist)
+                        0x22, 0x00, 0x80, 0xD2, // movz x2, #1 (nchanges)
+                        0xE3, 0x03, 0x1F, 0xAA, // mov x3, xzr (eventlist = NULL)
+                        0xE4, 0x03, 0x1F, 0xAA, // mov x4, xzr (nevents = 0)
+                        0xE5, 0x03, 0x1F, 0xAA, // mov x5, xzr (timeout = NULL)
+                        0x70, 0x2D, 0x80, 0xD2, // movz x16, #363 (SYS_kevent)
+                        0x01, 0x10, 0x00, 0xD4, // svc #0x80
+                        0x43, 0x00, 0x00, 0x54, // b.cc +2
+                        0xE0, 0x03, 0x00, 0xCB, // neg x0, x0
+                        0xBF, 0x03, 0x00, 0x91, // mov sp, x29
+                        0xFD, 0x7B, 0xC1, 0xA8, // ldp x29, x30, [sp], #16
+                        0xC0, 0x03, 0x5F, 0xD6, // ret
+                    };
+                    try module.defineFunctionBytes(func_ids[i], &arm64_kevent_add, &.{});
+                } else if (std.mem.eql(u8, name, "kevent_del")) {
+                    // ARM64 macOS: kevent(kq, changelist, 1, NULL, 0, NULL)
+                    // Builds kevent struct with EV_DELETE (0x0002)
+                    // x2=kq, x3=fd, x4=filter. macOS SYS_kevent = 363
+                    const arm64_kevent_del = [_]u8{
+                        0xFD, 0x7B, 0xBF, 0xA9, // stp x29, x30, [sp, #-16]!
+                        0xFD, 0x03, 0x00, 0x91, // mov x29, sp
+                        0xFF, 0x83, 0x00, 0xD1, // sub sp, sp, #32
+                        0xE3, 0x03, 0x00, 0xF9, // str x3, [sp, #0]   (ident = fd)
+                        0xE4, 0x13, 0x00, 0x79, // strh w4, [sp, #8]  (filter)
+                        0x48, 0x00, 0x80, 0x52, // movz w8, #0x0002   (EV_DELETE)
+                        0xE8, 0x17, 0x00, 0x79, // strh w8, [sp, #10] (flags)
+                        0xFF, 0x0F, 0x00, 0xB9, // str wzr, [sp, #12] (fflags = 0)
+                        0xFF, 0x0B, 0x00, 0xF9, // str xzr, [sp, #16] (data = 0)
+                        0xFF, 0x0F, 0x00, 0xF9, // str xzr, [sp, #24] (udata = 0)
+                        0xE0, 0x03, 0x02, 0xAA, // mov x0, x2  (kq)
+                        0xE1, 0x03, 0x00, 0x91, // mov x1, sp  (changelist)
+                        0x22, 0x00, 0x80, 0xD2, // movz x2, #1 (nchanges)
+                        0xE3, 0x03, 0x1F, 0xAA, // mov x3, xzr (eventlist = NULL)
+                        0xE4, 0x03, 0x1F, 0xAA, // mov x4, xzr (nevents = 0)
+                        0xE5, 0x03, 0x1F, 0xAA, // mov x5, xzr (timeout = NULL)
+                        0x70, 0x2D, 0x80, 0xD2, // movz x16, #363 (SYS_kevent)
+                        0x01, 0x10, 0x00, 0xD4, // svc #0x80
+                        0x43, 0x00, 0x00, 0x54, // b.cc +2
+                        0xE0, 0x03, 0x00, 0xCB, // neg x0, x0
+                        0xBF, 0x03, 0x00, 0x91, // mov sp, x29
+                        0xFD, 0x7B, 0xC1, 0xA8, // ldp x29, x30, [sp], #16
+                        0xC0, 0x03, 0x5F, 0xD6, // ret
+                    };
+                    try module.defineFunctionBytes(func_ids[i], &arm64_kevent_del, &.{});
+                } else if (std.mem.eql(u8, name, "kevent_wait")) {
+                    // ARM64 macOS: kevent(kq, NULL, 0, eventlist, max_events, NULL)
+                    // x2=kq, x3=buf_ptr(wasm), x4=max_events. SYS_kevent = 363
+                    // buf_ptr converted to real ptr via linmem at vmctx+0x40000
+                    const arm64_kevent_wait = [_]u8{
+                        0xFD, 0x7B, 0xBF, 0xA9, // stp x29, x30, [sp, #-16]!
+                        0xFD, 0x03, 0x00, 0x91, // mov x29, sp
+                        0x08, 0x00, 0x41, 0x91, // add x8, x0, #0x40, lsl #12  (linmem base)
+                        0x09, 0x01, 0x03, 0x8B, // add x9, x8, x3  (real eventlist ptr)
+                        0xE0, 0x03, 0x02, 0xAA, // mov x0, x2      (kq)
+                        0xE1, 0x03, 0x1F, 0xAA, // mov x1, xzr     (changelist = NULL)
+                        0xE2, 0x03, 0x1F, 0xAA, // mov x2, xzr     (nchanges = 0)
+                        0xE3, 0x03, 0x09, 0xAA, // mov x3, x9      (eventlist)
+                        // x4 = max_events (already in x4, untouched)
+                        0xE5, 0x03, 0x1F, 0xAA, // mov x5, xzr     (timeout = NULL, block)
+                        0x70, 0x2D, 0x80, 0xD2, // movz x16, #363  (SYS_kevent)
+                        0x01, 0x10, 0x00, 0xD4, // svc #0x80
+                        0x43, 0x00, 0x00, 0x54, // b.cc +2
+                        0xE0, 0x03, 0x00, 0xCB, // neg x0, x0
+                        0xFD, 0x7B, 0xC1, 0xA8, // ldp x29, x30, [sp], #16
+                        0xC0, 0x03, 0x5F, 0xD6, // ret
+                    };
+                    try module.defineFunctionBytes(func_ids[i], &arm64_kevent_wait, &.{});
+                } else if (std.mem.eql(u8, name, "set_nonblocking")) {
+                    // ARM64 macOS: fcntl(fd, F_GETFL) then fcntl(fd, F_SETFL, flags|O_NONBLOCK)
+                    // x2=fd. macOS SYS_fcntl=92, F_GETFL=3, F_SETFL=4, O_NONBLOCK=4
+                    const arm64_set_nonblocking = [_]u8{
+                        0xFD, 0x7B, 0xBF, 0xA9, // stp x29, x30, [sp, #-16]!
+                        0xFD, 0x03, 0x00, 0x91, // mov x29, sp
+                        0xF3, 0x53, 0xBF, 0xA9, // stp x19, x20, [sp, #-16]!
+                        0xF3, 0x03, 0x02, 0xAA, // mov x19, x2  (save fd)
+                        0xE0, 0x03, 0x13, 0xAA, // mov x0, x19  (fd)
+                        0x61, 0x00, 0x80, 0xD2, // movz x1, #3  (F_GETFL)
+                        0x90, 0x0B, 0x80, 0xD2, // movz x16, #92 (SYS_fcntl)
+                        0x01, 0x10, 0x00, 0xD4, // svc #0x80
+                        0x62, 0x01, 0x00, 0x54, // b.cs +11  (error → neg)
+                        0x88, 0x00, 0x80, 0xD2, // movz x8, #4  (O_NONBLOCK)
+                        0x14, 0x00, 0x08, 0xAA, // orr x20, x0, x8  (flags | O_NONBLOCK)
+                        0xE0, 0x03, 0x13, 0xAA, // mov x0, x19  (fd)
+                        0x81, 0x00, 0x80, 0xD2, // movz x1, #4  (F_SETFL)
+                        0xE2, 0x03, 0x14, 0xAA, // mov x2, x20  (new flags)
+                        0x90, 0x0B, 0x80, 0xD2, // movz x16, #92 (SYS_fcntl)
+                        0x01, 0x10, 0x00, 0xD4, // svc #0x80
+                        0x62, 0x00, 0x00, 0x54, // b.cs +3  (error → neg)
+                        0xE0, 0x03, 0x1F, 0xAA, // mov x0, xzr  (return 0)
+                        0x02, 0x00, 0x00, 0x14, // b +2  (skip error)
+                        0xE0, 0x03, 0x00, 0xCB, // neg x0, x0
+                        0xF3, 0x53, 0xC1, 0xA8, // ldp x19, x20, [sp], #16
+                        0xFD, 0x7B, 0xC1, 0xA8, // ldp x29, x30, [sp], #16
+                        0xC0, 0x03, 0x5F, 0xD6, // ret
+                    };
+                    try module.defineFunctionBytes(func_ids[i], &arm64_set_nonblocking, &.{});
+                } else if (std.mem.eql(u8, name, "fork")) {
+                    // ARM64 macOS: fork() syscall
+                    // Cranelift CC: x0=vmctx, x1=caller_vmctx (no value args)
+                    // macOS SYS_fork = 2. Returns child pid in parent, 0 in child.
+                    // macOS fork: x0=other_pid in both, x1=0 (parent) / x1=1 (child)
+                    // Must check x1 to distinguish, return 0 in child.
+                    const arm64_fork = [_]u8{
+                        0xFD, 0x7B, 0xBF, 0xA9, // 0: stp x29, x30, [sp, #-16]!
+                        0xFD, 0x03, 0x00, 0x91, // 1: mov x29, sp
+                        0x50, 0x00, 0x80, 0xD2, // 2: movz x16, #2  (SYS_fork)
+                        0x01, 0x10, 0x00, 0xD4, // 3: svc #0x80
+                        0x82, 0x00, 0x00, 0x54, // 4: b.cs +4 → 8  (error)
+                        0x81, 0x00, 0x00, 0xB4, // 5: cbz x1, +4 → 9  (parent: x0=child_pid)
+                        0x00, 0x00, 0x80, 0xD2, // 6: movz x0, #0  (child: return 0)
+                        0x02, 0x00, 0x00, 0x14, // 7: b +2 → 9  (epilogue)
+                        0xE0, 0x03, 0x00, 0xCB, // 8: neg x0, x0  (error: -errno)
+                        0xFD, 0x7B, 0xC1, 0xA8, // 9: ldp x29, x30, [sp], #16
+                        0xC0, 0x03, 0x5F, 0xD6, // 10: ret
+                    };
+                    try module.defineFunctionBytes(func_ids[i], &arm64_fork, &.{});
+                } else if (std.mem.eql(u8, name, "waitpid")) {
+                    // ARM64 macOS: wait4(pid, &status, options, NULL) syscall
+                    // Cranelift CC: x0=vmctx, x1=caller_vmctx, x2=pid
+                    // macOS SYS_wait4 = 7. Returns pid on success, status in stack buf.
+                    // We return (status >> 8) & 0xFF as the exit code.
+                    const arm64_waitpid = [_]u8{
+                        0xFD, 0x7B, 0xBF, 0xA9, // stp x29, x30, [sp, #-16]!
+                        0xFD, 0x03, 0x00, 0x91, // mov x29, sp
+                        0xFF, 0x43, 0x00, 0xD1, // sub sp, sp, #16  (stack space for status)
+                        0xE0, 0x03, 0x02, 0xAA, // mov x0, x2  (pid)
+                        0xE1, 0x03, 0x00, 0x91, // mov x1, sp  (status_ptr)
+                        0x02, 0x00, 0x80, 0xD2, // movz x2, #0  (options = 0)
+                        0x03, 0x00, 0x80, 0xD2, // movz x3, #0  (rusage = NULL)
+                        0xF0, 0x00, 0x80, 0xD2, // movz x16, #7  (SYS_wait4)
+                        0x01, 0x10, 0x00, 0xD4, // svc #0x80
+                        0x63, 0x00, 0x00, 0x54, // b.cc +3  (success → load status)
+                        0xE0, 0x03, 0x00, 0xCB, // neg x0, x0  (error: -errno)
+                        0x03, 0x00, 0x00, 0x14, // b +3  (skip to cleanup)
+                        // Success: extract exit code = (status >> 8) & 0xFF
+                        0xE0, 0x03, 0x40, 0xB9, // ldr w0, [sp]  (load status as i32)
+                        0x00, 0x3C, 0x48, 0xD3, // ubfx x0, x0, #8, #8  (UBFM x0,x0,#8,#15)
+                        0xFF, 0x43, 0x00, 0x91, // add sp, sp, #16  (cleanup)
+                        0xFD, 0x7B, 0xC1, 0xA8, // ldp x29, x30, [sp], #16
+                        0xC0, 0x03, 0x5F, 0xD6, // ret
+                    };
+                    try module.defineFunctionBytes(func_ids[i], &arm64_waitpid, &.{});
+                } else if (std.mem.eql(u8, name, "pipe")) {
+                    // ARM64 macOS: pipe() syscall
+                    // Cranelift CC: x0=vmctx, x1=caller_vmctx (no value args)
+                    // macOS SYS_pipe = 42. Writes [read_fd, write_fd] to buffer.
+                    // Returns packed: (write_fd << 32) | read_fd
+                    // macOS pipe: no args, returns x0=read_fd, x1=write_fd in registers.
+                    // Pack as (write_fd << 32) | read_fd for Cot.
+                    const arm64_pipe = [_]u8{
+                        0xFD, 0x7B, 0xBF, 0xA9, // 0: stp x29, x30, [sp, #-16]!
+                        0xFD, 0x03, 0x00, 0x91, // 1: mov x29, sp
+                        0x50, 0x05, 0x80, 0xD2, // 2: movz x16, #42  (SYS_pipe)
+                        0x01, 0x10, 0x00, 0xD4, // 3: svc #0x80
+                        0x62, 0x00, 0x00, 0x54, // 4: b.cs +3 → 7  (error)
+                        0x00, 0x80, 0x01, 0xAA, // 5: orr x0, x0, x1, lsl #32  (pack fds)
+                        0x02, 0x00, 0x00, 0x14, // 6: b +2 → 8  (epilogue)
+                        0xE0, 0x03, 0x00, 0xCB, // 7: neg x0, x0  (error: -errno)
+                        0xFD, 0x7B, 0xC1, 0xA8, // 8: ldp x29, x30, [sp], #16
+                        0xC0, 0x03, 0x5F, 0xD6, // 9: ret
+                    };
+                    try module.defineFunctionBytes(func_ids[i], &arm64_pipe, &.{});
+                } else if (std.mem.eql(u8, name, "dup2")) {
+                    // ARM64 macOS: dup2(oldfd, newfd) syscall
+                    // Cranelift CC: x0=vmctx, x1=caller_vmctx, x2=oldfd, x3=newfd
+                    // macOS SYS_dup2 = 90. Returns newfd on success, -errno on error.
+                    const arm64_dup2 = [_]u8{
+                        0xFD, 0x7B, 0xBF, 0xA9, // stp x29, x30, [sp, #-16]!
+                        0xFD, 0x03, 0x00, 0x91, // mov x29, sp
+                        0xE0, 0x03, 0x02, 0xAA, // mov x0, x2  (oldfd)
+                        0xE1, 0x03, 0x03, 0xAA, // mov x1, x3  (newfd)
+                        0x50, 0x0B, 0x80, 0xD2, // movz x16, #90  (SYS_dup2)
+                        0x01, 0x10, 0x00, 0xD4, // svc #0x80
+                        0x43, 0x00, 0x00, 0x54, // b.cc +2  (success)
+                        0xE0, 0x03, 0x00, 0xCB, // neg x0, x0  (error)
+                        0xFD, 0x7B, 0xC1, 0xA8, // ldp x29, x30, [sp], #16
+                        0xC0, 0x03, 0x5F, 0xD6, // ret
+                    };
+                    try module.defineFunctionBytes(func_ids[i], &arm64_dup2, &.{});
+                } else if (std.mem.eql(u8, name, "isatty")) {
+                    // ARM64 macOS: isatty(fd) via ioctl(fd, TIOCGETA, &termios_buf)
+                    // Cranelift CC: x0=vmctx, x1=caller_vmctx, x2=fd
+                    // Reference: POSIX isatty(3), macOS SYS_ioctl=54, TIOCGETA=0x40487413
+                    // Returns 1 if terminal, 0 if not.
+                    const arm64_isatty = [_]u8{
+                        // 0: stp x29, x30, [sp, #-32]!  (save frame + 16 bytes for termios)
+                        0xFD, 0x7B, 0xBE, 0xA9,
+                        // 1: mov x29, sp
+                        0xFD, 0x03, 0x00, 0x91,
+                        // 2: mov x0, x2                  (fd)
+                        0xE0, 0x03, 0x02, 0xAA,
+                        // 3: movz x1, #0x8413            (TIOCGETA low half)
+                        0x61, 0x82, 0x90, 0xD2,
+                        // 4: movk x1, #0x4048, lsl #16   (TIOCGETA high half = 0x40487413)
+                        0x01, 0x09, 0xA8, 0xF2,
+                        // 5: add x2, sp, #16              (&termios buf on stack)
+                        0xE2, 0x43, 0x00, 0x91,
+                        // 6: movz x16, #54                (SYS_ioctl)
+                        0xD0, 0x06, 0x80, 0xD2,
+                        // 7: svc #0x80
+                        0x01, 0x10, 0x00, 0xD4,
+                        // 8: b.cs +3                      (carry set = error → not tty, jump to 11)
+                        0x62, 0x00, 0x00, 0x54,
+                        // 9: movz x0, #1                  (success: is a tty)
+                        0x20, 0x00, 0x80, 0xD2,
+                        // 10: b +2                        (jump to 12: ldp+ret)
+                        0x02, 0x00, 0x00, 0x14,
+                        // 11: movz x0, #0                 (error: not a tty)
+                        0x00, 0x00, 0x80, 0xD2,
+                        // 12: ldp x29, x30, [sp], #32
+                        0xFD, 0x7B, 0xC2, 0xA8,
+                        // 13: ret
+                        0xC0, 0x03, 0x5F, 0xD6,
+                    };
+                    try module.defineFunctionBytes(func_ids[i], &arm64_isatty, &.{});
+                } else if (std.mem.eql(u8, name, "execve")) {
+                    // ARM64 macOS: execve(path, argv, envp) syscall
+                    // Cranelift CC: x0=vmctx, x1=caller_vmctx, x2=path_ptr, x3=argv_ptr, x4=envp_ptr
+                    // All pointers are wasm linear memory offsets — add linmem base.
+                    // macOS SYS_execve = 59. Does not return on success.
+                    // execve with argv/envp pointer fixup: wasm addresses → real addresses
+                    // argv[i] and envp[i] are wasm offsets that must have linmem_base added.
+                    const arm64_execve = [_]u8{
+                        0xFD, 0x7B, 0xBF, 0xA9, // 0: stp x29, x30, [sp, #-16]!
+                        0xFD, 0x03, 0x00, 0x91, // 1: mov x29, sp
+                        0x08, 0x00, 0x41, 0x91, // 2: add x8, x0, #0x40, lsl #12  (linmem base)
+                        0x00, 0x01, 0x02, 0x8B, // 3: add x0, x8, x2  (path = linmem + wasm_ptr)
+                        0x01, 0x01, 0x03, 0x8B, // 4: add x1, x8, x3  (argv = linmem + wasm_argv)
+                        0x02, 0x01, 0x04, 0x8B, // 5: add x2, x8, x4  (envp = linmem + wasm_envp)
+                        // Fixup argv pointers (each entry is a wasm addr that needs linmem_base)
+                        0xEA, 0x03, 0x01, 0xAA, // 6: mov x10, x1
+                        0x4B, 0x01, 0x40, 0xF9, // 7: ldr x11, [x10]  (argv_loop)
+                        0xAB, 0x00, 0x00, 0xB4, // 8: cbz x11, +5 → 13
+                        0x6B, 0x01, 0x08, 0x8B, // 9: add x11, x11, x8
+                        0x4B, 0x01, 0x00, 0xF9, // 10: str x11, [x10]
+                        0x4A, 0x21, 0x00, 0x91, // 11: add x10, x10, #8
+                        0xFB, 0xFF, 0xFF, 0x17, // 12: b -5 → 7
+                        // Fixup envp pointers
+                        0xEA, 0x03, 0x02, 0xAA, // 13: mov x10, x2
+                        0x4B, 0x01, 0x40, 0xF9, // 14: ldr x11, [x10]  (envp_loop)
+                        0xAB, 0x00, 0x00, 0xB4, // 15: cbz x11, +5 → 20
+                        0x6B, 0x01, 0x08, 0x8B, // 16: add x11, x11, x8
+                        0x4B, 0x01, 0x00, 0xF9, // 17: str x11, [x10]
+                        0x4A, 0x21, 0x00, 0x91, // 18: add x10, x10, #8
+                        0xFB, 0xFF, 0xFF, 0x17, // 19: b -5 → 14
+                        // Call execve (only returns on error)
+                        0x70, 0x07, 0x80, 0xD2, // 20: movz x16, #59  (SYS_execve)
+                        0x01, 0x10, 0x00, 0xD4, // 21: svc #0x80
+                        0xE0, 0x03, 0x00, 0xCB, // 22: neg x0, x0  (error: -errno)
+                        0xFD, 0x7B, 0xC1, 0xA8, // 23: ldp x29, x30, [sp], #16
+                        0xC0, 0x03, 0x5F, 0xD6, // 24: ret
+                    };
+                    try module.defineFunctionBytes(func_ids[i], &arm64_execve, &.{});
+                } else if (std.mem.eql(u8, name, "epoll_create") or
+                    std.mem.eql(u8, name, "epoll_add") or
+                    std.mem.eql(u8, name, "epoll_del") or
+                    std.mem.eql(u8, name, "epoll_wait"))
+                {
+                    // epoll is Linux-only — return -1 on macOS
+                    const arm64_stub_neg1 = [_]u8{
+                        0x00, 0x00, 0x80, 0x92, // movn x0, #0  (x0 = -1)
+                        0xC0, 0x03, 0x5F, 0xD6, // ret
+                    };
+                    try module.defineFunctionBytes(func_ids[i], &arm64_stub_neg1, &.{});
+                }
+            } else {
+                try module.defineFunction(func_ids[i], cf);
+            }
+        }
+
+        // Generate entry point or library wrappers
+        if (self.lib_mode) {
+            // Shared library: generate vmctx + C-ABI export wrappers
+            try self.generateLibWrappersMachO(&module, exports, func_to_type, types, data_segments, globals, func_ids, @intCast(compiled_funcs.len));
+        } else if (main_func_index != null) {
+            // Executable: generate _main entry point with vmctx init
+            try self.generateMainWrapperMachO(&module, data_segments, globals, @intCast(compiled_funcs.len));
+        }
+
+        // Generate DWARF debug info: map function code offsets to source lines.
+        // Build name→span lookup from IR functions, then create line entries.
+        if (self.debug_source_file.len > 0 and self.debug_ir_funcs.len > 0) {
+            module.setDebugInfo(self.debug_source_file, self.debug_source_text);
+
+            // Build IR function name → source span.start mapping
+            var ir_name_to_span = std.StringHashMap(u32).init(self.allocator);
+            defer ir_name_to_span.deinit();
+            for (self.debug_ir_funcs) |ir_func| {
+                try ir_name_to_span.put(ir_func.name, ir_func.span.start.offset);
+            }
+
+            // Collect function debug info for DWARF DW_TAG_subprogram DIEs
+            var debug_func_infos = std.ArrayListUnmanaged(dwarf_mod.DebugFuncInfo){};
+            defer debug_func_infos.deinit(self.allocator);
+
+            // Build IR function name → IR func mapping for local variable info
+            var ir_name_to_func = std.StringHashMap(*const ir_mod.Func).init(self.allocator);
+            defer ir_name_to_func.deinit();
+            for (self.debug_ir_funcs) |*ir_func| {
+                try ir_name_to_func.put(ir_func.name, ir_func);
+            }
+
+            // For each compiled function, look up its source span via export name
+            for (compiled_funcs, 0..) |_, i| {
+                // Find this function's export name (same logic as Pass 1)
+                var func_name: []const u8 = "";
+                for (exports) |exp| {
+                    if (exp.kind == .func and exp.index == i) {
+                        func_name = exp.name;
+                        break;
+                    }
+                }
+                if (func_name.len == 0) continue;
+
+                // Look up the IR function's source span
+                if (ir_name_to_span.get(func_name)) |source_offset| {
+                    const code_offset = module.getFuncCodeOffset(func_ids[i]);
+                    try module.addLineEntry(code_offset, source_offset);
+
+                    const func_code_size: u32 = @intCast(compiled_funcs[i].buffer.data.items.len);
+                    const decl_line = lineFromByteOffset(self.debug_source_text, source_offset);
+
+                    // Collect locals from IR function for DWARF variable/parameter DIEs
+                    var debug_locals = std.ArrayListUnmanaged(dwarf_mod.DebugLocalInfo){};
+                    defer debug_locals.deinit(self.allocator);
+
+                    if (ir_name_to_func.get(func_name)) |ir_func| {
+                        // Collect parameters
+                        for (ir_func.params) |param| {
+                            if (param.name.len == 0) continue;
+                            const type_name = if (self.debug_type_reg) |tr| tr.typeName(param.type_idx) else "i64";
+                            try debug_locals.append(self.allocator, .{
+                                .name = param.name,
+                                .type_name = type_name,
+                                .frame_offset = param.offset,
+                                .size = param.size,
+                                .is_param = true,
+                            });
+                        }
+                        // Collect locals (skip compiler temporaries)
+                        for (ir_func.locals) |local| {
+                            if (local.name.len == 0) continue;
+                            if (local.name.len >= 2 and local.name[0] == '_' and local.name[1] == '_') continue;
+                            if (local.is_param) continue;
+                            const type_name = if (self.debug_type_reg) |tr| tr.typeName(local.type_idx) else "i64";
+                            try debug_locals.append(self.allocator, .{
+                                .name = local.name,
+                                .type_name = type_name,
+                                .frame_offset = local.offset,
+                                .size = local.size,
+                                .is_param = false,
+                            });
+                        }
+                    }
+
+                    const owned_locals = try self.allocator.dupe(dwarf_mod.DebugLocalInfo, debug_locals.items);
+                    try module.addOwnedDebugLocals(owned_locals);
+
+                    try debug_func_infos.append(self.allocator, .{
+                        .name = func_name,
+                        .code_offset = code_offset,
+                        .code_size = func_code_size,
+                        .source_line = decl_line,
+                        .locals = owned_locals,
+                        .frame_size = compiled_funcs[i].frame_size,
+                    });
+                }
+            }
+
+            try module.setFuncInfos(debug_func_infos.items);
+            if (self.debug_type_reg) |tr| module.setTypeRegistry(tr);
+        }
+
+        // Write to memory buffer
+        var output = std.ArrayListUnmanaged(u8){};
+        defer output.deinit(self.allocator);
+        try module.finish(output.writer(self.allocator));
+
+        return output.toOwnedSlice(self.allocator);
+    }
+
+    /// Generate the _main wrapper and static vmctx data for Mach-O.
+    /// The wrapper initializes vmctx, installs signal handlers, and calls __wasm_main.
+    fn generateMainWrapperMachO(self: *Driver, module: *object_module.ObjectModule, data_segments: []const wasm_parser.DataSegment, globals: []const wasm_parser.GlobalType, num_funcs: u32) !void {
+        // ARM64 instruction encoding helpers
+        const A64 = struct {
+            fn mov(rd: u32, rm: u32) u32 { // MOV Xd, Xm (ORR Xd, XZR, Xm)
+                return 0xAA0003E0 | (rm << 16) | rd;
+            }
+            fn movz(rd: u32, imm16: u32) u32 { // MOVZ Xd, #imm16
+                return 0xD2800000 | (imm16 << 5) | rd;
+            }
+            fn movz_w(rd: u32, imm16: u32) u32 { // MOVZ Wd, #imm16
+                return 0x52800000 | (imm16 << 5) | rd;
+            }
+            fn movn_w(rd: u32, imm16: u32) u32 { // MOVN Wd, #imm16
+                return 0x12800000 | (imm16 << 5) | rd;
+            }
+            fn movk_lsl16(rd: u32, imm16: u32) u32 { // MOVK Xd, #imm16, lsl #16
+                return 0xF2A00000 | (imm16 << 5) | rd;
+            }
+            fn add_imm(rd: u32, rn: u32, imm12: u32) u32 { // ADD Xd, Xn, #imm12
+                return 0x91000000 | (imm12 << 10) | (rn << 5) | rd;
+            }
+            fn add_imm_lsl12(rd: u32, rn: u32, imm12: u32) u32 { // ADD Xd, Xn, #imm12, lsl #12
+                return 0x91400000 | (imm12 << 10) | (rn << 5) | rd;
+            }
+            fn subs_imm(rd: u32, rn: u32, imm12: u32) u32 { // SUBS Xd, Xn, #imm12
+                return 0xF1000000 | (imm12 << 10) | (rn << 5) | rd;
+            }
+            fn cmp_imm(rn: u32, imm12: u32) u32 { // CMP Xn, #imm12
+                return subs_imm(31, rn, imm12);
+            }
+            fn stp_pre(rt1: u32, rt2: u32, rn: u32, imm_bytes: i32) u32 { // STP [Xn, #imm]!
+                const imm7: u32 = @as(u32, @bitCast(@divExact(imm_bytes, 8))) & 0x7F;
+                return 0xA9800000 | (imm7 << 15) | (rt2 << 10) | (rn << 5) | rt1;
+            }
+            fn stp_off(rt1: u32, rt2: u32, rn: u32, imm_bytes: i32) u32 { // STP [Xn, #imm]
+                const imm7: u32 = @as(u32, @bitCast(@divExact(imm_bytes, 8))) & 0x7F;
+                return 0xA9000000 | (imm7 << 15) | (rt2 << 10) | (rn << 5) | rt1;
+            }
+            fn ldp_off(rt1: u32, rt2: u32, rn: u32, imm_bytes: i32) u32 { // LDP [Xn, #imm]
+                const imm7: u32 = @as(u32, @bitCast(@divExact(imm_bytes, 8))) & 0x7F;
+                return 0xA9400000 | (imm7 << 15) | (rt2 << 10) | (rn << 5) | rt1;
+            }
+            fn ldp_post(rt1: u32, rt2: u32, rn: u32, imm_bytes: i32) u32 { // LDP [Xn], #imm
+                const imm7: u32 = @as(u32, @bitCast(@divExact(imm_bytes, 8))) & 0x7F;
+                return 0xA8C00000 | (imm7 << 15) | (rt2 << 10) | (rn << 5) | rt1;
+            }
+            fn str_imm(rt: u32, rn: u32, imm_bytes: u32) u32 { // STR Xt, [Xn, #imm]
+                return 0xF9000000 | ((imm_bytes / 8) << 10) | (rn << 5) | rt;
+            }
+            fn str_w_imm(rt: u32, rn: u32, imm_bytes: u32) u32 { // STR Wt, [Xn, #imm]
+                return 0xB9000000 | ((imm_bytes / 4) << 10) | (rn << 5) | rt;
+            }
+            fn ldr_imm(rt: u32, rn: u32, imm_bytes: u32) u32 { // LDR Xt, [Xn, #imm]
+                return 0xF9400000 | ((imm_bytes / 8) << 10) | (rn << 5) | rt;
+            }
+            fn ldrb_reg(rt: u32, rn: u32, rm: u32) u32 { // LDRB Wt, [Xn, Xm]
+                return 0x38606800 | (rm << 16) | (rn << 5) | rt;
+            }
+            fn strb_post1(rt: u32, rn: u32) u32 { // STRB Wt, [Xn], #1
+                return 0x38000400 | (1 << 12) | (rn << 5) | rt;
+            }
+            fn strb_uoff0(rt: u32, rn: u32) u32 { // STRB Wt, [Xn, #0]
+                return 0x39000000 | (rn << 5) | rt;
+            }
+            fn lsr_reg(rd: u32, rn: u32, rm: u32) u32 { // LSRV Xd, Xn, Xm
+                return 0x9AC02400 | (rm << 16) | (rn << 5) | rd;
+            }
+            fn and_0xf(rd: u32, rn: u32) u32 { // AND Xd, Xn, #0xF
+                return 0x92400C00 | (rn << 5) | rd;
+            }
+            fn b(off: i32) u32 { // B offset (in instructions)
+                return 0x14000000 | (@as(u32, @bitCast(off)) & 0x3FFFFFF);
+            }
+            fn b_eq(off: i32) u32 { // B.EQ offset
+                return 0x54000000 | ((@as(u32, @bitCast(off)) & 0x7FFFF) << 5);
+            }
+            fn b_ge(off: i32) u32 { // B.GE offset
+                return 0x54000000 | ((@as(u32, @bitCast(off)) & 0x7FFFF) << 5) | 0xA;
+            }
+            fn bl() u32 { return 0x94000000; } // BL (reloc placeholder)
+            fn svc80() u32 { return 0xD4001001; } // SVC #0x80
+            fn adrp(rd: u32) u32 { return 0x90000000 | rd; } // ADRP (reloc placeholder)
+            fn add_pageoff(rd: u32, rn: u32) u32 { // ADD Xd, Xn, #pageoff (reloc placeholder)
+                return 0x91000000 | (rn << 5) | rd;
+            }
+            fn ret() u32 { return 0xD65F03C0; }
+            fn brk1() u32 { return 0xD4200020; } // BRK #1
+        };
+
+        // Helper to append little-endian u32
+        const appendInst = struct {
+            fn f(list: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, inst: u32) !void {
+                try list.appendSlice(alloc, &std.mem.toBytes(std.mem.nativeToBig(u32, @byteSwap(inst))));
+            }
+        }.f;
+
+        // Relocation types
+        const FinalizedMachReloc = buffer_mod.FinalizedMachReloc;
+        const FinalizedRelocTarget = buffer_mod.FinalizedRelocTarget;
+        const Reloc = buffer_mod.Reloc;
+        const ExternalName = buffer_mod.ExternalName;
+
+        // External name indices (must not collide with function indices 0..num_funcs-1)
+        const vmctx_ext_idx: u32 = num_funcs;
+        const wasm_main_ext_idx: u32 = num_funcs + 1;
+        const panic_strings_ext_idx: u32 = num_funcs + 2;
+        const signal_handler_ext_idx: u32 = num_funcs + 3;
+        const sigaction_ext_idx: u32 = num_funcs + 4;
+
+        const vmctx_name_ref = ExternalName{ .User = .{ .namespace = 0, .index = vmctx_ext_idx } };
+        const wasm_main_name_ref = ExternalName{ .User = .{ .namespace = 0, .index = wasm_main_ext_idx } };
+        const panic_strings_name_ref = ExternalName{ .User = .{ .namespace = 0, .index = panic_strings_ext_idx } };
+        const signal_handler_name_ref = ExternalName{ .User = .{ .namespace = 0, .index = signal_handler_ext_idx } };
+        const sigaction_name_ref = ExternalName{ .User = .{ .namespace = 0, .index = sigaction_ext_idx } };
+
+        // =================================================================
+        // Step 1: Declare and define static vmctx data section
+        // =================================================================
+        // Total virtual memory: 256 MB. Only initialized portion goes on disk;
+        // the rest is BSS (zero-fill, no disk cost). Go pattern: sysAlloc → mmap.
+        const vmctx_total: usize = 0x10000000; // 256 MB total virtual memory
+        const vmctx_init_size: usize = 0x100000; // 1 MB for initialized data (globals + data segments + control)
+        const vmctx_data = try self.allocator.alloc(u8, vmctx_init_size);
+        defer self.allocator.free(vmctx_data);
+        @memset(vmctx_data, 0);
+
+        const linear_memory_base: usize = 0x40000;
+        for (data_segments) |segment| {
+            const dest_offset = linear_memory_base + segment.offset;
+            if (dest_offset + segment.data.len <= vmctx_init_size) {
+                @memcpy(vmctx_data[dest_offset..][0..segment.data.len], segment.data);
+            }
+        }
+
+        const global_base: usize = 0x10000;
+        const global_stride: usize = 16;
+        for (globals, 0..) |g, i| {
+            const offset = global_base + i * global_stride;
+            if (offset + 8 <= vmctx_init_size) {
+                switch (g.val_type) {
+                    .i32 => {
+                        const val: u32 = @bitCast(@as(i32, @truncate(g.init_value)));
+                        @memcpy(vmctx_data[offset..][0..4], std.mem.asBytes(&val));
+                    },
+                    .i64 => {
+                        const val: u64 = @bitCast(g.init_value);
+                        @memcpy(vmctx_data[offset..][0..8], std.mem.asBytes(&val));
+                    },
+                    .f32 => {
+                        const val: u32 = @bitCast(@as(i32, @truncate(g.init_value)));
+                        @memcpy(vmctx_data[offset..][0..4], std.mem.asBytes(&val));
+                    },
+                    .f64 => {
+                        const val: u64 = @bitCast(g.init_value);
+                        @memcpy(vmctx_data[offset..][0..8], std.mem.asBytes(&val));
+                    },
+                    else => {},
+                }
+            }
+        }
+
+        // heap_bound = total virtual size - linear_memory_base (what the allocator sees)
+        const heap_bound: u64 = vmctx_total - 0x40000;
+        @memcpy(vmctx_data[0x20008..][0..8], std.mem.asBytes(&heap_bound));
+
+        const vmctx_data_id = try module.declareData("_vmctx_data", .Local, true);
+        try module.defineData(vmctx_data_id, vmctx_data);
+        // BSS extends virtual memory from init_size to total (no disk cost)
+        module.setBssSize(vmctx_total - vmctx_init_size);
+
+        // =================================================================
+        // Step 1b: Panic strings data section for signal handler
+        // Offset  Content              Length
+        // 0       "fatal error: "       13
+        // 13      "SIGILL\n"             7
+        // 20      "SIGABRT\n"            8
+        // 28      "SIGFPE\n"             7
+        // 35      "SIGBUS\n"             7
+        // 42      "SIGSEGV\n"            8
+        // 50      "unknown signal\n"    15
+        // 65      "pc=0x"                5
+        // 70      "addr=0x"              7
+        // 77      "0123456789abcdef"    16
+        // 93      "\n"                   1
+        // Total: 94 bytes
+        // =================================================================
+        const panic_strings = "fatal error: " ++ "SIGILL\n" ++ "SIGABRT\n" ++ "SIGFPE\n" ++ "SIGBUS\n" ++ "SIGSEGV\n" ++ "unknown signal\n" ++ "pc=0x" ++ "addr=0x" ++ "0123456789abcdef" ++ "\n";
+        const panic_data_id = try module.declareData("_cot_panic_strings", .Local, true);
+        try module.defineData(panic_data_id, panic_strings);
+
+        // =================================================================
+        // Step 2: Signal handler function (_cot_signal_handler)
+        // Called by kernel with C ABI: x0=signo, x1=siginfo_t*, x2=ucontext_t*
+        // Writes crash diagnostics to stderr, then exits with code 2.
+        //
+        // Output format (simplified Go pattern):
+        //   fatal error: SIGSEGV
+        //   pc=0x0000000100001234
+        //   addr=0x0000000000000000
+        // =================================================================
+        var handler_code = std.ArrayListUnmanaged(u8){};
+        defer handler_code.deinit(self.allocator);
+
+        // Register assignments:
+        //   x19 = signo (callee-saved)
+        //   x20 = siginfo_t* (callee-saved)
+        //   x21 = ucontext_t* (callee-saved)
+        //   x22 = panic_strings base (callee-saved)
+        // Stack frame: 96 bytes (regs at 0-48, hex buffer at 64-80)
+
+        // --- Prologue ---
+        // [0]  stp x29, x30, [sp, #-96]!
+        try appendInst(&handler_code, self.allocator, A64.stp_pre(29, 30, 31, -96));
+        // [4]  mov x29, sp
+        try appendInst(&handler_code, self.allocator, A64.add_imm(29, 31, 0));
+        // [8]  stp x19, x20, [sp, #16]
+        try appendInst(&handler_code, self.allocator, A64.stp_off(19, 20, 31, 16));
+        // [12] stp x21, x22, [sp, #32]
+        try appendInst(&handler_code, self.allocator, A64.stp_off(21, 22, 31, 32));
+
+        // --- Save kernel-provided arguments ---
+        // [16] mov x19, x0 (signo)
+        try appendInst(&handler_code, self.allocator, A64.mov(19, 0));
+        // [20] mov x20, x1 (siginfo_t*)
+        try appendInst(&handler_code, self.allocator, A64.mov(20, 1));
+        // [24] mov x21, x2 (ucontext_t*)
+        try appendInst(&handler_code, self.allocator, A64.mov(21, 2));
+
+        // --- Load panic strings base address ---
+        // [28] adrp x22, _cot_panic_strings@PAGE  (reloc)
+        try appendInst(&handler_code, self.allocator, A64.adrp(22));
+        // [32] add x22, x22, _cot_panic_strings@PAGEOFF (reloc)
+        try appendInst(&handler_code, self.allocator, A64.add_pageoff(22, 22));
+
+        // --- Write "fatal error: " (13 bytes) to stderr ---
+        // [36] mov x0, #2 (stderr)
+        try appendInst(&handler_code, self.allocator, A64.movz(0, 2));
+        // [40] mov x1, x22 (buf = strings[0])
+        try appendInst(&handler_code, self.allocator, A64.mov(1, 22));
+        // [44] mov x2, #13 (len)
+        try appendInst(&handler_code, self.allocator, A64.movz(2, 13));
+        // [48] mov x16, #4 (SYS_write)
+        try appendInst(&handler_code, self.allocator, A64.movz(16, 4));
+        // [52] movk x16, #0x2000, lsl #16 (macOS syscall namespace)
+        try appendInst(&handler_code, self.allocator, A64.movk_lsl16(16, 0x2000));
+        // [56] svc #0x80
+        try appendInst(&handler_code, self.allocator, A64.svc80());
+
+        // --- Signal name dispatch (CMP chain) ---
+        // Signal numbers: SIGILL=4, SIGABRT=6, SIGFPE=8, SIGBUS=10, SIGSEGV=11
+        // Instruction indices for labels (from current position = index 15):
+        //   [60]  cmp x19, #4       ; idx 15
+        //   [64]  b.eq Lsigill      ; idx 16 → target idx 29 (off=+13)
+        //   [68]  cmp x19, #6       ; idx 17
+        //   [72]  b.eq Lsigabrt     ; idx 18 → target idx 32 (off=+14)
+        //   [76]  cmp x19, #8       ; idx 19
+        //   [80]  b.eq Lsigfpe      ; idx 20 → target idx 35 (off=+15)
+        //   [84]  cmp x19, #10      ; idx 21
+        //   [88]  b.eq Lsigbus      ; idx 22 → target idx 38 (off=+16)
+        //   [92]  cmp x19, #11      ; idx 23
+        //   [96]  b.eq Lsigsegv     ; idx 24 → target idx 41 (off=+17)
+        //   [100] add x1, x22, #50  ; idx 25  default: "unknown signal\n"
+        //   [104] mov x2, #15       ; idx 26
+        //   [108] b Lwrite_sig      ; idx 27 → target idx 43 (off=+16)
+        // Instruction index layout (Lwrite_sig = idx 42):
+        //   idx 15-24: CMP/B.EQ chain (5 signals)
+        //   idx 25-27: default (add+mov+b)
+        //   idx 28-30: SIGILL (add+mov+b)
+        //   idx 31-33: SIGABRT (add+mov+b)
+        //   idx 34-36: SIGFPE (add+mov+b)
+        //   idx 37-39: SIGBUS (add+mov+b)
+        //   idx 40-41: SIGSEGV (add+mov, fall through)
+        //   idx 42: Lwrite_sig: mov x0, #2 (stderr)
+        //   idx 43-45: mov x16 + movk + svc (SYS_write)
+
+        // cmp x19, #4 (SIGILL)
+        try appendInst(&handler_code, self.allocator, A64.cmp_imm(19, 4));
+        // b.eq +12 → Lsigill
+        try appendInst(&handler_code, self.allocator, A64.b_eq(12));
+        // cmp x19, #6 (SIGABRT)
+        try appendInst(&handler_code, self.allocator, A64.cmp_imm(19, 6));
+        // b.eq +13 → Lsigabrt
+        try appendInst(&handler_code, self.allocator, A64.b_eq(13));
+        // cmp x19, #8 (SIGFPE)
+        try appendInst(&handler_code, self.allocator, A64.cmp_imm(19, 8));
+        // b.eq +14 → Lsigfpe
+        try appendInst(&handler_code, self.allocator, A64.b_eq(14));
+        // cmp x19, #10 (SIGBUS)
+        try appendInst(&handler_code, self.allocator, A64.cmp_imm(19, 10));
+        // b.eq +15 → Lsigbus
+        try appendInst(&handler_code, self.allocator, A64.b_eq(15));
+        // cmp x19, #11 (SIGSEGV)
+        try appendInst(&handler_code, self.allocator, A64.cmp_imm(19, 11));
+        // b.eq +16 → Lsigsegv
+        try appendInst(&handler_code, self.allocator, A64.b_eq(16));
+
+        // default: "unknown signal\n" (offset 50, len 15)
+        try appendInst(&handler_code, self.allocator, A64.add_imm(1, 22, 50));
+        try appendInst(&handler_code, self.allocator, A64.movz(2, 15));
+        try appendInst(&handler_code, self.allocator, A64.b(15)); // → Lwrite_sig (idx 42)
+
+        // Lsigill: "SIGILL\n" (offset 13, len 7)
+        try appendInst(&handler_code, self.allocator, A64.add_imm(1, 22, 13));
+        try appendInst(&handler_code, self.allocator, A64.movz(2, 7));
+        try appendInst(&handler_code, self.allocator, A64.b(12)); // → Lwrite_sig (idx 42)
+
+        // Lsigabrt: "SIGABRT\n" (offset 20, len 8)
+        try appendInst(&handler_code, self.allocator, A64.add_imm(1, 22, 20));
+        try appendInst(&handler_code, self.allocator, A64.movz(2, 8));
+        try appendInst(&handler_code, self.allocator, A64.b(9)); // → Lwrite_sig (idx 42)
+
+        // Lsigfpe: "SIGFPE\n" (offset 28, len 7)
+        try appendInst(&handler_code, self.allocator, A64.add_imm(1, 22, 28));
+        try appendInst(&handler_code, self.allocator, A64.movz(2, 7));
+        try appendInst(&handler_code, self.allocator, A64.b(6)); // → Lwrite_sig (idx 42)
+
+        // Lsigbus: "SIGBUS\n" (offset 35, len 7)
+        try appendInst(&handler_code, self.allocator, A64.add_imm(1, 22, 35));
+        try appendInst(&handler_code, self.allocator, A64.movz(2, 7));
+        try appendInst(&handler_code, self.allocator, A64.b(3)); // → Lwrite_sig (idx 42)
+
+        // Lsigsegv: "SIGSEGV\n" (offset 42, len 8)
+        try appendInst(&handler_code, self.allocator, A64.add_imm(1, 22, 42));
+        try appendInst(&handler_code, self.allocator, A64.movz(2, 8));
+        // fall through to Lwrite_sig
+
+        // Lwrite_sig: write signal name to stderr (idx 42)
+        try appendInst(&handler_code, self.allocator, A64.movz(0, 2)); // fd=stderr
+        try appendInst(&handler_code, self.allocator, A64.movz(16, 4)); // SYS_write
+        try appendInst(&handler_code, self.allocator, A64.movk_lsl16(16, 0x2000));
+        try appendInst(&handler_code, self.allocator, A64.svc80());
+
+        // --- Write "pc=0x" (offset 65, len 5) ---
+        try appendInst(&handler_code, self.allocator, A64.movz(0, 2));
+        try appendInst(&handler_code, self.allocator, A64.add_imm(1, 22, 65));
+        try appendInst(&handler_code, self.allocator, A64.movz(2, 5));
+        try appendInst(&handler_code, self.allocator, A64.movz(16, 4));
+        try appendInst(&handler_code, self.allocator, A64.movk_lsl16(16, 0x2000));
+        try appendInst(&handler_code, self.allocator, A64.svc80());
+
+        // --- Extract PC from ucontext ---
+        // macOS ARM64: ucontext_t.uc_mcontext at offset 48 (pointer)
+        // mcontext64.ss.pc at offset 272 from mcontext start
+        // (exception_state=16 bytes + regs[29]*8 + fp + lr + sp = 16+232+24 = 272)
+        try appendInst(&handler_code, self.allocator, A64.ldr_imm(10, 21, 48)); // x10 = uc_mcontext
+        try appendInst(&handler_code, self.allocator, A64.ldr_imm(10, 10, 272)); // x10 = pc
+
+        // --- Convert x10 to 16 hex chars into buffer at [sp, #64] ---
+        try appendInst(&handler_code, self.allocator, A64.add_imm(6, 22, 77)); // x6 = hex table
+        try appendInst(&handler_code, self.allocator, A64.movz(3, 60)); // x3 = shift (60..0 by 4)
+        try appendInst(&handler_code, self.allocator, A64.add_imm(7, 31, 64)); // x7 = &buf[sp+64]
+        // Lhex_pc (loop, 6 instructions):
+        try appendInst(&handler_code, self.allocator, A64.lsr_reg(5, 10, 3)); // x5 = val >> shift
+        try appendInst(&handler_code, self.allocator, A64.and_0xf(5, 5)); // x5 = nibble
+        try appendInst(&handler_code, self.allocator, A64.ldrb_reg(5, 6, 5)); // w5 = hex_table[nibble]
+        try appendInst(&handler_code, self.allocator, A64.strb_post1(5, 7)); // *x7++ = w5
+        try appendInst(&handler_code, self.allocator, A64.subs_imm(3, 3, 4)); // shift -= 4
+        try appendInst(&handler_code, self.allocator, A64.b_ge(-5)); // loop while shift >= 0
+        // Store '\n' after hex digits
+        try appendInst(&handler_code, self.allocator, A64.movz_w(5, 10)); // w5 = '\n'
+        try appendInst(&handler_code, self.allocator, A64.strb_uoff0(5, 7)); // *x7 = '\n'
+        // Write 17 bytes (16 hex + \n) from [sp+64]
+        try appendInst(&handler_code, self.allocator, A64.movz(0, 2));
+        try appendInst(&handler_code, self.allocator, A64.add_imm(1, 31, 64)); // buf = sp+64
+        try appendInst(&handler_code, self.allocator, A64.movz(2, 17));
+        try appendInst(&handler_code, self.allocator, A64.movz(16, 4));
+        try appendInst(&handler_code, self.allocator, A64.movk_lsl16(16, 0x2000));
+        try appendInst(&handler_code, self.allocator, A64.svc80());
+
+        // --- Write "addr=0x" (offset 70, len 7) ---
+        try appendInst(&handler_code, self.allocator, A64.movz(0, 2));
+        try appendInst(&handler_code, self.allocator, A64.add_imm(1, 22, 70));
+        try appendInst(&handler_code, self.allocator, A64.movz(2, 7));
+        try appendInst(&handler_code, self.allocator, A64.movz(16, 4));
+        try appendInst(&handler_code, self.allocator, A64.movk_lsl16(16, 0x2000));
+        try appendInst(&handler_code, self.allocator, A64.svc80());
+
+        // --- Extract fault address from siginfo_t ---
+        // macOS: siginfo_t.si_addr at offset 24
+        try appendInst(&handler_code, self.allocator, A64.ldr_imm(10, 20, 24)); // x10 = si_addr
+
+        // --- Convert x10 to hex (same loop pattern) ---
+        try appendInst(&handler_code, self.allocator, A64.add_imm(6, 22, 77));
+        try appendInst(&handler_code, self.allocator, A64.movz(3, 60));
+        try appendInst(&handler_code, self.allocator, A64.add_imm(7, 31, 64));
+        // Lhex_addr:
+        try appendInst(&handler_code, self.allocator, A64.lsr_reg(5, 10, 3));
+        try appendInst(&handler_code, self.allocator, A64.and_0xf(5, 5));
+        try appendInst(&handler_code, self.allocator, A64.ldrb_reg(5, 6, 5));
+        try appendInst(&handler_code, self.allocator, A64.strb_post1(5, 7));
+        try appendInst(&handler_code, self.allocator, A64.subs_imm(3, 3, 4));
+        try appendInst(&handler_code, self.allocator, A64.b_ge(-5));
+        try appendInst(&handler_code, self.allocator, A64.movz_w(5, 10));
+        try appendInst(&handler_code, self.allocator, A64.strb_uoff0(5, 7));
+        try appendInst(&handler_code, self.allocator, A64.movz(0, 2));
+        try appendInst(&handler_code, self.allocator, A64.add_imm(1, 31, 64));
+        try appendInst(&handler_code, self.allocator, A64.movz(2, 17));
+        try appendInst(&handler_code, self.allocator, A64.movz(16, 4));
+        try appendInst(&handler_code, self.allocator, A64.movk_lsl16(16, 0x2000));
+        try appendInst(&handler_code, self.allocator, A64.svc80());
+
+        // --- Exit with code 2 (Go's crash exit code) ---
+        try appendInst(&handler_code, self.allocator, A64.movz(0, 2)); // exit code 2
+        try appendInst(&handler_code, self.allocator, A64.movz(16, 1)); // SYS_exit = 1
+        try appendInst(&handler_code, self.allocator, A64.movk_lsl16(16, 0x2000));
+        try appendInst(&handler_code, self.allocator, A64.svc80());
+        try appendInst(&handler_code, self.allocator, A64.brk1()); // unreachable
+
+        // Declare and define the signal handler function
+        const handler_func_id = try module.declareFunction("_cot_signal_handler", .Local);
+
+        const handler_relocs = [_]FinalizedMachReloc{
+            // ADRP x22, _cot_panic_strings@PAGE at offset 28
+            .{
+                .offset = 28,
+                .kind = Reloc.Aarch64AdrPrelPgHi21,
+                .target = FinalizedRelocTarget{ .ExternalName = panic_strings_name_ref },
+                .addend = 0,
+            },
+            // ADD x22, x22, _cot_panic_strings@PAGEOFF at offset 32
+            .{
+                .offset = 32,
+                .kind = Reloc.Aarch64AddAbsLo12Nc,
+                .target = FinalizedRelocTarget{ .ExternalName = panic_strings_name_ref },
+                .addend = 0,
+            },
+        };
+
+        try module.defineFunctionBytes(handler_func_id, handler_code.items, &handler_relocs);
+
+        // =================================================================
+        // Step 3: Generate _main wrapper function
+        // Same as before but with signal handler installation added before
+        // the call to __wasm_main. Uses _sigaction from libSystem.
+        //
+        // macOS sigaction struct (16 bytes):
+        //   [0]  sa_handler/sa_sigaction (8 bytes) - function pointer
+        //   [8]  sa_mask (4 bytes) - signal mask (0xFFFFFFFF = block all)
+        //   [12] sa_flags (4 bytes) - SA_SIGINFO|SA_ONSTACK|SA_RESTART = 0x43
+        // =================================================================
+        var wrapper_code = std.ArrayListUnmanaged(u8){};
+        defer wrapper_code.deinit(self.allocator);
+
+        // Frame: 80 bytes (callee-saved regs + sigaction struct on stack)
+        //   [sp+0]:  x29, x30 (16 bytes)
+        //   [sp+16]: x19, x20 (16 bytes)
+        //   [sp+32]: x21, x22 (16 bytes)
+        //   [sp+48]: sigaction struct (16 bytes) — handler(8), mask(4), flags(4)
+        //   [sp+64]: padding to 80 (16 bytes)
+
+        // stp x29, x30, [sp, #-80]!
+        try appendInst(&wrapper_code, self.allocator, A64.stp_pre(29, 30, 31, -80));
+        // mov x29, sp
+        try appendInst(&wrapper_code, self.allocator, A64.add_imm(29, 31, 0));
+        // stp x19, x20, [sp, #16]
+        try appendInst(&wrapper_code, self.allocator, A64.stp_off(19, 20, 31, 16));
+        // stp x21, x22, [sp, #32]
+        try appendInst(&wrapper_code, self.allocator, A64.stp_off(21, 22, 31, 32));
+        // mov x19, x0 (argc)
+        try appendInst(&wrapper_code, self.allocator, A64.mov(19, 0));
+        // mov x20, x1 (argv)
+        try appendInst(&wrapper_code, self.allocator, A64.mov(20, 1));
+        // mov x21, x2 (envp)
+        try appendInst(&wrapper_code, self.allocator, A64.mov(21, 2));
+
+        // adrp x0, _vmctx_data@PAGE (reloc)
+        try appendInst(&wrapper_code, self.allocator, A64.adrp(0)); // offset 28
+        // add x0, x0, _vmctx_data@PAGEOFF (reloc)
+        try appendInst(&wrapper_code, self.allocator, A64.add_pageoff(0, 0)); // offset 32
+
+        // Initialize heap and store argc/argv/envp (same as before)
+        // add x8, x0, #0x20, lsl #12 (vmctx + 0x20000)
+        try appendInst(&wrapper_code, self.allocator, A64.add_imm_lsl12(8, 0, 0x20));
+        // add x9, x0, #0x40, lsl #12 (vmctx + 0x40000 = heap base)
+        try appendInst(&wrapper_code, self.allocator, A64.add_imm_lsl12(9, 0, 0x40));
+        // str x9, [x8] (store heap base ptr)
+        try appendInst(&wrapper_code, self.allocator, A64.str_imm(9, 8, 0));
+        // add x10, x0, #0x30, lsl #12 (vmctx + 0x30000, args area)
+        try appendInst(&wrapper_code, self.allocator, A64.add_imm_lsl12(10, 0, 0x30));
+        // str x19, [x10] (argc)
+        try appendInst(&wrapper_code, self.allocator, A64.str_imm(19, 10, 0));
+        // str x20, [x10, #8] (argv)
+        try appendInst(&wrapper_code, self.allocator, A64.str_imm(20, 10, 8));
+        // str x21, [x10, #16] (envp)
+        try appendInst(&wrapper_code, self.allocator, A64.str_imm(21, 10, 16));
+
+        // Save vmctx in x22 (callee-saved, survives sigaction calls)
+        // mov x22, x0
+        try appendInst(&wrapper_code, self.allocator, A64.mov(22, 0));
+
+        // --- Build sigaction struct on stack at [sp+48] ---
+        // Load signal handler address
+        // adrp x8, _cot_signal_handler@PAGE (reloc)
+        try appendInst(&wrapper_code, self.allocator, A64.adrp(8)); // offset 68
+        // add x8, x8, _cot_signal_handler@PAGEOFF (reloc)
+        try appendInst(&wrapper_code, self.allocator, A64.add_pageoff(8, 8)); // offset 72
+        // str x8, [sp, #48] (sa_handler)
+        try appendInst(&wrapper_code, self.allocator, A64.str_imm(8, 31, 48));
+        // movn w9, #0 (w9 = 0xFFFFFFFF, sa_mask = block all signals)
+        try appendInst(&wrapper_code, self.allocator, A64.movn_w(9, 0));
+        // str w9, [sp, #56] (sa_mask)
+        try appendInst(&wrapper_code, self.allocator, A64.str_w_imm(9, 31, 56));
+        // mov w9, #0x43 (SA_SIGINFO=0x40 | SA_ONSTACK=0x1 | SA_RESTART=0x2)
+        try appendInst(&wrapper_code, self.allocator, A64.movz_w(9, 0x43));
+        // str w9, [sp, #60] (sa_flags)
+        try appendInst(&wrapper_code, self.allocator, A64.str_w_imm(9, 31, 60));
+
+        // --- Install signal handlers via _sigaction(signo, &act, NULL) ---
+        // _sigaction is from libSystem (called via BL + BRANCH26 reloc)
+        // After each call, x0-x18 are clobbered (caller-saved), x19+ preserved
+
+        // SIGILL (4)
+        try appendInst(&wrapper_code, self.allocator, A64.movz(0, 4)); // signo
+        try appendInst(&wrapper_code, self.allocator, A64.add_imm(1, 31, 48)); // &sa
+        try appendInst(&wrapper_code, self.allocator, A64.movz(2, 0)); // NULL
+        try appendInst(&wrapper_code, self.allocator, A64.bl()); // bl _sigaction (reloc)
+        // SIGABRT (6)
+        try appendInst(&wrapper_code, self.allocator, A64.movz(0, 6));
+        try appendInst(&wrapper_code, self.allocator, A64.add_imm(1, 31, 48));
+        try appendInst(&wrapper_code, self.allocator, A64.movz(2, 0));
+        try appendInst(&wrapper_code, self.allocator, A64.bl()); // reloc
+        // SIGFPE (8)
+        try appendInst(&wrapper_code, self.allocator, A64.movz(0, 8));
+        try appendInst(&wrapper_code, self.allocator, A64.add_imm(1, 31, 48));
+        try appendInst(&wrapper_code, self.allocator, A64.movz(2, 0));
+        try appendInst(&wrapper_code, self.allocator, A64.bl()); // reloc
+        // SIGBUS (10)
+        try appendInst(&wrapper_code, self.allocator, A64.movz(0, 10));
+        try appendInst(&wrapper_code, self.allocator, A64.add_imm(1, 31, 48));
+        try appendInst(&wrapper_code, self.allocator, A64.movz(2, 0));
+        try appendInst(&wrapper_code, self.allocator, A64.bl()); // reloc
+        // SIGSEGV (11)
+        try appendInst(&wrapper_code, self.allocator, A64.movz(0, 11));
+        try appendInst(&wrapper_code, self.allocator, A64.add_imm(1, 31, 48));
+        try appendInst(&wrapper_code, self.allocator, A64.movz(2, 0));
+        try appendInst(&wrapper_code, self.allocator, A64.bl()); // reloc
+
+        // --- Call __wasm_main(vmctx, vmctx) ---
+        // mov x0, x22 (vmctx)
+        try appendInst(&wrapper_code, self.allocator, A64.mov(0, 22));
+        // mov x1, x22 (caller_vmctx = vmctx)
+        try appendInst(&wrapper_code, self.allocator, A64.mov(1, 22));
+        // bl __wasm_main (reloc)
+        try appendInst(&wrapper_code, self.allocator, A64.bl());
+
+        // --- Epilogue ---
+        // ldp x19, x20, [sp, #16]
+        try appendInst(&wrapper_code, self.allocator, A64.ldp_off(19, 20, 31, 16));
+        // ldp x21, x22, [sp, #32]
+        try appendInst(&wrapper_code, self.allocator, A64.ldp_off(21, 22, 31, 32));
+        // ldp x29, x30, [sp], #80
+        try appendInst(&wrapper_code, self.allocator, A64.ldp_post(29, 30, 31, 80));
+        // ret
+        try appendInst(&wrapper_code, self.allocator, A64.ret());
+
+        // Declare _main wrapper
+        const main_func_id = try module.declareFunction("_main", .Export);
+
+        // Register all external names
+        try module.declareExternalName(vmctx_ext_idx, "_vmctx_data");
+        try module.declareExternalName(wasm_main_ext_idx, "__wasm_main");
+        try module.declareExternalName(panic_strings_ext_idx, "_cot_panic_strings");
+        try module.declareExternalName(signal_handler_ext_idx, "_cot_signal_handler");
+        try module.declareExternalName(sigaction_ext_idx, "_sigaction");
+
+        // Compute relocation offsets for the wrapper
+        // Instruction layout (each 4 bytes):
+        //   [0-6]   prologue + save args (7 instrs, offset 0-24)
+        //   [7]     adrp x0, vmctx     → offset 28
+        //   [8]     add x0, x0, vmctx  → offset 32
+        //   [9-16]  heap init + store   (8 instrs, offset 36-64)
+        //   [17]    adrp x8, handler   → offset 68
+        //   [18]    add x8, x8, handler→ offset 72
+        //   [19-24] sigaction struct setup (6 instrs, offset 76-96)
+        //   [25-28] SIGILL sigaction call → BL at offset 112 (instr 28)
+        //   [29-32] SIGABRT → BL at offset 128 (instr 32)
+        //   [33-36] SIGFPE  → BL at offset 144 (instr 36)
+        //   [37-40] SIGBUS  → BL at offset 160 (instr 40)
+        //   [41-44] SIGSEGV → BL at offset 176 (instr 44)
+        //   [45]    mov x0, x22        → offset 180
+        //   [46]    mov x1, x22        → offset 184
+        // Verify wrapper code size and compute BL offsets dynamically.
+        // Each instruction is 4 bytes. Count BL instructions by scanning for 0x94000000.
+        // Layout: prologue(7) + vmctx_adrp_add(2) + heap_args(8) + save_vmctx(1) +
+        //         handler_adrp_add(2) + sa_struct(5) + 5*(3+bl) + mov_mov_bl + epilogue(4)
+        // Total: 7+2+8+1+2+5+20+3+4 = 52 instructions = 208 bytes
+
+        // Find BL instruction offsets by scanning the generated code
+        var bl_offsets: [6]u32 = undefined; // 5 sigaction + 1 wasm_main
+        var bl_count: usize = 0;
+        {
+            var off: u32 = 0;
+            while (off + 3 < wrapper_code.items.len) : (off += 4) {
+                const inst = std.mem.readInt(u32, wrapper_code.items[off..][0..4], .little);
+                if (inst == 0x94000000) { // BL placeholder
+                    bl_offsets[bl_count] = off;
+                    bl_count += 1;
+                }
+            }
+        }
+
+        const main_relocs = [_]FinalizedMachReloc{
+            // ADRP x0, _vmctx_data@PAGE at offset 28
+            .{
+                .offset = 28,
+                .kind = Reloc.Aarch64AdrPrelPgHi21,
+                .target = FinalizedRelocTarget{ .ExternalName = vmctx_name_ref },
+                .addend = 0,
+            },
+            // ADD x0, x0, _vmctx_data@PAGEOFF at offset 32
+            .{
+                .offset = 32,
+                .kind = Reloc.Aarch64AddAbsLo12Nc,
+                .target = FinalizedRelocTarget{ .ExternalName = vmctx_name_ref },
+                .addend = 0,
+            },
+            // ADRP x8, _cot_signal_handler@PAGE at offset 68
+            .{
+                .offset = 68,
+                .kind = Reloc.Aarch64AdrPrelPgHi21,
+                .target = FinalizedRelocTarget{ .ExternalName = signal_handler_name_ref },
+                .addend = 0,
+            },
+            // ADD x8, x8, _cot_signal_handler@PAGEOFF at offset 72
+            .{
+                .offset = 72,
+                .kind = Reloc.Aarch64AddAbsLo12Nc,
+                .target = FinalizedRelocTarget{ .ExternalName = signal_handler_name_ref },
+                .addend = 0,
+            },
+            // BL _sigaction for SIGILL (dynamically computed)
+            .{
+                .offset = bl_offsets[0],
+                .kind = Reloc.Arm64Call,
+                .target = FinalizedRelocTarget{ .ExternalName = sigaction_name_ref },
+                .addend = 0,
+            },
+            // BL _sigaction for SIGABRT
+            .{
+                .offset = bl_offsets[1],
+                .kind = Reloc.Arm64Call,
+                .target = FinalizedRelocTarget{ .ExternalName = sigaction_name_ref },
+                .addend = 0,
+            },
+            // BL _sigaction for SIGFPE
+            .{
+                .offset = bl_offsets[2],
+                .kind = Reloc.Arm64Call,
+                .target = FinalizedRelocTarget{ .ExternalName = sigaction_name_ref },
+                .addend = 0,
+            },
+            // BL _sigaction for SIGBUS
+            .{
+                .offset = bl_offsets[3],
+                .kind = Reloc.Arm64Call,
+                .target = FinalizedRelocTarget{ .ExternalName = sigaction_name_ref },
+                .addend = 0,
+            },
+            // BL _sigaction for SIGSEGV
+            .{
+                .offset = bl_offsets[4],
+                .kind = Reloc.Arm64Call,
+                .target = FinalizedRelocTarget{ .ExternalName = sigaction_name_ref },
+                .addend = 0,
+            },
+            // BL __wasm_main
+            .{
+                .offset = bl_offsets[5],
+                .kind = Reloc.Arm64Call,
+                .target = FinalizedRelocTarget{ .ExternalName = wasm_main_name_ref },
+                .addend = 0,
+            },
+        };
+
+        try module.defineFunctionBytes(main_func_id, wrapper_code.items, &main_relocs);
+    }
+
+    /// Generate vmctx data section and C-ABI export wrappers for shared library mode.
+    /// Each exported function gets a thin wrapper that loads vmctx and shifts user args
+    /// before calling the inner __wasm function (which expects Cranelift wasm CC).
+    fn generateLibWrappersMachO(self: *Driver, module: *object_module.ObjectModule, exports: []const wasm_parser.Export, func_to_type: []const u32, types: []const wasm_parser.FuncType, data_segments: []const wasm_parser.DataSegment, globals: []const wasm_parser.GlobalType, _: []const object_module.FuncId, num_funcs: u32) !void {
+        // ARM64 instruction encoding helpers (same as generateMainWrapperMachO)
+        const A64 = struct {
+            fn mov(rd: u32, rm: u32) u32 {
+                return 0xAA0003E0 | (rm << 16) | rd;
+            }
+            fn add_imm_lsl12(rd: u32, rn: u32, imm12: u32) u32 {
+                return 0x91400000 | (imm12 << 10) | (rn << 5) | rd;
+            }
+            fn stp_pre(rt1: u32, rt2: u32, rn: u32, imm_bytes: i32) u32 {
+                const imm7: u32 = @as(u32, @bitCast(@divExact(imm_bytes, 8))) & 0x7F;
+                return 0xA9800000 | (imm7 << 15) | (rt2 << 10) | (rn << 5) | rt1;
+            }
+            fn ldp_post(rt1: u32, rt2: u32, rn: u32, imm_bytes: i32) u32 {
+                const imm7: u32 = @as(u32, @bitCast(@divExact(imm_bytes, 8))) & 0x7F;
+                return 0xA8C00000 | (imm7 << 15) | (rt2 << 10) | (rn << 5) | rt1;
+            }
+            fn str_imm(rt: u32, rn: u32, imm_bytes: u32) u32 {
+                return 0xF9000000 | ((imm_bytes / 8) << 10) | (rn << 5) | rt;
+            }
+            fn bl() u32 { return 0x94000000; }
+            fn adrp(rd: u32) u32 { return 0x90000000 | rd; }
+            fn add_pageoff(rd: u32, rn: u32) u32 {
+                return 0x91000000 | (rn << 5) | rd;
+            }
+            fn ret() u32 { return 0xD65F03C0; }
+        };
+
+        const appendInst = struct {
+            fn f(list: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, inst: u32) !void {
+                try list.appendSlice(alloc, &std.mem.toBytes(std.mem.nativeToBig(u32, @byteSwap(inst))));
+            }
+        }.f;
+
+        const FinalizedMachReloc = buffer_mod.FinalizedMachReloc;
+        const FinalizedRelocTarget = buffer_mod.FinalizedRelocTarget;
+        const Reloc = buffer_mod.Reloc;
+        const ExternalName = buffer_mod.ExternalName;
+
+        // =================================================================
+        // Step 1: Create static vmctx data section (same as executable)
+        // =================================================================
+        const vmctx_total: usize = 0x10000000; // 256 MB total virtual memory
+        const vmctx_init_size: usize = 0x100000; // 1 MB for initialized data
+        const vmctx_data = try self.allocator.alloc(u8, vmctx_init_size);
+        defer self.allocator.free(vmctx_data);
+        @memset(vmctx_data, 0);
+
+        // Copy data segments into linear memory area
+        const linear_memory_base: usize = 0x40000;
+        for (data_segments) |segment| {
+            const dest_offset = linear_memory_base + segment.offset;
+            if (dest_offset + segment.data.len <= vmctx_init_size) {
+                @memcpy(vmctx_data[dest_offset..][0..segment.data.len], segment.data);
+            }
+        }
+
+        // Initialize globals
+        const global_base: usize = 0x10000;
+        const global_stride: usize = 16;
+        for (globals, 0..) |g, i| {
+            const offset = global_base + i * global_stride;
+            if (offset + 8 <= vmctx_init_size) {
+                switch (g.val_type) {
+                    .i32 => {
+                        const val: u32 = @bitCast(@as(i32, @truncate(g.init_value)));
+                        @memcpy(vmctx_data[offset..][0..4], std.mem.asBytes(&val));
+                    },
+                    .i64 => {
+                        const val: u64 = @bitCast(g.init_value);
+                        @memcpy(vmctx_data[offset..][0..8], std.mem.asBytes(&val));
+                    },
+                    .f32 => {
+                        const val: u32 = @bitCast(@as(i32, @truncate(g.init_value)));
+                        @memcpy(vmctx_data[offset..][0..4], std.mem.asBytes(&val));
+                    },
+                    .f64 => {
+                        const val: u64 = @bitCast(g.init_value);
+                        @memcpy(vmctx_data[offset..][0..8], std.mem.asBytes(&val));
+                    },
+                    else => {},
+                }
+            }
+        }
+
+        // heap_bound = total virtual size - linear_memory_base
+        const heap_bound: u64 = vmctx_total - 0x40000;
+        @memcpy(vmctx_data[0x20008..][0..8], std.mem.asBytes(&heap_bound));
+
+        const vmctx_data_id = try module.declareData("_vmctx_data", .Local, true);
+        try module.defineData(vmctx_data_id, vmctx_data);
+        module.setBssSize(vmctx_total - vmctx_init_size);
+
+        // External name index for vmctx_data (must not collide with function indices)
+        const vmctx_ext_idx: u32 = num_funcs;
+        const vmctx_name_ref = ExternalName{ .User = .{ .namespace = 0, .index = vmctx_ext_idx } };
+        try module.declareExternalName(vmctx_ext_idx, "_vmctx_data");
+
+        // Declare _environ (POSIX libc global: extern char **environ)
+        // On macOS, this is provided by libSystem and resolved by dyld at load time.
+        const environ_ext_idx: u32 = num_funcs + 1;
+        const environ_name_ref = ExternalName{ .User = .{ .namespace = 0, .index = environ_ext_idx } };
+        try module.declareExternalName(environ_ext_idx, "_environ");
+
+        // =================================================================
+        // Step 2: Generate C-ABI wrapper for each exported function
+        // =================================================================
+        // Each wrapper:
+        //   - Saves frame (stp x29, x30)
+        //   - Shifts user args from x0..x(N-1) to x2..x(N+1)
+        //   - Loads vmctx via ADRP+ADD into x0
+        //   - Initializes heap base ptr (idempotent: stores vmctx+0x40000 → [vmctx+0x20000])
+        //   - Loads envp from POSIX _environ global into vmctx+0x30010
+        //   - Sets x1 = x0 (caller_vmctx)
+        //   - Calls inner __wasm function via BL
+        //   - Restores frame and returns (return value in x0 preserved)
+        var next_ext_idx: u32 = environ_ext_idx + 1;
+
+        for (exports) |exp| {
+            if (exp.kind != .func) continue;
+
+            // Check if this is a user-exported function (not just a wasm export)
+            const is_export_fn = blk: {
+                for (self.debug_ir_funcs) |ir_func| {
+                    if (std.mem.eql(u8, ir_func.name, exp.name) and ir_func.is_export) break :blk true;
+                }
+                break :blk false;
+            };
+            if (!is_export_fn) continue;
+
+            // Get the number of user parameters from the wasm type
+            const num_params: u32 = if (exp.index < func_to_type.len) blk: {
+                const type_idx = func_to_type[exp.index];
+                if (type_idx < types.len) {
+                    break :blk @intCast(types[type_idx].params.len);
+                }
+                break :blk 0;
+            } else 0;
+
+            // External name for the inner __wasm function
+            const inner_ext_idx = next_ext_idx;
+            next_ext_idx += 1;
+            const inner_name = try std.fmt.allocPrint(self.allocator, "_{s}__wasm", .{exp.name});
+            defer self.allocator.free(inner_name);
+            const inner_name_ref = ExternalName{ .User = .{ .namespace = 0, .index = inner_ext_idx } };
+            try module.declareExternalName(inner_ext_idx, inner_name);
+
+            // Generate wrapper instructions
+            var code = std.ArrayListUnmanaged(u8){};
+            defer code.deinit(self.allocator);
+
+            // stp x29, x30, [sp, #-16]!
+            try appendInst(&code, self.allocator, A64.stp_pre(29, 30, 31, -16));
+
+            // Shift user args from C ABI positions to wasm CC positions
+            // Must go from highest to lowest to avoid clobbering
+            // C ABI: x0, x1, x2, ... → Wasm CC: x2, x3, x4, ...
+            var p: u32 = num_params;
+            while (p > 0) {
+                p -= 1;
+                try appendInst(&code, self.allocator, A64.mov(p + 2, p));
+            }
+
+            // adrp x0, _vmctx_data@PAGE
+            const adrp_offset: u32 = @intCast(code.items.len);
+            try appendInst(&code, self.allocator, A64.adrp(0));
+            // add x0, x0, _vmctx_data@PAGEOFF
+            const add_offset: u32 = @intCast(code.items.len);
+            try appendInst(&code, self.allocator, A64.add_pageoff(0, 0));
+
+            // Initialize heap base ptr (idempotent):
+            // add x8, x0, #0x20, lsl #12  (x8 = vmctx + 0x20000)
+            try appendInst(&code, self.allocator, A64.add_imm_lsl12(8, 0, 0x20));
+            // add x9, x0, #0x40, lsl #12  (x9 = vmctx + 0x40000 = linear memory base)
+            try appendInst(&code, self.allocator, A64.add_imm_lsl12(9, 0, 0x40));
+            // str x9, [x8]  (store heap base ptr)
+            try appendInst(&code, self.allocator, A64.str_imm(9, 8, 0));
+
+            // Initialize envp from POSIX _environ global (idempotent)
+            // adrp x10, _environ@PAGE
+            const adrp_environ_offset: u32 = @intCast(code.items.len);
+            try appendInst(&code, self.allocator, A64.adrp(10));
+            // add x10, x10, _environ@PAGEOFF
+            const add_environ_offset: u32 = @intCast(code.items.len);
+            try appendInst(&code, self.allocator, A64.add_pageoff(10, 10));
+            // ldr x10, [x10]  (dereference: x10 = *_environ = envp pointer)
+            try appendInst(&code, self.allocator, 0xF940014A);
+            // add x11, x0, #0x30, lsl #12  (x11 = vmctx + 0x30000)
+            try appendInst(&code, self.allocator, A64.add_imm_lsl12(11, 0, 0x30));
+            // str x10, [x11, #16]  (envp at vmctx + 0x30010)
+            try appendInst(&code, self.allocator, A64.str_imm(10, 11, 16));
+            // str xzr, [x11]  (argc = 0, no command-line args in dylib)
+            try appendInst(&code, self.allocator, A64.str_imm(31, 11, 0));
+            // str xzr, [x11, #8]  (argv = NULL)
+            try appendInst(&code, self.allocator, A64.str_imm(31, 11, 8));
+
+            // mov x1, x0  (caller_vmctx = vmctx)
+            try appendInst(&code, self.allocator, A64.mov(1, 0));
+
+            // bl inner__wasm function
+            const bl_offset: u32 = @intCast(code.items.len);
+            try appendInst(&code, self.allocator, A64.bl());
+
+            // ldp x29, x30, [sp], #16
+            try appendInst(&code, self.allocator, A64.ldp_post(29, 30, 31, 16));
+            // ret
+            try appendInst(&code, self.allocator, A64.ret());
+
+            // Declare wrapper function with export linkage
+            const wrapper_name = try std.fmt.allocPrint(self.allocator, "_{s}", .{exp.name});
+            defer self.allocator.free(wrapper_name);
+            const wrapper_func_id = try module.declareFunction(wrapper_name, .Export);
+
+            const wrapper_relocs = [_]FinalizedMachReloc{
+                // ADRP x0, _vmctx_data@PAGE
+                .{
+                    .offset = adrp_offset,
+                    .kind = Reloc.Aarch64AdrPrelPgHi21,
+                    .target = FinalizedRelocTarget{ .ExternalName = vmctx_name_ref },
+                    .addend = 0,
+                },
+                // ADD x0, x0, _vmctx_data@PAGEOFF
+                .{
+                    .offset = add_offset,
+                    .kind = Reloc.Aarch64AddAbsLo12Nc,
+                    .target = FinalizedRelocTarget{ .ExternalName = vmctx_name_ref },
+                    .addend = 0,
+                },
+                // ADRP x10, _environ@PAGE
+                .{
+                    .offset = adrp_environ_offset,
+                    .kind = Reloc.Aarch64AdrPrelPgHi21,
+                    .target = FinalizedRelocTarget{ .ExternalName = environ_name_ref },
+                    .addend = 0,
+                },
+                // ADD x10, x10, _environ@PAGEOFF
+                .{
+                    .offset = add_environ_offset,
+                    .kind = Reloc.Aarch64AddAbsLo12Nc,
+                    .target = FinalizedRelocTarget{ .ExternalName = environ_name_ref },
+                    .addend = 0,
+                },
+                // BL inner__wasm
+                .{
+                    .offset = bl_offset,
+                    .kind = Reloc.Arm64Call,
+                    .target = FinalizedRelocTarget{ .ExternalName = inner_name_ref },
+                    .addend = 0,
+                },
+            };
+
+            try module.defineFunctionBytes(wrapper_func_id, code.items, &wrapper_relocs);
+        }
+    }
+
+    /// Generate ELF object file from compiled functions.
+    /// Uses ObjectModule to bridge CompiledCode to ELF format.
+    fn generateElf(self: *Driver, compiled_funcs: []const native_compile.CompiledCode, exports: []const wasm_parser.Export, data_segments: []const wasm_parser.DataSegment, globals: []const wasm_parser.GlobalType) ![]u8 {
+        var module = object_module.ObjectModule.initWithTarget(
+            self.allocator,
+            .linux,
+            .x86_64,
+        );
+        defer module.deinit();
+
+        // Build export name map for function lookup
+        var export_names = std.StringHashMap(u32).init(self.allocator);
+        defer export_names.deinit();
+        for (exports, 0..) |exp, i| {
+            if (exp.kind == .func) {
+                try export_names.put(exp.name, @intCast(i));
+            }
+        }
+
+        // Track if we need to generate a main wrapper
+        var main_func_index: ?usize = null;
+
+        // Pass 1: Declare all functions and external names (Cranelift pattern)
+        var elf_func_ids = try self.allocator.alloc(object_module.FuncId, compiled_funcs.len);
+        defer self.allocator.free(elf_func_ids);
+
+        for (compiled_funcs, 0..) |_, i| {
+            var func_name: []const u8 = "";
+            var func_name_allocated = false;
+            for (exports) |exp| {
+                if (exp.kind == .func and exp.index == i) {
+                    func_name = exp.name;
+                    break;
+                }
+            }
+            if (func_name.len == 0) {
+                func_name = try std.fmt.allocPrint(self.allocator, "func_{d}", .{i});
+                func_name_allocated = true;
+            }
+            defer if (func_name_allocated) self.allocator.free(func_name);
+
+            const is_main = std.mem.eql(u8, func_name, "main");
+            if (is_main) {
+                main_func_index = i;
+            }
+
+            // ELF: no underscore prefix (Linux C ABI uses bare names)
+            const mangled_name = if (is_main)
+                "__wasm_main"
+            else
+                func_name;
+
+            // Zig pattern: export fn → Export linkage (global visibility), internal fn → Local
+            const is_export_fn = blk: {
+                for (self.debug_ir_funcs) |ir_func| {
+                    if (std.mem.eql(u8, ir_func.name, func_name) and ir_func.is_export) break :blk true;
+                }
+                break :blk false;
+            };
+            const linkage: object_module.Linkage = if (is_main)
+                .Local
+            else if (func_name_allocated)
+                .Local
+            else if (self.lib_mode and !is_export_fn)
+                .Local
+            else
+                .Export;
+
+            elf_func_ids[i] = try module.declareFunction(mangled_name, linkage);
+            try module.declareExternalName(@intCast(i), mangled_name);
+        }
+
+        // Pass 2: Define all functions (relocations can now resolve forward references)
+        for (compiled_funcs, 0..) |*cf, i| {
+            // Check for native overrides (exported runtime stubs replaced with x86-64 syscalls)
+            var override_name: ?[]const u8 = null;
+            for (exports) |exp| {
+                if (exp.kind == .func and exp.index == i) {
+                    if (std.mem.eql(u8, exp.name, "write") or
+                        std.mem.eql(u8, exp.name, "fd_write") or
+                        std.mem.eql(u8, exp.name, "fd_read") or
+                        std.mem.eql(u8, exp.name, "fd_close") or
+                        std.mem.eql(u8, exp.name, "fd_seek") or
+                        std.mem.eql(u8, exp.name, "fd_open") or
+                        std.mem.eql(u8, exp.name, "time") or
+                        std.mem.eql(u8, exp.name, "random") or
+                        std.mem.eql(u8, exp.name, "exit") or
+                        std.mem.eql(u8, exp.name, "wasi_fd_write") or
+                        std.mem.eql(u8, exp.name, "args_count") or
+                        std.mem.eql(u8, exp.name, "arg_len") or
+                        std.mem.eql(u8, exp.name, "arg_ptr") or
+                        std.mem.eql(u8, exp.name, "environ_count") or
+                        std.mem.eql(u8, exp.name, "environ_len") or
+                        std.mem.eql(u8, exp.name, "environ_ptr") or
+                        std.mem.eql(u8, exp.name, "net_socket") or
+                        std.mem.eql(u8, exp.name, "net_bind") or
+                        std.mem.eql(u8, exp.name, "net_listen") or
+                        std.mem.eql(u8, exp.name, "net_accept") or
+                        std.mem.eql(u8, exp.name, "net_connect") or
+                        std.mem.eql(u8, exp.name, "net_set_reuse_addr") or
+                        std.mem.eql(u8, exp.name, "kqueue_create") or
+                        std.mem.eql(u8, exp.name, "kevent_add") or
+                        std.mem.eql(u8, exp.name, "kevent_del") or
+                        std.mem.eql(u8, exp.name, "kevent_wait") or
+                        std.mem.eql(u8, exp.name, "epoll_create") or
+                        std.mem.eql(u8, exp.name, "epoll_add") or
+                        std.mem.eql(u8, exp.name, "epoll_del") or
+                        std.mem.eql(u8, exp.name, "epoll_wait") or
+                        std.mem.eql(u8, exp.name, "set_nonblocking") or
+                        std.mem.eql(u8, exp.name, "fork") or
+                        std.mem.eql(u8, exp.name, "execve") or
+                        std.mem.eql(u8, exp.name, "waitpid") or
+                        std.mem.eql(u8, exp.name, "pipe") or
+                        std.mem.eql(u8, exp.name, "dup2") or
+                        std.mem.eql(u8, exp.name, "isatty"))
+                    {
+                        override_name = exp.name;
+                        break;
+                    }
+                }
+            }
+            if (override_name) |name| {
+                if (std.mem.eql(u8, name, "write") or std.mem.eql(u8, name, "fd_write")) {
+                    // x86-64 Linux syscall for write(fd, ptr, len)
+                    // Cranelift CC: rdi=vmctx, rsi=caller_vmctx, rdx=fd, rcx=ptr(wasm), r8=len
+                    // Linux write: rax=1(SYS_write), rdi=fd, rsi=buf, rdx=count
+                    const x64_write = [_]u8{
+                        0x55, // push rbp
+                        0x48, 0x89, 0xE5, // mov rbp, rsp
+                        0x48, 0x8D, 0xB7, 0x00, 0x00, 0x04, 0x00, // lea rsi, [rdi + 0x40000]  (linmem base)
+                        0x48, 0x01, 0xCE, // add rsi, rcx              (real_ptr = linmem + wasm_ptr)
+                        0x48, 0x89, 0xD7, // mov rdi, rdx              (fd)
+                        0x4C, 0x89, 0xC2, // mov rdx, r8               (len)
+                        0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00, // mov rax, 1  (SYS_write)
+                        0x0F, 0x05, // syscall
+                        0x5D, // pop rbp
+                        0xC3, // ret
+                    };
+                    try module.defineFunctionBytes(elf_func_ids[i], &x64_write, &.{});
+                } else if (std.mem.eql(u8, name, "fd_read")) {
+                    // x86-64 Linux syscall for read(fd, buf, count)
+                    // Cranelift CC: rdi=vmctx, rsi=caller_vmctx, rdx=fd, rcx=buf(wasm), r8=len
+                    // Linux read: rax=0(SYS_read), rdi=fd, rsi=buf, rdx=count
+                    // Returns bytes read on success, -errno on error.
+                    const x64_read = [_]u8{
+                        0x55, // push rbp
+                        0x48, 0x89, 0xE5, // mov rbp, rsp
+                        0x48, 0x8D, 0xB7, 0x00, 0x00, 0x04, 0x00, // lea rsi, [rdi + 0x40000]  (linmem base)
+                        0x48, 0x01, 0xCE, // add rsi, rcx              (real_buf = linmem + wasm_ptr)
+                        0x48, 0x89, 0xD7, // mov rdi, rdx              (fd)
+                        0x4C, 0x89, 0xC2, // mov rdx, r8               (count)
+                        0x48, 0x31, 0xC0, // xor rax, rax              (SYS_read = 0)
+                        0x0F, 0x05, // syscall
+                        0x5D, // pop rbp
+                        0xC3, // ret
+                    };
+                    try module.defineFunctionBytes(elf_func_ids[i], &x64_read, &.{});
+                } else if (std.mem.eql(u8, name, "fd_close")) {
+                    // x86-64 Linux syscall for close(fd)
+                    // Cranelift CC: rdi=vmctx, rsi=caller_vmctx, rdx=fd
+                    // Linux close: rax=3(SYS_close), rdi=fd
+                    // Returns 0 on success, -errno on error.
+                    const x64_close = [_]u8{
+                        0x55, // push rbp
+                        0x48, 0x89, 0xE5, // mov rbp, rsp
+                        0x48, 0x89, 0xD7, // mov rdi, rdx              (fd)
+                        0x48, 0xC7, 0xC0, 0x03, 0x00, 0x00, 0x00, // mov rax, 3  (SYS_close)
+                        0x0F, 0x05, // syscall
+                        0x5D, // pop rbp
+                        0xC3, // ret
+                    };
+                    try module.defineFunctionBytes(elf_func_ids[i], &x64_close, &.{});
+                } else if (std.mem.eql(u8, name, "fd_seek")) {
+                    // x86-64 Linux syscall for lseek(fd, offset, whence)
+                    // Cranelift CC: rdi=vmctx, rsi=caller_vmctx, rdx=fd, rcx=offset, r8=whence
+                    // Linux lseek: rax=8(SYS_lseek), rdi=fd, rsi=offset, rdx=whence
+                    // Returns new offset on success, -errno on error.
+                    const x64_seek = [_]u8{
+                        0x55, // push rbp
+                        0x48, 0x89, 0xE5, // mov rbp, rsp
+                        0x48, 0x89, 0xD7, // mov rdi, rdx              (fd)
+                        0x48, 0x89, 0xCE, // mov rsi, rcx              (offset)
+                        0x4C, 0x89, 0xC2, // mov rdx, r8               (whence)
+                        0x48, 0xC7, 0xC0, 0x08, 0x00, 0x00, 0x00, // mov rax, 8  (SYS_lseek)
+                        0x0F, 0x05, // syscall
+                        0x5D, // pop rbp
+                        0xC3, // ret
+                    };
+                    try module.defineFunctionBytes(elf_func_ids[i], &x64_seek, &.{});
+                } else if (std.mem.eql(u8, name, "fd_open")) {
+                    // x86-64 Linux syscall for openat(AT_FDCWD, path, flags, mode)
+                    // Cranelift CC: rdi=vmctx, rsi=caller_vmctx, rdx=path_ptr(wasm), rcx=path_len, r8=flags
+                    // Must null-terminate path: copy to stack buffer, append \0
+                    // Flags use macOS values (stdlib canonical), translated to Linux here:
+                    //   macOS O_CREAT(0x200) → Linux(0x40)
+                    //   macOS O_TRUNC(0x400) → Linux(0x200)
+                    //   macOS O_APPEND(0x8)  → Linux(0x400)
+                    // Returns fd on success, -errno on error.
+                    const x64_open = [_]u8{
+                        0x55, //  0: push rbp
+                        0x48, 0x89, 0xE5, //  1: mov rbp, rsp
+                        0x48, 0x8D, 0x87, 0x00, 0x00, 0x04, 0x00, //  4: lea rax, [rdi + 0x40000]  (linmem base)
+                        0x48, 0x01, 0xD0, // 11: add rax, rdx              (real path src)
+                        0x49, 0x89, 0xCA, // 14: mov r10, rcx              (save path_len)
+                        0x48, 0x81, 0xF9, 0x00, 0x04, 0x00, 0x00, // 17: cmp rcx, 1024
+                        0x76, 0x0C, // 24: jbe +12                  (→ .copy_start at 38)
+                        0x48, 0xC7, 0xC0, 0xDC, 0xFF, 0xFF, 0xFF, // 26: mov rax, -36  (-ENAMETOOLONG)
+                        0x5D, // 33: pop rbp
+                        0xC3, // 34: ret
+                        0x90, 0x90, 0x90, // 35: nop nop nop (padding to .copy_start)
+                        // .copy_start (offset 38):
+                        0x48, 0x81, 0xEC, 0x10, 0x04, 0x00, 0x00, // 38: sub rsp, 1040
+                        0x49, 0x89, 0xE3, // 45: mov r11, rsp              (dest)
+                        // .copy_loop (offset 48):
+                        0x4D, 0x85, 0xD2, // 48: test r10, r10
+                        0x74, 0x12, // 51: jz +18                  (→ .null_term at 71)
+                        0x44, 0x0F, 0xB6, 0x08, // 53: movzx r9d, byte [rax]
+                        0x45, 0x88, 0x0B, // 57: mov [r11], r9b
+                        0x48, 0xFF, 0xC0, // 60: inc rax
+                        0x49, 0xFF, 0xC3, // 63: inc r11
+                        0x49, 0xFF, 0xCA, // 66: dec r10
+                        0xEB, 0xE9, // 69: jmp -23                 (→ .copy_loop at 48)
+                        // .null_term (offset 71):
+                        0x41, 0xC6, 0x03, 0x00, // 71: mov byte [r11], 0
+                        // openat(AT_FDCWD, path, translated_flags, mode)
+                        0x48, 0xC7, 0xC7, 0x9C, 0xFF, 0xFF, 0xFF, // 75: mov rdi, -100  (AT_FDCWD)
+                        0x48, 0x89, 0xE6, // 82: mov rsi, rsp              (path on stack)
+                        // --- Flag translation: macOS canonical → Linux ---
+                        0x44, 0x89, 0xC0, // 85: mov eax, r8d              (copy macOS flags)
+                        0x83, 0xE0, 0x03, // 88: and eax, 3                (keep access mode O_RDONLY/O_WRONLY/O_RDWR)
+                        0x41, 0x0F, 0xBA, 0xE0, 0x09, // 91: bt r8d, 9     (test macOS O_CREAT 0x200)
+                        0x73, 0x03, // 96: jnc +3                  (skip if not set)
+                        0x83, 0xC8, 0x40, // 98: or eax, 0x40              (Linux O_CREAT)
+                        0x41, 0x0F, 0xBA, 0xE0, 0x0A, //101: bt r8d, 10    (test macOS O_TRUNC 0x400)
+                        0x73, 0x05, //106: jnc +5                  (skip 5-byte or eax,imm32)
+                        0x0D, 0x00, 0x02, 0x00, 0x00, //108: or eax, 0x200 (Linux O_TRUNC)
+                        0x41, 0x0F, 0xBA, 0xE0, 0x03, //113: bt r8d, 3     (test macOS O_APPEND 0x8)
+                        0x73, 0x05, //118: jnc +5                  (skip 5-byte or eax,imm32)
+                        0x0D, 0x00, 0x04, 0x00, 0x00, //120: or eax, 0x400 (Linux O_APPEND)
+                        0x41, 0x0F, 0xBA, 0xE0, 0x0B, //125: bt r8d, 11    (test macOS O_EXCL 0x800)
+                        0x73, 0x03, //130: jnc +3                  (skip if not set)
+                        0x83, 0xC8, 0x80, //132: or eax, 0x80              (Linux O_EXCL)
+                        0x89, 0xC2, //135: mov edx, eax             (Linux flags → rdx)
+                        // --- End flag translation ---
+                        0x49, 0xC7, 0xC2, 0xA4, 0x01, 0x00, 0x00, //137: mov r10, 420  (mode 0644, arg4=r10 for syscall)
+                        0x48, 0xC7, 0xC0, 0x01, 0x01, 0x00, 0x00, //144: mov rax, 257  (SYS_openat)
+                        0x0F, 0x05, //151: syscall
+                        0x48, 0x89, 0xEC, //153: mov rsp, rbp  (restore stack)
+                        0x5D, //156: pop rbp
+                        0xC3, //157: ret
+                    };
+                    try module.defineFunctionBytes(elf_func_ids[i], &x64_open, &.{});
+                } else if (std.mem.eql(u8, name, "time")) {
+                    // x86-64 Linux: clock_gettime(CLOCK_REALTIME, &timespec) → nanoseconds
+                    // Cranelift CC: rdi=vmctx, rsi=caller_vmctx (no user args)
+                    // Returns: i64 nanoseconds = tv_sec * 1_000_000_000 + tv_nsec
+                    const x64_time = [_]u8{
+                        0x55, //  0: push rbp
+                        0x48, 0x89, 0xE5, //  1: mov rbp, rsp
+                        0x48, 0x83, 0xEC, 0x10, //  4: sub rsp, 16            (timespec on stack)
+                        0x31, 0xFF, //  8: xor edi, edi            (CLOCK_REALTIME = 0)
+                        0x48, 0x89, 0xE6, // 10: mov rsi, rsp             (&timespec)
+                        0x48, 0xC7, 0xC0, 0xE4, 0x00, 0x00, 0x00, // 13: mov rax, 228  (SYS_clock_gettime)
+                        0x0F, 0x05, // 20: syscall
+                        0x48, 0x8B, 0x04, 0x24, // 22: mov rax, [rsp]         (tv_sec)
+                        0x48, 0x69, 0xC0, 0x00, 0xCA, 0x9A, 0x3B, // 26: imul rax, 1000000000
+                        0x48, 0x03, 0x44, 0x24, 0x08, // 33: add rax, [rsp+8]     (+ tv_nsec)
+                        0x48, 0x83, 0xC4, 0x10, // 38: add rsp, 16
+                        0x5D, // 42: pop rbp
+                        0xC3, // 43: ret
+                    };
+                    try module.defineFunctionBytes(elf_func_ids[i], &x64_time, &.{});
+                } else if (std.mem.eql(u8, name, "random")) {
+                    // x86-64 Linux: getrandom(buf, count, flags) — fill buffer with random bytes
+                    // Cranelift CC: rdi=vmctx, rsi=caller_vmctx, rdx=buf(wasm ptr), rcx=len
+                    // SYS_getrandom=318, no chunk limit needed but loop handles partial reads
+                    // Returns 0 on success, -errno on error.
+                    const x64_random = [_]u8{
+                        0x55, //  0: push rbp
+                        0x48, 0x89, 0xE5, //  1: mov rbp, rsp
+                        0x4C, 0x8D, 0x8F, 0x00, 0x00, 0x04, 0x00, //  4: lea r9, [rdi + 0x40000]  (linmem base)
+                        0x49, 0x01, 0xD1, // 11: add r9, rdx               (real buf)
+                        0x49, 0x89, 0xCA, // 14: mov r10, rcx              (remaining len)
+                        // .loop (offset 17):
+                        0x4D, 0x85, 0xD2, // 17: test r10, r10
+                        0x74, 0x1E, // 20: jz +30                  (→ .success at 52)
+                        0x4C, 0x89, 0xCF, // 22: mov rdi, r9               (buf)
+                        0x4C, 0x89, 0xD6, // 25: mov rsi, r10              (count)
+                        0x31, 0xD2, // 28: xor edx, edx             (flags = 0)
+                        0x48, 0xC7, 0xC0, 0x3E, 0x01, 0x00, 0x00, // 30: mov rax, 318  (SYS_getrandom)
+                        0x0F, 0x05, // 37: syscall
+                        0x48, 0x85, 0xC0, // 39: test rax, rax
+                        0x78, 0x0C, // 42: js +12                  (→ .error at 56)
+                        0x49, 0x01, 0xC1, // 44: add r9, rax               (buf += bytes)
+                        0x49, 0x29, 0xC2, // 47: sub r10, rax              (remaining -= bytes)
+                        0xEB, 0xDD, // 50: jmp -35                 (→ .loop at 17)
+                        // .success (offset 52):
+                        0x31, 0xC0, // 52: xor eax, eax             (return 0)
+                        0x5D, // 54: pop rbp
+                        0xC3, // 55: ret
+                        // .error (offset 56):
+                        0x5D, // 56: pop rbp                    (rax already negative)
+                        0xC3, // 57: ret
+                    };
+                    try module.defineFunctionBytes(elf_func_ids[i], &x64_random, &.{});
+                } else if (std.mem.eql(u8, name, "exit")) {
+                    // x86-64 Linux: exit_group(code) — never returns
+                    // Cranelift CC: rdi=vmctx, rsi=caller_vmctx, rdx=code
+                    // SYS_exit_group=231 (kills all threads)
+                    const x64_exit = [_]u8{
+                        0x48, 0x89, 0xD7, // mov rdi, rdx              (exit code)
+                        0x48, 0xC7, 0xC0, 0xE7, 0x00, 0x00, 0x00, // mov rax, 231  (SYS_exit_group)
+                        0x0F, 0x05, // syscall
+                    };
+                    try module.defineFunctionBytes(elf_func_ids[i], &x64_exit, &.{});
+                } else if (std.mem.eql(u8, name, "wasi_fd_write")) {
+                    // x86-64 Linux syscall for WASI fd_write(fd, iovs, iovs_len, nwritten)
+                    // Cranelift CC: rdi=vmctx, rsi=caller_vmctx, rdx=fd, rcx=iovs, r8=iovs_len, r9=nwritten
+                    // Fast path: adapter always sends 1 iovec
+                    // Returns 0 (ESUCCESS) on success, -errno on error.
+                    // Register plan: r10=linmem, r11=iovs addr (then reused),
+                    // ecx=iovec.buf, r8d=iovec.buf_len (all caller-saved)
+                    const x64_wasi_write = [_]u8{
+                        0x55, //  0: push rbp
+                        0x48, 0x89, 0xE5, //  1: mov rbp, rsp
+                        0x4C, 0x8D, 0x97, 0x00, 0x00, 0x04, 0x00, //  4: lea r10, [rdi + 0x40000]  (r10 = linmem base)
+                        0x4D, 0x8D, 0x1C, 0x0A, // 11: lea r11, [r10 + rcx]    (r11 = linmem + iovs)
+                        0x41, 0x8B, 0x0B, // 15: mov ecx, [r11]            (ecx = iovec.buf offset, i32)
+                        0x45, 0x8B, 0x43, 0x04, // 18: mov r8d, [r11 + 4]      (r8d = iovec.buf_len, i32)
+                        // SYS_write(fd, buf, len)
+                        0x48, 0x89, 0xD7, // 22: mov rdi, rdx              (fd)
+                        0x49, 0x8D, 0x34, 0x0A, // 25: lea rsi, [r10 + rcx]    (real buf = linmem + buf_offset)
+                        0x44, 0x89, 0xC2, // 29: mov edx, r8d              (len = buf_len)
+                        0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00, // 32: mov rax, 1  (SYS_write)
+                        0x0F, 0x05, // 39: syscall
+                        // Check result
+                        0x48, 0x85, 0xC0, // 41: test rax, rax
+                        0x78, 0x0A, // 44: js +10                  (→ .error at 56)
+                        // Success: store bytes_written at linmem+nwritten
+                        0x4B, 0x8D, 0x0C, 0x0A, // 46: lea rcx, [r10 + r9]    (linmem + nwritten)
+                        0x89, 0x01, // 50: mov [rcx], eax           (store result as i32)
+                        0x31, 0xC0, // 52: xor eax, eax             (return 0 = ESUCCESS)
+                        0x5D, // 54: pop rbp
+                        0xC3, // 55: ret
+                        // .error (offset 56): rax already has -errno from Linux
+                        0x5D, // 56: pop rbp
+                        0xC3, // 57: ret
+                    };
+                    try module.defineFunctionBytes(elf_func_ids[i], &x64_wasi_write, &.{});
+                } else if (std.mem.eql(u8, name, "args_count")) {
+                    // x86-64: read argc from vmctx+0x30000
+                    // Cranelift CC: rdi=vmctx, rsi=caller_vmctx (no user args)
+                    const x64_args_count = [_]u8{
+                        0x48, 0x8B, 0x87, 0x00, 0x00, 0x03, 0x00, // mov rax, [rdi + 0x30000]  (argc)
+                        0xC3, // ret
+                    };
+                    try module.defineFunctionBytes(elf_func_ids[i], &x64_args_count, &.{});
+                } else if (std.mem.eql(u8, name, "arg_len")) {
+                    // x86-64: strlen(argv[n]) with bounds check
+                    // Cranelift CC: rdi=vmctx, rsi=caller_vmctx, rdx=n
+                    // Returns strlen or 0 if n >= argc.
+                    const x64_arg_len = [_]u8{
+                        0x48, 0x8B, 0x87, 0x00, 0x00, 0x03, 0x00, //  0: mov rax, [rdi + 0x30000]  (argc)
+                        0x48, 0x39, 0xC2, //  7: cmp rdx, rax              (n vs argc)
+                        0x72, 0x04, // 10: jb +4                   (n < argc → .valid at 16)
+                        0x31, 0xC0, // 12: xor eax, eax             (return 0)
+                        0xC3, // 14: ret
+                        0x90, // 15: nop padding
+                        // .valid (offset 16):
+                        0x48, 0x8B, 0x87, 0x08, 0x00, 0x03, 0x00, // 16: mov rax, [rdi + 0x30008]  (argv)
+                        0x48, 0x8B, 0x04, 0xD0, // 23: mov rax, [rax + rdx*8]  (argv[n])
+                        0x31, 0xC9, // 27: xor ecx, ecx             (len = 0)
+                        // .strlen_loop (offset 29):
+                        0x80, 0x3C, 0x08, 0x00, // 29: cmp byte [rax + rcx], 0
+                        0x74, 0x05, // 33: je +5                   (→ .done at 40)
+                        0x48, 0xFF, 0xC1, // 35: inc rcx
+                        0xEB, 0xF5, // 38: jmp -11                 (→ .strlen_loop at 29)
+                        // .done (offset 40):
+                        0x48, 0x89, 0xC8, // 40: mov rax, rcx             (return len)
+                        0xC3, // 43: ret
+                    };
+                    try module.defineFunctionBytes(elf_func_ids[i], &x64_arg_len, &.{});
+                } else if (std.mem.eql(u8, name, "arg_ptr")) {
+                    // x86-64: copy argv[n] into linear memory at wasm offset 0xAF000 + n*4096
+                    // Cranelift CC: rdi=vmctx, rsi=caller_vmctx, rdx=n
+                    // Each arg gets a 4096-byte slot; copy limited to 4095 bytes + NUL
+                    // Returns wasm offset (0xAF000 + n*4096) or 0 if n >= argc.
+                    const x64_arg_ptr = [_]u8{
+                        0x55, //  0: push rbp
+                        0x48, 0x89, 0xE5, //  1: mov rbp, rsp
+                        0x48, 0x8B, 0x87, 0x00, 0x00, 0x03, 0x00, //  4: mov rax, [rdi + 0x30000]  (argc)
+                        0x48, 0x39, 0xC2, // 11: cmp rdx, rax              (n vs argc)
+                        0x72, 0x05, // 14: jb +5                   (n < argc → .valid at 21)
+                        0x31, 0xC0, // 16: xor eax, eax             (return 0)
+                        0x5D, // 18: pop rbp
+                        0xC3, // 19: ret
+                        0x90, // 20: nop padding
+                        // .valid (offset 21):
+                        0x48, 0x8B, 0x87, 0x08, 0x00, 0x03, 0x00, // 21: mov rax, [rdi + 0x30008]  (argv)
+                        0x4C, 0x8B, 0x04, 0xD0, // 28: mov r8, [rax + rdx*8]   (r8 = argv[n], src)
+                        // dest = linmem + 0xAF000 + n*4096
+                        0x48, 0x89, 0xD0, // 32: mov rax, rdx              (n)
+                        0x48, 0xC1, 0xE0, 0x0C, // 35: shl rax, 12             (n * 4096)
+                        0x4C, 0x8D, 0x8F, 0x00, 0x00, 0x04, 0x00, // 39: lea r9, [rdi + 0x40000]  (linmem base)
+                        0x49, 0x81, 0xC1, 0x00, 0xF0, 0x0A, 0x00, // 46: add r9, 0xAF000
+                        0x49, 0x01, 0xC1, // 53: add r9, rax               (dest = linmem + 0xAF000 + n*4096)
+                        0x48, 0x89, 0xD1, // 56: mov rcx, rdx              (save n for return value)
+                        0x41, 0xBA, 0xFF, 0x0F, 0x00, 0x00, // 59: mov r10d, 4095          (max copy)
+                        // .copy_loop (offset 65):
+                        0x4D, 0x85, 0xD2, // 65: test r10, r10
+                        0x74, 0x16, // 68: jz +22                  (→ .truncate at 92)
+                        0x41, 0x0F, 0xB6, 0x00, // 70: movzx eax, byte [r8]
+                        0x41, 0x88, 0x01, // 74: mov [r9], al
+                        0x85, 0xC0, // 77: test eax, eax
+                        0x74, 0x0F, // 79: jz +15                  (NUL found → .done at 96)
+                        0x49, 0xFF, 0xC0, // 81: inc r8
+                        0x49, 0xFF, 0xC1, // 84: inc r9
+                        0x49, 0xFF, 0xCA, // 87: dec r10
+                        0xEB, 0xE5, // 90: jmp -27                 (→ .copy_loop at 65)
+                        // .truncate (offset 92):
+                        0x41, 0xC6, 0x01, 0x00, // 92: mov byte [r9], 0  (NUL-terminate)
+                        // .done (offset 96): return wasm offset 0xAF000 + n*4096
+                        0x48, 0xC7, 0xC0, 0x00, 0xF0, 0x0A, 0x00, // 96: mov rax, 0xAF000
+                        0x48, 0xC1, 0xE1, 0x0C, //103: shl rcx, 12  (n * 4096)
+                        0x48, 0x01, 0xC8, //107: add rax, rcx  (0xAF000 + n*4096)
+                        0x5D, //110: pop rbp
+                        0xC3, //111: ret
+                    };
+                    try module.defineFunctionBytes(elf_func_ids[i], &x64_arg_ptr, &.{});
+                } else if (std.mem.eql(u8, name, "environ_count")) {
+                    // x86-64: count envp entries by walking until NULL pointer
+                    // Cranelift CC: rdi=vmctx, rsi=caller_vmctx (no user args)
+                    // vmctx+0x30010 = envp (stored by main wrapper)
+                    const x64_environ_count = [_]u8{
+                        0x55, //  0: push rbp
+                        0x48, 0x89, 0xE5, //  1: mov rbp, rsp
+                        0x48, 0x8B, 0x87, 0x10, 0x00, 0x03, 0x00, //  4: mov rax, [rdi + 0x30010]  (envp)
+                        0x31, 0xC9, // 11: xor ecx, ecx             (count = 0)
+                        0x48, 0x85, 0xC0, // 13: test rax, rax
+                        0x74, 0x0E, // 16: jz +14                   (NULL envp → .done at 32)
+                        // .loop (offset 18):
+                        0x48, 0x8B, 0x14, 0xC8, // 18: mov rdx, [rax + rcx*8]  (*envp++)
+                        0x48, 0x85, 0xD2, // 22: test rdx, rdx
+                        0x74, 0x05, // 25: jz +5                    (NULL → .done at 32)
+                        0x48, 0xFF, 0xC1, // 27: inc rcx                (count++)
+                        0xEB, 0xF2, // 30: jmp -14                  (→ .loop at 18)
+                        // .done (offset 32):
+                        0x48, 0x89, 0xC8, // 32: mov rax, rcx          (return count)
+                        0x5D, // 35: pop rbp
+                        0xC3, // 36: ret
+                    };
+                    try module.defineFunctionBytes(elf_func_ids[i], &x64_environ_count, &.{});
+                } else if (std.mem.eql(u8, name, "environ_len")) {
+                    // x86-64: strlen(envp[n])
+                    // Cranelift CC: rdi=vmctx, rsi=caller_vmctx, rdx=n
+                    const x64_environ_len = [_]u8{
+                        0x55, //  0: push rbp
+                        0x48, 0x89, 0xE5, //  1: mov rbp, rsp
+                        0x48, 0x8B, 0x87, 0x10, 0x00, 0x03, 0x00, //  4: mov rax, [rdi + 0x30010]  (envp)
+                        0x48, 0x85, 0xC0, // 11: test rax, rax
+                        0x74, 0x09, // 14: jz +9                    (NULL envp → return 0 at 25)
+                        0x4C, 0x8B, 0x04, 0xD0, // 16: mov r8, [rax + rdx*8]   (r8 = envp[n])
+                        0x4D, 0x85, 0xC0, // 20: test r8, r8
+                        0x75, 0x04, // 23: jnz +4                   (non-NULL → .valid at 29)
+                        0x31, 0xC0, // 25: xor eax, eax             (return 0)
+                        0x5D, // 27: pop rbp
+                        0xC3, // 28: ret
+                        // .valid (offset 29):
+                        0x31, 0xC0, // 29: xor eax, eax             (len = 0)
+                        // .strlen_loop (offset 31):
+                        0x41, 0x0F, 0xB6, 0x0C, 0x00, // 31: movzx ecx, byte [r8 + rax]
+                        0x85, 0xC9, // 36: test ecx, ecx
+                        0x74, 0x05, // 38: jz +5                    (NUL → .done at 45)
+                        0x48, 0xFF, 0xC0, // 40: inc rax                (len++)
+                        0xEB, 0xF2, // 43: jmp -14                  (→ .strlen_loop at 31)
+                        // .done (offset 45):
+                        0x5D, // 45: pop rbp
+                        0xC3, // 46: ret
+                    };
+                    try module.defineFunctionBytes(elf_func_ids[i], &x64_environ_len, &.{});
+                } else if (std.mem.eql(u8, name, "environ_ptr")) {
+                    // x86-64: copy envp[n] into linear memory at wasm offset 0x7F000 + n*4096
+                    // Cranelift CC: rdi=vmctx, rsi=caller_vmctx, rdx=n
+                    // Same pattern as x64_arg_ptr but uses envp from vmctx+0x30010
+                    // and writes to 0x7F000 instead of 0xAF000
+                    const x64_environ_ptr = [_]u8{
+                        0x55, //  0: push rbp
+                        0x48, 0x89, 0xE5, //  1: mov rbp, rsp
+                        0x48, 0x8B, 0x87, 0x10, 0x00, 0x03, 0x00, //  4: mov rax, [rdi + 0x30010]  (envp)
+                        0x48, 0x85, 0xC0, // 11: test rax, rax
+                        0x74, 0x09, // 14: jz +9                    (NULL envp → return 0 at 25)
+                        0x4C, 0x8B, 0x04, 0xD0, // 16: mov r8, [rax + rdx*8]   (r8 = envp[n], src)
+                        0x4D, 0x85, 0xC0, // 20: test r8, r8
+                        0x75, 0x04, // 23: jnz +4                   (non-NULL → .valid at 29)
+                        0x31, 0xC0, // 25: xor eax, eax             (return 0)
+                        0x5D, // 27: pop rbp
+                        0xC3, // 28: ret
+                        // .valid (offset 29):
+                        // dest = linmem + 0x7F000 + n*4096
+                        0x48, 0x89, 0xD0, // 29: mov rax, rdx              (n)
+                        0x48, 0xC1, 0xE0, 0x0C, // 32: shl rax, 12             (n * 4096)
+                        0x4C, 0x8D, 0x8F, 0x00, 0x00, 0x04, 0x00, // 36: lea r9, [rdi + 0x40000]  (linmem base)
+                        0x49, 0x81, 0xC1, 0x00, 0xF0, 0x07, 0x00, // 43: add r9, 0x7F000
+                        0x49, 0x01, 0xC1, // 50: add r9, rax               (dest = linmem + 0x7F000 + n*4096)
+                        0x48, 0x89, 0xD1, // 53: mov rcx, rdx              (save n for return value)
+                        0x41, 0xBA, 0xFF, 0x0F, 0x00, 0x00, // 56: mov r10d, 4095          (max copy)
+                        // .copy_loop (offset 62):
+                        0x4D, 0x85, 0xD2, // 62: test r10, r10
+                        0x74, 0x16, // 65: jz +22                  (→ .truncate at 89)
+                        0x41, 0x0F, 0xB6, 0x00, // 67: movzx eax, byte [r8]
+                        0x41, 0x88, 0x01, // 71: mov [r9], al
+                        0x85, 0xC0, // 74: test eax, eax
+                        0x74, 0x0F, // 76: jz +15                  (NUL found → .done at 93)
+                        0x49, 0xFF, 0xC0, // 78: inc r8
+                        0x49, 0xFF, 0xC1, // 81: inc r9
+                        0x49, 0xFF, 0xCA, // 84: dec r10
+                        0xEB, 0xE5, // 87: jmp -27                 (→ .copy_loop at 62)
+                        // .truncate (offset 89):
+                        0x41, 0xC6, 0x01, 0x00, // 89: mov byte [r9], 0  (NUL-terminate)
+                        // .done (offset 93): return wasm offset 0x7F000 + n*4096
+                        0x48, 0xC7, 0xC0, 0x00, 0xF0, 0x07, 0x00, // 93: mov rax, 0x7F000
+                        0x48, 0xC1, 0xE1, 0x0C, //100: shl rcx, 12  (n * 4096)
+                        0x48, 0x01, 0xC8, //104: add rax, rcx  (0x7F000 + n*4096)
+                        0x5D, //107: pop rbp
+                        0xC3, //108: ret
+                    };
+                    try module.defineFunctionBytes(elf_func_ids[i], &x64_environ_ptr, &.{});
+                } else if (std.mem.eql(u8, name, "net_socket")) {
+                    // x86-64 Linux syscall for socket(domain, type, protocol)
+                    // Cranelift CC: rdi=vmctx, rsi=caller_vmctx, rdx=domain, rcx=type, r8=protocol
+                    // Linux socket: rax=41(SYS_socket), rdi=domain, rsi=type, rdx=protocol
+                    const x64_socket = [_]u8{
+                        0x55, // push rbp
+                        0x48, 0x89, 0xE5, // mov rbp, rsp
+                        0x48, 0x89, 0xD7, // mov rdi, rdx  (domain)
+                        0x48, 0x89, 0xCE, // mov rsi, rcx  (type)
+                        0x4C, 0x89, 0xC2, // mov rdx, r8   (protocol)
+                        0x48, 0xC7, 0xC0, 0x29, 0x00, 0x00, 0x00, // mov rax, 41  (SYS_socket)
+                        0x0F, 0x05, // syscall
+                        0x5D, // pop rbp
+                        0xC3, // ret
+                    };
+                    try module.defineFunctionBytes(elf_func_ids[i], &x64_socket, &.{});
+                } else if (std.mem.eql(u8, name, "net_bind")) {
+                    // x86-64 Linux syscall for bind(fd, addr, addrlen)
+                    // Cranelift CC: rdi=vmctx, rsi=caller_vmctx, rdx=fd, rcx=addr(wasm), r8=addrlen
+                    // Linux bind: rax=49(SYS_bind), rdi=fd, rsi=addr, rdx=addrlen
+                    const x64_bind = [_]u8{
+                        0x55, // push rbp
+                        0x48, 0x89, 0xE5, // mov rbp, rsp
+                        0x4C, 0x8D, 0x8F, 0x00, 0x00, 0x04, 0x00, // lea r9, [rdi + 0x40000]  (linmem base)
+                        0x49, 0x01, 0xC9, // add r9, rcx  (real addr = linmem + wasm_ptr)
+                        0x48, 0x89, 0xD7, // mov rdi, rdx  (fd)
+                        0x4C, 0x89, 0xCE, // mov rsi, r9   (addr)
+                        0x4C, 0x89, 0xC2, // mov rdx, r8   (addrlen)
+                        0x48, 0xC7, 0xC0, 0x31, 0x00, 0x00, 0x00, // mov rax, 49  (SYS_bind)
+                        0x0F, 0x05, // syscall
+                        0x5D, // pop rbp
+                        0xC3, // ret
+                    };
+                    try module.defineFunctionBytes(elf_func_ids[i], &x64_bind, &.{});
+                } else if (std.mem.eql(u8, name, "net_listen")) {
+                    // x86-64 Linux syscall for listen(fd, backlog)
+                    // Cranelift CC: rdi=vmctx, rsi=caller_vmctx, rdx=fd, rcx=backlog
+                    // Linux listen: rax=50(SYS_listen), rdi=fd, rsi=backlog
+                    const x64_listen = [_]u8{
+                        0x55, // push rbp
+                        0x48, 0x89, 0xE5, // mov rbp, rsp
+                        0x48, 0x89, 0xD7, // mov rdi, rdx  (fd)
+                        0x48, 0x89, 0xCE, // mov rsi, rcx  (backlog)
+                        0x48, 0xC7, 0xC0, 0x32, 0x00, 0x00, 0x00, // mov rax, 50  (SYS_listen)
+                        0x0F, 0x05, // syscall
+                        0x5D, // pop rbp
+                        0xC3, // ret
+                    };
+                    try module.defineFunctionBytes(elf_func_ids[i], &x64_listen, &.{});
+                } else if (std.mem.eql(u8, name, "net_accept")) {
+                    // x86-64 Linux syscall for accept(fd, NULL, NULL)
+                    // Cranelift CC: rdi=vmctx, rsi=caller_vmctx, rdx=fd
+                    // Linux accept: rax=43(SYS_accept), rdi=fd, rsi=addr(NULL), rdx=addrlen(NULL)
+                    const x64_accept = [_]u8{
+                        0x55, // push rbp
+                        0x48, 0x89, 0xE5, // mov rbp, rsp
+                        0x48, 0x89, 0xD7, // mov rdi, rdx  (fd)
+                        0x31, 0xF6, // xor esi, esi  (addr = NULL)
+                        0x31, 0xD2, // xor edx, edx  (addrlen = NULL)
+                        0x48, 0xC7, 0xC0, 0x2B, 0x00, 0x00, 0x00, // mov rax, 43  (SYS_accept)
+                        0x0F, 0x05, // syscall
+                        0x5D, // pop rbp
+                        0xC3, // ret
+                    };
+                    try module.defineFunctionBytes(elf_func_ids[i], &x64_accept, &.{});
+                } else if (std.mem.eql(u8, name, "net_connect")) {
+                    // x86-64 Linux syscall for connect(fd, addr, addrlen)
+                    // Cranelift CC: rdi=vmctx, rsi=caller_vmctx, rdx=fd, rcx=addr(wasm), r8=addrlen
+                    // Linux connect: rax=42(SYS_connect), rdi=fd, rsi=addr, rdx=addrlen
+                    const x64_connect = [_]u8{
+                        0x55, // push rbp
+                        0x48, 0x89, 0xE5, // mov rbp, rsp
+                        0x4C, 0x8D, 0x8F, 0x00, 0x00, 0x04, 0x00, // lea r9, [rdi + 0x40000]  (linmem base)
+                        0x49, 0x01, 0xC9, // add r9, rcx  (real addr = linmem + wasm_ptr)
+                        0x48, 0x89, 0xD7, // mov rdi, rdx  (fd)
+                        0x4C, 0x89, 0xCE, // mov rsi, r9   (addr)
+                        0x4C, 0x89, 0xC2, // mov rdx, r8   (addrlen)
+                        0x48, 0xC7, 0xC0, 0x2A, 0x00, 0x00, 0x00, // mov rax, 42  (SYS_connect)
+                        0x0F, 0x05, // syscall
+                        0x5D, // pop rbp
+                        0xC3, // ret
+                    };
+                    try module.defineFunctionBytes(elf_func_ids[i], &x64_connect, &.{});
+                } else if (std.mem.eql(u8, name, "net_set_reuse_addr")) {
+                    // x86-64 Linux syscall for setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &val, 4)
+                    // Cranelift CC: rdi=vmctx, rsi=caller_vmctx, rdx=fd
+                    // Linux: SOL_SOCKET=1, SO_REUSEADDR=2
+                    // SYS_setsockopt = 54
+                    const x64_reuse = [_]u8{
+                        0x55, //  0: push rbp
+                        0x48, 0x89, 0xE5, //  1: mov rbp, rsp
+                        0x48, 0x83, 0xEC, 0x10, //  4: sub rsp, 16
+                        0xC7, 0x04, 0x24, 0x01, 0x00, 0x00, 0x00, //  8: mov dword [rsp], 1  (optval = 1)
+                        0x48, 0x89, 0xD7, // 15: mov rdi, rdx  (fd)
+                        0xBE, 0x01, 0x00, 0x00, 0x00, // 18: mov esi, 1  (SOL_SOCKET)
+                        0xBA, 0x02, 0x00, 0x00, 0x00, // 23: mov edx, 2  (SO_REUSEADDR)
+                        0x48, 0x89, 0xE1, // 28: mov rcx, rsp  (&optval, arg4 in rcx for syscall→r10)
+                        0x49, 0x89, 0xCA, // 31: mov r10, rcx  (Linux syscall: arg4 in r10)
+                        0x41, 0xB8, 0x04, 0x00, 0x00, 0x00, // 34: mov r8d, 4  (optlen)
+                        0x48, 0xC7, 0xC0, 0x36, 0x00, 0x00, 0x00, // 40: mov rax, 54  (SYS_setsockopt)
+                        0x0F, 0x05, // 47: syscall
+                        0x48, 0x83, 0xC4, 0x10, // 49: add rsp, 16
+                        0x5D, // 53: pop rbp
+                        0xC3, // 54: ret
+                    };
+                    try module.defineFunctionBytes(elf_func_ids[i], &x64_reuse, &.{});
+                } else if (std.mem.eql(u8, name, "epoll_create")) {
+                    // x86-64 Linux: epoll_create1(0)
+                    // SYS_epoll_create1 = 291
+                    const x64_epoll_create = [_]u8{
+                        0x55, // push rbp
+                        0x48, 0x89, 0xE5, // mov rbp, rsp
+                        0x31, 0xFF, // xor edi, edi  (flags = 0)
+                        0x48, 0xC7, 0xC0, 0x23, 0x01, 0x00, 0x00, // mov rax, 291 (SYS_epoll_create1)
+                        0x0F, 0x05, // syscall
+                        0x5D, // pop rbp
+                        0xC3, // ret
+                    };
+                    try module.defineFunctionBytes(elf_func_ids[i], &x64_epoll_create, &.{});
+                } else if (std.mem.eql(u8, name, "epoll_add")) {
+                    // x86-64 Linux: epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &event)
+                    // rdx=epfd, rcx=fd, r8=events_mask
+                    // SYS_epoll_ctl = 233, EPOLL_CTL_ADD = 1
+                    // Build struct epoll_event on stack: events(u32@0), data.fd(i32@4)
+                    const x64_epoll_add = [_]u8{
+                        0x55, //  0: push rbp
+                        0x48, 0x89, 0xE5, //  1: mov rbp, rsp
+                        0x48, 0x83, 0xEC, 0x10, //  4: sub rsp, 16
+                        0x44, 0x89, 0x04, 0x24, //  8: mov [rsp], r8d  (events = events_mask)
+                        0x89, 0x4C, 0x24, 0x04, // 12: mov [rsp+4], ecx (data.fd = fd)
+                        0x48, 0x89, 0xD7, // 16: mov rdi, rdx  (epfd)
+                        0xBE, 0x01, 0x00, 0x00, 0x00, // 19: mov esi, 1  (EPOLL_CTL_ADD)
+                        0x48, 0x89, 0xCA, // 24: mov rdx, rcx  (fd)
+                        0x49, 0x89, 0xE2, // 27: mov r10, rsp  (&event, arg4)
+                        0x48, 0xC7, 0xC0, 0xE9, 0x00, 0x00, 0x00, // 30: mov rax, 233 (SYS_epoll_ctl)
+                        0x0F, 0x05, // 37: syscall
+                        0x48, 0x83, 0xC4, 0x10, // 39: add rsp, 16
+                        0x5D, // 43: pop rbp
+                        0xC3, // 44: ret
+                    };
+                    try module.defineFunctionBytes(elf_func_ids[i], &x64_epoll_add, &.{});
+                } else if (std.mem.eql(u8, name, "epoll_del")) {
+                    // x86-64 Linux: epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL)
+                    // rdx=epfd, rcx=fd. SYS_epoll_ctl = 233, EPOLL_CTL_DEL = 2
+                    const x64_epoll_del = [_]u8{
+                        0x55, // push rbp
+                        0x48, 0x89, 0xE5, // mov rbp, rsp
+                        0x48, 0x89, 0xD7, // mov rdi, rdx  (epfd)
+                        0xBE, 0x02, 0x00, 0x00, 0x00, // mov esi, 2  (EPOLL_CTL_DEL)
+                        0x48, 0x89, 0xCA, // mov rdx, rcx  (fd)
+                        0x4D, 0x31, 0xD2, // xor r10, r10  (event = NULL)
+                        0x48, 0xC7, 0xC0, 0xE9, 0x00, 0x00, 0x00, // mov rax, 233 (SYS_epoll_ctl)
+                        0x0F, 0x05, // syscall
+                        0x5D, // pop rbp
+                        0xC3, // ret
+                    };
+                    try module.defineFunctionBytes(elf_func_ids[i], &x64_epoll_del, &.{});
+                } else if (std.mem.eql(u8, name, "epoll_wait")) {
+                    // x86-64 Linux: epoll_wait(epfd, events, maxevents, timeout=-1)
+                    // rdx=epfd, rcx=buf_ptr(wasm), r8=max_events
+                    // SYS_epoll_wait = 232, timeout=-1 (block indefinitely)
+                    const x64_epoll_wait = [_]u8{
+                        0x55, // push rbp
+                        0x48, 0x89, 0xE5, // mov rbp, rsp
+                        0x4C, 0x8D, 0x8F, 0x00, 0x00, 0x04, 0x00, // lea r9, [rdi + 0x40000] (linmem)
+                        0x49, 0x01, 0xC9, // add r9, rcx  (real buf ptr)
+                        0x48, 0x89, 0xD7, // mov rdi, rdx  (epfd)
+                        0x4C, 0x89, 0xCE, // mov rsi, r9   (events buf)
+                        0x4C, 0x89, 0xC2, // mov rdx, r8   (maxevents)
+                        0x49, 0xC7, 0xC2, 0xFF, 0xFF, 0xFF, 0xFF, // mov r10, -1  (timeout = block)
+                        0x48, 0xC7, 0xC0, 0xE8, 0x00, 0x00, 0x00, // mov rax, 232 (SYS_epoll_wait)
+                        0x0F, 0x05, // syscall
+                        0x5D, // pop rbp
+                        0xC3, // ret
+                    };
+                    try module.defineFunctionBytes(elf_func_ids[i], &x64_epoll_wait, &.{});
+                } else if (std.mem.eql(u8, name, "set_nonblocking")) {
+                    // x86-64 Linux: fcntl(fd, F_GETFL) + fcntl(fd, F_SETFL, flags|O_NONBLOCK)
+                    // rdx=fd. SYS_fcntl=72, F_GETFL=3, F_SETFL=4, O_NONBLOCK=0x800
+                    const x64_set_nonblocking = [_]u8{
+                        0x55, //  0: push rbp
+                        0x48, 0x89, 0xE5, //  1: mov rbp, rsp
+                        0x41, 0x54, //  4: push r12  (save fd)
+                        0x49, 0x89, 0xD4, //  6: mov r12, rdx  (fd)
+                        0x4C, 0x89, 0xE7, //  9: mov rdi, r12  (fd)
+                        0xBE, 0x03, 0x00, 0x00, 0x00, // 12: mov esi, 3  (F_GETFL)
+                        0x48, 0xC7, 0xC0, 0x48, 0x00, 0x00, 0x00, // 17: mov rax, 72 (SYS_fcntl)
+                        0x0F, 0x05, // 24: syscall
+                        0x48, 0x85, 0xC0, // 26: test rax, rax
+                        0x78, 0x15, // 29: js +21  (→ error at 52)
+                        0x48, 0x0D, 0x00, 0x08, 0x00, 0x00, // 31: or rax, 0x800 (O_NONBLOCK)
+                        0x4C, 0x89, 0xE7, // 37: mov rdi, r12  (fd)
+                        0xBE, 0x04, 0x00, 0x00, 0x00, // 40: mov esi, 4  (F_SETFL)
+                        0x48, 0x89, 0xC2, // 45: mov rdx, rax  (new flags)
+                        0x48, 0xC7, 0xC0, 0x48, 0x00, 0x00, 0x00, // 48: mov rax, 72 (SYS_fcntl)
+                        0x0F, 0x05, // 55: syscall
+                        // 57: (fall through — rax has result or error)
+                        0x41, 0x5C, // 57: pop r12
+                        0x5D, // 59: pop rbp
+                        0xC3, // 60: ret
+                    };
+                    try module.defineFunctionBytes(elf_func_ids[i], &x64_set_nonblocking, &.{});
+                } else if (std.mem.eql(u8, name, "fork")) {
+                    // x86-64 Linux: fork() syscall (SYS_fork = 57)
+                    const x64_fork = [_]u8{
+                        0x55, // push rbp
+                        0x48, 0x89, 0xE5, // mov rbp, rsp
+                        0x48, 0xC7, 0xC0, 0x39, 0x00, 0x00, 0x00, // mov rax, 57 (SYS_fork)
+                        0x0F, 0x05, // syscall
+                        0x5D, // pop rbp
+                        0xC3, // ret
+                    };
+                    try module.defineFunctionBytes(elf_func_ids[i], &x64_fork, &.{});
+                } else if (std.mem.eql(u8, name, "waitpid")) {
+                    // x86-64 Linux: wait4(pid, &status, options, NULL) (SYS_wait4 = 61)
+                    // Cranelift CC: rdi=vmctx, rsi=caller_vmctx, rdx=pid
+                    // Returns exit code = (status >> 8) & 0xFF
+                    const x64_waitpid = [_]u8{
+                        0x55, //  0: push rbp
+                        0x48, 0x89, 0xE5, //  1: mov rbp, rsp
+                        0x48, 0x83, 0xEC, 0x10, //  4: sub rsp, 16  (status on stack)
+                        0x48, 0x89, 0xD7, //  8: mov rdi, rdx  (pid)
+                        0x48, 0x89, 0xE6, // 11: mov rsi, rsp  (status_ptr)
+                        0x31, 0xD2, // 14: xor edx, edx  (options = 0)
+                        0x49, 0xC7, 0xC2, 0x00, 0x00, 0x00, 0x00, // 16: mov r10, 0  (rusage = NULL)
+                        0x48, 0xC7, 0xC0, 0x3D, 0x00, 0x00, 0x00, // 23: mov rax, 61  (SYS_wait4)
+                        0x0F, 0x05, // 30: syscall
+                        0x48, 0x85, 0xC0, // 32: test rax, rax
+                        0x78, 0x09, // 35: js +9  (error → return rax)
+                        0x8B, 0x04, 0x24, // 37: mov eax, [rsp]  (load status as i32)
+                        0xC1, 0xE8, 0x08, // 40: shr eax, 8  (status >> 8)
+                        0x25, 0xFF, 0x00, 0x00, 0x00, // 43: and eax, 0xFF  (& 0xFF)
+                        0x48, 0x83, 0xC4, 0x10, // 48: add rsp, 16
+                        0x5D, // 52: pop rbp
+                        0xC3, // 53: ret
+                    };
+                    try module.defineFunctionBytes(elf_func_ids[i], &x64_waitpid, &.{});
+                } else if (std.mem.eql(u8, name, "pipe")) {
+                    // x86-64 Linux: pipe2(fds_ptr, 0) (SYS_pipe2 = 293)
+                    // Returns packed: (write_fd << 32) | read_fd  (as i64 from stack)
+                    const x64_pipe = [_]u8{
+                        0x55, // push rbp
+                        0x48, 0x89, 0xE5, // mov rbp, rsp
+                        0x48, 0x83, 0xEC, 0x10, // sub rsp, 16  (stack for fds)
+                        0x48, 0x89, 0xE7, // mov rdi, rsp  (fds_ptr)
+                        0x31, 0xF6, // xor esi, esi  (flags = 0)
+                        0x48, 0xC7, 0xC0, 0x25, 0x01, 0x00, 0x00, // mov rax, 293  (SYS_pipe2)
+                        0x0F, 0x05, // syscall
+                        0x48, 0x85, 0xC0, // test rax, rax
+                        0x78, 0x04, // js +4  (error → return rax)
+                        0x48, 0x8B, 0x04, 0x24, // mov rax, [rsp]  (packed fds as i64)
+                        0x48, 0x83, 0xC4, 0x10, // add rsp, 16
+                        0x5D, // pop rbp
+                        0xC3, // ret
+                    };
+                    try module.defineFunctionBytes(elf_func_ids[i], &x64_pipe, &.{});
+                } else if (std.mem.eql(u8, name, "dup2")) {
+                    // x86-64 Linux: dup2(oldfd, newfd) (SYS_dup2 = 33)
+                    // Cranelift CC: rdi=vmctx, rsi=caller_vmctx, rdx=oldfd, rcx=newfd
+                    const x64_dup2 = [_]u8{
+                        0x55, // push rbp
+                        0x48, 0x89, 0xE5, // mov rbp, rsp
+                        0x48, 0x89, 0xD7, // mov rdi, rdx  (oldfd)
+                        0x48, 0x89, 0xCE, // mov rsi, rcx  (newfd)
+                        0x48, 0xC7, 0xC0, 0x21, 0x00, 0x00, 0x00, // mov rax, 33  (SYS_dup2)
+                        0x0F, 0x05, // syscall
+                        0x5D, // pop rbp
+                        0xC3, // ret
+                    };
+                    try module.defineFunctionBytes(elf_func_ids[i], &x64_dup2, &.{});
+                } else if (std.mem.eql(u8, name, "isatty")) {
+                    // x86-64 Linux: isatty(fd) via ioctl(fd, TCGETS, &termios_buf)
+                    // Cranelift CC: rdi=vmctx, rsi=caller_vmctx, rdx=fd
+                    // Reference: POSIX isatty(3), Linux SYS_ioctl=16, TCGETS=0x5401
+                    // Returns 1 if terminal, 0 if not.
+                    const x64_isatty = [_]u8{
+                        0x55, //  0: push rbp
+                        0x48, 0x89, 0xE5, //  1: mov rbp, rsp
+                        0x48, 0x83, 0xEC, 0x40, //  4: sub rsp, 64      (termios buf)
+                        0x48, 0x89, 0xD7, //  8: mov rdi, rdx           (fd)
+                        0x48, 0xC7, 0xC6, 0x01, 0x54, 0x00, 0x00, // 11: mov rsi, 0x5401  (TCGETS)
+                        0x48, 0x89, 0xE2, // 18: mov rdx, rsp           (&termios buf)
+                        0x48, 0xC7, 0xC0, 0x10, 0x00, 0x00, 0x00, // 21: mov rax, 16  (SYS_ioctl)
+                        0x0F, 0x05, // 28: syscall
+                        0x48, 0x85, 0xC0, // 30: test rax, rax
+                        0x78, 0x09, // 33: js +9 → 44 (error: not tty)
+                        0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00, // 35: mov rax, 1   (is tty)
+                        0xEB, 0x07, // 42: jmp +7 → 51 (cleanup)
+                        0x48, 0xC7, 0xC0, 0x00, 0x00, 0x00, 0x00, // 44: mov rax, 0   (not tty)
+                        0x48, 0x83, 0xC4, 0x40, // 51: add rsp, 64
+                        0x5D, // 55: pop rbp
+                        0xC3, // 56: ret
+                    };
+                    try module.defineFunctionBytes(elf_func_ids[i], &x64_isatty, &.{});
+                } else if (std.mem.eql(u8, name, "execve")) {
+                    // x86-64 Linux: execve(path, argv, envp) (SYS_execve = 59)
+                    // Cranelift CC: rdi=vmctx, rsi=caller_vmctx, rdx=path, rcx=argv, r8=envp
+                    // All pointers are wasm offsets — add linmem base (vmctx + 0x40000)
+                    // execve with argv/envp pointer fixup (wasm offsets → real addresses)
+                    const x64_execve = [_]u8{
+                        0x55, //  0: push rbp
+                        0x48, 0x89, 0xE5, //  1: mov rbp, rsp
+                        0x4C, 0x8D, 0x8F, 0x00, 0x00, 0x04, 0x00, //  4: lea r9, [rdi + 0x40000] (linmem)
+                        0x4C, 0x01, 0xCA, // 11: add rdx, r9  (path)
+                        0x4C, 0x01, 0xC9, // 14: add rcx, r9  (argv)
+                        0x4D, 0x01, 0xC8, // 17: add r8, r9   (envp)
+                        // Fixup argv pointers
+                        0x49, 0x89, 0xCA, // 20: mov r10, rcx
+                        0x4D, 0x8B, 0x1A, // 23: ldr r11, [r10]  (argv_loop)
+                        0x4D, 0x85, 0xDB, // 26: test r11, r11
+                        0x74, 0x0C, // 29: jz +12 → 43 (argv_done)
+                        0x4D, 0x01, 0xCB, // 31: add r11, r9
+                        0x4D, 0x89, 0x1A, // 34: mov [r10], r11
+                        0x49, 0x83, 0xC2, 0x08, // 37: add r10, 8
+                        0xEB, 0xEC, // 41: jmp -20 → 23 (argv_loop)
+                        // Fixup envp pointers
+                        0x4D, 0x89, 0xC2, // 43: mov r10, r8  (argv_done)
+                        0x4D, 0x8B, 0x1A, // 46: ldr r11, [r10]  (envp_loop)
+                        0x4D, 0x85, 0xDB, // 49: test r11, r11
+                        0x74, 0x0C, // 52: jz +12 → 66 (envp_done)
+                        0x4D, 0x01, 0xCB, // 54: add r11, r9
+                        0x4D, 0x89, 0x1A, // 57: mov [r10], r11
+                        0x49, 0x83, 0xC2, 0x08, // 60: add r10, 8
+                        0xEB, 0xEC, // 64: jmp -20 → 46 (envp_loop)
+                        // Call execve
+                        0x48, 0x89, 0xD7, // 66: mov rdi, rdx (path)
+                        0x48, 0x89, 0xCE, // 69: mov rsi, rcx (argv)
+                        0x4C, 0x89, 0xC2, // 72: mov rdx, r8  (envp)
+                        0x48, 0xC7, 0xC0, 0x3B, 0x00, 0x00, 0x00, // 75: mov rax, 59 (SYS_execve)
+                        0x0F, 0x05, // 82: syscall
+                        0x5D, // 84: pop rbp
+                        0xC3, // 85: ret
+                    };
+                    try module.defineFunctionBytes(elf_func_ids[i], &x64_execve, &.{});
+                } else if (std.mem.eql(u8, name, "kqueue_create") or
+                    std.mem.eql(u8, name, "kevent_add") or
+                    std.mem.eql(u8, name, "kevent_del") or
+                    std.mem.eql(u8, name, "kevent_wait"))
+                {
+                    // kqueue is macOS-only — return -1 on Linux
+                    const x64_stub_neg1 = [_]u8{
+                        0x48, 0xC7, 0xC0, 0xFF, 0xFF, 0xFF, 0xFF, // mov rax, -1
+                        0xC3, // ret
+                    };
+                    try module.defineFunctionBytes(elf_func_ids[i], &x64_stub_neg1, &.{});
+                }
+            } else {
+                try module.defineFunction(elf_func_ids[i], cf);
+            }
+        }
+
+        // If we have a main function, generate the wrapper and static vmctx
+        // Skip in lib mode — shared libraries don't have entry points
+        if (main_func_index != null and !self.lib_mode) {
+            try self.generateMainWrapperElf(&module, data_segments, globals, @intCast(compiled_funcs.len));
+        }
+
+        // Write to memory buffer
+        var output = std.ArrayListUnmanaged(u8){};
+        defer output.deinit(self.allocator);
+        try module.finish(output.writer(self.allocator));
+
+        return output.toOwnedSlice(self.allocator);
+    }
+
+    /// Generate the main wrapper and static vmctx data for ELF (x86-64 Linux).
+    /// The wrapper initializes vmctx, installs signal handlers, and calls __wasm_main.
+    fn generateMainWrapperElf(self: *Driver, module: *object_module.ObjectModule, data_segments: []const wasm_parser.DataSegment, globals: []const wasm_parser.GlobalType, num_funcs: u32) !void {
+        // Relocation types
+        const FinalizedMachReloc = buffer_mod.FinalizedMachReloc;
+        const FinalizedRelocTarget = buffer_mod.FinalizedRelocTarget;
+        const Reloc = buffer_mod.Reloc;
+        const ExternalName = buffer_mod.ExternalName;
+
+        // External name indices
+        const vmctx_ext_idx: u32 = num_funcs;
+        const wasm_main_ext_idx: u32 = num_funcs + 1;
+        const panic_strings_ext_idx: u32 = num_funcs + 2;
+        const signal_handler_ext_idx: u32 = num_funcs + 3;
+        const sigreturn_ext_idx: u32 = num_funcs + 4;
+
+        const vmctx_name_ref = ExternalName{ .User = .{ .namespace = 0, .index = vmctx_ext_idx } };
+        const wasm_main_name_ref = ExternalName{ .User = .{ .namespace = 0, .index = wasm_main_ext_idx } };
+        const panic_strings_name_ref = ExternalName{ .User = .{ .namespace = 0, .index = panic_strings_ext_idx } };
+        const signal_handler_name_ref = ExternalName{ .User = .{ .namespace = 0, .index = signal_handler_ext_idx } };
+        const sigreturn_name_ref = ExternalName{ .User = .{ .namespace = 0, .index = sigreturn_ext_idx } };
+
+        // =================================================================
+        // Step 1: Declare and define static vmctx data section
+        // =================================================================
+        // Total virtual memory: 256 MB. Only initialized portion goes on disk;
+        // the rest is BSS (zero-fill, no disk cost). Go pattern: sysAlloc → mmap.
+        const vmctx_total: usize = 0x10000000; // 256 MB total virtual memory
+        const vmctx_init_size: usize = 0x100000; // 1 MB for initialized data (globals + data segments + control)
+        const vmctx_data = try self.allocator.alloc(u8, vmctx_init_size);
+        defer self.allocator.free(vmctx_data);
+        @memset(vmctx_data, 0);
+
+        const linear_memory_base: usize = 0x40000;
+        for (data_segments) |segment| {
+            const dest_offset = linear_memory_base + segment.offset;
+            if (dest_offset + segment.data.len <= vmctx_init_size) {
+                @memcpy(vmctx_data[dest_offset..][0..segment.data.len], segment.data);
+            }
+        }
+
+        const global_base: usize = 0x10000;
+        const global_stride: usize = 16;
+        for (globals, 0..) |g, i| {
+            const offset = global_base + i * global_stride;
+            if (offset + 8 <= vmctx_init_size) {
+                switch (g.val_type) {
+                    .i32 => {
+                        const val: u32 = @bitCast(@as(i32, @truncate(g.init_value)));
+                        @memcpy(vmctx_data[offset..][0..4], std.mem.asBytes(&val));
+                    },
+                    .i64 => {
+                        const val: u64 = @bitCast(g.init_value);
+                        @memcpy(vmctx_data[offset..][0..8], std.mem.asBytes(&val));
+                    },
+                    .f32 => {
+                        const val: u32 = @bitCast(@as(i32, @truncate(g.init_value)));
+                        @memcpy(vmctx_data[offset..][0..4], std.mem.asBytes(&val));
+                    },
+                    .f64 => {
+                        const val: u64 = @bitCast(g.init_value);
+                        @memcpy(vmctx_data[offset..][0..8], std.mem.asBytes(&val));
+                    },
+                    else => {},
+                }
+            }
+        }
+
+        const heap_bound: u64 = vmctx_total - 0x40000;
+        @memcpy(vmctx_data[0x20008..][0..8], std.mem.asBytes(&heap_bound));
+
+        const vmctx_data_id = try module.declareData("vmctx_data", .Local, true);
+        try module.defineData(vmctx_data_id, vmctx_data);
+        // BSS extends virtual memory from init_size to total (no disk cost)
+        module.setBssSize(vmctx_total - vmctx_init_size);
+
+        // =================================================================
+        // Step 1b: Panic strings data section (same content as MachO)
+        // =================================================================
+        const panic_strings = "fatal error: " ++ "SIGILL\n" ++ "SIGABRT\n" ++ "SIGFPE\n" ++ "SIGBUS\n" ++ "SIGSEGV\n" ++ "unknown signal\n" ++ "pc=0x" ++ "addr=0x" ++ "0123456789abcdef" ++ "\n";
+        const panic_data_id = try module.declareData("cot_panic_strings", .Local, true);
+        try module.defineData(panic_data_id, panic_strings);
+
+        // =================================================================
+        // Step 2: Signal handler function (cot_signal_handler)
+        // x86-64 Linux, called by kernel: rdi=signo, rsi=siginfo_t*, rdx=ucontext_t*
+        // Uses raw syscalls: SYS_write=1, SYS_exit_group=231
+        //
+        // Linux offsets:
+        //   siginfo_t.si_addr: offset 16
+        //   ucontext_t PC (REG_RIP): offset 168 (embedded, not pointer)
+        //     uc_flags(8)+uc_link(8)+uc_stack(24)+uc_mcontext.gregs offset 40
+        //     REG_RIP = index 16: 40 + 16*8 = 168
+        // =================================================================
+        var handler_code = std.ArrayListUnmanaged(u8){};
+        defer handler_code.deinit(self.allocator);
+
+        // Track relocation offsets for lea [rip + cot_panic_strings]
+        var handler_strings_reloc_offset: u32 = 0;
+
+        // --- Prologue ---
+        // push rbp
+        try handler_code.append(self.allocator, 0x55);
+        // mov rbp, rsp
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0x48, 0x89, 0xe5 });
+        // push rbx (callee-saved, will hold panic_strings base)
+        try handler_code.append(self.allocator, 0x53);
+        // push r12 (callee-saved, will hold signo)
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0x41, 0x54 });
+        // push r13 (callee-saved, will hold siginfo_t*)
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0x41, 0x55 });
+        // push r14 (callee-saved, will hold ucontext_t*)
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0x41, 0x56 });
+        // sub rsp, 24 (align stack + 17 byte hex buffer)
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0x48, 0x83, 0xec, 0x18 });
+
+        // --- Save arguments ---
+        // mov r12d, edi (signo, 32-bit)
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0x44, 0x89, 0xe7 }); // Actually: mov edi, r12d is 44 89 e7
+        // Wait, I need mov r12d, edi. That's: 41 89 FC
+        // Let me redo: mov r12, rdi would be 49 89 FC but I want just the 32-bit signo
+        // Actually let's use 64-bit mov: mov r12, rdi = 49 89 FC
+        // Hmm, let me re-emit. Clear what I just emitted for "mov r12d, edi" and redo.
+
+        // Actually the handler_code already has wrong bytes. Let me restart the handler with a cleaner approach.
+        handler_code.clearRetainingCapacity();
+
+        // Prologue: save callee-saved registers
+        try handler_code.append(self.allocator, 0x55); // push rbp
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0x48, 0x89, 0xe5 }); // mov rbp, rsp
+        try handler_code.append(self.allocator, 0x53); // push rbx
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0x41, 0x54 }); // push r12
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0x41, 0x55 }); // push r13
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0x41, 0x56 }); // push r14
+        // sub rsp, 32 (hex buffer + alignment)
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0x48, 0x83, 0xec, 0x20 });
+
+        // Save args in callee-saved regs
+        // mov r12, rdi (signo) — 49 89 fc
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0x49, 0x89, 0xfc });
+        // mov r13, rsi (siginfo_t*) — 49 89 f5
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0x49, 0x89, 0xf5 });
+        // mov r14, rdx (ucontext_t*) — 49 89 d6
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0x49, 0x89, 0xd6 });
+
+        // Load panic strings base into rbx
+        // lea rbx, [rip + cot_panic_strings] — 48 8d 1d XX XX XX XX
+        handler_strings_reloc_offset = @intCast(handler_code.items.len + 3); // reloc at disp32
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0x48, 0x8d, 0x1d, 0x00, 0x00, 0x00, 0x00 });
+
+        // --- Write "fatal error: " (13 bytes) to stderr ---
+        // mov eax, 1 (SYS_write)
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0xb8, 0x01, 0x00, 0x00, 0x00 });
+        // mov edi, 2 (stderr)
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0xbf, 0x02, 0x00, 0x00, 0x00 });
+        // mov rsi, rbx (buf = strings[0])
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0x48, 0x89, 0xde });
+        // mov edx, 13 (len)
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0xba, 0x0d, 0x00, 0x00, 0x00 });
+        // syscall
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0x0f, 0x05 });
+
+        // --- Signal name dispatch ---
+        // We'll use a series of cmp + je. Signal names at offsets in panic_strings:
+        // SIGILL=4→off13,len7  SIGABRT=6→off20,len8  SIGFPE=8→off28,len7
+        // SIGBUS=7(Linux)→off35,len7  SIGSEGV=11→off42,len8  default→off50,len15
+        //
+        // Strategy: load default first, then overwrite with cmp/cmov-style branches.
+        // Actually, use cmp+je chain with forward jumps to write_sig label.
+
+        // lea rsi, [rbx + 50] (default: "unknown signal\n")
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0x48, 0x8d, 0x73, 0x32 }); // 0x32=50
+        // mov edx, 15
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0xba, 0x0f, 0x00, 0x00, 0x00 });
+
+        // cmp r12d, 4 (SIGILL)
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0x41, 0x83, 0xfc, 0x04 });
+        // je .sigill (short jump, will patch offset)
+        const sigill_jmp_off = handler_code.items.len;
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0x74, 0x00 }); // placeholder
+
+        // cmp r12d, 6 (SIGABRT)
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0x41, 0x83, 0xfc, 0x06 });
+        const sigabrt_jmp_off = handler_code.items.len;
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0x74, 0x00 });
+
+        // cmp r12d, 8 (SIGFPE)
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0x41, 0x83, 0xfc, 0x08 });
+        const sigfpe_jmp_off = handler_code.items.len;
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0x74, 0x00 });
+
+        // cmp r12d, 7 (SIGBUS - Linux uses 7, not 10 like macOS)
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0x41, 0x83, 0xfc, 0x07 });
+        const sigbus_jmp_off = handler_code.items.len;
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0x74, 0x00 });
+
+        // cmp r12d, 11 (SIGSEGV)
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0x41, 0x83, 0xfc, 0x0b });
+        const sigsegv_jmp_off = handler_code.items.len;
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0x74, 0x00 });
+
+        // jmp .write_sig (default, no match)
+        const default_jmp_off = handler_code.items.len;
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0xeb, 0x00 }); // placeholder
+
+        // .sigill: lea rsi, [rbx+13]; mov edx, 7; jmp .write_sig
+        handler_code.items[sigill_jmp_off + 1] = @intCast(handler_code.items.len - sigill_jmp_off - 2);
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0x48, 0x8d, 0x73, 0x0d }); // lea rsi,[rbx+13]
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0xba, 0x07, 0x00, 0x00, 0x00 }); // mov edx,7
+        const sigill_jmp2_off = handler_code.items.len;
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0xeb, 0x00 });
+
+        // .sigabrt: lea rsi, [rbx+20]; mov edx, 8; jmp .write_sig
+        handler_code.items[sigabrt_jmp_off + 1] = @intCast(handler_code.items.len - sigabrt_jmp_off - 2);
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0x48, 0x8d, 0x73, 0x14 }); // lea rsi,[rbx+20]
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0xba, 0x08, 0x00, 0x00, 0x00 }); // mov edx,8
+        const sigabrt_jmp2_off = handler_code.items.len;
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0xeb, 0x00 });
+
+        // .sigfpe: lea rsi, [rbx+28]; mov edx, 7; jmp .write_sig
+        handler_code.items[sigfpe_jmp_off + 1] = @intCast(handler_code.items.len - sigfpe_jmp_off - 2);
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0x48, 0x8d, 0x73, 0x1c }); // lea rsi,[rbx+28]
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0xba, 0x07, 0x00, 0x00, 0x00 }); // mov edx,7
+        const sigfpe_jmp2_off = handler_code.items.len;
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0xeb, 0x00 });
+
+        // .sigbus: lea rsi, [rbx+35]; mov edx, 7; jmp .write_sig
+        handler_code.items[sigbus_jmp_off + 1] = @intCast(handler_code.items.len - sigbus_jmp_off - 2);
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0x48, 0x8d, 0x73, 0x23 }); // lea rsi,[rbx+35]
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0xba, 0x07, 0x00, 0x00, 0x00 }); // mov edx,7
+        const sigbus_jmp2_off = handler_code.items.len;
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0xeb, 0x00 });
+
+        // .sigsegv: lea rsi, [rbx+42]; mov edx, 8 (fall through to write_sig)
+        handler_code.items[sigsegv_jmp_off + 1] = @intCast(handler_code.items.len - sigsegv_jmp_off - 2);
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0x48, 0x8d, 0x73, 0x2a }); // lea rsi,[rbx+42]
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0xba, 0x08, 0x00, 0x00, 0x00 }); // mov edx,8
+
+        // .write_sig: — patch all forward jumps
+        const write_sig_off = handler_code.items.len;
+        handler_code.items[default_jmp_off + 1] = @intCast(write_sig_off - default_jmp_off - 2);
+        handler_code.items[sigill_jmp2_off + 1] = @intCast(write_sig_off - sigill_jmp2_off - 2);
+        handler_code.items[sigabrt_jmp2_off + 1] = @intCast(write_sig_off - sigabrt_jmp2_off - 2);
+        handler_code.items[sigfpe_jmp2_off + 1] = @intCast(write_sig_off - sigfpe_jmp2_off - 2);
+        handler_code.items[sigbus_jmp2_off + 1] = @intCast(write_sig_off - sigbus_jmp2_off - 2);
+
+        // Write signal name: syscall(SYS_write=1, fd=2, rsi=buf, rdx=len)
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0xb8, 0x01, 0x00, 0x00, 0x00 }); // mov eax, 1
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0xbf, 0x02, 0x00, 0x00, 0x00 }); // mov edi, 2
+        // rsi and rdx already set from dispatch above
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0x0f, 0x05 }); // syscall
+
+        // --- Hex conversion helper (inline macro-like) ---
+        // For each of PC and addr, we:
+        //   1. Write prefix string
+        //   2. Convert 64-bit value to 16 hex chars + \n on stack
+        //   3. Write the buffer
+
+        // === Write "pc=0x" (5 bytes at offset 65) ===
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0xb8, 0x01, 0x00, 0x00, 0x00 }); // mov eax, 1
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0xbf, 0x02, 0x00, 0x00, 0x00 }); // mov edi, 2
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0x48, 0x8d, 0x73, 0x41 }); // lea rsi,[rbx+65]
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0xba, 0x05, 0x00, 0x00, 0x00 }); // mov edx, 5
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0x0f, 0x05 }); // syscall
+
+        // Extract PC: Linux ucontext_t REG_RIP at offset 168 (embedded)
+        // mov rax, [r14 + 168] — 49 8b 86 a8 00 00 00
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0x49, 0x8b, 0x86, 0xa8, 0x00, 0x00, 0x00 });
+
+        // Convert rax to 16 hex chars at [rsp]
+        // lea rdi, [rbx + 77] (hex table "0123456789abcdef")
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0x48, 0x8d, 0x7b, 0x4d }); // lea rdi,[rbx+77]
+        // mov ecx, 60 (shift counter, 60..0 by 4)
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0xb9, 0x3c, 0x00, 0x00, 0x00 });
+        // lea r8, [rsp] (buffer pointer)
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0x4c, 0x8d, 0x04, 0x24 });
+        // .hex_loop_pc:
+        const hex_pc_loop = handler_code.items.len;
+        //   mov rdx, rax; shr rdx, cl; and edx, 0xf; movzx edx, byte [rdi+rdx]; mov [r8], dl; inc r8; sub ecx, 4; jge .hex_loop_pc
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0x48, 0x89, 0xc2 }); // mov rdx, rax
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0x48, 0xd3, 0xea }); // shr rdx, cl
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0x83, 0xe2, 0x0f }); // and edx, 0xf
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0x0f, 0xb6, 0x14, 0x17 }); // movzx edx, byte [rdi+rdx]
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0x41, 0x88, 0x10 }); // mov [r8], dl
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0x49, 0xff, 0xc0 }); // inc r8
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0x83, 0xe9, 0x04 }); // sub ecx, 4
+        // jge .hex_loop_pc
+        const hex_pc_jge_off = handler_code.items.len;
+        const hex_pc_disp: i8 = @intCast(@as(i32, @intCast(hex_pc_loop)) - @as(i32, @intCast(handler_code.items.len + 2)));
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0x7d, @bitCast(hex_pc_disp) });
+
+        // Store '\n' and write 17 bytes
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0x41, 0xc6, 0x00, 0x0a }); // mov byte [r8], 0x0a
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0xb8, 0x01, 0x00, 0x00, 0x00 }); // mov eax, 1
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0xbf, 0x02, 0x00, 0x00, 0x00 }); // mov edi, 2
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0x48, 0x89, 0xe6 }); // mov rsi, rsp
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0xba, 0x11, 0x00, 0x00, 0x00 }); // mov edx, 17
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0x0f, 0x05 }); // syscall
+
+        // === Write "addr=0x" (7 bytes at offset 70) ===
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0xb8, 0x01, 0x00, 0x00, 0x00 }); // mov eax, 1
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0xbf, 0x02, 0x00, 0x00, 0x00 }); // mov edi, 2
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0x48, 0x8d, 0x73, 0x46 }); // lea rsi,[rbx+70]
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0xba, 0x07, 0x00, 0x00, 0x00 }); // mov edx, 7
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0x0f, 0x05 }); // syscall
+
+        // Extract fault addr: siginfo_t.si_addr at offset 16 on Linux
+        // mov rax, [r13 + 16] — 49 8b 45 10
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0x49, 0x8b, 0x45, 0x10 });
+
+        // Same hex conversion loop for addr
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0x48, 0x8d, 0x7b, 0x4d }); // lea rdi,[rbx+77]
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0xb9, 0x3c, 0x00, 0x00, 0x00 }); // mov ecx, 60
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0x4c, 0x8d, 0x04, 0x24 }); // lea r8, [rsp]
+        const hex_addr_loop = handler_code.items.len;
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0x48, 0x89, 0xc2 }); // mov rdx, rax
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0x48, 0xd3, 0xea }); // shr rdx, cl
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0x83, 0xe2, 0x0f }); // and edx, 0xf
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0x0f, 0xb6, 0x14, 0x17 }); // movzx edx, byte [rdi+rdx]
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0x41, 0x88, 0x10 }); // mov [r8], dl
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0x49, 0xff, 0xc0 }); // inc r8
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0x83, 0xe9, 0x04 }); // sub ecx, 4
+        const hex_addr_jge_off = handler_code.items.len;
+        const hex_addr_disp: i8 = @intCast(@as(i32, @intCast(hex_addr_loop)) - @as(i32, @intCast(handler_code.items.len + 2)));
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0x7d, @bitCast(hex_addr_disp) });
+
+        // Store '\n' and write
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0x41, 0xc6, 0x00, 0x0a }); // mov byte [r8], 0x0a
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0xb8, 0x01, 0x00, 0x00, 0x00 }); // mov eax, 1
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0xbf, 0x02, 0x00, 0x00, 0x00 }); // mov edi, 2
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0x48, 0x89, 0xe6 }); // mov rsi, rsp
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0xba, 0x11, 0x00, 0x00, 0x00 }); // mov edx, 17
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0x0f, 0x05 }); // syscall
+
+        // --- Exit with code 2 ---
+        // mov eax, 231 (SYS_exit_group)
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0xb8, 0xe7, 0x00, 0x00, 0x00 });
+        // mov edi, 2
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0xbf, 0x02, 0x00, 0x00, 0x00 });
+        // syscall
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0x0f, 0x05 });
+        // ud2 (unreachable)
+        try handler_code.appendSlice(self.allocator, &[_]u8{ 0x0f, 0x0b });
+
+        // Suppress unused variable warnings
+        _ = hex_pc_jge_off;
+        _ = hex_addr_jge_off;
+
+        // Declare and define signal handler
+        const handler_func_id = try module.declareFunction("cot_signal_handler", .Local);
+        const handler_relocs = [_]FinalizedMachReloc{
+            .{
+                .offset = handler_strings_reloc_offset,
+                .kind = Reloc.X86PCRel4,
+                .target = FinalizedRelocTarget{ .ExternalName = panic_strings_name_ref },
+                .addend = -4,
+            },
+        };
+        try module.defineFunctionBytes(handler_func_id, handler_code.items, &handler_relocs);
+
+        // =================================================================
+        // Step 2b: Sigreturn trampoline (required by Linux rt_sigaction)
+        // Just: mov rax, 15; syscall (SYS_rt_sigreturn)
+        // =================================================================
+        const sigreturn_code = [_]u8{
+            0xb8, 0x0f, 0x00, 0x00, 0x00, // mov eax, 15 (SYS_rt_sigreturn)
+            0x0f, 0x05, // syscall
+        };
+        const sigreturn_func_id = try module.declareFunction("cot_sigreturn", .Local);
+        try module.defineFunctionBytes(sigreturn_func_id, &sigreturn_code, &.{});
+
+        // =================================================================
+        // Step 3: Generate main wrapper
+        // Same as original but with rt_sigaction calls before __wasm_main.
+        //
+        // Linux kernel rt_sigaction struct (32 bytes):
+        //   [0]  sa_handler (8 bytes)
+        //   [8]  sa_flags (8 bytes) = SA_SIGINFO|SA_ONSTACK|SA_RESTART|SA_RESTORER
+        //        = 0x4|0x8000000|0x10000000|0x4000000 = 0x1C000004
+        //   [16] sa_restorer (8 bytes) = address of cot_sigreturn
+        //   [24] sa_mask (8 bytes) = 0xFFFFFFFFFFFFFFFF
+        //
+        // rt_sigaction syscall: rax=13, rdi=signo, rsi=&act, rdx=NULL, r10=8
+        // =================================================================
+        var wrapper_code = std.ArrayListUnmanaged(u8){};
+        defer wrapper_code.deinit(self.allocator);
+
+        // Track relocation offsets
+        var reloc_list = std.ArrayListUnmanaged(FinalizedMachReloc){};
+        defer reloc_list.deinit(self.allocator);
+
+        // push rbp
+        try wrapper_code.append(self.allocator, 0x55);
+        // mov rbp, rsp
+        try wrapper_code.appendSlice(self.allocator, &[_]u8{ 0x48, 0x89, 0xe5 });
+        // push rdi (argc)
+        try wrapper_code.append(self.allocator, 0x57);
+        // push rsi (argv)
+        try wrapper_code.append(self.allocator, 0x56);
+        // push rdx (envp)
+        try wrapper_code.append(self.allocator, 0x52);
+        // sub rsp, 32 (sigaction struct on stack, 32 bytes)
+        try wrapper_code.appendSlice(self.allocator, &[_]u8{ 0x48, 0x83, 0xec, 0x20 });
+
+        // lea rdi, [rip + vmctx_data]
+        const vmctx_reloc_off: u32 = @intCast(wrapper_code.items.len + 3);
+        try wrapper_code.appendSlice(self.allocator, &[_]u8{ 0x48, 0x8d, 0x3d, 0x00, 0x00, 0x00, 0x00 });
+        try reloc_list.append(self.allocator, .{
+            .offset = vmctx_reloc_off,
+            .kind = Reloc.X86PCRel4,
+            .target = FinalizedRelocTarget{ .ExternalName = vmctx_name_ref },
+            .addend = -4,
+        });
+
+        // lea rax, [rdi + 0x40000] (heap base)
+        try wrapper_code.appendSlice(self.allocator, &[_]u8{ 0x48, 0x8d, 0x87, 0x00, 0x00, 0x04, 0x00 });
+        // mov [rdi + 0x20000], rax (store heap base)
+        try wrapper_code.appendSlice(self.allocator, &[_]u8{ 0x48, 0x89, 0x87, 0x00, 0x00, 0x02, 0x00 });
+
+        // Restore envp, argv, argc from stack and store into vmctx
+        // We need to access the stack items above the 32-byte sigaction area
+        // Stack layout: [rsp]=sigaction(32), [rsp+32]=envp, [rsp+40]=argv, [rsp+48]=argc
+        // mov rax, [rsp+32] (envp)
+        try wrapper_code.appendSlice(self.allocator, &[_]u8{ 0x48, 0x8b, 0x44, 0x24, 0x20 });
+        // mov [rdi + 0x30010], rax
+        try wrapper_code.appendSlice(self.allocator, &[_]u8{ 0x48, 0x89, 0x87, 0x10, 0x00, 0x03, 0x00 });
+        // mov rax, [rsp+40] (argv)
+        try wrapper_code.appendSlice(self.allocator, &[_]u8{ 0x48, 0x8b, 0x44, 0x24, 0x28 });
+        // mov [rdi + 0x30008], rax
+        try wrapper_code.appendSlice(self.allocator, &[_]u8{ 0x48, 0x89, 0x87, 0x08, 0x00, 0x03, 0x00 });
+        // mov rax, [rsp+48] (argc, originally in edi so 32-bit)
+        try wrapper_code.appendSlice(self.allocator, &[_]u8{ 0x48, 0x63, 0x44, 0x24, 0x30 }); // movsxd rax, [rsp+48]
+        // mov [rdi + 0x30000], rax
+        try wrapper_code.appendSlice(self.allocator, &[_]u8{ 0x48, 0x89, 0x87, 0x00, 0x00, 0x03, 0x00 });
+
+        // Save rdi (vmctx) — push it on stack (we'll need it after sigaction calls)
+        try wrapper_code.append(self.allocator, 0x57); // push rdi
+
+        // --- Build sigaction struct at [rsp+8] (rsp moved by push rdi) ---
+        // Actually, after the push, the original sigaction area is at [rsp+8].
+        // Let's use [rsp+8] for the struct.
+
+        // lea rax, [rip + cot_signal_handler]
+        const handler_reloc_off: u32 = @intCast(wrapper_code.items.len + 3);
+        try wrapper_code.appendSlice(self.allocator, &[_]u8{ 0x48, 0x8d, 0x05, 0x00, 0x00, 0x00, 0x00 });
+        try reloc_list.append(self.allocator, .{
+            .offset = handler_reloc_off,
+            .kind = Reloc.X86PCRel4,
+            .target = FinalizedRelocTarget{ .ExternalName = signal_handler_name_ref },
+            .addend = -4,
+        });
+        // mov [rsp+8], rax (sa_handler)
+        try wrapper_code.appendSlice(self.allocator, &[_]u8{ 0x48, 0x89, 0x44, 0x24, 0x08 });
+
+        // mov rax, 0x1C000004 (sa_flags = SA_SIGINFO|SA_ONSTACK|SA_RESTART|SA_RESTORER)
+        try wrapper_code.appendSlice(self.allocator, &[_]u8{ 0x48, 0xc7, 0xc0, 0x04, 0x00, 0x00, 0x1c });
+        // mov [rsp+16], rax (sa_flags)
+        try wrapper_code.appendSlice(self.allocator, &[_]u8{ 0x48, 0x89, 0x44, 0x24, 0x10 });
+
+        // lea rax, [rip + cot_sigreturn]
+        const sigreturn_reloc_off: u32 = @intCast(wrapper_code.items.len + 3);
+        try wrapper_code.appendSlice(self.allocator, &[_]u8{ 0x48, 0x8d, 0x05, 0x00, 0x00, 0x00, 0x00 });
+        try reloc_list.append(self.allocator, .{
+            .offset = sigreturn_reloc_off,
+            .kind = Reloc.X86PCRel4,
+            .target = FinalizedRelocTarget{ .ExternalName = sigreturn_name_ref },
+            .addend = -4,
+        });
+        // mov [rsp+24], rax (sa_restorer)
+        try wrapper_code.appendSlice(self.allocator, &[_]u8{ 0x48, 0x89, 0x44, 0x24, 0x18 });
+
+        // mov qword [rsp+32], -1 (sa_mask = all bits set)
+        try wrapper_code.appendSlice(self.allocator, &[_]u8{ 0x48, 0xc7, 0x44, 0x24, 0x20, 0xff, 0xff, 0xff, 0xff });
+
+        // --- Call rt_sigaction for each signal ---
+        // syscall(13, signo, &act, NULL, 8)
+        // rax=13, rdi=signo, rsi=&act, rdx=NULL, r10=8
+        const signals = [_]u8{ 4, 6, 8, 7, 11 }; // SIGILL, SIGABRT, SIGFPE, SIGBUS(7 on Linux), SIGSEGV
+        for (signals) |signo| {
+            // mov eax, 13 (SYS_rt_sigaction)
+            try wrapper_code.appendSlice(self.allocator, &[_]u8{ 0xb8, 0x0d, 0x00, 0x00, 0x00 });
+            // mov edi, signo
+            try wrapper_code.appendSlice(self.allocator, &[_]u8{ 0xbf, signo, 0x00, 0x00, 0x00 });
+            // lea rsi, [rsp+8] (act struct)
+            try wrapper_code.appendSlice(self.allocator, &[_]u8{ 0x48, 0x8d, 0x74, 0x24, 0x08 });
+            // xor edx, edx (NULL oact)
+            try wrapper_code.appendSlice(self.allocator, &[_]u8{ 0x31, 0xd2 });
+            // mov r10d, 8 (sigsetsize)
+            try wrapper_code.appendSlice(self.allocator, &[_]u8{ 0x41, 0xba, 0x08, 0x00, 0x00, 0x00 });
+            // syscall
+            try wrapper_code.appendSlice(self.allocator, &[_]u8{ 0x0f, 0x05 });
+        }
+
+        // --- Restore vmctx and call __wasm_main ---
+        // pop rdi (vmctx)
+        try wrapper_code.append(self.allocator, 0x5f);
+        // mov rsi, rdi (caller_vmctx = vmctx)
+        try wrapper_code.appendSlice(self.allocator, &[_]u8{ 0x48, 0x89, 0xfe });
+
+        // call __wasm_main
+        const wasm_main_reloc_off: u32 = @intCast(wrapper_code.items.len + 1);
+        try wrapper_code.appendSlice(self.allocator, &[_]u8{ 0xe8, 0x00, 0x00, 0x00, 0x00 });
+        try reloc_list.append(self.allocator, .{
+            .offset = wasm_main_reloc_off,
+            .kind = Reloc.X86CallPCRel4,
+            .target = FinalizedRelocTarget{ .ExternalName = wasm_main_name_ref },
+            .addend = -4,
+        });
+
+        // Epilogue: clean up stack and return
+        // add rsp, 32 (remove sigaction struct)
+        try wrapper_code.appendSlice(self.allocator, &[_]u8{ 0x48, 0x83, 0xc4, 0x20 });
+        // pop rdx (discard saved envp)
+        try wrapper_code.append(self.allocator, 0x5a);
+        // pop rsi (discard saved argv)
+        try wrapper_code.append(self.allocator, 0x5e);
+        // pop rdi (discard saved argc)
+        try wrapper_code.append(self.allocator, 0x5f);
+        // pop rbp
+        try wrapper_code.append(self.allocator, 0x5d);
+        // ret
+        try wrapper_code.append(self.allocator, 0xc3);
+
+        // Declare main wrapper
+        const main_func_id = try module.declareFunction("main", .Export);
+
+        // Register all external names
+        try module.declareExternalName(vmctx_ext_idx, "vmctx_data");
+        try module.declareExternalName(wasm_main_ext_idx, "__wasm_main");
+        try module.declareExternalName(panic_strings_ext_idx, "cot_panic_strings");
+        try module.declareExternalName(signal_handler_ext_idx, "cot_signal_handler");
+        try module.declareExternalName(sigreturn_ext_idx, "cot_sigreturn");
+
+        try module.defineFunctionBytes(main_func_id, wrapper_code.items, reloc_list.items);
+    }
+
+    /// Generate WebAssembly binary.
+    /// Uses Go-style Linker for module structure with proper SP globals.
+    fn generateWasmCode(self: *Driver, funcs: []const ir_mod.Func, globals: []const ir_mod.Global, type_reg: *types_mod.TypeRegistry) ![]u8 {
+        debug.log(.codegen, "driver: generating Wasm for {d} functions", .{funcs.len});
+
+        var linker = wasm.Linker.init(self.allocator);
+        defer linker.deinit();
+
+        const is_wasm_gc = self.target.isWasmGC();
+
+        // Configure memory (256 pages = 16MB minimum)
+        // Pages 0-127: Stack (grows down from 8MB, matches OS thread default)
+        // Page 128+: Heap (starts at 8MB / 0x800000)
+        linker.setMemory(256, null);
+
+        // ====================================================================
+        // Add CTXT global (closure context pointer, Go: REG_CTXT = Global 1)
+        // Must be before arc.addToLinker so heap_ptr shifts to global 2
+        // Layout: SP(0), CTXT(1), heap_ptr(2)
+        // ====================================================================
+        _ = try linker.addGlobal(.{ .val_type = .i64, .mutable = true, .init_i64 = 0 });
+
+        // ====================================================================
+        // WasmGC: Register GC struct types in linker BEFORE runtime functions.
+        // GC types get indices 0..N-1, shifting all function type indices by N.
+        // This must happen before ARC/runtime function assembly so that
+        // call_indirect type indices in those functions are correct.
+        // ====================================================================
+        if (is_wasm_gc) {
+            const wasm_link = @import("codegen/wasm/link.zig");
+            // First pass: register all struct/union base type names
+            for (type_reg.types.items) |t| {
+                if (t == .struct_type) {
+                    const st = t.struct_type;
+                    // Pre-register with empty fields to get type index
+                    _ = try linker.addGcStructType(st.name, &.{});
+                } else if (t == .union_type) {
+                    const ut = t.union_type;
+                    // Register empty base type for the union
+                    _ = try linker.addGcStructType(ut.name, &.{});
+                    // Register variant subtypes: __union_Name_variant
+                    for (ut.variants) |v| {
+                        const variant_name = try std.fmt.allocPrint(self.allocator, "__union_{s}_{s}", .{ ut.name, v.name });
+                        _ = try linker.addGcStructType(variant_name, &.{});
+                    }
+                }
+            }
+            // Second pass: fill in field types (may reference other structs)
+            // Compound fields (string=3 chunks, slice=3 chunks) are expanded to
+            // multiple i64 GC fields so struct.new/get/set operate per-chunk.
+            for (type_reg.types.items) |t| {
+                if (t == .struct_type) {
+                    const st = t.struct_type;
+                    // Count total chunks across all fields
+                    var total_chunks: usize = 0;
+                    for (st.fields) |field| {
+                        const field_info = type_reg.get(field.type_idx);
+                        if (field_info == .struct_type) {
+                            total_chunks += 1; // GC ref = 1 chunk
+                        } else {
+                            const field_size = type_reg.sizeOf(field.type_idx);
+                            total_chunks += @max(1, (field_size + 7) / 8);
+                        }
+                    }
+                    var gc_fields = try self.allocator.alloc(wasm_link.GcFieldType, total_chunks);
+                    defer self.allocator.free(gc_fields);
+                    var chunk_idx: usize = 0;
+                    for (st.fields) |field| {
+                        const is_float = field.type_idx == types_mod.TypeRegistry.F64 or
+                            field.type_idx == types_mod.TypeRegistry.F32;
+                        const field_info = type_reg.get(field.type_idx);
+                        // Check if field is a struct type (or pointer to struct) → GC ref
+                        const field_struct_name: ?[]const u8 = switch (field_info) {
+                            .struct_type => |fst| fst.name,
+                            .pointer => |ptr| switch (type_reg.get(ptr.elem)) {
+                                .struct_type => |fst| fst.name,
+                                else => null,
+                            },
+                            else => null,
+                        };
+                        const gc_ref: ?u32 = if (field_struct_name) |name|
+                            linker.gc_struct_name_map.get(name)
+                        else
+                            null;
+                        if (gc_ref != null) {
+                            // Struct field: single GC ref
+                            gc_fields[chunk_idx] = .{
+                                .val_type = .i64,
+                                .mutable = true,
+                                .gc_ref = gc_ref,
+                            };
+                            chunk_idx += 1;
+                        } else {
+                            // Primitive or compound field: expand to i64 chunks
+                            const field_size = type_reg.sizeOf(field.type_idx);
+                            const num_chunks = @max(1, (field_size + 7) / 8);
+                            for (0..num_chunks) |ci| {
+                                gc_fields[chunk_idx] = .{
+                                    .val_type = if (ci == 0 and is_float) .f64 else .i64,
+                                    .mutable = true,
+                                    .gc_ref = null,
+                                };
+                                chunk_idx += 1;
+                            }
+                        }
+                    }
+                    // Update the existing struct type's fields
+                    const type_idx = linker.gc_struct_name_map.get(st.name).?;
+                    const gs = &linker.gc_struct_types.items[type_idx];
+                    gs.field_offset = @intCast(linker.gc_field_storage.items.len);
+                    gs.field_count = @intCast(gc_fields.len);
+                    try linker.gc_field_storage.appendSlice(self.allocator, gc_fields);
+                }
+            }
+
+            // Third pass: fill in union variant subtype fields + set super_type
+            for (type_reg.types.items) |t| {
+                if (t == .union_type) {
+                    const ut = t.union_type;
+                    const base_idx = linker.gc_struct_name_map.get(ut.name) orelse continue;
+
+                    for (ut.variants) |v| {
+                        const variant_name = try std.fmt.allocPrint(self.allocator, "__union_{s}_{s}", .{ ut.name, v.name });
+                        const variant_idx = linker.gc_struct_name_map.get(variant_name) orelse continue;
+
+                        // Set super_type to base union type
+                        linker.gc_struct_types.items[variant_idx].super_type = base_idx;
+
+                        // Build fields for variant payload
+                        if (v.payload_type == types_mod.TypeRegistry.VOID) {
+                            // Unit variant: no fields (empty struct subtype)
+                            continue;
+                        }
+
+                        const payload_info = type_reg.get(v.payload_type);
+                        if (payload_info == .struct_type) {
+                            // Struct payload: expand fields same as struct type registration
+                            const pst = payload_info.struct_type;
+                            var total_chunks: usize = 0;
+                            for (pst.fields) |field| {
+                                const fi = type_reg.get(field.type_idx);
+                                if (fi == .struct_type) {
+                                    total_chunks += 1;
+                                } else {
+                                    const fs = type_reg.sizeOf(field.type_idx);
+                                    total_chunks += @max(1, (fs + 7) / 8);
+                                }
+                            }
+                            var gc_fields = try self.allocator.alloc(wasm_link.GcFieldType, total_chunks);
+                            defer self.allocator.free(gc_fields);
+                            var ci: usize = 0;
+                            for (pst.fields) |field| {
+                                const is_float = field.type_idx == types_mod.TypeRegistry.F64 or
+                                    field.type_idx == types_mod.TypeRegistry.F32;
+                                const fi = type_reg.get(field.type_idx);
+                                const field_struct_name: ?[]const u8 = switch (fi) {
+                                    .struct_type => |fst| fst.name,
+                                    .pointer => |ptr| switch (type_reg.get(ptr.elem)) {
+                                        .struct_type => |fst| fst.name,
+                                        else => null,
+                                    },
+                                    else => null,
+                                };
+                                const gc_ref: ?u32 = if (field_struct_name) |name|
+                                    linker.gc_struct_name_map.get(name)
+                                else
+                                    null;
+                                if (gc_ref != null) {
+                                    gc_fields[ci] = .{ .val_type = .i64, .mutable = true, .gc_ref = gc_ref };
+                                    ci += 1;
+                                } else {
+                                    const fs = type_reg.sizeOf(field.type_idx);
+                                    const nc = @max(1, (fs + 7) / 8);
+                                    for (0..nc) |cj| {
+                                        gc_fields[ci] = .{
+                                            .val_type = if (cj == 0 and is_float) .f64 else .i64,
+                                            .mutable = true,
+                                            .gc_ref = null,
+                                        };
+                                        ci += 1;
+                                    }
+                                }
+                            }
+                            const gv = &linker.gc_struct_types.items[variant_idx];
+                            gv.field_offset = @intCast(linker.gc_field_storage.items.len);
+                            gv.field_count = @intCast(gc_fields.len);
+                            try linker.gc_field_storage.appendSlice(self.allocator, gc_fields);
+                        } else {
+                            // Primitive payload: single i64 field
+                            const is_float = v.payload_type == types_mod.TypeRegistry.F64 or
+                                v.payload_type == types_mod.TypeRegistry.F32;
+                            const gc_field = wasm_link.GcFieldType{
+                                .val_type = if (is_float) .f64 else .i64,
+                                .mutable = true,
+                                .gc_ref = null,
+                            };
+                            const gv = &linker.gc_struct_types.items[variant_idx];
+                            gv.field_offset = @intCast(linker.gc_field_storage.items.len);
+                            gv.field_count = 1;
+                            try linker.gc_field_storage.append(self.allocator, gc_field);
+                        }
+                    }
+                }
+            }
+        }
+
+        // ====================================================================
+        // Heap pointer global for linear memory allocation (slice growth, etc.)
+        // WasmGC: no ARC, but slice_runtime still needs a heap pointer for
+        // growslice (linear memory backing store for slices).
+        // Layout: SP(0), CTXT(1), heap_ptr(2)
+        // ====================================================================
+        const heap_ptr_dynamic_idx = try linker.addGlobal(.{
+            .val_type = .i32,
+            .mutable = true,
+            .init_i32 = @intCast(0x800000), // HEAP_START = 8MB
+        });
+        const heap_ptr_global = heap_ptr_dynamic_idx + 1; // Offset by SP
+
+        // ====================================================================
+        // Add WASI runtime functions FIRST (adds WASI host imports for Wasm targets)
+        // Must be before other runtimes so import_count is known for index offsetting.
+        // Reference: WASI preview1 fd_write
+        // ====================================================================
+        const wasi_funcs = try wasi_runtime.addToLinker(self.allocator, &linker, self.target);
+
+        // ====================================================================
+        // For --target=js (browser): register user extern fns as real Wasm imports
+        // instead of stubs. These become import entries in the Wasm binary that
+        // the JS host must provide. Module name "env" (standard convention).
+        // Runtime functions (alloc, fd_write, etc.) remain as module stubs.
+        // Reference: WASI import pattern in wasi_runtime.zig — same addType+addImport.
+        // Reference: Go syscall/js — wasm_exec.js provides host functions.
+        // ====================================================================
+        if (!self.target.isWasi()) {
+            for (self.user_extern_fns.items, 0..) |name, idx| {
+                // Skip runtime functions — they're already handled as module stubs
+                // by wasi_runtime, mem_runtime, print_runtime, etc.
+                if (wasi_runtime.isRuntimeFunction(name)) continue;
+
+                const param_count = self.user_extern_param_counts.items[idx];
+                const has_result = self.user_extern_has_result.items[idx];
+
+                // Create Wasm type: all params are i64 (Cot's Wasm calling convention)
+                const wasm_constants = @import("codegen/wasm/constants.zig");
+                var param_types_buf: [32]wasm_constants.ValType = undefined;
+                const pc = @min(param_count, 32);
+                for (0..pc) |i| {
+                    param_types_buf[i] = .i64;
+                }
+                const result_types: []const wasm_constants.ValType = if (has_result) &.{.i64} else &.{};
+                const type_idx = try linker.addType(param_types_buf[0..pc], result_types);
+
+                _ = try linker.addImport(.{
+                    .module = "env",
+                    .name = name,
+                    .type_idx = type_idx,
+                });
+            }
+        }
+
+        // On Wasm targets, WASI imports shift all module function indices.
+        // All module function indices must be offset by import_count to get
+        // the correct Wasm function index for call instructions.
+        const import_count = linker.numImports();
+
+        // ====================================================================
+        // Add memory utility functions (memcpy, memset_zero, string_eq, string_concat)
+        // These are non-ARC, needed by stdlib on both ARC and WasmGC paths.
+        // ====================================================================
+        const mem_funcs = try mem_runtime.addToLinker(self.allocator, &linker, heap_ptr_global);
+
+        // ====================================================================
+        // Add slice runtime functions (Go style)
+        // Reference: Go runtime/slice.go
+        // ====================================================================
+        const slice_funcs = try slice_runtime.addToLinker(self.allocator, &linker, heap_ptr_global);
+
+        // ====================================================================
+        // Add print runtime functions (Go style)
+        // On Wasm: write forwards to WASI fd_write_simple for real I/O.
+        // On native: write is a stub, overridden with ARM64/x64 syscall.
+        // Reference: Go runtime/print.go
+        // ====================================================================
+        const wasi_write_override: ?u32 = if (self.target.isWasm()) wasi_funcs.fd_write_simple_idx else null;
+        const print_funcs = try print_runtime.addToLinker(self.allocator, &linker, import_count, wasi_write_override);
+
+        // ====================================================================
+        // Add test runtime functions (Zig test runner pattern)
+        // Reference: Zig test runner output format
+        // ====================================================================
+        const test_funcs = try test_runtime.addToLinker(self.allocator, &linker, print_funcs.write_idx, print_funcs.eprint_int_idx, wasi_funcs.time_idx);
+
+        // ====================================================================
+        // Add bench runtime functions (Go testing.B calibration pattern)
+        // ====================================================================
+        const bench_funcs = try bench_runtime.addToLinker(self.allocator, &linker, print_funcs.write_idx, print_funcs.eprint_int_idx, wasi_funcs.time_idx, self.bench_n);
+
+        // ====================================================================
+        // Add executor runtime (call_indirect bridge for task polling)
+        // Swift reference: ExecutorJob.runSynchronously(on:)
+        // ====================================================================
+        const executor_funcs = try executor_runtime.addToLinker(self.allocator, &linker);
+
+        // Get actual count from linker - never hardcode (Go: len(hostImports))
+        const runtime_func_count = linker.funcCount();
+
+        // Set minimum table size of 1 for call_indirect (destructor calls)
+        // Table entry 0 is reserved (null/no destructor)
+        linker.setTableSize(1);
+
+        // Build function name -> index mapping
+        // Runtime functions come first, then user functions
+        var func_indices = wasm.FuncIndexMap{};
+        defer func_indices.deinit(self.allocator);
+
+        // Add memory utility function names to index map
+        // Module function indices are offset by import_count to get Wasm function indices
+        try func_indices.put(self.allocator, mem_runtime.ALLOC_NAME, mem_funcs.alloc_idx + import_count);
+        try func_indices.put(self.allocator, mem_runtime.DEALLOC_NAME, mem_funcs.dealloc_idx + import_count);
+        try func_indices.put(self.allocator, mem_runtime.REALLOC_NAME, mem_funcs.realloc_idx + import_count);
+        try func_indices.put(self.allocator, "realloc", mem_funcs.realloc_idx + import_count); // alias for user code
+        try func_indices.put(self.allocator, mem_runtime.ALLOC_RAW_NAME, mem_funcs.alloc_raw_idx + import_count);
+        try func_indices.put(self.allocator, mem_runtime.REALLOC_RAW_NAME, mem_funcs.realloc_raw_idx + import_count);
+        try func_indices.put(self.allocator, mem_runtime.DEALLOC_RAW_NAME, mem_funcs.dealloc_raw_idx + import_count);
+        try func_indices.put(self.allocator, mem_runtime.MEMCPY_NAME, mem_funcs.memcpy_idx + import_count);
+        try func_indices.put(self.allocator, mem_runtime.MEMSET_ZERO_NAME, mem_funcs.memset_zero_idx + import_count);
+        try func_indices.put(self.allocator, mem_runtime.STRING_EQ_NAME, mem_funcs.string_eq_idx + import_count);
+        try func_indices.put(self.allocator, mem_runtime.STRING_CONCAT_NAME, mem_funcs.string_concat_idx + import_count);
+        try func_indices.put(self.allocator, "memcmp", mem_funcs.memcmp_idx + import_count);
+        try func_indices.put(self.allocator, "retain", mem_funcs.retain_noop_idx + import_count);
+        try func_indices.put(self.allocator, "release", mem_funcs.release_noop_idx + import_count);
+
+        // Add slice function names to index map (Go)
+        try func_indices.put(self.allocator, slice_runtime.GROWSLICE_NAME, slice_funcs.growslice_idx + import_count);
+        try func_indices.put(self.allocator, slice_runtime.NEXTSLICECAP_NAME, slice_funcs.nextslicecap_idx + import_count);
+
+        // Add print function names to index map (Go)
+        try func_indices.put(self.allocator, print_runtime.WRITE_NAME, print_funcs.write_idx);
+        try func_indices.put(self.allocator, print_runtime.PRINT_INT_NAME, print_funcs.print_int_idx);
+        try func_indices.put(self.allocator, print_runtime.EPRINT_INT_NAME, print_funcs.eprint_int_idx);
+        try func_indices.put(self.allocator, print_runtime.INT_TO_STRING_NAME, print_funcs.int_to_string_idx);
+        try func_indices.put(self.allocator, print_runtime.PRINT_FLOAT_NAME, print_funcs.print_float_idx);
+        try func_indices.put(self.allocator, print_runtime.EPRINT_FLOAT_NAME, print_funcs.eprint_float_idx);
+        try func_indices.put(self.allocator, print_runtime.FLOAT_TO_STRING_NAME, print_funcs.float_to_string_idx);
+
+        // Add WASI function names to index map
+        try func_indices.put(self.allocator, wasi_runtime.FD_WRITE_NAME, wasi_funcs.fd_write_idx);
+        try func_indices.put(self.allocator, wasi_runtime.FD_WRITE_SIMPLE_NAME, wasi_funcs.fd_write_simple_idx);
+        try func_indices.put(self.allocator, wasi_runtime.FD_READ_SIMPLE_NAME, wasi_funcs.fd_read_simple_idx);
+        try func_indices.put(self.allocator, wasi_runtime.FD_CLOSE_NAME, wasi_funcs.fd_close_idx);
+        try func_indices.put(self.allocator, wasi_runtime.FD_SEEK_NAME, wasi_funcs.fd_seek_idx);
+        try func_indices.put(self.allocator, wasi_runtime.FD_OPEN_NAME, wasi_funcs.fd_open_idx);
+        try func_indices.put(self.allocator, wasi_runtime.TIME_NAME, wasi_funcs.time_idx);
+        try func_indices.put(self.allocator, wasi_runtime.RANDOM_NAME, wasi_funcs.random_idx);
+        try func_indices.put(self.allocator, wasi_runtime.EXIT_NAME, wasi_funcs.exit_idx);
+        try func_indices.put(self.allocator, wasi_runtime.ARGS_COUNT_NAME, wasi_funcs.args_count_idx);
+        try func_indices.put(self.allocator, wasi_runtime.ARG_LEN_NAME, wasi_funcs.arg_len_idx);
+        try func_indices.put(self.allocator, wasi_runtime.ARG_PTR_NAME, wasi_funcs.arg_ptr_idx);
+        try func_indices.put(self.allocator, wasi_runtime.ENVIRON_COUNT_NAME, wasi_funcs.environ_count_idx);
+        try func_indices.put(self.allocator, wasi_runtime.ENVIRON_LEN_NAME, wasi_funcs.environ_len_idx);
+        try func_indices.put(self.allocator, wasi_runtime.ENVIRON_PTR_NAME, wasi_funcs.environ_ptr_idx);
+        // Networking
+        try func_indices.put(self.allocator, wasi_runtime.NET_SOCKET_NAME, wasi_funcs.net_socket_idx);
+        try func_indices.put(self.allocator, wasi_runtime.NET_BIND_NAME, wasi_funcs.net_bind_idx);
+        try func_indices.put(self.allocator, wasi_runtime.NET_LISTEN_NAME, wasi_funcs.net_listen_idx);
+        try func_indices.put(self.allocator, wasi_runtime.NET_ACCEPT_NAME, wasi_funcs.net_accept_idx);
+        try func_indices.put(self.allocator, wasi_runtime.NET_CONNECT_NAME, wasi_funcs.net_connect_idx);
+        try func_indices.put(self.allocator, wasi_runtime.NET_SET_REUSE_ADDR_NAME, wasi_funcs.net_set_reuse_addr_idx);
+        // Event loop (kqueue/epoll)
+        try func_indices.put(self.allocator, wasi_runtime.KQUEUE_CREATE_NAME, wasi_funcs.kqueue_create_idx);
+        try func_indices.put(self.allocator, wasi_runtime.KEVENT_ADD_NAME, wasi_funcs.kevent_add_idx);
+        try func_indices.put(self.allocator, wasi_runtime.KEVENT_DEL_NAME, wasi_funcs.kevent_del_idx);
+        try func_indices.put(self.allocator, wasi_runtime.KEVENT_WAIT_NAME, wasi_funcs.kevent_wait_idx);
+        try func_indices.put(self.allocator, wasi_runtime.EPOLL_CREATE_NAME, wasi_funcs.epoll_create_idx);
+        try func_indices.put(self.allocator, wasi_runtime.EPOLL_ADD_NAME, wasi_funcs.epoll_add_idx);
+        try func_indices.put(self.allocator, wasi_runtime.EPOLL_DEL_NAME, wasi_funcs.epoll_del_idx);
+        try func_indices.put(self.allocator, wasi_runtime.EPOLL_WAIT_NAME, wasi_funcs.epoll_wait_idx);
+        try func_indices.put(self.allocator, wasi_runtime.SET_NONBLOCK_NAME, wasi_funcs.set_nonblocking_idx);
+        // Process spawning
+        try func_indices.put(self.allocator, wasi_runtime.FORK_NAME, wasi_funcs.fork_idx);
+        try func_indices.put(self.allocator, wasi_runtime.EXECVE_NAME, wasi_funcs.execve_idx);
+        try func_indices.put(self.allocator, wasi_runtime.WAITPID_NAME, wasi_funcs.waitpid_idx);
+        try func_indices.put(self.allocator, wasi_runtime.PIPE_NAME, wasi_funcs.pipe_idx);
+        try func_indices.put(self.allocator, wasi_runtime.DUP2_NAME, wasi_funcs.dup2_idx);
+        try func_indices.put(self.allocator, wasi_runtime.ISATTY_NAME, wasi_funcs.isatty_idx);
+        // Directory
+        try func_indices.put(self.allocator, wasi_runtime.MKDIR_NAME, wasi_funcs.mkdir_idx);
+        try func_indices.put(self.allocator, wasi_runtime.DIR_OPEN_NAME, wasi_funcs.dir_open_idx);
+        try func_indices.put(self.allocator, wasi_runtime.DIR_NEXT_NAME, wasi_funcs.dir_next_idx);
+        try func_indices.put(self.allocator, wasi_runtime.DIR_CLOSE_NAME, wasi_funcs.dir_close_idx);
+        try func_indices.put(self.allocator, wasi_runtime.STAT_TYPE_NAME, wasi_funcs.stat_type_idx);
+        try func_indices.put(self.allocator, wasi_runtime.UNLINK_NAME, wasi_funcs.unlink_idx);
+
+        // Add test function names to index map (Zig)
+        try func_indices.put(self.allocator, test_runtime.TEST_BEGIN_NAME, test_funcs.test_begin_idx + import_count);
+        try func_indices.put(self.allocator, test_runtime.TEST_PRINT_NAME_NAME, test_funcs.test_print_name_idx + import_count);
+        try func_indices.put(self.allocator, test_runtime.TEST_PASS_NAME, test_funcs.test_pass_idx + import_count);
+        try func_indices.put(self.allocator, test_runtime.TEST_FAIL_NAME, test_funcs.test_fail_idx + import_count);
+        try func_indices.put(self.allocator, test_runtime.TEST_SUMMARY_NAME, test_funcs.test_summary_idx + import_count);
+        try func_indices.put(self.allocator, test_runtime.TEST_STORE_FAIL_VALUES_NAME, test_funcs.test_store_fail_values_idx + import_count);
+
+        // Add bench function names to index map (Go testing.B)
+        try func_indices.put(self.allocator, bench_runtime.BENCH_PRINT_NAME_NAME, bench_funcs.bench_print_name_idx + import_count);
+        try func_indices.put(self.allocator, bench_runtime.BENCH_CALIBRATE_START_NAME, bench_funcs.bench_calibrate_start_idx + import_count);
+        try func_indices.put(self.allocator, bench_runtime.BENCH_CALIBRATE_END_NAME, bench_funcs.bench_calibrate_end_idx + import_count);
+        try func_indices.put(self.allocator, bench_runtime.BENCH_MEASURE_START_NAME, bench_funcs.bench_measure_start_idx + import_count);
+        try func_indices.put(self.allocator, bench_runtime.BENCH_MEASURE_END_NAME, bench_funcs.bench_measure_end_idx + import_count);
+        try func_indices.put(self.allocator, bench_runtime.BENCH_GET_N_NAME, bench_funcs.bench_get_n_idx + import_count);
+        try func_indices.put(self.allocator, bench_runtime.BENCH_SUMMARY_NAME, bench_funcs.bench_summary_idx + import_count);
+
+        // Add executor runtime function indices
+        try func_indices.put(self.allocator, executor_runtime.POLL_TASK_NAME, executor_funcs.poll_task_idx + import_count);
+        try func_indices.put(self.allocator, executor_runtime.RUN_UNTIL_COMPLETE_NAME, executor_funcs.run_until_complete_idx + import_count);
+        // task_cancel/task_is_cancelled are stdlib Cot functions (not runtime)
+        // — they compile from stdlib/sys.cot and work on both native and Wasm.
+
+        // Add user function names (offset by runtime func count + import count)
+        for (funcs, 0..) |*ir_func, i| {
+            try func_indices.put(self.allocator, ir_func.name, @intCast(i + runtime_func_count + import_count));
+        }
+
+        // ====================================================================
+        // Build destructor table: map type_name -> table index
+        // Reference: Swift stores destructor pointer in type metadata
+        // WasmGC: skip — GC handles object lifetime, no manual destructors
+        // ====================================================================
+        var destructor_table = std.StringHashMap(u32).init(self.allocator);
+        defer destructor_table.deinit();
+
+        // Metadata address map: type_name -> metadata memory address
+        var metadata_addrs = std.StringHashMap(i32).init(self.allocator);
+        defer metadata_addrs.deinit();
+
+        // WasmGC: no destructor table needed — GC handles object lifetime
+        // ARC destructors are native-only (handled in compileNative path)
+
+        // ====================================================================
+        // Build function table: ALL user functions get table entries
+        // Go reference: link/internal/wasm/asm.go:476-494
+        // Go uses: table[funcValueOffset + i] = function[i]
+        // We use a direct map: func_name → table_idx (assigned by linker)
+        // ====================================================================
+        var func_table_indices = std.StringHashMap(u32).init(self.allocator);
+        defer func_table_indices.deinit();
+
+        for (funcs, 0..) |*ir_func, i| {
+            const func_idx: u32 = @intCast(i + runtime_func_count);
+            const table_idx = try linker.addTableFunc(func_idx);
+            try func_table_indices.put(ir_func.name, table_idx);
+        }
+
+        // ====================================================================
+        // Build function type index map: func_name → Wasm type section index
+        // Go reference: wasmobj.go — type index from instruction's p.To.Offset
+        // Pre-register all function types for call_indirect resolution
+        // ====================================================================
+        var func_type_indices = std.StringHashMap(u32).init(self.allocator);
+        defer func_type_indices.deinit();
+
+        if (!is_wasm_gc) {
+            // Reserve offset 0 as null sentinel. cot_release checks
+            // "if (metadata_ptr != 0)" to skip destructor lookup — so metadata must
+            // never live at offset 0. This matches C's convention (address 0 = NULL).
+            _ = try linker.addData(&[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0 });
+
+            // Generate metadata for each type with destructor
+            // Metadata layout: type_id(4), size(4), destructor_ptr(4) = 12 bytes
+            var metadata_buf: [12]u8 = undefined;
+
+            var type_id: u32 = 1;
+            var dtor_iter = destructor_table.iterator();
+            while (dtor_iter.next()) |entry| {
+                const dtor_idx = entry.value_ptr.*;
+
+                // Build metadata bytes
+                std.mem.writeInt(u32, metadata_buf[0..4], type_id, .little); // type_id
+                std.mem.writeInt(u32, metadata_buf[4..8], 8, .little); // size (placeholder)
+                std.mem.writeInt(u32, metadata_buf[8..12], dtor_idx, .little); // destructor table index
+
+                const offset = try linker.addData(&metadata_buf);
+                try metadata_addrs.put(entry.key_ptr.*, offset);
+
+                debug.log(.codegen, "driver: metadata for {s} at offset {d}, dtor_idx={d}", .{ entry.key_ptr.*, offset, dtor_idx });
+                type_id += 1;
+            }
+        }
+
+        // ====================================================================
+        // Pass 1: Collect all string literals and add to linker
+        // ====================================================================
+        var string_offsets = std.StringHashMap(i32).init(self.allocator);
+        defer string_offsets.deinit();
+
+        for (funcs) |*ir_func| {
+            for (ir_func.string_literals) |str| {
+                if (!string_offsets.contains(str)) {
+                    const offset = try linker.addData(str);
+                    try string_offsets.put(str, offset);
+                    debug.log(.codegen, "driver: string literal at offset {d}: \"{s}\"", .{ offset, str });
+                }
+            }
+        }
+
+        // ====================================================================
+        // Pass 2: Generate code for each function
+        // ====================================================================
+        for (funcs) |*ir_func| {
+            // Per-function arena: all SSA data allocated here, freed at once after codegen
+            var func_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer func_arena.deinit();
+            const func_alloc = func_arena.allocator();
+
+            // Build SSA
+            var ssa_builder = try ssa_builder_mod.SSABuilder.init(func_alloc, ir_func, globals, type_reg, self.target);
+            errdefer ssa_builder.deinit();
+
+            const ssa_func = try ssa_builder.build();
+            // No need for individual deinit — arena frees everything at once
+            ssa_builder.deinit();
+
+            // SSA text dump (Wasm path) — same as native path
+            if (debug.isEnabled(.ssa)) {
+                const ssa_dbg = @import("ssa/debug.zig");
+                debug.log(.ssa, "\n=== SSA for '{s}' ({d} blocks) ===", .{ ir_func.name, ssa_func.blocks.items.len });
+                for (ssa_func.blocks.items) |blk| {
+                    debug.log(.ssa, "  Block b{d} ({s}, {d} values, succs={d}, preds={d}):", .{
+                        blk.id, @tagName(blk.kind), blk.values.items.len, blk.succs.len, blk.preds.len,
+                    });
+                    for (blk.values.items) |val| {
+                        var abuf: [256]u8 = undefined;
+                        var alen: usize = 0;
+                        for (val.args) |a| {
+                            if (alen > 0) { abuf[alen] = ' '; alen += 1; }
+                            const s = std.fmt.bufPrint(abuf[alen..], "v{d}", .{a.id}) catch break;
+                            alen += s.len;
+                        }
+                        const type_name = type_reg.typeName(val.type_idx);
+                        debug.log(.ssa, "    v{d}: {s} <{s}> {s} aux={d} uses={d}", .{
+                            val.id, @tagName(val.op), type_name, abuf[0..alen], val.aux_int, val.uses,
+                        });
+                    }
+                    if (blk.controls[0]) |c| {
+                        if (blk.controls[1]) |c2| {
+                            debug.log(.ssa, "    control: v{d} v{d}", .{ c.id, c2.id });
+                        } else {
+                            debug.log(.ssa, "    control: v{d}", .{c.id});
+                        }
+                    }
+                }
+                _ = ssa_dbg;
+            }
+
+            // COT_SSA: interactive HTML visualizer (Go GOSSAFUNC port)
+            const ssa_html = @import("ssa/html.zig");
+            var html_writer: ?ssa_html.HTMLWriter = null;
+            if (self.ssa_html_func) |target_name| {
+                if (std.mem.eql(u8, ir_func.name, target_name) or
+                    std.mem.eql(u8, target_name, "*"))
+                {
+                    const html_path = std.fmt.allocPrint(self.allocator, "{s}.ssa.html", .{ir_func.name}) catch ir_func.name;
+                    html_writer = ssa_html.HTMLWriter.init(self.allocator, ir_func.name, html_path, type_reg);
+
+                    // Write source code column (if source text available)
+                    if (self.parsed_file_texts.len > 0) {
+                        const src_text = self.parsed_file_texts[0];
+                        const src_path = if (self.parsed_file_paths.len > 0) self.parsed_file_paths[0] else "unknown";
+                        html_writer.?.writeSources(src_text, src_path);
+                    }
+
+                    // Initial SSA state
+                    html_writer.?.writePhase("start", "start", ssa_func);
+                }
+            }
+
+            // Run Wasm-specific passes with optimization (Go pass order)
+            // Reference: Go compile.go lines 58-145 — pass loop + HTMLWriter integration
+            // Each pass is timed (Go: time.Now before/after, LogStat "TIME(ns)").
+            const ssa_debug = @import("ssa/debug.zig");
+            var t: i128 = undefined;
+            var elapsed: i128 = undefined;
+
+            // Async state machine splitting — must run FIRST, before other SSA passes.
+            // Transforms async functions with multiple await points into state machines.
+            // Rust reference: rustc_mir_transform/src/coroutine.rs (StateTransform)
+            t = debug.timestamp();
+            try async_split.asyncSplit(ssa_func, type_reg);
+            elapsed = debug.timestamp() - t;
+            debug.logTimed(.ssa, "  pass async_split", elapsed, .{});
+            if (html_writer != null) html_writer.?.writePhase("async_split", "async_split", ssa_func);
+
+            t = debug.timestamp();
+            try copyelim.copyelim(ssa_func);
+            elapsed = debug.timestamp() - t;
+            debug.logTimed(.copyelim, "  pass copyelim", elapsed, .{});
+            ssa_debug.checkFunc(ssa_func, "copyelim", func_alloc);
+            if (html_writer != null) html_writer.?.writePhase("copyelim", "copyelim", ssa_func);
+
+            t = debug.timestamp();
+            try rewritegeneric.rewrite(func_alloc, ssa_func, &string_offsets);
+            elapsed = debug.timestamp() - t;
+            debug.logTimed(.codegen, "  pass rewritegeneric", elapsed, .{});
+            ssa_debug.checkFunc(ssa_func, "rewritegeneric", func_alloc);
+            if (html_writer != null) html_writer.?.writePhase("rewritegeneric", "rewritegeneric", ssa_func);
+
+            t = debug.timestamp();
+            try decompose_builtin.decompose(func_alloc, ssa_func, type_reg);
+            elapsed = debug.timestamp() - t;
+            debug.logTimed(.codegen, "  pass decompose", elapsed, .{});
+            ssa_debug.checkFunc(ssa_func, "decompose", func_alloc);
+            if (html_writer != null) html_writer.?.writePhase("decompose", "decompose", ssa_func);
+
+            t = debug.timestamp();
+            try rewritedec.rewrite(func_alloc, ssa_func);
+            elapsed = debug.timestamp() - t;
+            debug.logTimed(.codegen, "  pass rewritedec", elapsed, .{});
+            ssa_debug.checkFunc(ssa_func, "rewritedec", func_alloc);
+            if (html_writer != null) html_writer.?.writePhase("rewritedec", "rewritedec", ssa_func);
+
+            t = debug.timestamp();
+            try copyelim.copyelim(ssa_func);
+            elapsed = debug.timestamp() - t;
+            debug.logTimed(.copyelim, "  pass copyelim2", elapsed, .{});
+            ssa_debug.checkFunc(ssa_func, "copyelim2", func_alloc);
+            if (html_writer != null) html_writer.?.writePhase("copyelim2", "copyelim (2nd)", ssa_func);
+
+            t = debug.timestamp();
+            try cse_pass.cse(ssa_func);
+            elapsed = debug.timestamp() - t;
+            debug.logTimed(.codegen, "  pass cse", elapsed, .{});
+            ssa_debug.checkFunc(ssa_func, "cse", func_alloc);
+            if (html_writer != null) html_writer.?.writePhase("cse", "cse", ssa_func);
+
+            t = debug.timestamp();
+            try deadcode.deadcode(ssa_func);
+            elapsed = debug.timestamp() - t;
+            debug.logTimed(.deadcode, "  pass deadcode", elapsed, .{});
+            ssa_debug.checkFunc(ssa_func, "deadcode", func_alloc);
+            if (html_writer != null) html_writer.?.writePhase("deadcode", "deadcode", ssa_func);
+
+            t = debug.timestamp();
+            try schedule.schedule(ssa_func);
+            elapsed = debug.timestamp() - t;
+            debug.logTimed(.schedule, "  pass schedule", elapsed, .{});
+            ssa_debug.checkFunc(ssa_func, "schedule", func_alloc);
+            if (html_writer != null) html_writer.?.writePhase("schedule", "schedule", ssa_func);
+
+            t = debug.timestamp();
+            try layout.layout(ssa_func);
+            elapsed = debug.timestamp() - t;
+            debug.logTimed(.codegen, "  pass layout", elapsed, .{});
+            ssa_debug.checkFunc(ssa_func, "layout", func_alloc);
+            if (html_writer != null) html_writer.?.writePhase("layout", "layout", ssa_func);
+
+            t = debug.timestamp();
+            try lower_wasm.lower(ssa_func);
+            elapsed = debug.timestamp() - t;
+            debug.logTimed(.codegen, "  pass lower_wasm", elapsed, .{});
+            ssa_debug.checkFunc(ssa_func, "lower_wasm", func_alloc);
+            if (html_writer != null) {
+                html_writer.?.writePhase("lower_wasm", "lower_wasm", ssa_func);
+                html_writer.?.flushPhases(ssa_func);
+                html_writer.?.close();
+                html_writer.?.deinit();
+                html_writer = null;
+            }
+
+            // Determine function signature
+            var param_count: u32 = 0;
+            for (ssa_func.blocks.items) |block| {
+                for (block.values.items) |v| {
+                    if (v.op == .arg) {
+                        const arg_idx: u32 = @intCast(v.aux_int);
+                        if (arg_idx >= param_count) param_count = arg_idx + 1;
+                    }
+                }
+            }
+            var params: [32]wasm.ValType = undefined;
+            // WasmGC: parallel array for GC-aware param types (ref types for structs)
+            var gc_params: [32]wasm.WasmType = undefined;
+            var wasm_param_idx: usize = 0;
+            {
+                // Build Wasm param types, decomposing compound types (slice, string)
+                // into 2 separate i64 entries (ptr, len). This must match the SSA
+                // builder's arg decomposition in ssa_builder.zig.
+                // WasmGC: no decomposition — structs are single (ref null $T) values.
+                for (ir_func.params) |param| {
+                    const param_type = type_reg.get(param.type_idx);
+                    const is_string_or_slice = param.type_idx == types_mod.TypeRegistry.STRING or param_type == .slice;
+                    const type_size = type_reg.sizeOf(param.type_idx);
+                    const is_opt_ptr = param_type == .optional and blk: {
+                        const ei = type_reg.get(param_type.optional.elem);
+                        break :blk ei == .pointer and ei.pointer.managed;
+                    };
+                    const is_compound_opt = param_type == .optional and type_reg.get(param_type.optional.elem) != .pointer and !is_opt_ptr;
+                    // Compound optionals are always linear memory (not GC refs), decompose on all targets.
+                    // Structs/unions/tuples skip decomposition on WasmGC (they use GC refs).
+                    const is_large_struct = (!is_wasm_gc and (param_type == .struct_type or param_type == .union_type or param_type == .tuple) and type_size > 8) or (is_compound_opt and type_size > 8);
+
+                    // WasmGC: struct and managed pointer-to-struct params are single (ref null $typeidx)
+                    // Raw pointers (@intToPtr) are i64 linear memory addresses, not GC refs.
+                    // Reference: Kotlin/Dart WasmGC — struct refs in params, including self: *Type
+                    const is_gc_struct_param = is_wasm_gc and (param_type == .struct_type or
+                        (param_type == .pointer and param_type.pointer.managed and type_reg.get(param_type.pointer.elem) == .struct_type));
+                    if (is_gc_struct_param) {
+                        const st = if (param_type == .struct_type)
+                            param_type.struct_type
+                        else
+                            type_reg.get(param_type.pointer.elem).struct_type;
+                        const gc_type_idx = linker.gc_struct_name_map.get(st.name) orelse 0;
+                        gc_params[wasm_param_idx] = wasm.WasmType.gcRefNull(gc_type_idx);
+                        params[wasm_param_idx] = .i64; // placeholder for param_count
+                        wasm_param_idx += 1;
+                    } else if (is_opt_ptr or is_string_or_slice) {
+                        // ?*T / String / Slice: 2 i64 params (tag+payload or ptr+len)
+                        params[wasm_param_idx] = .i64;
+                        gc_params[wasm_param_idx] = wasm.WasmType.fromVal(.i64);
+                        wasm_param_idx += 1;
+                        params[wasm_param_idx] = .i64;
+                        gc_params[wasm_param_idx] = wasm.WasmType.fromVal(.i64);
+                        wasm_param_idx += 1;
+                    } else if (is_large_struct) {
+                        // Large struct: N i64 params (one per 8-byte chunk)
+                        const num_slots = (type_size + 7) / 8;
+                        for (0..num_slots) |_| {
+                            params[wasm_param_idx] = .i64;
+                            gc_params[wasm_param_idx] = wasm.WasmType.fromVal(.i64);
+                            wasm_param_idx += 1;
+                        }
+                    } else {
+                        const is_float = param.type_idx == types_mod.TypeRegistry.F64 or
+                            param.type_idx == types_mod.TypeRegistry.F32;
+                        params[wasm_param_idx] = if (is_float) .f64 else .i64;
+                        gc_params[wasm_param_idx] = wasm.WasmType.fromVal(if (is_float) .f64 else .i64);
+                        wasm_param_idx += 1;
+                    }
+                }
+            }
+            const has_return = ir_func.return_type != types_mod.TypeRegistry.VOID;
+            const ret_is_float = ir_func.return_type == types_mod.TypeRegistry.F64 or
+                ir_func.return_type == types_mod.TypeRegistry.F32;
+            // Decompose compound return types (string, slice) into 2 i64 values
+            // to match the param decomposition pattern above.
+            // WasmGC: no decomposition — compound returns are single ref values.
+            const ret_type_info = type_reg.get(ir_func.return_type);
+            const ret_is_opt_ptr = ret_type_info == .optional and blk: {
+                const ei = type_reg.get(ret_type_info.optional.elem);
+                break :blk ei == .pointer and ei.pointer.managed;
+            };
+            const ret_is_compound = ir_func.return_type == types_mod.TypeRegistry.STRING or ret_type_info == .slice or ret_is_opt_ptr;
+            const results: []const wasm.ValType = if (!has_return)
+                &[_]wasm.ValType{}
+            else if (ret_is_compound)
+                &[_]wasm.ValType{ .i64, .i64 }
+            else if (ret_is_float)
+                &[_]wasm.ValType{.f64}
+            else
+                &[_]wasm.ValType{.i64};
+
+
+            // Add function type to linker
+            // WasmGC: use addTypeWasm for GC-aware type registration (ref type params)
+            const type_idx = if (is_wasm_gc) blk: {
+                // Convert results to WasmType, handling GC ref returns
+                var gc_results: [4]wasm.WasmType = undefined;
+                var gc_results_len: usize = results.len;
+                // WasmGC: struct returns become (ref null $T) result types.
+                // Raw pointers (@intToPtr) return i64, not GC refs.
+                const is_gc_struct_return = ret_type_info == .struct_type or
+                    (ret_type_info == .pointer and ret_type_info.pointer.managed and type_reg.get(ret_type_info.pointer.elem) == .struct_type);
+                if (has_return and is_gc_struct_return) {
+                    const st = if (ret_type_info == .struct_type)
+                        ret_type_info.struct_type
+                    else
+                        type_reg.get(ret_type_info.pointer.elem).struct_type;
+                    const gc_type_idx_ret = linker.gc_struct_name_map.get(st.name) orelse 0;
+                    gc_results[0] = wasm.WasmType.gcRefNull(gc_type_idx_ret);
+                    gc_results_len = 1;
+                } else {
+                    for (results, 0..) |r, ri| gc_results[ri] = wasm.WasmType.fromVal(r);
+                }
+                break :blk try linker.addTypeWasm(gc_params[0..wasm_param_idx], gc_results[0..gc_results_len]);
+            } else blk: {
+                // Fill remaining params (e.g., state pointer for async poll functions)
+                // SSA may have more args than ir_func.params due to async split.
+                for (wasm_param_idx..param_count) |i| {
+                    params[i] = .i64;
+                    gc_params[i] = wasm.WasmType.fromVal(.i64);
+                }
+                if (wasm_param_idx < param_count) wasm_param_idx = param_count;
+                break :blk try linker.addType(params[0..wasm_param_idx], results);
+            };
+
+            // Register this function's Wasm type index for call_indirect resolution
+            try func_type_indices.put(ir_func.name, type_idx);
+
+            // Post-pass: resolve call_indirect type indices on SSA values
+            // Go: type index is stored in instruction by assembler (p.To.Offset)
+            // We set aux_int on wasm_lowered_closure_call/inter_call values
+            for (ssa_func.blocks.items) |block| {
+                for (block.values.items) |sv| {
+                    if (sv.op == .wasm_lowered_closure_call or sv.op == .wasm_lowered_inter_call) {
+                        // Determine actual param count and return type from the call's args
+                        const skip: usize = if (sv.op == .wasm_lowered_closure_call) 2 else 1;
+                        const n_params: u32 = @intCast(sv.args.len - skip);
+                        const has_res = sv.type_idx != types_mod.TypeRegistry.VOID and sv.type_idx != 0;
+
+                        // Build Wasm type signature and register with linker
+                        // WasmGC: use WasmType to support GC ref params (same as direct call path)
+                        var gc_cp: [16]wasm.WasmType = undefined;
+                        var cp: [16]wasm.ValType = undefined;
+                        for (0..n_params) |pi| {
+                            const arg_val = sv.args[skip + pi];
+                            const is_f = arg_val.type_idx == types_mod.TypeRegistry.F64 or
+                                arg_val.type_idx == types_mod.TypeRegistry.F32;
+                            const arg_type_info = type_reg.get(arg_val.type_idx);
+                            const is_gc_ref = is_wasm_gc and (arg_type_info == .struct_type or
+                                (arg_type_info == .pointer and arg_type_info.pointer.managed and type_reg.get(arg_type_info.pointer.elem) == .struct_type));
+                            if (is_gc_ref) {
+                                const st = if (arg_type_info == .struct_type)
+                                    arg_type_info.struct_type
+                                else
+                                    type_reg.get(arg_type_info.pointer.elem).struct_type;
+                                const gc_idx = linker.gc_struct_name_map.get(st.name) orelse 0;
+                                gc_cp[pi] = wasm.WasmType.gcRefNull(gc_idx);
+                            } else {
+                                gc_cp[pi] = wasm.WasmType.fromVal(if (is_f) .f64 else .i64);
+                            }
+                            cp[pi] = if (is_f) .f64 else .i64;
+                        }
+                        const ret_f = sv.type_idx == types_mod.TypeRegistry.F64 or
+                            sv.type_idx == types_mod.TypeRegistry.F32;
+
+                        const call_type_idx = if (is_wasm_gc) blk: {
+                            // WasmGC: handle GC ref return types
+                            var gc_res: [2]wasm.WasmType = undefined;
+                            var gc_res_len: usize = 0;
+                            if (has_res) {
+                                const ci_ret_type_info = type_reg.get(sv.type_idx);
+                                const is_gc_ret = ci_ret_type_info == .struct_type or
+                                    (ci_ret_type_info == .pointer and ci_ret_type_info.pointer.managed and type_reg.get(ci_ret_type_info.pointer.elem) == .struct_type);
+                                if (is_gc_ret) {
+                                    const st = if (ci_ret_type_info == .struct_type)
+                                        ci_ret_type_info.struct_type
+                                    else
+                                        type_reg.get(ci_ret_type_info.pointer.elem).struct_type;
+                                    const gc_idx = linker.gc_struct_name_map.get(st.name) orelse 0;
+                                    gc_res[0] = wasm.WasmType.gcRefNull(gc_idx);
+                                } else {
+                                    gc_res[0] = wasm.WasmType.fromVal(if (ret_f) .f64 else .i64);
+                                }
+                                gc_res_len = 1;
+                            }
+                            break :blk try linker.addTypeWasm(gc_cp[0..n_params], gc_res[0..gc_res_len]);
+                        } else blk: {
+                            const res: []const wasm.ValType = if (!has_res)
+                                &[_]wasm.ValType{}
+                            else if (ret_f)
+                                &[_]wasm.ValType{.f64}
+                            else
+                                &[_]wasm.ValType{.i64};
+                            break :blk try linker.addType(cp[0..n_params], res);
+                        };
+                        sv.aux_int = @intCast(linker.funcTypeIndex(call_type_idx));
+                    }
+                }
+            }
+
+            // Generate function body code using Go-style two-pass architecture
+            const gc_name_map = if (is_wasm_gc) &linker.gc_struct_name_map else null;
+            const gc_array_map = if (is_wasm_gc) &linker.gc_array_name_map else null;
+            const gc_type_reg = if (is_wasm_gc) type_reg else null;
+            const body = try wasm.generateFunc(self.allocator, ssa_func, &func_indices, &string_offsets, &metadata_addrs, &func_table_indices, gc_name_map, gc_array_map, gc_type_reg);
+            errdefer self.allocator.free(body);
+
+            // Export all functions for AOT compatibility
+            // (AOT needs function names to resolve calls)
+            const exported = true;
+
+            // Add function to linker
+            _ = try linker.addFunc(.{
+                .name = ir_func.name,
+                .type_idx = type_idx,
+                .code = body, // Linker takes ownership
+                .exported = exported,
+            });
+        }
+
+        // Add _start wrapper for WASI compatibility (wasmtime expects _start, not main)
+        // _start calls main and drops the return value (if any).
+        if (self.target.isWasm()) {
+            if (func_indices.get("main")) |main_wasm_idx| {
+                const start_type = try linker.addType(&[_]wasm.ValType{}, &[_]wasm.ValType{});
+                var start_code = wasm_old.CodeBuilder.init(self.allocator);
+                defer start_code.deinit();
+                try start_code.emitCall(main_wasm_idx);
+                // If main returns a value, drop it (_start must return void)
+                const main_returns_value = blk: {
+                    for (funcs) |*ir_func| {
+                        if (std.mem.eql(u8, ir_func.name, "main")) {
+                            break :blk ir_func.return_type != types_mod.TypeRegistry.VOID;
+                        }
+                    }
+                    break :blk false;
+                };
+                if (main_returns_value) {
+                    try start_code.emitDrop();
+                }
+                const start_body = try start_code.finish();
+                _ = try linker.addFunc(.{
+                    .name = "_start",
+                    .type_idx = start_type,
+                    .code = start_body,
+                    .exported = true,
+                });
+            }
+        }
+
+        // Emit Wasm binary using Go-style linker
+        // This includes proper sections: type, function, memory, global (SP), export, code, data
+        var output: std.ArrayListUnmanaged(u8) = .{};
+        try linker.emit(&output);
+        return output.toOwnedSlice(self.allocator);
+    }
+};
+
+// ============================================================================
+// ============================================================================
+// Tests
+// ============================================================================
+
+test "Driver: init and set target" {
+    const allocator = std.testing.allocator;
+    var driver = Driver.init(allocator);
+    driver.setTarget(.{ .arch = .amd64, .os = .linux });
+    try std.testing.expectEqual(target_mod.Arch.amd64, driver.target.arch);
+    try std.testing.expectEqual(target_mod.Os.linux, driver.target.os);
+}
+
+test "Driver: test mode toggle" {
+    const allocator = std.testing.allocator;
+    var driver = Driver.init(allocator);
+    try std.testing.expect(!driver.test_mode);
+    driver.setTestMode(true);
+    try std.testing.expect(driver.test_mode);
+}
+
+test "Driver: normalizePath returns copy on error" {
+    const allocator = std.testing.allocator;
+    var driver = Driver.init(allocator);
+    const result = try driver.normalizePath("nonexistent_file_12345.zig");
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("nonexistent_file_12345.zig", result);
+}

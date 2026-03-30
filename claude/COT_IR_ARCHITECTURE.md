@@ -1,188 +1,153 @@
-# Cot IR Architecture: The Evolution from Monolith to Pluggable Compiler
+# Cot Compiler Architecture: Three Libraries
 
-**Date:** 2026-03-27
+**Date:** 2026-03-28
 **Author:** John Cottrell / Claude
-**Status:** Design Document — Future Architecture
+**Status:** Design Document — Target Architecture
 
 ---
 
-## 1. How This Design Evolved
+## 1. Overview
 
-This document traces the evolution of an idea through a single conversation, from an initial question about compiler modularity to a concrete three-library architecture.
-
-### Starting Point: "Best of Breed"
-
-Cot's compiler is assembled from proven reference implementations:
-
-| Component | Reference | Why |
-|-----------|-----------|-----|
-| Syntax | Zig | Clean systems-level syntax |
-| DX sugar | TypeScript | Familiar feel (@safe mode, string interpolation) |
-| impl/traits | Rust | Method dispatch, trait system |
-| ARC + VWT | Swift | Non-GC memory management, value witnesses |
-| Generics | Swift | Shared bodies + @inlinable monomorphization |
-| Concurrency | Swift | Actors, async/await, Sendable |
-| Native codegen | Cranelift (Rust/Wasmtime) | Fast compile, direct SSA → native |
-| WasmGC | Kotlin/Wasm | GC struct/array types for browser |
-| Parser/SSA | Go | Recursive descent, phi insertion, schedule pass |
-
-The question arose: could each of these be a swappable library?
-
-### The Pluggable Compiler Idea
-
-The initial concept was radical — every compiler phase as a C ABI library:
-
-```
-Scanner library → Parser library → Type System library → Memory library → ...
-```
-
-With abstract interfaces (traits) for each concern:
-
-```
-trait MemoryStrategy {
-    fn needsTracking(type) bool
-    fn onValueCopied(value) → IR ops
-    fn onScopeExit(live_values) → IR ops
-}
-
-// ARC implements MemoryStrategy
-// GC implements MemoryStrategy
-// Rust-style Ownership implements MemoryStrategy
-```
-
-This would allow switching ARC for GC, actors for goroutines, monomorphization for type erasure — all through C ABI plugin boundaries.
-
-### Why Full Pluggability Is Impractical (For Now)
-
-Cross-cutting concerns make full separation extremely hard:
-
-- **ARC touches everything:** Checker (track ARC fields) → Lowerer (insert retain/release) → SSA passes (eliminate redundant pairs) → Codegen (emit calls)
-- **Generics touch everything:** Checker (type params) → Lowerer (VWT/metadata) → Codegen (indirect calls)
-- **Concurrency touches everything:** Checker (isolation) → Lowerer (state machines) → Runtime (executor)
-
-The interactions between strategies compound: ARC + Actors (deinit on executor), Generics + ARC (VWT witnesses call retain/release), Concurrency + Generics (Sendable checking needs generic strategy).
-
-**Conclusion:** Full pluggability is a research project. But the right boundaries DO exist.
-
-### The LLVM Insight
-
-LLVM proved that ONE boundary — frontend → IR → backend — is enough to create an ecosystem. Clang, Rust, Swift, Zig, Julia all share LLVM's backend through a common IR.
-
-But LLVM IR is too low-level. It doesn't understand ARC, actors, or generics. Swift needed an extra layer (SIL) because LLVM couldn't optimize retain/release pairs — by the time they're lowered to `call @swift_retain`, LLVM sees opaque function calls.
-
-**Cot's opportunity:** Create an IR that sits ABOVE LLVM's level — one that understands ARC, actors, VWT, and generics natively. This is what Swift's SIL does, but SIL was never designed as a public compilation target.
-
-### The Wasm Custom Section Idea
-
-A key realization: the serialized IR format could be embedded in a standard Wasm binary as a custom section. The same `.wasm` file is:
-
-1. **Runnable by any Wasm runtime** (browsers, wasmtime) — they read the Code section
-2. **Compilable to optimized native** by the Cot backend — it reads the cot_ssa custom section
-3. **Inspectable by standard tools** (wasm-tools, wasm-objdump)
-
-```
-.wasm file layout:
-  [ Standard Wasm sections ]     ← browsers/wasmtime execute this
-  [ "cot_ssa" custom section ]   ← native backend reads this (SSA form)
-  [ "cot_types" custom section ] ← type metadata, VWT info, actor annotations
-```
-
-The SSA section contains the full register-based IR with ARC instructions, actor operations, and generic dispatch — everything the native backend needs to produce optimized code without reconstructing it from stack-based Wasm bytecode.
-
-Three build modes from the same compiler:
-
-```bash
-cot build main.cot -o main.wasm                # both sections (default)
-cot build main.cot -o main.wasm --target=wasm   # strip cot_ssa (smaller)
-cot build main.cot -o main.wasm --target=native  # strip Code section
-```
-
-### From Wasm-to-Native (Deleted) to CIR-to-Native
-
-Cot previously had a wasm-to-native path that tried to reconstruct SSA from Wasm stack bytecode. It was fragile and buggy — information was lost during Wasm emission and imperfectly recovered.
-
-The CIR approach fixes this: both the Wasm Code section and the cot_ssa section are generated from the same SSA simultaneously. No reconstruction, no information loss.
-
-```
-Old (deleted):  SSA → Wasm stack ops → parse → reconstruct SSA → native
-New (proposed): SSA → Wasm stack ops (Code section) + SSA directly (custom section)
-```
-
-### The Final Architecture: Three Libraries
-
-The design converged on three libraries with clear responsibilities and C ABI boundaries:
+The Cot compiler is split into three libraries with C ABI boundaries. Each can be developed, tested, and replaced independently.
 
 ```
 libcot (frontend)  →  libcir (IR + passes)  →  libclif (native backend)
-     Zig → Cot            Zig → Cot              Rust (Cranelift crate)
 ```
+
+**Why three, not two or one:**
+
+- **libcot can be rewritten in Cot** while libcir stays stable in Zig — enables incremental self-hosting
+- **libcir can be swapped** — a GC-based IR library could replace the ARC-based one without touching the frontend or backend
+- **libclif is interchangeable** — the Zig Cranelift port or the Rust Cranelift crate, same C ABI
+- **Other frontends** (different syntax, different language) call libcir directly, never touch libcot
+- **Frontend syntax changes** don't affect the IR or backend
 
 ---
 
-## 2. Architecture Overview
+## 2. Architecture
 
 ```
-┌──────────────────────────────────────────────────────────┐
-│  cot (CLI binary) — thin driver                           │
-│  Links: libcot + libcir + libclif                         │
-│                                                           │
-│  cot build main.cot -o main      (native via all three)  │
-│  cot build main.cot -o main.wasm (wasm via libcot+libcir)│
-│  cot check main.cot              (libcot only)           │
-│  cot lsp                         (libcot only)           │
-├──────────────────────────────────────────────────────────┤
-│                                                           │
-│  ┌──────────────┐ ┌───────────────┐ ┌─────────────────┐ │
-│  │   libcot      │ │   libcir      │ │   libclif       │ │
-│  │              │ │               │ │                 │ │
-│  │  Scanner     │ │  SSA Builder  │ │  Read CIR       │ │
-│  │  Parser      │ │  SSA Passes   │ │  Lower to CLIF  │ │
-│  │  AST         │ │  ARC Optimize │ │  Cranelift crate│ │
-│  │  Checker     │ │  VWT Dispatch │ │  ARM64 backend  │ │
-│  │  Types       │ │  Concurrency  │ │  x64 backend    │ │
-│  │  Lowerer     │ │  Wasm Emit    │ │  Object file    │ │
-│  │  LSP         │ │  CIR Emit     │ │  Linker invoke  │ │
-│  │              │ │               │ │                 │ │
-│  │ Cot-specific │ │ Lang-agnostic │ │ Target-specific │ │
-│  │              │ │               │ │                 │ │
-│  └──────┬───────┘ └───────┬───────┘ └────────┬────────┘ │
-│         │    C ABI        │    C ABI          │          │
-│         └────────→────────┘──────────→────────┘          │
-└──────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────────────┐
+│  cot (CLI binary) — thin driver                                             │
+│  Links: libts + libcot + libcir + (libclif or libllvm)                      │
+├────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌────────────┐                                                             │
+│  │ libts      │ TS/JS pre-processor (.ts/.js files)                         │
+│  │ (Zig)      │ TS scanner, TS parser, AST-to-AST transform                │
+│  │ ~5-8K lines│ Produces Cot AST nodes in memory (no .cot on disk)          │
+│  └─────┬──────┘                                                             │
+│        │ cot_compile_ast() — passes Cot AST to libcot                       │
+│        ▼                                                                     │
+│  ┌────────────┐                                                             │
+│  │ libcot     │ Cot frontend (.cot files OR pre-built ASTs from libts)      │
+│  │ (Zig→Cot)  │ Checker, Lowerer, LSP                                       │
+│  │ ~32K lines │ Scanner + Parser used for .cot; skipped for libts input      │
+│  └─────┬──────┘                                                             │
+│        │ C ABI (cir.h)                                                      │
+│        ▼                                                                     │
+│  ┌──────────────┐     ┌──────────────────────────────┐                      │
+│  │  libcir      │     │  Native Backends (clif.h)     │                      │
+│  │  (Zig)       │────→│                               │                      │
+│  │              │     │  libclif-zig  Cranelift port  │                      │
+│  │  SSA Builder │     │  libclif-rs   Cranelift crate │                      │
+│  │  SSA Passes  │     │  libllvm-zig  LLVM C API     │                      │
+│  │  ARC / VWT   │     │  libclif      Cot self-host  │                      │
+│  │  Concurrency │     │                               │                      │
+│  │  Wasm Emit   │     │  --backend=cranelift (fast)   │                      │
+│  │  CIR Serial  │     │  --backend=llvm (optimized)   │                      │
+│  │              │     └──────────────────────────────┘                      │
+│  │  Language-   │                                                            │
+│  │  agnostic    │     Wasm output: libcir emits directly                     │
+│  └──────────────┘     Native output: via clif.h backend                      │
+│                                                                              │
+│  Dependency chain: libts → libcot → libcir → libclif                         │
+│  libts is optional — .cot files go directly through libcot                   │
+└────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Library Responsibilities
 
-**libcot — The Frontend (language-specific)**
-- Knows Cot syntax, @safe mode, struct literals, method dispatch
-- Parses `.cot` files into AST
-- Type checks (generics, Sendable, actor isolation)
-- Lowers AST → CIR instructions via C ABI calls to libcir
-- Provides LSP for editor integration
-- Another frontend (PyCot, CotScript) would replace this entirely
+**libcot — Frontend (language-specific)**
 
-**libcir — The IR (language-agnostic)**
-- Knows ARC, VWT, actors, generics — but NOT Cot syntax
-- Builds SSA from C ABI calls (cir_build_retain, cir_build_actor_enqueue, etc.)
-- Runs optimization passes (ARC pair elimination, dead code, scheduling)
-- Emits Wasm bytecode (Code section)
-- Emits CIR binary format (cot_ssa custom section)
-- Any frontend that can call the C ABI can use this
+Knows Cot syntax, `@safe` mode, method dispatch, struct literals, string interpolation. Parses `.cot` files, type-checks, and lowers to CIR instructions via C ABI calls to libcir.
 
-**libclif — The Native Backend (target-specific)**
-- Reads CIR module (in-memory pointer or from cot_ssa section)
-- Translates SSA → Cranelift CLIF IR
-- Cranelift compiles CLIF → ARM64/x64 machine code
-- Emits object file, invokes system linker
-- Written in Rust, uses cranelift crate directly (free updates)
+- Scanner, parser, AST
+- Checker (types, Sendable, actor isolation)
+- Lowerer (AST → CIR instruction calls)
+- LSP (diagnostics, completions, hover, goto-def)
+- Exposes `cot_compile_ast()` entry point for external frontends to provide pre-built ASTs
+- First library to be rewritten in Cot (self-hosting milestone)
+
+**libts — TypeScript Pre-Processor (calls into libcot)**
+
+Thin layer that parses `.ts`/`.js` files and transforms them into Cot AST nodes in memory. Does NOT duplicate libcot's checker or lowerer — calls `cot_compile_ast()` to reuse them.
+
+- TS/JS scanner and parser (~3-5K lines)
+- AST-to-AST transform: TS nodes → Cot AST nodes in memory (no `.cot` files on disk)
+- Type mapping: `class` → `struct`, `interface` → `trait`, `Promise<T>` → `async fn`, `throw` → error union, `T | U` → tagged union
+- Auto-generates `impl Trait for Struct` for structural subtyping
+- Source map tracking: TS spans → Cot AST spans, so errors point to original `.ts` lines
+- Node module resolution (`node_modules`, `package.json`)
+- tsconfig.json support
+
+```
+.ts source → libts scanner → libts parser → TS AST → libts transform → Cot AST
+                                                                          │
+                          cot_compile_ast() ←─────────────────────────────┘
+                                │
+                    libcot checker → libcot lowerer → CIR
+```
+
+libts depends on libcot (for AST node types and compile_ast entry). libcot doesn't know libts exists. Clean one-way dependency.
+
+**libcir — IR (language-agnostic)**
+
+Knows ARC, VWT, actors, generics — but NOT Cot syntax. Builds SSA from C ABI calls, runs optimization passes, emits Wasm bytecode and CIR binary format. This is Cot's equivalent of Swift's SIL.
+
+- SSA builder (phi insertion, memory threading)
+- SSA passes (ARC optimization, dead code, scheduling)
+- VWT dispatch, generic specialization
+- Concurrency lowering (state machines, actor queues)
+- Wasm bytecode emission
+- CIR binary serialization (SPIR-V-style, Wasm custom section)
+- C ABI for other frontends: `cir_build_retain()`, `cir_build_actor_enqueue()`, etc.
+- Stays in Zig longer — complex optimization code benefits from stability
+
+**libclif — Native Backend (target-specific)**
+
+Reads CIR and produces native machine code. Four interchangeable implementations behind the same C ABI (`clif.h`):
+
+| Implementation | Language | Lines | Strengths | Use Case |
+|---------------|----------|-------|-----------|----------|
+| `libclif-zig` | Zig | ~68K | Battle-tested, all tests pass, no external deps | Default today |
+| `libclif-rs` | Rust | ~5-10K | Thin wrapper around Cranelift crate, free updates | Fast compile, debug builds |
+| `libllvm-zig` | Zig | ~3-5K | Calls LLVM C API (`llvm-c/Core.h`), optimized codegen | Release builds (`--release`) |
+| `libclif` | Cot | ~60-80K | Full self-hosting, zero external deps | Ultimate goal |
+
+Same `clif_compile(cir_module, target, output_path)` call — the CLI selects via `--backend=cranelift|llvm`.
+
+**LLVM backend details:**
+- Zig has first-class LLVM C API access via `@cImport` — the same mechanism Zig's own compiler uses
+- CIR maps almost 1:1 to LLVM IR: `cir_build_add` → `LLVMBuildAdd`, `cir_build_brif` → `LLVMBuildCondBr`
+- ARC compiles to plain LLVM IR: `retain` → `atomicrmw add`, `release` → `atomicrmw sub` + branch to dealloc
+- Coroutines come free via LLVM intrinsics (`llvm.coro.begin/suspend/end`) — solves native async state machines
+- Full optimization pipeline: O0/O1/O2/O3, LTO, autovectorization, PGO
+- Wider target coverage: ARM64, x64, RISC-V, Wasm (via LLVM Wasm backend), anything LLVM supports
+
+**Backend strategy (same model as Zig and Rust):**
+```
+cot build app.cot                  # Cranelift: fast compile (~0.1s), good code
+cot build app.cot --release        # LLVM: slow compile (~2s), optimized code
+```
 
 ---
 
-## 3. C ABI Interfaces
+## 3. C ABI Boundaries
 
-### libcot → libcir Boundary
+### libcot → libcir
 
-libcot's lowerer calls these to build the IR:
+libcot's lowerer calls these to build IR:
 
 ```c
 // Module lifecycle
@@ -218,20 +183,20 @@ void            cir_build_br(CirBuilderRef b, CirBlockRef target);
 void            cir_build_brif(CirBuilderRef b, CirValueRef cond,
                                CirBlockRef then_b, CirBlockRef else_b);
 
-// SSA Instructions — ARC (memory management)
+// SSA Instructions — ARC
 CirValueRef     cir_build_retain(CirBuilderRef b, CirValueRef val);
 CirValueRef     cir_build_release(CirBuilderRef b, CirValueRef val);
 CirValueRef     cir_build_alloc(CirBuilderRef b, CirTypeRef type, uint64_t size);
 CirValueRef     cir_build_is_unique(CirBuilderRef b, CirValueRef val);
 
-// SSA Instructions — VWT (generics)
+// SSA Instructions — VWT / Generics
 CirValueRef     cir_build_vwt_copy(CirBuilderRef b, CirValueRef metadata,
                                     CirValueRef src, CirValueRef dst);
 CirValueRef     cir_build_vwt_destroy(CirBuilderRef b, CirValueRef metadata,
                                        CirValueRef val);
 CirValueRef     cir_build_vwt_size(CirBuilderRef b, CirValueRef metadata);
 
-// SSA Instructions — Concurrency (actors, tasks)
+// SSA Instructions — Concurrency
 CirValueRef     cir_build_actor_enqueue(CirBuilderRef b, CirValueRef actor,
                                          CirValueRef job);
 CirValueRef     cir_build_task_create(CirBuilderRef b, CirFuncRef body,
@@ -242,22 +207,20 @@ CirValueRef     cir_build_await(CirBuilderRef b, CirValueRef future);
 // Passes and emission
 void            cir_run_passes(CirModuleRef mod);
 int             cir_emit_wasm(CirModuleRef mod, const char* output_path);
-int             cir_emit_wasm_with_ssa(CirModuleRef mod, const char* output_path);
-
-// For in-process native compilation (no serialization)
+int             cir_emit_wasm_with_cir(CirModuleRef mod, const char* output_path);
 const void*     cir_get_module_ptr(CirModuleRef mod);
 ```
 
-### libcir → libclif Boundary
+### libcir → libclif
 
 ```c
-// Single function: compile CIR module to native object file
+// In-process: compile CIR module to native object file
 int             clif_compile(const void* cir_module,
                              const char* target,       // "arm64-macos", "x64-linux"
                              const char* output_path); // "main.o"
 
-// Or from serialized format
-int             clif_compile_file(const char* wasm_path,  // .wasm with cot_ssa section
+// From serialized format: read .wasm with cot_ssa section
+int             clif_compile_file(const char* wasm_path,
                                   const char* target,
                                   const char* output_path);
 ```
@@ -266,353 +229,282 @@ int             clif_compile_file(const char* wasm_path,  // .wasm with cot_ssa 
 
 ## 4. Data Flow
 
-### Native Build (in-process, fast)
+### Native Build (in-process)
 
 ```
 cot build main.cot -o main
 
-  libcot                     libcir                     libclif
-  ┌──────────┐              ┌──────────┐              ┌──────────┐
-  │ scan     │              │ SSA in   │              │ read CIR │
-  │ parse    │──cir_build_*─→│ memory   │──cir_module*─→│ → CLIF   │
-  │ check    │              │ ARC opt  │              │ → ARM64  │
-  │ lower    │              │ schedule │              │ → .o     │
-  └──────────┘              └──────────┘              └──────────┘
-                                                         │
-                                                      zig cc → binary
+  libcot                   libcir                     libclif
+  ┌──────────┐            ┌──────────┐              ┌──────────┐
+  │ scan     │            │ build SSA│              │ read CIR │
+  │ parse    │─cir_build_→│ ARC opt  │─cir_module*─→│ → CLIF   │
+  │ check    │            │ schedule │              │ → ARM64  │
+  │ lower    │            │          │              │ → .o     │
+  └──────────┘            └──────────┘              └──────────┘
 ```
-
-No serialization. Same process. Pointers passed via C ABI.
 
 ### Wasm Build (in-process)
 
 ```
 cot build main.cot -o main.wasm
 
-  libcot                     libcir
-  ┌──────────┐              ┌──────────┐
-  │ scan     │              │ SSA in   │
-  │ parse    │──cir_build_*─→│ memory   │──→ .wasm file
-  │ check    │              │ ARC opt  │
-  │ lower    │              │ wasm emit│
-  └──────────┘              └──────────┘
-
+  libcot                   libcir
+  ┌──────────┐            ┌──────────┐
+  │ scan     │            │ build SSA│
+  │ parse    │─cir_build_→│ ARC opt  │──→ .wasm file
+  │ check    │            │ wasm emit│
+  │ lower    │            └──────────┘
+  └──────────┘
   libclif not involved.
 ```
 
 ### Wasm + CIR Build (portable artifact)
 
 ```
-cot build main.cot -o main.wasm --emit-ir
+cot build main.cot --emit-ir -o main.wasm
 
-  libcot                     libcir
-  ┌──────────┐              ┌──────────┐
-  │ scan     │              │ SSA in   │
-  │ parse    │──cir_build_*─→│ memory   │──→ .wasm file with:
-  │ check    │              │ ARC opt  │     ├── Code section (Wasm bytecode)
-  │ lower    │              │ wasm emit│     └── cot_ssa section (SSA binary)
-  └──────────┘              │ CIR emit │
-                            └──────────┘
+  Produces .wasm with both:
+    Code section   ← runnable by browsers/wasmtime
+    cot_ssa section ← readable by libclif for native compilation
 
-  Later, on any machine:
-  cot-backend main.wasm -o main    (libclif reads cot_ssa → native)
+  Later: cot-backend main.wasm -o main
 ```
 
-### Check Only
+### Check / LSP
 
 ```
-cot check main.cot
-
-  libcot only
-  ┌──────────┐
-  │ scan     │
-  │ parse    │──→ errors/warnings/diagnostics
-  │ check    │
-  └──────────┘
+cot check main.cot       libcot only (no IR, no codegen)
+cot lsp                   libcot only
 ```
 
-### LSP
+### TypeScript Build (libts → libcot → libcir)
 
 ```
-cot lsp
+cot build app.ts -o app
 
-  libcot only
-  ┌──────────┐
-  │ scan     │
-  │ parse    │──→ diagnostics, completions, hover, goto-def
-  │ check    │
-  │ LSP      │
-  └──────────┘
+  libts                    libcot                     libcir          libclif
+  ┌──────────┐            ┌──────────┐              ┌──────────┐   ┌──────────┐
+  │ scan TS  │            │          │              │ build SSA│   │ read CIR │
+  │ parse TS │─Cot AST──→│ check    │─cir_build_──→│ ARC opt  │──→│ → ARM64  │
+  │ transform│            │ lower    │              │ schedule │   │ → .o     │
+  └──────────┘            └──────────┘              └──────────┘   └──────────┘
+
+  libts produces Cot AST in memory. libcot's checker and lowerer are reused
+  entirely — no duplication. TypeScript gets ARC, actors, generics, Wasm,
+  and native for free.
+  Classes → structs. Promise<T> → async fn. throw → error union.
 ```
 
-### Other Frontend
+### Mixed Project (.cot + .ts files)
 
 ```
-PyCot frontend (hypothetical):
+cot build src/
 
-  PyCot                      libcir                     libclif
-  ┌──────────┐              ┌──────────┐              ┌──────────┐
-  │ scan Py  │              │ SSA in   │              │ read CIR │
-  │ parse Py │──cir_build_*─→│ memory   │──cir_module*─→│ → CLIF   │
-  │ check Py │              │ ARC opt  │              │ → native │
-  │ lower Py │              │ passes   │              │          │
-  └──────────┘              └──────────┘              └──────────┘
+  main.ts ──→ libts ──→ Cot AST ──┐
+                                    ├──→ libcot checker+lowerer ──→ CIR ──→ binary
+  utils.cot ──→ libcot scanner ──→ Cot AST ──┘
 
-  PyCot gets ARC, actors, generics, Wasm, and native for free.
-  It only implements Python syntax → CIR instruction translation.
+  Zero interop cost — both paths produce the same Cot AST.
+  The checker and lowerer see identical input regardless of source language.
+  A Cot library imported from TypeScript is just a typed import.
 ```
 
----
+### Other Frontends (future)
 
-## 5. File Mapping: Current Zig → New Structure
-
-### libcot (Frontend)
-
-| Current Zig File | New Location | Lines |
-|------------------|--------------|-------|
-| `compiler/frontend/scanner.zig` | `libcot/scanner.zig` | ~1,200 |
-| `compiler/frontend/parser.zig` | `libcot/parser.zig` | ~2,400 |
-| `compiler/frontend/ast.zig` | `libcot/ast.zig` | ~800 |
-| `compiler/frontend/checker.zig` | `libcot/checker.zig` | ~5,000 |
-| `compiler/frontend/lower.zig` | `libcot/lower.zig` | ~13,000 |
-| `compiler/frontend/types.zig` | `libcot/types.zig` | ~2,500 |
-| `compiler/frontend/source.zig` | `libcot/source.zig` | ~300 |
-| `compiler/frontend/errors.zig` | `libcot/errors.zig` | ~200 |
-| `compiler/frontend/target.zig` | `libcot/target.zig` | ~100 |
-| `compiler/frontend/vwt_gen.zig` | `libcot/vwt_gen.zig` | ~1,500 |
-| `compiler/lsp/` | `libcot/lsp/` | ~5,000 |
-| **Total** | | **~32,000** |
-
-### libcir (IR + Passes + Wasm Emit)
-
-| Current Zig File | New Location | Lines |
-|------------------|--------------|-------|
-| `compiler/frontend/ssa_builder.zig` | `libcir/ssa_builder.zig` | ~2,900 |
-| `compiler/ir/` | `libcir/ir/` | ~6,400 |
-| `compiler/ssa/` | `libcir/ssa/` | ~8,200 |
-| `compiler/codegen/wasm/` | `libcir/wasm/` | ~5,500 |
-| `compiler/codegen/test_runtime.zig` | `libcir/test_runtime.zig` | ~500 |
-| `compiler/codegen/bench_runtime.zig` | `libcir/bench_runtime.zig` | ~300 |
-| New: `cir_api.zig` (C ABI exports) | `libcir/cir_api.zig` | ~500 |
-| New: `cir_serialize.zig` (binary format) | `libcir/cir_serialize.zig` | ~1,000 |
-| **Total** | | **~25,300** |
-
-### libclif (Native Backend — Rust)
-
-| Current Zig File | Replaced By | Lines |
-|------------------|-------------|-------|
-| `compiler/codegen/native/` (68K lines) | `libclif/src/` (~5-10K Rust) | ~5,000-10,000 |
-
-The 68K lines of hand-ported Cranelift in Zig becomes ~5-10K lines of Rust calling the real Cranelift crate. The register allocator, instruction selector, ARM64/x64 emitters — all come from the crate.
-
-### CLI Driver
-
-| Current Zig File | New Location | Lines |
-|------------------|--------------|-------|
-| `compiler/driver.zig` (6,700 lines) | `cot-cli/main.zig` (~500 lines) | ~500 |
-| `compiler/cli.zig` | `cot-cli/cli.zig` | ~300 |
-| `compiler/main.zig` | `cot-cli/main.zig` | ~200 |
-
-The driver shrinks from 6,700 lines to ~500 because all the logic moves into the libraries.
-
----
-
-## 6. CIR Binary Format (Wasm Custom Section)
-
-The CIR binary format lives inside a standard Wasm custom section named `cot_ssa`. It uses LEB128 encoding (same as Wasm) for compactness.
+Other languages can follow the same pattern as libts — parse their syntax, transform to Cot AST, call `cot_compile_ast()`. Or they can bypass libcot entirely and call `cir_build_*()` directly for maximum control:
 
 ```
-Custom Section "cot_ssa":
-  Magic: 0x43 0x49 0x52 0x00    ("CIR\0")
-  Version: LEB128
-
-  Section: Types
-    Count: LEB128
-    [TypeEntry]:
-      Kind: u8 (struct=1, actor=2, enum=3, func=4, ...)
-      Name: string (LEB128 length + bytes)
-      Fields: [FieldEntry] (type_idx + name + offset)
-
-  Section: Metadata
-    Count: LEB128
-    [MetadataEntry]:
-      Type: type_idx
-      VWT pointer: u32 (index into function table)
-      Size: LEB128
-      Stride: LEB128
-      Flags: u32 (Sendable, actor, trivial, ...)
-
-  Section: Functions
-    Count: LEB128
-    [FuncEntry]:
-      Name: string
-      Signature: type_idx
-      IsAsync: bool
-      ActorIsolation: u8 (none=0, actor=1, global_actor=2)
-      BlockCount: LEB128
-      [BlockEntry]:
-        ValueCount: LEB128
-        [ValueEntry]:
-          Opcode: u8
-          Type: type_idx
-          Args: [value_idx] (LEB128 each)
-          AuxData: varies by opcode
-
-  Section: Strings
-    Count: LEB128
-    [StringEntry]:
-      Length: LEB128
-      Bytes: [u8]
-
-  Section: Globals
-    Count: LEB128
-    [GlobalEntry]:
-      Name: string
-      Type: type_idx
-      Size: LEB128
-```
-
-### CIR Opcodes (subset)
-
-```
-// Arithmetic (0x00-0x1F)
-0x00  add
-0x01  sub
-0x02  mul
-0x03  div_s
-0x04  div_u
-0x05  rem_s
-0x06  rem_u
-0x07  and
-0x08  or
-0x09  xor
-0x0A  shl
-0x0B  shr_s
-0x0C  shr_u
-
-// Memory (0x20-0x3F)
-0x20  load
-0x21  store
-0x22  local_addr
-0x23  global_addr
-0x24  off_ptr
-
-// Control (0x40-0x5F)
-0x40  br
-0x41  brif
-0x42  ret
-0x43  ret_void
-0x44  call
-0x45  call_indirect
-0x46  phi
-0x47  select
-
-// Constants (0x60-0x6F)
-0x60  const_int
-0x61  const_float
-0x62  const_bool
-0x63  const_nil
-
-// Comparison (0x70-0x7F)
-0x70  eq
-0x71  ne
-0x72  lt
-0x73  le
-0x74  gt
-0x75  ge
-
-// ARC (0xA0-0xAF) — language-agnostic memory management
-0xA0  retain
-0xA1  release
-0xA2  alloc
-0xA3  dealloc
-0xA4  is_unique
-0xA5  arc_retain_value    // VWT-aware retain
-0xA6  arc_release_value   // VWT-aware release
-
-// VWT / Generics (0xB0-0xBF)
-0xB0  vwt_copy
-0xB1  vwt_destroy
-0xB2  vwt_size
-0xB3  vwt_stride
-0xB4  metadata_addr
-0xB5  vwt_init_with_copy
-0xB6  vwt_assign_with_copy
-
-// Concurrency (0xC0-0xCF)
-0xC0  actor_enqueue
-0xC1  actor_resign
-0xC2  task_create
-0xC3  task_switch
-0xC4  task_cancel
-0xC5  task_is_cancelled
-0xC6  await_future
-0xC7  async_suspend        // state machine suspension point
-0xC8  async_resume         // state machine resume point
+  libfoo (any language)   libcir                     libclif
+  ┌──────────┐           ┌──────────┐              ┌──────────┐
+  │ parse    │─cir_build_→│ build SSA│─cir_module*─→│ → native │
+  │ check    │           │ ARC opt  │              │          │
+  │ lower    │           │ wasm emit│──→ .wasm     │          │
+  └──────────┘           └──────────┘              └──────────┘
 ```
 
 ---
 
-## 7. The Self-Hosting Path
+## 5. CIR Binary Format
 
-### Phase 1: Restructure Zig (current code, new boundaries)
+CIR is serialized into a standard Wasm custom section named `cot_ssa`. The format uses SPIR-V-style 32-bit word-aligned encoding for fast parsing.
+
+Full specification: **[CIR_FORMAT_SPEC.md](CIR_FORMAT_SPEC.md)**
+
+Key properties:
+- Header: magic (`CIR\0`), version, generator, bound (max Result ID)
+- Instructions: `(word_count << 16) | opcode` first word, operand words follow
+- String heap: deduplicated, offset-referenced
+- Types are instructions with Result IDs
+- ~80 language-agnostic opcodes (ARC, VWT, actors, generics)
+- Unknown opcodes skippable via word count (forward-compatible)
+- Validation: structural, ARC, type, and concurrency rules
+
+---
+
+## 6. File Mapping: Current Zig → New Structure
+
+### libcot (Frontend) ~32K lines
+
+| Current File | New Location |
+|-------------|-------------|
+| `compiler/frontend/scanner.zig` | `src/libcot/scanner.zig` |
+| `compiler/frontend/parser.zig` | `src/libcot/parser.zig` |
+| `compiler/frontend/ast.zig` | `src/libcot/ast.zig` |
+| `compiler/frontend/checker.zig` | `src/libcot/checker.zig` |
+| `compiler/frontend/lower.zig` | `src/libcot/lower.zig` |
+| `compiler/frontend/types.zig` | `src/libcot/types.zig` |
+| `compiler/frontend/source.zig` | `src/libcot/source.zig` |
+| `compiler/frontend/errors.zig` | `src/libcot/errors.zig` |
+| `compiler/frontend/vwt_gen.zig` | `src/libcot/vwt_gen.zig` |
+| `compiler/lsp/` | `src/libcot/lsp/` |
+
+### libcir (IR + Passes + Wasm Emit) ~25K lines
+
+| Current File | New Location |
+|-------------|-------------|
+| `compiler/frontend/ssa_builder.zig` | `src/libcir/ssa_builder.zig` |
+| `compiler/ir/` | `src/libcir/ir/` |
+| `compiler/ssa/` | `src/libcir/ssa/` |
+| `compiler/codegen/wasm/` | `src/libcir/wasm/` |
+| `compiler/codegen/test_runtime.zig` | `src/libcir/test_runtime.zig` |
+| New: C ABI exports | `src/libcir/cir_api.zig` |
+| New: CIR serializer | `src/libcir/cir_serialize.zig` |
+
+### libts (TypeScript Pre-Processor) ~5-8K lines Zig (new)
+
+| File | Purpose |
+|------|---------|
+| `src/libts/scanner.zig` | JS/TS lexer (template literals, optional chaining, nullish coalescing) |
+| `src/libts/parser.zig` | JS/TS parser (ESM, strict mode, TS type annotations, generics) |
+| `src/libts/transform.zig` | TS AST → Cot AST in-memory transform (the core — class→struct, interface→trait, throw→error union) |
+| `src/libts/source_map.zig` | TS span → Cot AST span tracking (errors point to original .ts lines) |
+| `src/libts/tsconfig.zig` | tsconfig.json loader |
+| `src/libts/node_resolve.zig` | Node module resolution (node_modules, package.json) |
+
+No checker, no lowerer — those are in libcot and reused via `cot_compile_ast()`.
+
+See **[TYPESCRIPT_NATIVE.md](TYPESCRIPT_NATIVE.md)** for the full TypeScript plan.
+
+### libclif (Native Backend) — interchangeable implementations
+
+| Implementation | Location | Lines | Purpose |
+|---------------|----------|-------|---------|
+| Cranelift Zig port | `src/libclif-zig/` | ~68K | Current default, battle-tested |
+| Cranelift Rust crate | `src/libclif-rs/` | ~5-10K | Thin wrapper, free updates |
+| LLVM via Zig | `src/libllvm-zig/` | ~3-5K | Optimized release builds, coroutines |
+| Cranelift Cot port | `src/libclif/` | ~60-80K | Ultimate self-hosting goal |
+
+**libllvm-zig structure:**
+
+| File | Purpose |
+|------|---------|
+| `src/libllvm-zig/lower.zig` | CIR → LLVM IR translation |
+| `src/libllvm-zig/optimize.zig` | LLVM pass pipeline (O0-O3, LTO) |
+| `src/libllvm-zig/emit.zig` | LLVM → object file (arm64, x64, wasm, risc-v) |
+| `src/libllvm-zig/link.zig` | System linker invocation |
+| `src/libllvm-zig/arc.zig` | ARC intrinsics as LLVM IR |
+| `src/libllvm-zig/async.zig` | Coroutines via LLVM coro intrinsics (solves Gap 9) |
+
+Zig calls the LLVM C API (`llvm-c/Core.h`) via `@cImport` — the same mechanism Zig's own compiler uses. No FFI wrapper needed.
+
+### CLI Driver ~500 lines
+
+| Current File | New Location |
+|-------------|-------------|
+| `compiler/driver.zig` | `src/cot-cli/main.zig` |
+| `compiler/cli.zig` | `src/cot-cli/cli.zig` |
+| `compiler/main.zig` | `src/cot-cli/main.zig` |
+
+---
+
+## 7. Self-Hosting Path
+
+### Phase 1: Restructure Zig into three libraries
+
+Same code, new boundaries. Add C ABI wrappers. Verify 370 tests pass.
 
 ```
-zig-libcot/    ← compiler/frontend/ + compiler/lsp/
-zig-libcir/    ← compiler/ir/ + compiler/ssa/ + compiler/codegen/wasm/
-rust-libclif/  ← new Rust project, replaces compiler/codegen/native/
-cot-cli/       ← thin driver
+src/libcot/    ← compiler/frontend/ + compiler/lsp/
+src/libcir/    ← compiler/ir/ + compiler/ssa/ + compiler/codegen/wasm/
+src/libclif/   ← compiler/codegen/native/
+src/cot-cli/   ← thin driver
 ```
 
-Verify: 370 tests pass, selfcot builds. No functional changes — just file reorganization + C ABI wrappers.
+### Phase 2: Freeze Zig, hand-port libcot to Cot
 
-### Phase 2: Hand-port libcot to Cot
-
-John hand-writes the Cot frontend in Cot, using the Zig code as reference. This is the learning phase — understanding every compiler stage by implementing it.
+John hand-writes the Cot frontend in Cot, learning every compiler stage. The Zig code is the answer key.
 
 ```
-cot-libcot/    ← hand-written in Cot (scanner, parser, checker, lowerer)
-zig-libcir/    ← still Zig (unchanged)
-rust-libclif/  ← still Rust (unchanged)
+src/libcot/         ← hand-written in Cot (the frontend)
+src/libcir/         ← still Zig (stable, complex optimization code)
+src/libclif/        ← still Zig (unchanged)
 ```
 
 ### Phase 3: Hand-port libcir to Cot
 
 ```
-cot-libcot/    ← Cot
-cot-libcir/    ← hand-written in Cot (SSA, passes, wasm emit, CIR format)
-rust-libclif/  ← still Rust (unchanged)
+src/libcot/         ← Cot
+src/libcir/         ← hand-written in Cot (SSA, passes, wasm emit)
+src/libclif/        ← still Zig or switch to Rust Cranelift crate
 ```
 
-### Phase 4: Delete Zig entirely
+### Phase 4: Full self-hosting
 
 ```
-cot-libcot/    ← Cot (self-hosted frontend)
-cot-libcir/    ← Cot (self-hosted IR)
-rust-libclif/  ← Rust (Cranelift crate, the only non-Cot dependency)
-cot-cli/       ← Cot
+src/libcot/         ← Cot (self-hosted frontend)
+src/libcir/         ← Cot (self-hosted IR)
+src/libclif/        ← Zig or Rust (native backend — only non-Cot piece)
 ```
 
-The Zig code becomes the historical bootstrapper — frozen, never touched again. Like how Rust's original OCaml compiler is archived but never used.
+### Phase 5 (Ultimate): Port Cranelift to Cot
+
+```
+src/libcot/         ← Cot
+src/libcir/         ← Cot
+src/libclif/        ← Cot (Cranelift port — ARM64, x64 only)
+
+Zero external dependencies. ~100K lines of Cot.
+The compiler compiles itself. That's it.
+```
 
 ### Bootstrap Chain
 
 ```
-First time:
-  zig-libcot + zig-libcir + rust-libclif → compiles cot-libcot → cot-libcot binary
-
-Every release after:
-  cot-libcot(N) + cot-libcir(N) + rust-libclif → compiles cot-libcot(N+1)
-
-  Zig only needed if bootstrap from scratch.
-  Rust only rebuilds if Cranelift updates.
+First time:     Zig libcot + Zig libcir + Zig libclif → compiles Cot libcot
+Every release:  Cot libcot(N) + libcir + libclif → compiles Cot libcot(N+1)
+Final state:    Cot libcot(N) + Cot libcir(N) + Cot libclif → compiles everything(N+1)
 ```
 
 ---
 
-## 8. The Bigger Vision: CIR as a Compilation Target
+## 8. The Bigger Vision: Native TypeScript + CIR as Platform
 
-Once CIR has a stable C API (libcir) and a serialized binary format (cot_ssa custom section), it becomes a compilation target for other languages — not just Cot.
+### TypeScript Native
+
+The first major second frontend. Compiles `.ts` and `.js` files to native binaries using the same CIR pipeline. No V8, no JIT, no garbage collector. ARC memory, static dispatch, zero runtime overhead.
+
+```
+cot build app.ts -o app          # TypeScript → native binary
+cot build app.ts --target=wasm   # TypeScript → Wasm
+cot run app.ts                   # Compile + run
+```
+
+Two standard libraries:
+- `stdlib/*.cot` — Cot stdlib (existing, Zig-style)
+- `stdlib/*.ts` — Node-compatible API surface (TypeScript syntax, calls into Cot stdlib)
+
+npm packages: downloaded from registry, compiled from source, cached in `~/.cot/packages/`. Pure TypeScript packages work. Native addons don't.
+
+Compliance measured against industry-standard test suites:
+- **Test262** (~50K JS tests): target 95%+ on strict mode subset
+- **TypeScript test suite** (~80K cases): target 90%+ conformance
+- **Node.js test suite** (~5K tests): target 80%+ on implemented modules
+
+Full plan: **[TYPESCRIPT_NATIVE.md](TYPESCRIPT_NATIVE.md)**
+
+### CIR as a Compilation Target
+
+Once CIR has a stable C API (libcir) and binary format (cot_ssa), it becomes a compilation target for other languages:
 
 ```
 LLVM:     "Write a frontend, get optimization + codegen free"
@@ -622,48 +514,17 @@ Cot CIR:  "Write a frontend, get ARC + actors + generics + Wasm + native free"
           Commoditizes memory management and concurrency.
 ```
 
-Any language that wants:
-- Automatic reference counting (no GC pauses)
-- Actor-based concurrency (compile-time data race prevention)
-- Generic dispatch (VWT shared bodies or monomorphization)
-- Wasm + native from the same compilation
-
-...can target CIR instead of implementing all of it from scratch.
-
-This is the long-term differentiator. Not the language — the IR.
+Any language that wants automatic reference counting, actor-based concurrency, generic dispatch, and Wasm + native from the same compilation — targets CIR instead of implementing it from scratch.
 
 ---
 
-## 9. Comparison with Existing IRs
-
-| | LLVM IR | .NET IL | JVM Bytecode | Cot CIR |
-|---|---|---|---|---|
-| Level | Low (near assembly) | Medium (typed stack) | Medium (typed stack) | High (SSA + semantics) |
-| Memory model | Manual | GC | GC | ARC |
-| Understands generics | No | Yes (reified) | Yes (erased) | Yes (VWT) |
-| Understands concurrency | No | Partial (async) | Partial (threads) | Yes (actors) |
-| Understands ownership | No | No | No | Yes (retain/release) |
-| Compilation | AOT | JIT (RyuJIT) | JIT (HotSpot) | AOT |
-| Wasm target | Yes (backend) | Experimental | No | Yes (native emit) |
-| Format | Bitcode (binary) | PE/.dll (binary) | .class (binary) | Wasm custom section |
-| Self-hosted | No (C++) | No (C#→.NET) | No (Java→JVM) | Yes (Cot→CIR) |
-
-CIR occupies a unique position: higher-level than LLVM (understands ARC, actors, generics), but AOT-compiled (no runtime JIT like .NET/JVM), with Wasm as a first-class target, and the entire stack self-hostable in the source language.
-
----
-
-## 10. What This Means for the Business
-
-The open-source / closed-source split becomes natural:
+## 9. Business Model
 
 | Component | License | Rationale |
 |-----------|---------|-----------|
-| libcot (Cot frontend) | Open source (MIT) | The language is the community |
-| libcir (CIR) | Open source (MIT) | The IR is the ecosystem — needs adoption |
-| libclif (native backend) | Open source (MIT) | Thin wrapper around open-source Cranelift |
+| libcot | Open source (MIT) | The language is the community |
+| libcir | Open source (MIT) | The IR needs ecosystem adoption |
+| libclif | Open source (MIT) | Thin wrapper around open-source backends |
 | cot-cli | Open source (MIT) | Users need the compiler |
-| **Cot Studio** | **Proprietary** | IDE, component library, deployment platform |
+| **Cot Studio** | **Proprietary** | IDE, component library, Canvas UI, deployment |
 | **Cot Cloud** | **Proprietary** | Managed Wasm deployment, edge runtime |
-| **CIR Optimizer Pro** | **Proprietary** | Advanced ARC/actor optimization passes |
-
-The language, IR, and compiler are free. The developer experience, deployment platform, and advanced tooling are the product. Same model as Rust (free) + Ferrocene (paid certified compiler) or VS Code (free) + GitHub Copilot (paid).

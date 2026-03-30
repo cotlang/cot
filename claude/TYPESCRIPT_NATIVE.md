@@ -8,15 +8,16 @@
 
 ## Architecture
 
+libts is a **pre-processor** that transforms TypeScript AST into Cot AST in memory, then hands it to libcot's existing checker and lowerer. No duplication of compiler logic. No intermediate `.cot` files on disk.
+
 ```
-Source Files          Frontends              IR              Backends
-───────────          ─────────              ──              ────────
-  .cot  ──────→  libcot (Zig syntax)  ──→
-                                            CIR  ──→  libclif (native)
-  .ts/.js ────→  libts  (TS/JS syntax) ──→          libwasm (Wasm)
+.cot  ──→  libcot scanner+parser  ──→  Cot AST  ──┐
+                                                     ├──→  libcot checker+lowerer  ──→  CIR  ──→  native/Wasm
+.ts   ──→  libts scanner+parser   ──→  TS AST  ──→  libts transform  ──→  Cot AST  ──┘
+.js   ──→  (same as .ts, all types inferred)
 ```
 
-Both frontends emit the same CIR. Same optimization passes. Same native code. A project can mix `.cot` and `.ts` files — they interop at CIR level with zero overhead.
+Both paths produce the same Cot AST. The checker and lowerer are reused entirely — libts is ~5-8K lines, not a whole compiler. A project can mix `.cot` and `.ts` files with zero interop cost.
 
 ### Two Standard Libraries
 
@@ -254,21 +255,52 @@ async fn fetchUser(id: f64) User {
 
 ## Frontend Structure
 
+libts is a **pre-processor**, not a full compiler. It has no checker, no lowerer — those are in libcot and reused via `cot_compile_ast()`.
+
 ```
 src/
-  libts/                TypeScript frontend
-    scanner.zig           JS/TS lexer (template literals, JSX future)
-    parser.zig            JS/TS parser (ESM, strict mode, TS extensions)
-    checker.zig           TypeScript type checker (structural subtyping)
-    lower.zig             TS AST → CIR
-    tsconfig.zig          tsconfig.json loader (compilerOptions mapping)
-    node_resolve.zig      Node module resolution (node_modules, package.json)
+  libts/                   TypeScript pre-processor (~5-8K lines)
+    scanner.zig              JS/TS lexer (template literals, `?.`, `??`, `=>`, `<T>`)
+    parser.zig               JS/TS parser (ESM, strict mode, TS type annotations)
+    transform.zig            TS AST → Cot AST in-memory (class→struct, interface→trait,
+                               Promise→async, throw→error union, T|U→tagged union)
+    source_map.zig           TS span → Cot AST span tracking (errors point to .ts lines)
+    tsconfig.zig             tsconfig.json loader (compilerOptions mapping)
+    node_resolve.zig         Node module resolution (node_modules, package.json)
 
-  libts-cot/            TypeScript frontend (self-hosted, future)
-    scanner.ts            Same but written in TypeScript
-    parser.ts             Bootstrapped by libts
-    ...
+  libcot/                  Cot frontend (existing, unchanged)
+    ...                      cot_compile_ast() entry point receives Cot AST from libts
+                             Checker and lowerer run on the transformed AST — no duplication
 ```
+
+### New C ABI entry point on libcot
+
+```c
+// cot.h — new entry point for pre-built ASTs
+CirModuleRef cot_compile_ast(CotCompilerRef c, CotAst* ast);
+```
+
+libts calls this instead of `cot_compile(source_text)`. The checker and lowerer receive a Cot AST and don't know it originated from TypeScript.
+
+### Key transform rules (transform.zig)
+
+| TypeScript | Cot AST output | Notes |
+|-----------|----------------|-------|
+| `class Foo { ... }` | `struct Foo { ... }` + `new` + methods | Heap-allocated, ARC |
+| `interface Bar { ... }` | `trait Bar { ... }` | Auto-generate `impl` for matching structs |
+| `foo(x: number): string` | `fn foo(x: f64) string` | Type annotation mapping |
+| `async function f()` | `async fn f()` | Direct mapping |
+| `throw new Error(msg)` | `return error.X` | Error union |
+| `try { } catch (e) { }` | `x catch \|err\| { }` | Error handling |
+| `x?.foo` | `x?.foo` | Already identical |
+| `x ?? y` | `x orelse y` | Already equivalent |
+| `` `hello ${name}` `` | `"hello ${name}"` | String interpolation |
+| `const f = (x) => x * 2` | `const f = fn(x: f64) f64 { return x * 2 }` | Closure |
+| `T \| U` | `union { t: T, u: U }` | Tagged union |
+| `T[]` / `Array<T>` | `List(T)` | |
+| `Map<K,V>` | `Map(K,V)` | |
+| `Promise<T>` | async fn return | |
+| `null` / `undefined` | `null` (optional `?T`) | Unified |
 
 ### Module Resolution (Node algorithm)
 
@@ -323,34 +355,42 @@ A `cot.json` or `tsconfig.json` can set project-level defaults.
 
 ## Implementation Phases
 
-### Phase 1: TypeScript Scanner + Parser (4-6 weeks)
-- Lex JS/TS tokens (superset of Cot tokens + `?:`, `?.`, `??`, `=>`, `<T>`, JSX future)
-- Parse ESM + strict mode JS/TS into AST
-- No type checking yet — just parse and emit CIR with `any` types
+**Prerequisite:** libcot restructuring complete (src/libcot-zig with `cot_compile_ast()` entry point).
+
+### Phase 1: TS Scanner + Parser + Basic Transform (4-6 weeks)
+- `scanner.zig`: Lex JS/TS tokens (superset of Cot — add `?.`, `??`, `=>`, `<T>`, `:` type annotations)
+- `parser.zig`: Parse ESM + strict mode JS/TS into TS AST
+- `transform.zig`: Basic TS AST → Cot AST transform (functions, variables, classes, basic types)
+- `source_map.zig`: Span tracking so errors point to `.ts` lines
+- No structural subtyping yet — just direct type mapping (`number`→`f64`, `string`→`string`)
 - **Gate:** `cot run hello.ts` where hello.ts is `console.log("hello world")` produces a native binary
 
-### Phase 2: TypeScript Type Checker (6-8 weeks)
-- Structural subtyping (interface conformance without explicit `impl`)
-- Generic type resolution `<T>`
-- Union type narrowing (`typeof`, `instanceof`, discriminated unions)
-- `strict` mode checks (no implicit `any`, strict null checks)
+### Phase 2: Full Transform + Structural Subtyping (4-6 weeks)
+- Complete transform rules: interfaces→traits, union types→tagged unions, throw→error unions
+- Auto-generate `impl Trait for Struct` when a class satisfies an interface structurally
+- Generic `<T>` → Cot `(T)` mapping
+- `async/await` + `Promise<T>` → Cot async functions
+- `any`/`unknown` → tagged union with runtime dispatch
 - **Gate:** Real-world TS files with types compile and run correctly
 
 ### Phase 3: Node-Compatible Standard Library (4-6 weeks)
 - `stdlib/*.ts` files implementing Node API surface
 - `fs`, `path`, `http`, `crypto`, `console`, `process`, `events`, `stream`, `url`, `buffer`
-- **Gate:** A basic Express-style HTTP server compiles and serves requests
+- Each `.ts` stdlib file compiled by libts, calls into existing Cot stdlib
+- **Gate:** A basic HTTP server compiles and serves requests
 
 ### Phase 4: npm Package Compatibility (4-6 weeks)
-- `node_modules` resolution
-- `package.json` reading
-- Compile pure-TS npm packages (no native addons, no V8 APIs)
+- `node_resolve.zig`: `node_modules` resolution, `package.json` reading
+- `tsconfig.zig`: `tsconfig.json` loader
+- Compile pure-TS npm packages from source, cache compiled CIR in `~/.cot/packages/`
 - **Gate:** A project using `zod` for validation compiles and runs
 
-### Phase 5: Performance + Polish (ongoing)
-- Optimize tagged union dispatch for `any`/`unknown` types
-- Tree shaking for unused stdlib modules
-- Source maps for debugging
+### Phase 5: Compliance + Polish (ongoing)
+- Run Test262 strict mode subset, track pass rate toward 95%+
+- Run TypeScript conformance tests, track toward 90%+
+- Run Node.js API tests for implemented modules
+- Optimize tagged union dispatch for `any`/`unknown`
+- Tree shaking for unused stdlib
 - `cot init --template=ts` for new TS projects
 
 ---
