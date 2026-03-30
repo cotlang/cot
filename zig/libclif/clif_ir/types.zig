@@ -296,10 +296,7 @@ pub const Type = struct {
         return self.eql(F16) or self.eql(F32) or self.eql(F64) or self.eql(F128);
     }
 
-    /// Register class for this type (matches regalloc/index.zig RegClass).
-    pub const RegClass = enum(u2) { int = 0, float = 1, vector = 2 };
-
-    pub fn regClass(self: Self) RegClass {
+    pub fn regClass(self: Self) @import("../regalloc/index.zig").RegClass {
         if (self.isVector()) return .vector;
         if (self.isFloat()) return .float;
         return .int;

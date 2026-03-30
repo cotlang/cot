@@ -7,7 +7,7 @@
 
 const std = @import("std");
 const cir_read = @import("cir_read.zig");
-const compile_mod = @import("compile.zig");
+const cir_translate = @import("cir_translate.zig");
 
 // Re-exports for internal use
 pub const clif = @import("clif_ir/mod.zig");
@@ -27,11 +27,10 @@ export fn clif_compile(
     out_ptr: *[*]const u8,
     out_len: *usize,
 ) callconv(.c) i32 {
-    const result = compileImpl(cir_ptr, cir_len, target_str, out_ptr, out_len) catch |err| {
+    compileImpl(cir_ptr, cir_len, target_str, out_ptr, out_len) catch |err| {
         std.debug.print("zig-libclif error: {s}\n", .{@errorName(err)});
         return 1;
     };
-    _ = result;
     return 0;
 }
 
@@ -54,23 +53,24 @@ fn compileImpl(
     out_ptr: *[*]const u8,
     out_len: *usize,
 ) !void {
-    _ = target_str;
-
     if (cir_ptr == null or cir_len == 0) return error.NoCirData;
 
     const cir_bytes = cir_ptr.?[0..cir_len];
     const allocator = std.heap.page_allocator;
 
+    // Resolve target ISA
+    _ = target_str;
+    const compile_mod = @import("compile.zig");
+    const isa = compile_mod.detectNativeIsa();
+
     // Parse CIR
     var module = try cir_read.readModule(allocator, cir_bytes);
     defer module.deinit();
 
-    // TODO: Translate CIR functions → CLIF IR → hand-ported backend → .o
-    // For now, verify the CIR parsed correctly by checking function count
-    if (module.functions.len == 0) return error.NoFunctions;
+    // Translate CIR → CLIF IR → hand-ported backend → .o
+    const obj_bytes = try cir_translate.translateModule(allocator, &module, isa);
 
-    // Placeholder: return empty .o (will be replaced with real compilation)
-    _ = out_ptr;
-    _ = out_len;
-    return error.NotYetImplemented;
+    // Copy to caller-owned memory
+    out_ptr.* = obj_bytes.ptr;
+    out_len.* = obj_bytes.len;
 }
