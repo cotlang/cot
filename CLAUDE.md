@@ -42,34 +42,32 @@ COT_SSA=funcName ./zig-out/bin/cot build file.cot     # SSA HTML visualizer
 ## Architecture
 
 ```
-zig/libcot/                              rust/libclif/
+zig/libcot/ (72K lines)                  rust/libclif/
   cli.zig (arg parsing)                    src/lib.rs (C ABI entry)
   main.zig (command dispatch)              src/cir.rs (CIR reader)
   driver.zig (pipeline orchestrator)       src/translate.rs (CIR → Cranelift)
   frontend/ (scanner, parser,              Cargo.toml (cranelift deps)
     checker, lower)
   ssa/ (SSA passes)                      zig/libclif/
-  codegen/wasm/ (Wasm bytecode)            lib.zig (C ABI entry)
-  codegen/native/                          cir_read.zig (CIR reader)
-    ssa_to_clif.zig (SSA → CLIF IR)        cir_translate.zig (CIR → hand-ported CLIF)
-    cir_write.zig (CLIF → CIR bytes)       compile.zig, machinst/, isa/, regalloc/
-    libclif.zig (C ABI to rust/libclif)
-    arc_native.zig, io_native.zig, ...
-  ir/clif/ (CLIF IR data structures)
+  codegen/wasm/ (Wasm bytecode)            lib.zig (C ABI entry, same as rust)
+  codegen/ssa_to_cir.zig (SSA → CIR)      cir_read.zig (CIR reader)
+  codegen/arc_runtime.zig (ARC as CIR)    cir_translate.zig (CIR → hand-ported CLIF)
+  codegen/io_runtime.zig (I/O as CIR)     compile.zig, machinst/, isa/, regalloc/
+  codegen/libclif.zig (C ABI to libclif)
   lsp/ (language server)
 ```
+
+**The boundary is CIR.** libcot produces CIR bytes. libclif (rust or zig) consumes them.
 
 **Native compilation flow:**
 ```
 Cot source → libcot (parse, check, lower, SSA passes)
-  → ssa_to_clif.zig (SSA → CLIF IR)
-  → cir_write.zig (CLIF IR → CIR binary format)
-  → rust/libclif (CIR → real Cranelift → user .o)
-  + hand-ported backend (CLIF IR → runtime .o)
-  → linker (user .o + runtime .o → executable)
+  → ssa_to_cir.zig (SSA → CIR binary format, includes runtime + data + entry wrapper)
+  → libclif (CIR → Cranelift IR → native .o)
+  → linker (.o → executable)
 ```
 
-**Backend selection:** `--backend=cranelift` (default, real Cranelift via Rust) or `--backend=zig` (hand-ported Cranelift).
+**Backend selection:** `--backend=cranelift` (default, real Cranelift via `rust/libclif`) or `--backend=zig` (hand-ported Cranelift via `zig/libclif`). Both consume identical CIR bytes via the `clif_compile` C ABI.
 
 **Key directories:**
 | Path | Purpose |
@@ -80,22 +78,23 @@ Cot source → libcot (parse, check, lower, SSA passes)
 | `zig/libcot/frontend/` | Scanner, parser, checker, lowerer |
 | `zig/libcot/ssa/passes/` | SSA optimization passes |
 | `zig/libcot/codegen/wasm/` | Wasm bytecode generation |
-| `zig/libcot/codegen/native/ssa_to_clif.zig` | SSA → CLIF IR translation |
-| `zig/libcot/codegen/native/cir_write.zig` | CLIF IR → CIR binary serializer |
-| `zig/libcot/codegen/native/libclif.zig` | C ABI bindings to rust/libclif |
-| `zig/libcot/codegen/native/arc_native.zig` | ARC runtime as CLIF IR |
-| `zig/libcot/ir/clif/` | CLIF IR data structures |
+| `zig/libcot/codegen/ssa_to_cir.zig` | SSA → CIR direct translation |
+| `zig/libcot/codegen/arc_runtime.zig` | ARC runtime as CIR |
+| `zig/libcot/codegen/io_runtime.zig` | I/O runtime as CIR |
+| `zig/libcot/codegen/print_runtime_native.zig` | Print runtime as CIR |
+| `zig/libcot/codegen/signal_runtime.zig` | Signal handler as CIR |
+| `zig/libcot/codegen/test_runtime_native.zig` | Test runner as CIR |
+| `zig/libcot/codegen/libclif.zig` | C ABI bindings to libclif |
 | `zig/libcot/lsp/` | Language server (LSP over stdio) |
 | `rust/libclif/` | Real Cranelift backend (CIR → .o) |
-| `zig/libclif/` | Hand-ported Cranelift backend (drop-in alternative) |
+| `zig/libclif/` | Hand-ported Cranelift backend (CIR → .o, drop-in) |
 | `editors/vscode/` | VS Code/Cursor extension |
 
 **Reference implementations (copy, don't invent):**
 | Component | Reference |
 |-----------|-----------|
 | Cot → Wasm | `references/go/src/cmd/compile/internal/wasm/` |
-| SSA → CLIF | `references/rust/compiler/rustc_codegen_cranelift/src/` |
-| CLIF → ARM64 | `references/wasmtime/cranelift/codegen/src/isa/aarch64/` |
+| SSA → CIR | `references/rust/compiler/rustc_codegen_cranelift/src/` |
 | Concurrency | `references/swift/stdlib/public/Concurrency/` |
 
 ---
@@ -157,13 +156,14 @@ Lives in `self/`, written in Cot. Compiles `.cot` → `.wasm`. ~46,000 lines acr
 
 ## CIR Binary Format
 
-The bridge between `zig/libcot` and `rust/libclif`. Serialized by `cir_write.zig`, read by `cir.rs`.
+The contract between `zig/libcot` and `rust/libclif` (or `zig/libclif`). Serialized by `ssa_to_cir.zig`, read by `cir.rs` / `cir_read.zig`.
 
-- SPIR-V-inspired binary format with string heap, function definitions, typed instructions
-- Call instructions carry callee parameter types from the CLIF signature (no guessing)
-- Multi-return functions serialize all return values
+- SPIR-V-inspired binary format with string heap, function definitions, data definitions
+- Section 0x01: string heap, Section 0x04: data/globals, Section 0x06: function definitions
+- All integer params use CIR_I64 (Cranelift 64-bit ABI)
 - `OP_BITCAST` (0x0049) for i64↔f64 conversion
 - `OP_FUNC_ADDR` (0x0095) carries full callee signature for function pointers
+- Entry wrapper (`__cot_entry`) stores argc/argv/envp and calls `_cot_main`
 - See `claude/CIR_FORMAT_SPEC.md` for full spec
 
 ---
@@ -206,7 +206,6 @@ zig build test                                    # Compiler unit tests (once)
 | `claude/WASM_CODEGEN_REFERENCE.md` | Wasm codegen pipeline reference |
 | `claude/WASM_PLATFORM_VISION.md` | Wasm platform vision |
 | `claude/COT_SSA_PLAN.md` | SSA HTML visualizer |
-| `claude/LINUX_X64_PARITY.md` | x64 native backend status |
 | `docs/syntax.md` | Complete language syntax reference |
 
 ---
