@@ -576,6 +576,23 @@ fn translate_instruction(
             }
         }
 
+        // -- Bitcast --
+        0x0049 => {
+            let result_id = inst.words[0];
+            let type_idx = inst.words[1];
+            let val_id = inst.words[2];
+            let target_type = cir_type_to_clif(type_idx);
+            if let Ok(val) = use_value(val_id, builder, value_map, var_map) {
+                let val_ty = builder.func.dfg.value_type(val);
+                let result = if val_ty == target_type {
+                    val
+                } else {
+                    builder.ins().bitcast(target_type, ir::MemFlags::new(), val)
+                };
+                def_value(result_id, result, builder, value_map, var_map, next_var);
+            }
+        }
+
         // -- Return --
         OP_RET => {
             let sig_ret_count = builder.func.signature.returns.len();

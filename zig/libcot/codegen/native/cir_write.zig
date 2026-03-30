@@ -446,7 +446,7 @@ fn serializeInstruction(writer: *CirWriter, data: clif.InstructionData, result_i
                 .sextend => writer.emit(0x0041, &.{ result_id, result_type, arg }), // OP_SEXTEND
                 .ireduce => writer.emit(0x0042, &.{ result_id, result_type, arg }), // OP_IREDUCE
                 .ineg => writer.emit(0x0017, &.{ result_id, result_type, arg }),
-                .bitcast => writer.emit(OP_COPY, &.{ result_id, result_type, arg }),
+                .bitcast => writer.emit(0x0049, &.{ result_id, result_type, arg }), // OP_BITCAST
                 .fcvt_from_sint => writer.emit(0x0043, &.{ result_id, result_type, arg }),
                 .fcvt_to_sint => writer.emit(0x0044, &.{ result_id, result_type, arg }),
                 .fcvt_to_uint => writer.emit(0x0048, &.{ result_id, result_type, arg }),

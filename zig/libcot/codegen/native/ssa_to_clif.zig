@@ -659,6 +659,18 @@ const SsaToClifTranslator = struct {
                 try self.putValue(v.id, result);
             },
 
+            // Wasm reinterpret (bitcast between int and float)
+            .wasm_i64_reinterpret_f64 => {
+                const arg = self.getClif(v.args[0]);
+                const result = try ins.bitcast(clif.Type.I64, arg);
+                try self.putValue(v.id, result);
+            },
+            .wasm_f64_reinterpret_i64 => {
+                const arg = self.getClif(v.args[0]);
+                const result = try ins.bitcast(clif.Type.F64, arg);
+                try self.putValue(v.id, result);
+            },
+
             // Wasm float builtins — binary (min, max, copysign)
             .wasm_f64_min => try self.emitFloatBinary(v, .fmin, clif.Type.F64),
             .wasm_f64_max => try self.emitFloatBinary(v, .fmax, clif.Type.F64),
@@ -943,7 +955,7 @@ const SsaToClifTranslator = struct {
                     else => null,
                 };
                 if (fn_name) |name| {
-                    const func_ref = try self.getOrCreateFuncRef(name, 0, 0);
+                    const func_ref = try self.getOrCreateFuncRef(name, 0, 0, null);
                     const result = try ins.funcAddr(clif.Type.I64, func_ref);
                     try self.putValue(v.id, result);
                 } else {
@@ -969,7 +981,7 @@ const SsaToClifTranslator = struct {
                     // in self.func_refs as a hash map key (arena-style, freed at translator deinit)
                     const dtor_name = try std.fmt.allocPrint(self.allocator, "{s}_deinit", .{tname});
                     if (self.func_index_map.get(dtor_name) != null) {
-                        const func_ref = try self.getOrCreateFuncRef(dtor_name, 1, 0);
+                        const func_ref = try self.getOrCreateFuncRef(dtor_name, 1, 0, null);
                         const result = try ins.funcAddr(clif.Type.I64, func_ref);
                         try self.putValue(v.id, result);
                     } else {
@@ -1085,7 +1097,7 @@ const SsaToClifTranslator = struct {
             // ============================================================
             .retain => {
                 const arg = self.getClif(v.args[0]);
-                const func_ref = try self.getOrCreateFuncRef("retain", 1, 1);
+                const func_ref = try self.getOrCreateFuncRef("retain", 1, 1, null);
                 const call_result = try ins.call(func_ref, &[_]clif.Value{arg});
                 if (call_result.results.len > 0) {
                     try self.putValue(v.id, call_result.results[0]);
@@ -1093,7 +1105,7 @@ const SsaToClifTranslator = struct {
             },
             .release => {
                 const arg = self.getClif(v.args[0]);
-                const func_ref = try self.getOrCreateFuncRef("release", 1, 0);
+                const func_ref = try self.getOrCreateFuncRef("release", 1, 0, null);
                 _ = try ins.call(func_ref, &[_]clif.Value{arg});
             },
 
@@ -1622,11 +1634,10 @@ const SsaToClifTranslator = struct {
             try call_args.append(self.allocator, clif_arg);
         }
 
-        // Create/get function reference (exclude memory arg from param count)
-        const n_params = call_args.items.len;
+        // Create/get function reference, passing actual arg types for correct signature
         const has_return = v.type_idx != TypeRegistry.VOID and v.type_idx != TypeRegistry.SSA_MEM;
         const n_returns: usize = if (has_return) 1 else 0;
-        const func_ref = try self.getOrCreateFuncRef(func_name, n_params, n_returns);
+        const func_ref = try self.getOrCreateFuncRef(func_name, call_args.items.len, n_returns, call_args.items);
 
         const call_result = try self.builder.ins().call(func_ref, call_args.items);
         if (call_result.results.len > 0) {
@@ -1770,7 +1781,7 @@ const SsaToClifTranslator = struct {
         }
     }
 
-    fn getOrCreateFuncRef(self: *Self, name: []const u8, n_params: usize, n_returns: usize) !clif.FuncRef {
+    fn getOrCreateFuncRef(self: *Self, name: []const u8, n_params: usize, n_returns: usize, actual_args: ?[]const clif.Value) !clif.FuncRef {
         if (self.func_refs.get(name)) |ref| return ref;
 
         // Build signature from callee's actual IR type info.
@@ -1820,9 +1831,16 @@ const SsaToClifTranslator = struct {
                 }
             }
         } else {
-            // External/runtime function — fall back to n_params × I64
-            for (0..n_params) |_| {
-                try sig.addParam(self.allocator, clif.AbiParam.init(clif.Type.I64));
+            // External/runtime function — use actual arg types if available, fallback to I64
+            if (actual_args) |args| {
+                for (args) |arg| {
+                    const ty = self.clif_func.dfg.valueType(arg);
+                    try sig.addParam(self.allocator, clif.AbiParam.init(ty));
+                }
+            } else {
+                for (0..n_params) |_| {
+                    try sig.addParam(self.allocator, clif.AbiParam.init(clif.Type.I64));
+                }
             }
             for (0..n_returns) |_| {
                 try sig.addReturn(self.allocator, clif.AbiParam.init(clif.Type.I64));
