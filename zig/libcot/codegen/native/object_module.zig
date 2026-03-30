@@ -17,11 +17,11 @@ const Allocator = std.mem.Allocator;
 
 // Import buffer types for relocation handling
 const buffer_mod = @import("machinst/buffer.zig");
-const FinalizedMachReloc = buffer_mod.FinalizedMachReloc;
-const FinalizedRelocTarget = buffer_mod.FinalizedRelocTarget;
+pub const FinalizedMachReloc = buffer_mod.FinalizedMachReloc;
+pub const FinalizedRelocTarget = buffer_mod.FinalizedRelocTarget;
 const MachBufferFinalized = buffer_mod.MachBufferFinalized;
-const Reloc = buffer_mod.Reloc;
-const ExternalName = buffer_mod.ExternalName;
+pub const Reloc = buffer_mod.Reloc;
+pub const ExternalName = buffer_mod.ExternalName;
 const LibCall = buffer_mod.LibCall;
 const KnownSymbol = buffer_mod.KnownSymbol;
 const CodeOffset = buffer_mod.CodeOffset;

@@ -221,8 +221,9 @@ impl CirInst {
 
 pub struct CirGlobal {
     pub name_offset: u32,
-    pub type_idx: u32,
+    pub flags: u32,      // bit 0: writable, bit 1: zero-init, bit 2: export
     pub size: u32,
+    pub data: Vec<u8>,   // empty if zero-init
 }
 
 // -- Reader --
@@ -420,13 +421,33 @@ impl<'a> CirReader<'a> {
     }
 
     fn read_globals(&mut self, end: usize) -> Result<Vec<CirGlobal>, String> {
+        // Section 0x04 format: byte_count(u32), then repeating [name_offset, flags, size, [bytes...]]
+        let byte_count = self.read_u32()? as usize;
+        let data_start = self.pos;
+        let data_end = data_start + byte_count;
         let mut globals = vec![];
-        while self.pos < end {
+        while self.pos < data_end {
             let name_offset = self.read_u32()?;
-            let type_idx = self.read_u32()?;
-            let size = self.read_u32()?;
-            globals.push(CirGlobal { name_offset, type_idx, size });
+            let flags = self.read_u32()?;
+            let size = self.read_u32()? as usize;
+            let zero_init = (flags & 2) != 0;
+            let data = if zero_init || size == 0 {
+                vec![]
+            } else {
+                if self.pos + size > self.data.len() {
+                    return Err(format!("global data truncated at {}", self.pos));
+                }
+                let d = self.data[self.pos..self.pos + size].to_vec();
+                self.pos += size;
+                // Align to 4 bytes
+                while self.pos % 4 != 0 { self.pos += 1; }
+                d
+            };
+            globals.push(CirGlobal { name_offset, flags, size: size as u32, data });
         }
+        // Skip to section end (padded)
+        self.pos = ((data_end + 3) / 4) * 4;
+        if self.pos < end { self.pos = end; }
         Ok(globals)
     }
 

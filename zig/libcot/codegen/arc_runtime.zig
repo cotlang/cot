@@ -286,20 +286,38 @@ const CirFuncBuilder = struct {
     }
 
     fn jump(self: *CirFuncBuilder, target: u32) void {
-        self.writer.emit(OP_JUMP, &.{target});
+        self.writer.emit(OP_JUMP, &.{ target, 0 });
+    }
+
+    fn jumpWithArgs(self: *CirFuncBuilder, target: u32, args: []const u32) void {
+        var buf: [32]u32 = undefined;
+        buf[0] = target;
+        buf[1] = @intCast(args.len);
+        for (args, 0..) |a, i| buf[2 + i] = a;
+        self.writer.emit(OP_JUMP, buf[0 .. 2 + args.len]);
     }
 
     fn brif(self: *CirFuncBuilder, cond: u32, true_block: u32, false_block: u32) void {
-        self.writer.emit(OP_BRIF, &.{ cond, true_block, false_block });
+        self.writer.emit(OP_BRIF, &.{ cond, true_block, false_block, 0, 0 });
     }
 
     fn trap(self: *CirFuncBuilder) void {
         self.writer.emit(OP_TRAP, &.{});
     }
 
-    fn funcAddr(self: *CirFuncBuilder, name_off: u32) u32 {
+    fn funcAddr(self: *CirFuncBuilder, name_off: u32, param_count: u32, return_count: u32) u32 {
         const id = self.nextId();
-        self.writer.emit(OP_FUNC_ADDR, &.{ id, CIR_I64, name_off });
+        var buf: [32]u32 = undefined;
+        buf[0] = id;
+        buf[1] = CIR_I64;
+        buf[2] = name_off;
+        buf[3] = param_count;
+        var pos: usize = 4;
+        for (0..param_count) |_| { buf[pos] = CIR_I64; pos += 1; }
+        buf[pos] = return_count;
+        pos += 1;
+        for (0..return_count) |_| { buf[pos] = CIR_I64; pos += 1; }
+        self.writer.emit(OP_FUNC_ADDR, buf[0..pos]);
         return id;
     }
 
@@ -748,32 +766,27 @@ fn generateRetain(writer: *CirWriter) void {
     b.brif(is_slow, 7, 6);
     writer.endBlock();
 
-    // Block 6: inline increment
+    // Block 6: inline increment — compute rc_addr and pass to block 8
     writer.beginBlock(6, 0, &.{8}, &.{5});
     const v_rc_off = b.iconst(REFCOUNT_OFFSET);
-    const rc_addr = b.add(header_ptr, v_rc_off);
-    b.jump(8);
+    const rc_addr_inline = b.add(header_ptr, v_rc_off);
+    b.jumpWithArgs(8, &.{rc_addr_inline});
     writer.endBlock();
 
-    // Block 7: side table increment
+    // Block 7: side table increment — compute st_rc_addr and pass to block 8
     writer.beginBlock(7, 0, &.{8}, &.{5});
     const v_clear = b.iconst(@bitCast(USE_SLOW_RC_CLEAR_MASK));
     const cleared = b.band(refcount, v_clear);
     const v_shift = b.iconst(SIDE_TABLE_ALIGN_SHIFT);
     const st_ptr = b.shl(cleared, v_shift);
     const v_st_rc_off = b.iconst(SIDE_TABLE_REFCOUNT_OFFSET);
-    const st_rc_addr = b.add(st_ptr, v_st_rc_off);
-    b.jump(8);
+    const rc_addr_st = b.add(st_ptr, v_st_rc_off);
+    b.jumpWithArgs(8, &.{rc_addr_st});
     writer.endBlock();
 
-    // Block 8: shared increment — add STRONG_RC_ONE to refcount at rc_addr
-    // Note: CIR doesn't have atomic_rmw_add, so we do load/add/store (single-threaded for now)
+    // Block 8: shared increment — rc_addr comes as block parameter (PHI from blocks 6/7)
     writer.beginBlock(8, 0, &.{}, &.{ 6, 7 });
-    // Use rc_addr from block 6 or st_rc_addr from block 7 depending on path
-    // In CIR we can reference the appropriate value since both jump to this block
-    // For simplicity, we use the last defined rc_addr (block 7's st_rc_addr path covers both)
-    // Actually, in CIR SSA, we need a PHI-like mechanism. For now, use the inline path's rc_addr.
-    // The CIR consumer will handle the proper value routing.
+    const rc_addr = b.arg(0); // block param: rc_addr from either path
     const old_rc = b.load(rc_addr);
     const v_strong_one = b.iconst(STRONG_RC_ONE);
     const new_rc = b.add(old_rc, v_strong_one);
@@ -874,27 +887,27 @@ fn generateRelease(writer: *CirWriter) void {
     b.brif(is_slow, 6, 5);
     writer.endBlock();
 
-    // Block 5: inline path
+    // Block 5: inline path — compute rc_addr and pass to block 7
     writer.beginBlock(5, 0, &.{7}, &.{4});
     const v_rc_off = b.iconst(REFCOUNT_OFFSET);
-    const rc_addr = b.add(header_ptr, v_rc_off);
-    b.jump(7);
+    const rc_addr_inline = b.add(header_ptr, v_rc_off);
+    b.jumpWithArgs(7, &.{rc_addr_inline});
     writer.endBlock();
 
-    // Block 6: side table path
+    // Block 6: side table path — compute st_rc_addr and pass to block 7
     writer.beginBlock(6, 0, &.{7}, &.{4});
     const v_clear = b.iconst(@bitCast(USE_SLOW_RC_CLEAR_MASK));
     const cleared6 = b.band(refcount, v_clear);
     const v_shift6 = b.iconst(SIDE_TABLE_ALIGN_SHIFT);
     const st_ptr6 = b.shl(cleared6, v_shift6);
     const v_st_rc_off6 = b.iconst(SIDE_TABLE_REFCOUNT_OFFSET);
-    const st_rc_addr6 = b.add(st_ptr6, v_st_rc_off6);
-    _ = st_rc_addr6;
-    b.jump(7);
+    const rc_addr_st = b.add(st_ptr6, v_st_rc_off6);
+    b.jumpWithArgs(7, &.{rc_addr_st});
     writer.endBlock();
 
-    // Block 7: decrement — check IsDeiniting first
+    // Block 7: decrement — rc_addr comes as block parameter (PHI from blocks 5/6)
     writer.beginBlock(7, 0, &.{ 13, 14 }, &.{ 5, 6 });
+    const rc_addr = b.arg(0);
     const pre_rc = b.load(rc_addr);
     const v_deinit_bit = b.iconst(IS_DEINITING_BIT);
     const deinit_check = b.band(pre_rc, v_deinit_bit);
@@ -912,9 +925,8 @@ fn generateRelease(writer: *CirWriter) void {
     b.jump(1);
     writer.endBlock();
 
-    // Block 14: do decrement
+    // Block 14: do decrement — rc_addr dominates from block 7 (block 7 dominates 14)
     writer.beginBlock(14, 0, &.{ 8, 1 }, &.{7});
-    // load-sub-store (non-atomic for now)
     const old_rc = b.load(rc_addr);
     const v_neg_strong = b.iconst(-STRONG_RC_ONE);
     const new_rc = b.add(old_rc, v_neg_strong);
@@ -930,7 +942,7 @@ fn generateRelease(writer: *CirWriter) void {
     b.brif(was_last, 8, 1);
     writer.endBlock();
 
-    // Block 8: check destructor — set IsDeiniting
+    // Block 8: check destructor — set IsDeiniting (rc_addr dominates from block 7→14→8)
     writer.beginBlock(8, 0, &.{ 9, 10 }, &.{14});
     const rc_val = b.load(rc_addr);
     const v_clear_mask = b.iconst(@bitCast(~(@as(u64, @bitCast(@as(i64, @bitCast(STRONG_EXTRA_MASK)))) | USE_SLOW_RC_BIT)));
@@ -1164,26 +1176,27 @@ fn generateUnownedRetain(writer: *CirWriter) void {
     b.brif(is_slow, 5, 4);
     writer.endBlock();
 
-    // Block 4: inline — rc_addr = header + REFCOUNT_OFFSET
+    // Block 4: inline — compute rc_addr and pass to block 6
     writer.beginBlock(4, 0, &.{6}, &.{3});
     const v_rc_off = b.iconst(REFCOUNT_OFFSET);
-    const rc_addr = b.add(header_ptr, v_rc_off);
-    b.jump(6);
+    const rc_addr_inline = b.add(header_ptr, v_rc_off);
+    b.jumpWithArgs(6, &.{rc_addr_inline});
     writer.endBlock();
 
-    // Block 5: side table
+    // Block 5: side table — compute st_rc_addr and pass to block 6
     writer.beginBlock(5, 0, &.{6}, &.{3});
     const v_clear = b.iconst(@bitCast(USE_SLOW_RC_CLEAR_MASK));
     const cleared = b.band(refcount, v_clear);
     const v_shift = b.iconst(SIDE_TABLE_ALIGN_SHIFT);
     const st_ptr = b.shl(cleared, v_shift);
     const v_st_off = b.iconst(SIDE_TABLE_REFCOUNT_OFFSET);
-    const st_rc_addr = b.add(st_ptr, v_st_off);
-    b.jump(6);
+    const rc_addr_st = b.add(st_ptr, v_st_off);
+    b.jumpWithArgs(6, &.{rc_addr_st});
     writer.endBlock();
 
-    // Block 6: increment unowned
+    // Block 6: increment unowned — rc_addr is block parameter (PHI from blocks 4/5)
     writer.beginBlock(6, 0, &.{}, &.{ 4, 5 });
+    const rc_addr = b.arg(0);
     const old_rc = b.load(rc_addr);
     const v_unowned_one = b.iconst(UNOWNED_RC_ONE);
     const new_rc = b.add(old_rc, v_unowned_one);
@@ -1241,27 +1254,29 @@ fn generateUnownedRelease(writer: *CirWriter) void {
     b.brif(is_slow, 5, 4);
     writer.endBlock();
 
-    // Block 4: inline path
+    // Block 4: inline path — pass (rc_addr, st_ptr=0) to block 6
     writer.beginBlock(4, 0, &.{6}, &.{3});
     const v_rc_off = b.iconst(REFCOUNT_OFFSET);
-    const rc_addr = b.add(header_ptr, v_rc_off);
-    const v_zero_st = b.iconst(0); // no side table
-    b.jump(6);
+    const rc_addr_inline = b.add(header_ptr, v_rc_off);
+    const v_no_st = b.iconst(0); // no side table
+    b.jumpWithArgs(6, &.{ rc_addr_inline, v_no_st });
     writer.endBlock();
 
-    // Block 5: side table path
+    // Block 5: side table path — pass (st_rc_addr, st_ptr) to block 6
     writer.beginBlock(5, 0, &.{6}, &.{3});
     const v_clear = b.iconst(@bitCast(USE_SLOW_RC_CLEAR_MASK));
     const cleared = b.band(refcount, v_clear);
     const v_shift = b.iconst(SIDE_TABLE_ALIGN_SHIFT);
-    const st_ptr = b.shl(cleared, v_shift);
+    const st_ptr_5 = b.shl(cleared, v_shift);
     const v_st_off = b.iconst(SIDE_TABLE_REFCOUNT_OFFSET);
-    const st_rc_addr = b.add(st_ptr, v_st_off);
-    b.jump(6);
+    const rc_addr_st = b.add(st_ptr_5, v_st_off);
+    b.jumpWithArgs(6, &.{ rc_addr_st, st_ptr_5 });
     writer.endBlock();
 
-    // Block 6: decrement unowned
+    // Block 6: decrement unowned — rc_addr and st_ptr are block parameters
     writer.beginBlock(6, 0, &.{ 7, 1 }, &.{ 4, 5 });
+    const rc_addr = b.arg(0);
+    const st_ptr = b.arg(1);
     const old_rc = b.load(rc_addr);
     const v_neg_unowned = b.iconst(-UNOWNED_RC_ONE);
     const new_rc = b.add(old_rc, v_neg_unowned);
@@ -1277,18 +1292,15 @@ fn generateUnownedRelease(writer: *CirWriter) void {
     b.brif(is_last, 7, 1);
     writer.endBlock();
 
-    // Block 7: dealloc obj, check side table
+    // Block 7: dealloc obj, check side table (st_ptr dominates from block 6)
     writer.beginBlock(7, 0, &.{ 8, 1 }, &.{6});
     b.call0(dealloc_name, &.{obj});
-    // Check if side table exists (st_ptr != 0)
-    // In inline path, st_ptr was 0; in side table path, it was the decoded pointer
-    // For simplicity, check if refcount had UseSlowRC bit set
     const v_zero_7 = b.iconst(0);
     const has_st = b.icmp_ne(st_ptr, v_zero_7);
     b.brif(has_st, 8, 1);
     writer.endBlock();
 
-    // Block 8: side table cleanup — zero object_ptr
+    // Block 8: side table cleanup — zero object_ptr (st_ptr dominates from block 6→7→8)
     writer.beginBlock(8, 0, &.{ 9, 1 }, &.{7});
     const v_zero_8 = b.iconst(0);
     b.store(st_ptr, v_zero_8); // object_ptr = 0

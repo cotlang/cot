@@ -65,8 +65,8 @@ const B = struct {
     fn stackSlot(self: *B, slot_idx: u32, size: u32, alignment: u32) void { self.writer.emit(OP_STACK_SLOT_DECL, &.{ slot_idx, size, alignment }); }
     fn ret(self: *B, val: u32) void { self.writer.emit(OP_RET, &.{val}); }
     fn retVoid(self: *B) void { self.writer.emit(OP_RET_VOID, &.{}); }
-    fn jump(self: *B, target: u32) void { self.writer.emit(OP_JUMP, &.{target}); }
-    fn brif(self: *B, cond: u32, tb: u32, fb: u32) void { self.writer.emit(OP_BRIF, &.{ cond, tb, fb }); }
+    fn jump(self: *B, target: u32) void { self.writer.emit(OP_JUMP, &.{ target, 0 }); }
+    fn brif(self: *B, cond: u32, tb: u32, fb: u32) void { self.writer.emit(OP_BRIF, &.{ cond, tb, fb, 0, 0 }); }
     fn call1(self: *B, name_off: u32, args: []const u32) u32 {
         const result_id = self.nextId();
         var buf: [64]u32 = undefined;

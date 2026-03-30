@@ -1494,14 +1494,6 @@ fn compileAndLinkFull(
         std.process.exit(1);
     };
 
-    // CIR path: link the extra runtime .o file produced by generateNativeCodeViaCIR
-    if (compile_driver.cir_runtime_obj_path) |rtp| {
-        link_args.append(allocator, rtp) catch {
-            std.debug.print("Error: Allocation failed\n", .{});
-            std.process.exit(1);
-        };
-    }
-
     // Debug mode: link DWARF runtime reader for file:line:column in crash traces.
     // Zig reference: std.debug reads DWARF from own binary at crash time.
     // The .o is pre-compiled at `zig build` time and embedded in the compiler.

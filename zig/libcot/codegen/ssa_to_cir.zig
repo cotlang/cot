@@ -36,6 +36,7 @@ const MAGIC: u32 = 0x00434952; // "CIR\0"
 const VERSION_1_0: u32 = 0x00010000;
 
 const SECTION_STRING_HEAP: u16 = 0x01;
+const SECTION_GLOBALS: u16 = 0x04;
 const SECTION_FUNC_DEFS: u16 = 0x06;
 
 // Structure markers
@@ -153,7 +154,7 @@ const CIR_BOOL: u32 = 1;
 const CIR_I8: u32 = 2;
 const CIR_I16: u32 = 3;
 const CIR_I32: u32 = 4;
-const CIR_I64: u32 = 5;
+pub const CIR_I64: u32 = 5;
 const CIR_U8: u32 = 6;
 const CIR_U16: u32 = 7;
 const CIR_U32: u32 = 8;
@@ -257,6 +258,8 @@ pub const CirWriter = struct {
     /// Function definition words — written during serialization.
     /// String heap is assembled separately and prepended at finish() time.
     words: std.ArrayListUnmanaged(u32),
+    /// Data definition bytes — globals, string data, type metadata, etc.
+    data_defs: std.ArrayListUnmanaged(u8),
     string_heap: std.ArrayListUnmanaged(u8),
     string_offsets: std.StringHashMapUnmanaged(u32),
     allocator: Allocator,
@@ -264,6 +267,7 @@ pub const CirWriter = struct {
     pub fn init(allocator: Allocator) CirWriter {
         return .{
             .words = .{},
+            .data_defs = .{},
             .string_heap = .{},
             .string_offsets = .{},
             .allocator = allocator,
@@ -272,6 +276,7 @@ pub const CirWriter = struct {
 
     pub fn deinit(self: *CirWriter) void {
         self.words.deinit(self.allocator);
+        self.data_defs.deinit(self.allocator);
         self.string_heap.deinit(self.allocator);
         self.string_offsets.deinit(self.allocator);
     }
@@ -342,8 +347,40 @@ pub const CirWriter = struct {
         self.words.append(self.allocator, (@as(u32, 1) << 16) | @as(u32, BLOCK_END)) catch {};
     }
 
+    /// Add a data definition (global variable or data blob).
+    /// Format: name_offset(u32), flags(u32), size(u32), [bytes if not zero-init]
+    /// flags bit 0: writable, bit 1: zero-init (no bytes follow), bit 2: export
+    pub fn defineData(self: *CirWriter, name: []const u8, data: []const u8, writable: bool, is_export: bool) void {
+        const name_off = self.internString(name);
+        var flags: u32 = 0;
+        if (writable) flags |= 1;
+        if (data.len == 0) flags |= 2; // zero-init marker (shouldn't happen with data)
+        if (is_export) flags |= 4;
+        // Write as raw bytes into data_defs buffer
+        self.data_defs.appendSlice(self.allocator, std.mem.asBytes(&name_off)) catch {};
+        self.data_defs.appendSlice(self.allocator, std.mem.asBytes(&flags)) catch {};
+        const size: u32 = @intCast(data.len);
+        self.data_defs.appendSlice(self.allocator, std.mem.asBytes(&size)) catch {};
+        self.data_defs.appendSlice(self.allocator, data) catch {};
+        // Pad to 4-byte alignment
+        while (self.data_defs.items.len % 4 != 0) {
+            self.data_defs.append(self.allocator, 0) catch {};
+        }
+    }
+
+    /// Add a zero-initialized data definition (global variable).
+    pub fn defineZeroData(self: *CirWriter, name: []const u8, size: u32, writable: bool, is_export: bool) void {
+        const name_off = self.internString(name);
+        var flags: u32 = 2; // zero-init
+        if (writable) flags |= 1;
+        if (is_export) flags |= 4;
+        self.data_defs.appendSlice(self.allocator, std.mem.asBytes(&name_off)) catch {};
+        self.data_defs.appendSlice(self.allocator, std.mem.asBytes(&flags)) catch {};
+        self.data_defs.appendSlice(self.allocator, std.mem.asBytes(&size)) catch {};
+    }
+
     /// Finalize and return the CIR bytes.
-    /// Assembles: [header] [string_heap_section] [func_defs_section]
+    /// Assembles: [header] [string_heap_section] [globals_section] [func_defs_section]
     pub fn finish(self: *CirWriter) []const u8 {
         var out = std.ArrayListUnmanaged(u32){};
 
@@ -367,6 +404,24 @@ pub const CirWriter = struct {
                 const remaining = @min(4, heap_bytes - i);
                 @memcpy(word[0..remaining], self.string_heap.items[i..][0..remaining]);
                 out.append(self.allocator, std.mem.bytesAsValue(u32, &word).*) catch {};
+            }
+        }
+
+        // Globals section (data definitions)
+        if (self.data_defs.items.len > 0) {
+            const data_bytes = self.data_defs.items.len;
+            const data_words = (data_bytes + 3) / 4;
+            const data_section_wc: u32 = @intCast(2 + data_words);
+            out.append(self.allocator, (data_section_wc << 16) | @as(u32, SECTION_GLOBALS)) catch {};
+            out.append(self.allocator, @intCast(data_bytes)) catch {};
+            {
+                var i: usize = 0;
+                while (i < data_bytes) : (i += 4) {
+                    var word: [4]u8 = .{ 0, 0, 0, 0 };
+                    const remaining = @min(4, data_bytes - i);
+                    @memcpy(word[0..remaining], self.data_defs.items[i..][0..remaining]);
+                    out.append(self.allocator, std.mem.bytesAsValue(u32, &word).*) catch {};
+                }
             }
         }
 
@@ -599,7 +654,12 @@ const SsaToCirTranslator = struct {
                     try param_types.append(self.allocator, CIR_I64);
                 }
             } else {
-                try param_types.append(self.allocator, self.ssaTypeToCirType(param.type_idx));
+                // Use CIR_I64 for all integer types (including bool/i8/i16/i32).
+                // Cranelift 64-bit ABI uses i64 for all integer params.
+                // Only emit narrow types for floats.
+                const raw_type = self.ssaTypeToCirType(param.type_idx);
+                const sig_type = if (raw_type == CIR_F64 or raw_type == CIR_F32) raw_type else CIR_I64;
+                try param_types.append(self.allocator, sig_type);
             }
         }
 
@@ -614,7 +674,9 @@ const SsaToCirTranslator = struct {
                 try return_types.append(self.allocator, CIR_I64);
                 try return_types.append(self.allocator, CIR_I64);
             } else {
-                try return_types.append(self.allocator, self.ssaTypeToCirType(self.ir_return_type));
+                const raw_ret = self.ssaTypeToCirType(self.ir_return_type);
+                const sig_ret = if (raw_ret == CIR_F64 or raw_ret == CIR_F32) raw_ret else CIR_I64;
+                try return_types.append(self.allocator, sig_ret);
             }
         }
     }
@@ -716,7 +778,7 @@ const SsaToCirTranslator = struct {
         // CTXT symbol
         {
             const gv_id = self.nextGvId();
-            const name = self.reverse_map.get(self.ctxt_symbol_idx) orelse "_cot_ctxt";
+            const name = self.reverse_map.get(self.ctxt_symbol_idx) orelse "cot_ctxt";
             const name_off = writer.internString(name);
             writer.emit(OP_GLOBAL_VALUE_SYMBOL, &.{ gv_id, name_off, 0, 0, 1 }); // colocated=1
         }
@@ -790,7 +852,7 @@ const SsaToCirTranslator = struct {
             },
             .const_bool => {
                 const imm: i64 = if (v.aux_int != 0) 1 else 0;
-                self.emitConstInt(writer, result_id, CIR_I64, imm);
+                self.emitConstInt(writer, result_id, CIR_I8, imm);
                 try self.putValue(v.id, result_id);
             },
             .const_nil => {
@@ -1204,7 +1266,7 @@ const SsaToCirTranslator = struct {
                     else => null,
                 };
                 if (global_name) |name| {
-                    if (self.global_symbol_map.get(name)) |sym_idx| {
+                    if (self.global_symbol_map.get(name)) |_| {
                         const gv_id = self.nextGvId();
                         const name_off = writer.internString(name);
                         writer.emit(OP_GLOBAL_VALUE_SYMBOL, &.{ gv_id, name_off, 0, 0, 1 });
@@ -1608,7 +1670,7 @@ const SsaToCirTranslator = struct {
                 if (global_idx == 1) {
                     // CTXT global: emit global_value for _cot_ctxt + load
                     const gv_id = self.nextGvId();
-                    const name_off = writer.internString("_cot_ctxt");
+                    const name_off = writer.internString("cot_ctxt");
                     writer.emit(OP_GLOBAL_VALUE_SYMBOL, &.{ gv_id, name_off, 0, 0, 1 });
                     const addr_id = self.nextSyntheticId();
                     writer.emit(OP_GLOBAL_VALUE, &.{ addr_id, CIR_I64, gv_id });
@@ -1666,7 +1728,7 @@ const SsaToCirTranslator = struct {
                     // Collect phi args for successor
                     var phi_args = std.ArrayListUnmanaged(u32){};
                     defer phi_args.deinit(self.allocator);
-                    try self.collectPhiArgs(ssa_blk, target_ssa, &phi_args);
+                    try self.collectPhiArgs(ssa_blk, target_ssa, &phi_args, writer);
                     var operands_buf: [64]u32 = undefined;
                     operands_buf[0] = target_idx;
                     operands_buf[1] = @intCast(phi_args.items.len);
@@ -1721,8 +1783,8 @@ const SsaToCirTranslator = struct {
                     defer then_phi_args.deinit(self.allocator);
                     var else_phi_args = std.ArrayListUnmanaged(u32){};
                     defer else_phi_args.deinit(self.allocator);
-                    try self.collectPhiArgs(ssa_blk, then_ssa, &then_phi_args);
-                    try self.collectPhiArgs(ssa_blk, else_ssa, &else_phi_args);
+                    try self.collectPhiArgs(ssa_blk, then_ssa, &then_phi_args, writer);
+                    try self.collectPhiArgs(ssa_blk, else_ssa, &else_phi_args, writer);
 
                     var operands_buf: [64]u32 = undefined;
                     operands_buf[0] = cond;
@@ -1780,12 +1842,24 @@ const SsaToCirTranslator = struct {
     // Phi resolution
     // ========================================================================
 
-    fn collectPhiArgs(self: *Self, from_block: *const ssa_block.Block, to_block: *const ssa_block.Block, phi_args: *std.ArrayListUnmanaged(u32)) !void {
+    fn collectPhiArgs(self: *Self, from_block: *const ssa_block.Block, to_block: *const ssa_block.Block, phi_args: *std.ArrayListUnmanaged(u32), writer: *CirWriter) !void {
         const pred_idx = self.findPredIndex(to_block, from_block) orelse return;
         for (to_block.values.items) |v| {
             if (v.op == .phi and v.type_idx != TypeRegistry.SSA_MEM) {
                 if (pred_idx < v.args.len) {
-                    const arg_val = self.getCirId(v.args[pred_idx]);
+                    var arg_val = self.getCirId(v.args[pred_idx]);
+                    // Check if type narrowing is needed (e.g., i64 → i8 for bool phis)
+                    const phi_cir_type = self.ssaTypeToCirType(v.type_idx);
+                    if (phi_cir_type != CIR_I64 and phi_cir_type != CIR_F64 and phi_cir_type != CIR_F32) {
+                        const arg_ssa = v.args[pred_idx];
+                        const arg_cir_type = self.ssaTypeToCirType(arg_ssa.type_idx);
+                        if (arg_cir_type != phi_cir_type) {
+                            // Insert ireduce to narrow the value
+                            const narrow_id = self.nextSyntheticId();
+                            writer.emit(OP_IREDUCE, &.{ narrow_id, phi_cir_type, arg_val });
+                            arg_val = narrow_id;
+                        }
+                    }
                     try phi_args.append(self.allocator, arg_val);
                 }
             }
@@ -1828,13 +1902,20 @@ const SsaToCirTranslator = struct {
             arg_ids[i] = self.getCirId(arg);
         }
 
+        // Resolve aliased names via func_index_map → reverse_map
+        // e.g., "realloc" → idx of "cot_realloc" → "cot_realloc"
+        const resolved_name = if (self.func_index_map.get(func_name)) |idx|
+            (self.reverse_map.get(idx) orelse func_name)
+        else
+            func_name;
+
         // Look up callee's IR func for parameter types
         const callee_ir = self.findIrFunc(func_name);
         const has_return = v.type_idx != TypeRegistry.VOID and v.type_idx != TypeRegistry.SSA_MEM;
 
         // Build CIR call: (result_count, [result_id, result_type]..., name_offset, arg_count, [arg_type, arg_value_id]...)
         const result_id: u32 = v.id;
-        const name_off = writer.internString(func_name);
+        const name_off = writer.internString(resolved_name);
         var operands_buf: [256]u32 = undefined;
 
         // Determine result info
@@ -1874,15 +1955,24 @@ const SsaToCirTranslator = struct {
         operands_buf[pos] = @intCast(arg_count);
         pos += 1;
 
-        // Emit arg types and values
+        // Emit arg types and values.
+        // Use CIR_I64 for all integer params (Cranelift 64-bit ABI passes all ints as i64).
+        // Only use float types (CIR_F64/F32) when the arg is actually a float.
         for (0..arg_count) |i| {
-            // Get callee's expected parameter type
-            const param_type: u32 = if (callee_ir) |ir_func| blk: {
+            var param_type: u32 = CIR_I64;
+            // Check if this arg is a float — look at both IR param type and SSA value type
+            if (callee_ir) |ir_func| {
                 if (i < ir_func.params.len) {
-                    break :blk self.ssaTypeToCirType(ir_func.params[i].type_idx);
+                    const pt = self.ssaTypeToCirType(ir_func.params[i].type_idx);
+                    if (pt == CIR_F64 or pt == CIR_F32) param_type = pt;
                 }
-                break :blk CIR_I64;
-            } else CIR_I64;
+            } else {
+                // Runtime function — check SSA arg type for floats
+                if (i < data_args.len) {
+                    const pt = self.ssaTypeToCirType(data_args[i].type_idx);
+                    if (pt == CIR_F64 or pt == CIR_F32) param_type = pt;
+                }
+            }
             operands_buf[pos] = param_type;
             operands_buf[pos + 1] = arg_ids[i];
             pos += 2;
@@ -1905,7 +1995,7 @@ const SsaToCirTranslator = struct {
                 const context = self.getCirId(v.args[1]);
                 // Store to CTXT
                 const gv_id = self.nextGvId();
-                const name_off = writer.internString("_cot_ctxt");
+                const name_off = writer.internString("cot_ctxt");
                 writer.emit(OP_GLOBAL_VALUE_SYMBOL, &.{ gv_id, name_off, 0, 0, 1 });
                 const ctxt_addr = self.nextSyntheticId();
                 writer.emit(OP_GLOBAL_VALUE, &.{ ctxt_addr, CIR_I64, gv_id });
@@ -1985,7 +2075,7 @@ const SsaToCirTranslator = struct {
         }
     }
 
-    fn emitRuntimeCall(self: *Self, result_id: u32, name: []const u8, args: []const u32, ret_type: u32, writer: *CirWriter) !void {
+    fn emitRuntimeCall(_: *Self, result_id: u32, name: []const u8, args: []const u32, ret_type: u32, writer: *CirWriter) !void {
         const name_off = writer.internString(name);
         const has_return = ret_type != CIR_VOID;
         var operands_buf: [64]u32 = undefined;

@@ -91,11 +91,26 @@ const B = struct {
     fn arg(self: *B, idx: u32) u32 { const id = self.nextId(); self.writer.emit(OP_ARG, &.{ id, CIR_I64, idx }); return id; }
     fn localAddr(self: *B, slot: u32) u32 { const id = self.nextId(); self.writer.emit(OP_LOCAL_ADDR, &.{ id, CIR_I64, slot }); return id; }
     fn stackSlot(self: *B, slot_idx: u32, size: u32, alignment: u32) void { self.writer.emit(OP_STACK_SLOT_DECL, &.{ slot_idx, size, alignment }); }
-    fn funcAddr(self: *B, name_off: u32) u32 { const id = self.nextId(); self.writer.emit(OP_FUNC_ADDR, &.{ id, CIR_I64, name_off }); return id; }
+    fn funcAddr(self: *B, name_off: u32, param_count: u32, return_count: u32) u32 {
+        const id = self.nextId();
+        // Format: result_id, type, name_off, param_count, [param_types...], return_count, [return_types...]
+        var buf: [32]u32 = undefined;
+        buf[0] = id;
+        buf[1] = CIR_I64;
+        buf[2] = name_off;
+        buf[3] = param_count;
+        var pos: usize = 4;
+        for (0..param_count) |_| { buf[pos] = CIR_I64; pos += 1; }
+        buf[pos] = return_count;
+        pos += 1;
+        for (0..return_count) |_| { buf[pos] = CIR_I64; pos += 1; }
+        self.writer.emit(OP_FUNC_ADDR, buf[0..pos]);
+        return id;
+    }
     fn ret(self: *B, val: u32) void { self.writer.emit(OP_RET, &.{val}); }
     fn retVoid(self: *B) void { self.writer.emit(OP_RET_VOID, &.{}); }
-    fn jump(self: *B, target: u32) void { self.writer.emit(OP_JUMP, &.{target}); }
-    fn brif(self: *B, cond: u32, tb: u32, fb: u32) void { self.writer.emit(OP_BRIF, &.{ cond, tb, fb }); }
+    fn jump(self: *B, target: u32) void { self.writer.emit(OP_JUMP, &.{ target, 0 }); }
+    fn brif(self: *B, cond: u32, tb: u32, fb: u32) void { self.writer.emit(OP_BRIF, &.{ cond, tb, fb, 0, 0 }); }
     fn trap(self: *B) void { self.writer.emit(OP_TRAP, &.{}); }
     fn call1(self: *B, name_off: u32, args: []const u32) u32 {
         const result_id = self.nextId();
@@ -411,7 +426,7 @@ fn genInstallSignals(writer: *CirWriter) void {
 
     // Step 3: Setup sigaction struct
     const sa_addr = b.localAddr(1);
-    const handler_addr = b.funcAddr(handler_name);
+    const handler_addr = b.funcAddr(handler_name, 3, 0);
     b.store(sa_addr, handler_addr); // handler pointer at offset 0
 
     const sa_off8 = b.iconst(8);
@@ -490,7 +505,7 @@ fn genPrintSourceLoc(writer: *CirWriter) void {
     var b = B{ .writer = writer };
     b.stackSlot(0, 16, 8);
 
-    const pc = b.arg(0);
+    _ = b.arg(0);
 
     // Write "  at <unknown>\n"
     const buf = b.localAddr(0);

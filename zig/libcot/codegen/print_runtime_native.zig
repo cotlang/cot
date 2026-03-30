@@ -16,6 +16,7 @@ const OP_SUB: u16 = 0x0011;
 const OP_UDIV: u16 = 0x0014;
 const OP_UMOD: u16 = 0x0016;
 const OP_EQ: u16 = 0x0030;
+const OP_NE: u16 = 0x0031;
 const OP_LT: u16 = 0x0032;
 const OP_ULT: u16 = 0x0036;
 const OP_IREDUCE: u16 = 0x0042;
@@ -61,6 +62,7 @@ const B = struct {
     fn udiv(self: *B, l: u32, r: u32) u32 { const id = self.nextId(); self.writer.emit(OP_UDIV, &.{ id, CIR_I64, l, r }); return id; }
     fn urem(self: *B, l: u32, r: u32) u32 { const id = self.nextId(); self.writer.emit(OP_UMOD, &.{ id, CIR_I64, l, r }); return id; }
     fn icmp_eq(self: *B, l: u32, r: u32) u32 { const id = self.nextId(); self.writer.emit(OP_EQ, &.{ id, CIR_I64, l, r }); return id; }
+    fn icmp_ne(self: *B, l: u32, r: u32) u32 { const id = self.nextId(); self.writer.emit(OP_NE, &.{ id, CIR_I64, l, r }); return id; }
     fn icmp_slt(self: *B, l: u32, r: u32) u32 { const id = self.nextId(); self.writer.emit(OP_LT, &.{ id, CIR_I64, l, r }); return id; }
     fn icmp_ult(self: *B, l: u32, r: u32) u32 { const id = self.nextId(); self.writer.emit(OP_ULT, &.{ id, CIR_I64, l, r }); return id; }
     fn ireduce8(self: *B, val: u32) u32 { const id = self.nextId(); self.writer.emit(OP_IREDUCE, &.{ id, CIR_I8, val }); return id; }
@@ -72,10 +74,18 @@ const B = struct {
     fn stackSlot(self: *B, slot_idx: u32, size: u32, alignment: u32) void { self.writer.emit(OP_STACK_SLOT_DECL, &.{ slot_idx, size, alignment }); }
     fn ret(self: *B, val: u32) void { self.writer.emit(OP_RET, &.{val}); }
     fn retVoid(self: *B) void { self.writer.emit(OP_RET_VOID, &.{}); }
-    fn jump(self: *B, target: u32) void { self.writer.emit(OP_JUMP, &.{target}); }
-    fn brif(self: *B, cond: u32, tb: u32, fb: u32) void { self.writer.emit(OP_BRIF, &.{ cond, tb, fb }); }
+    fn jump(self: *B, target: u32) void { self.writer.emit(OP_JUMP, &.{ target, 0 }); }
+    fn jumpWithArgs(self: *B, target: u32, args: []const u32) void {
+        var buf: [16]u32 = undefined;
+        buf[0] = target;
+        buf[1] = @intCast(args.len);
+        for (args, 0..) |a, i| buf[2 + i] = a;
+        self.writer.emit(OP_JUMP, buf[0 .. 2 + args.len]);
+    }
+    fn brif(self: *B, cond: u32, tb: u32, fb: u32) void { self.writer.emit(OP_BRIF, &.{ cond, tb, fb, 0, 0 }); }
     fn ineg(self: *B, val: u32) u32 { const id = self.nextId(); self.writer.emit(OP_INEG, &.{ id, CIR_I64, val }); return id; }
     fn bitcast_i64(self: *B, val: u32) u32 { const id = self.nextId(); self.writer.emit(OP_BITCAST, &.{ id, CIR_I64, val }); return id; }
+    fn bitcast_f64(self: *B, val: u32) u32 { const id = self.nextId(); self.writer.emit(OP_BITCAST, &.{ id, CIR_F64, val }); return id; }
     fn call1(self: *B, name_off: u32, args: []const u32) u32 {
         const result_id = self.nextId();
         var buf: [64]u32 = undefined;
@@ -118,6 +128,7 @@ fn genPrintInt(writer: *CirWriter, name: []const u8, fd: i64) void {
     const write_name = writer.internString("write");
 
     // Blocks: 0=entry, 1=negative, 2=positive, 3=zero, 4=nonzero, 5=loop, 6=write
+    // Block params: block 4 receives abs_val; block 5 receives (remaining, pos); block 6 receives (final_pos)
     writer.beginFuncWithSig(name_off, &.{CIR_I64}, &.{}, 7, 0);
 
     // Block 0: entry — check sign
@@ -130,22 +141,23 @@ fn genPrintInt(writer: *CirWriter, name: []const u8, fd: i64) void {
     b.brif(is_neg, 1, 2);
     writer.endBlock();
 
-    // Block 1: negative — write '-', negate
+    // Block 1: negative — write '-', negate, jump to block 4 with abs_val
     writer.beginBlock(1, 0, &.{4}, &.{0});
     const buf_addr_neg = b.localAddr(0);
     const minus = b.iconst8(0x2D);
     b.store8(buf_addr_neg, minus);
     const v_fd = b.iconst(fd);
-    const v_one = b.iconst(1);
-    _ = b.call1(write_name, &.{ v_fd, buf_addr_neg, v_one });
+    const v_one_neg = b.iconst(1);
+    _ = b.call1(write_name, &.{ v_fd, buf_addr_neg, v_one_neg });
     const abs_val = b.sub(v_zero, val);
-    b.jump(4);
+    b.jumpWithArgs(4, &.{abs_val});
     writer.endBlock();
 
     // Block 2: positive — check zero
     writer.beginBlock(2, 0, &.{ 3, 4 }, &.{0});
     const is_zero = b.icmp_eq(val, v_zero);
-    b.brif(is_zero, 3, 4);
+    // brif with then_args for block 4 = val
+    writer.emit(OP_BRIF, &.{ is_zero, 3, 4, 0, 1, val });
     writer.endBlock();
 
     // Block 3: zero — write "0"
@@ -159,37 +171,40 @@ fn genPrintInt(writer: *CirWriter, name: []const u8, fd: i64) void {
     b.retVoid();
     writer.endBlock();
 
-    // Block 4: nonzero — setup loop
+    // Block 4: nonzero — setup loop, pass (abs_val, 22) to block 5
     writer.beginBlock(4, 0, &.{5}, &.{ 1, 2 });
-    const v_pos = b.iconst(22);
-    b.jump(5);
+    const abs_val_4 = b.arg(0); // block param: abs value from block 1 or 2
+    const v_pos_init = b.iconst(22);
+    b.jumpWithArgs(5, &.{ abs_val_4, v_pos_init });
     writer.endBlock();
 
-    // Block 5: digit loop — extract digits right to left
+    // Block 5: digit loop — remaining and pos are block params
     writer.beginBlock(5, 0, &.{ 6, 5 }, &.{ 4, 5 });
-    // Use abs_val from block 1 or val from block 2 (depends on path)
-    // Simplified: use val (works for positive path)
+    const remaining = b.arg(0); // block param: remaining value
+    const pos = b.arg(1); // block param: current buffer position
     const v_ten = b.iconst(10);
-    const digit = b.urem(val, v_ten);
+    const digit = b.urem(remaining, v_ten);
     const v_0x30 = b.iconst(0x30);
     const char_val = b.add(digit, v_0x30);
     const char_i8 = b.ireduce8(char_val);
     const buf_base = b.localAddr(0);
-    const write_addr5 = b.add(buf_base, v_pos);
+    const write_addr5 = b.add(buf_base, pos);
     b.store8(write_addr5, char_i8);
 
-    const next_remaining = b.udiv(val, v_ten);
-    const next_pos = b.sub(v_pos, v_one);
-    _ = next_remaining; _ = next_pos;
+    const next_remaining = b.udiv(remaining, v_ten);
+    const v_one_l = b.iconst(1);
+    const next_pos = b.sub(pos, v_one_l);
     const v_zero2 = b.iconst(0);
     const is_done = b.icmp_eq(next_remaining, v_zero2);
-    b.brif(is_done, 6, 5);
+    // brif: done → block 6 (pass next_pos), not done → block 5 (pass next_remaining, next_pos)
+    writer.emit(OP_BRIF, &.{ is_done, 6, 5, 1, next_pos, 2, next_remaining, next_pos });
     writer.endBlock();
 
-    // Block 6: write result
+    // Block 6: write result — final_pos is block param
     writer.beginBlock(6, 0, &.{}, &.{5});
+    const final_pos = b.arg(0); // block param: position where last digit was written
     const v_one_w = b.iconst(1);
-    const start_pos = b.add(next_pos, v_one_w);
+    const start_pos = b.add(final_pos, v_one_w);
     const buf_base_w = b.localAddr(0);
     const v_23 = b.iconst(23);
     const len = b.sub(v_23, start_pos);
@@ -209,6 +224,7 @@ fn genIntToString(writer: *CirWriter) void {
     const name_off = writer.internString("int_to_string");
 
     // Blocks: 0=entry, 1=negative, 2=positive, 3=zero, 4=nonzero, 5=loop, 6=done, 7=add_sign, 8=ret
+    // Block params: 4=(abs_val, is_neg), 5=(remaining, idx), 6=(final_idx, is_neg), 7=(idx), 8=(final_idx)
     writer.beginFuncWithSig(name_off, &.{ CIR_I64, CIR_I64 }, &.{CIR_I64}, 9, 0);
 
     writer.beginBlock(0, 0, &.{ 1, 2 }, &.{});
@@ -220,16 +236,19 @@ fn genIntToString(writer: *CirWriter) void {
     b.brif(is_neg, 1, 2);
     writer.endBlock();
 
-    // Block 1: negative
+    // Block 1: negative — negate and pass (abs_val, is_neg=1) to block 4
     writer.beginBlock(1, 0, &.{4}, &.{0});
     const abs_val = b.ineg(val);
-    b.jump(4);
+    const v_one_1 = b.iconst(1);
+    b.jumpWithArgs(4, &.{ abs_val, v_one_1 });
     writer.endBlock();
 
-    // Block 2: positive
+    // Block 2: positive — check zero
     writer.beginBlock(2, 0, &.{ 3, 4 }, &.{0});
     const is_zero = b.icmp_eq(val, v_zero);
-    b.brif(is_zero, 3, 4);
+    // brif: zero → 3, nonzero → 4 with (val, is_neg=0)
+    const v_zero_flag = b.iconst(0);
+    writer.emit(OP_BRIF, &.{ is_zero, 3, 4, 0, 2, val, v_zero_flag });
     writer.endBlock();
 
     // Block 3: zero
@@ -242,51 +261,62 @@ fn genIntToString(writer: *CirWriter) void {
     b.ret(v_one_ret);
     writer.endBlock();
 
-    // Block 4: nonzero — start loop at idx 20
+    // Block 4: nonzero — setup loop with (remaining, idx=20)
     writer.beginBlock(4, 0, &.{5}, &.{ 1, 2 });
+    const abs_val_4 = b.arg(0); // block param
+    const is_neg_4 = b.arg(1); // block param
     const v_20_4 = b.iconst(20);
-    _ = v_20_4;
-    b.jump(5);
+    b.jumpWithArgs(5, &.{ abs_val_4, v_20_4 });
     writer.endBlock();
 
-    // Block 5: digit loop
+    // Block 5: digit loop — (remaining, idx) are block params
     writer.beginBlock(5, 0, &.{ 6, 5 }, &.{ 4, 5 });
+    const remaining = b.arg(0);
+    const idx = b.arg(1);
     const v_ten = b.iconst(10);
-    const digit = b.urem(val, v_ten);
+    const digit = b.urem(remaining, v_ten);
     const v_0x30 = b.iconst(0x30);
     const char_val = b.add(digit, v_0x30);
     const char_i8 = b.ireduce8(char_val);
-    const wr_addr = b.add(buf_ptr, v_20_4);
+    const wr_addr = b.add(buf_ptr, idx);
     b.store8(wr_addr, char_i8);
-    const next_rem = b.udiv(val, v_ten);
+    const next_rem = b.udiv(remaining, v_ten);
     const v_one_l = b.iconst(1);
-    const next_idx = b.sub(v_20_4, v_one_l);
-    _ = next_rem; _ = next_idx;
+    const next_idx = b.sub(idx, v_one_l);
     const v_zero5 = b.iconst(0);
     const done = b.icmp_eq(next_rem, v_zero5);
-    b.brif(done, 6, 5);
+    // done → block 6 (pass next_idx, is_neg_4), not done → block 5 (pass next_rem, next_idx)
+    writer.emit(OP_BRIF, &.{ done, 6, 5, 2, next_idx, is_neg_4, 2, next_rem, next_idx });
     writer.endBlock();
 
-    // Block 6: done — check sign
+    // Block 6: done — check sign. (final_idx, is_neg) are block params
     writer.beginBlock(6, 0, &.{ 7, 8 }, &.{5});
-    // Simplified: just check is_neg from entry
-    b.brif(is_neg, 7, 8);
+    const final_idx = b.arg(0);
+    const is_neg_6 = b.arg(1);
+    const v_zero_6 = b.iconst(0);
+    const check_neg = b.icmp_ne(is_neg_6, v_zero_6);
+    // neg → block 7 (pass final_idx), not neg → block 8 (pass final_idx)
+    writer.emit(OP_BRIF, &.{ check_neg, 7, 8, 1, final_idx, 1, final_idx });
     writer.endBlock();
 
-    // Block 7: add sign
+    // Block 7: add sign — final_idx is block param
     writer.beginBlock(7, 0, &.{8}, &.{6});
-    const sign_addr = b.add(buf_ptr, next_idx);
+    const idx_7 = b.arg(0);
+    const sign_addr = b.add(buf_ptr, idx_7);
     const minus = b.iconst8(0x2D);
     b.store8(sign_addr, minus);
     const v_one_s = b.iconst(1);
-    const adj_idx = b.sub(next_idx, v_one_s);
-    b.jump(8);
+    const adj_idx = b.sub(idx_7, v_one_s);
+    b.jumpWithArgs(8, &.{adj_idx});
     writer.endBlock();
 
-    // Block 8: return length
+    // Block 8: return length — final_idx is block param
     writer.beginBlock(8, 0, &.{}, &.{ 6, 7 });
-    const v_20_r = b.iconst(20);
-    const len = b.sub(v_20_r, next_idx);
+    const ret_idx = b.arg(0);
+    const v_one_r = b.iconst(1);
+    const start = b.add(ret_idx, v_one_r);
+    const v_21 = b.iconst(21);
+    const len = b.sub(v_21, start);
     b.ret(len);
     writer.endBlock();
 
@@ -301,12 +331,13 @@ fn genPrintFloat(writer: *CirWriter, name: []const u8, fd: i64) void {
     const snprintf_name = writer.internString("snprintf");
     const write_name = writer.internString("write");
 
-    writer.beginFuncWithSig(name_off, &.{CIR_F64}, &.{}, 1, 0);
+    // print_float takes i64 bits — the compiler bitcasts float → i64 before calling
+    writer.beginFuncWithSig(name_off, &.{CIR_I64}, &.{}, 1, 0);
     writer.beginBlock(0, 0, &.{}, &.{});
     var b = B{ .writer = writer };
     b.stackSlot(0, 32, 8);
     b.stackSlot(1, 8, 8);
-    const f_val = b.argF64(0);
+    const val_bits = b.arg(0); // i64 bits of the float
 
     // Store "%g\0" format string
     const fmt_addr = b.localAddr(1);
@@ -321,10 +352,9 @@ fn genPrintFloat(writer: *CirWriter, name: []const u8, fd: i64) void {
     const ch_0 = b.iconst8(0);
     b.store8(fmt2, ch_0);
 
-    // Bitcast f64 -> i64
-    const val_bits = b.bitcast_i64(f_val);
-
-    // snprintf(buf, 32, fmt, val_bits)
+    // snprintf(buf, 32, fmt, val_bits) — pass i64 bits directly
+    // On macOS ARM64, variadic args go in integer registers, so the f64 bits
+    // must be passed as i64 (NOT bitcast to f64 which would use d registers)
     const buf = b.localAddr(0);
     const v_32 = b.iconst(32);
     const len = b.call1(snprintf_name, &.{ buf, v_32, fmt_addr, val_bits });
@@ -345,6 +375,7 @@ fn genFloatToString(writer: *CirWriter) void {
     const name_off = writer.internString("float_to_string");
     const snprintf_name = writer.internString("snprintf");
 
+    // float_to_string: native passes f64 directly (SystemV ABI uses float registers)
     writer.beginFuncWithSig(name_off, &.{ CIR_F64, CIR_I64 }, &.{CIR_I64}, 1, 0);
     writer.beginBlock(0, 0, &.{}, &.{});
     var b = B{ .writer = writer };
@@ -365,6 +396,7 @@ fn genFloatToString(writer: *CirWriter) void {
     const ch_0 = b.iconst8(0);
     b.store8(fmt2, ch_0);
 
+    // Bitcast f64 → i64 bits for snprintf variadic (macOS ARM64: variadic args in int registers)
     const val_bits = b.bitcast_i64(f_val);
     const v_32 = b.iconst(32);
     const len = b.call1(snprintf_name, &.{ buf_ptr, v_32, fmt_addr, val_bits });

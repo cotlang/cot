@@ -17,6 +17,8 @@ const OP_DIV: u16 = 0x0013;
 const OP_UDIV: u16 = 0x0014;
 const OP_UMOD: u16 = 0x0016;
 const OP_AND: u16 = 0x0020;
+const OP_OR: u16 = 0x0021;
+const OP_SHL: u16 = 0x0023;
 const OP_SHR: u16 = 0x0024;
 const OP_EQ: u16 = 0x0030;
 const OP_NE: u16 = 0x0031;
@@ -84,7 +86,9 @@ const B = struct {
     fn udiv(self: *B, l: u32, r: u32) u32 { const id = self.nextId(); self.writer.emit(OP_UDIV, &.{ id, CIR_I64, l, r }); return id; }
     fn urem(self: *B, l: u32, r: u32) u32 { const id = self.nextId(); self.writer.emit(OP_UMOD, &.{ id, CIR_I64, l, r }); return id; }
     fn band(self: *B, l: u32, r: u32) u32 { const id = self.nextId(); self.writer.emit(OP_AND, &.{ id, CIR_I64, l, r }); return id; }
+    fn shl(self: *B, l: u32, r: u32) u32 { const id = self.nextId(); self.writer.emit(OP_SHL, &.{ id, CIR_I64, l, r }); return id; }
     fn shr(self: *B, l: u32, r: u32) u32 { const id = self.nextId(); self.writer.emit(OP_SHR, &.{ id, CIR_I64, l, r }); return id; }
+    fn bor(self: *B, l: u32, r: u32) u32 { const id = self.nextId(); self.writer.emit(OP_OR, &.{ id, CIR_I64, l, r }); return id; }
     fn icmp_eq(self: *B, l: u32, r: u32) u32 { const id = self.nextId(); self.writer.emit(OP_EQ, &.{ id, CIR_I64, l, r }); return id; }
     fn icmp_ne(self: *B, l: u32, r: u32) u32 { const id = self.nextId(); self.writer.emit(OP_NE, &.{ id, CIR_I64, l, r }); return id; }
     fn icmp_slt(self: *B, l: u32, r: u32) u32 { const id = self.nextId(); self.writer.emit(OP_LT, &.{ id, CIR_I64, l, r }); return id; }
@@ -97,6 +101,7 @@ const B = struct {
     fn load32(self: *B, addr: u32) u32 { const id = self.nextId(); self.writer.emit(OP_LOAD, &.{ id, CIR_I32, addr }); return id; }
     fn load8(self: *B, addr: u32) u32 { const id = self.nextId(); self.writer.emit(OP_LOAD, &.{ id, CIR_I8, addr }); return id; }
     fn store(self: *B, addr: u32, val: u32) void { self.writer.emit(OP_STORE, &.{ CIR_I64, addr, val }); }
+    fn store32(self: *B, addr: u32, val: u32) void { self.writer.emit(OP_STORE, &.{ CIR_I32, addr, val }); }
     fn store8(self: *B, addr: u32, val: u32) void { self.writer.emit(OP_STORE, &.{ CIR_I8, addr, val }); }
     fn uextend(self: *B, val: u32) u32 { const id = self.nextId(); self.writer.emit(OP_UEXTEND, &.{ id, CIR_I64, val }); return id; }
     fn sextend(self: *B, val: u32) u32 { const id = self.nextId(); self.writer.emit(OP_SEXTEND, &.{ id, CIR_I64, val }); return id; }
@@ -110,8 +115,8 @@ const B = struct {
     fn globalValue(self: *B, gv_id: u32) u32 { const id = self.nextId(); self.writer.emit(OP_GLOBAL_VALUE, &.{ id, CIR_I64, gv_id }); return id; }
     fn ret(self: *B, val: u32) void { self.writer.emit(OP_RET, &.{val}); }
     fn retVoid(self: *B) void { self.writer.emit(OP_RET_VOID, &.{}); }
-    fn jump(self: *B, target: u32) void { self.writer.emit(OP_JUMP, &.{target}); }
-    fn brif(self: *B, cond: u32, tb: u32, fb: u32) void { self.writer.emit(OP_BRIF, &.{ cond, tb, fb }); }
+    fn jump(self: *B, target: u32) void { self.writer.emit(OP_JUMP, &.{ target, 0 }); }
+    fn brif(self: *B, cond: u32, tb: u32, fb: u32) void { self.writer.emit(OP_BRIF, &.{ cond, tb, fb, 0, 0 }); }
 
     fn call1(self: *B, name_off: u32, args: []const u32) u32 {
         const result_id = self.nextId();
@@ -166,7 +171,7 @@ pub fn generate(
     genEnvironPtr(writer, envp_symbol_idx, lib_mode);
 
     // Directory runtime
-    genPathOp(writer, "cot_mkdir", "mkdir", 3);
+    genPathOp(writer, "cot_mkdir", "c_mkdir", 3);
     genPathOp(writer, "dir_open", "opendir", 2);
     genForward3(writer, "dir_next", "readdir", true);
     genForward1WithErrno(writer, "dir_close", "closedir");
@@ -181,8 +186,8 @@ pub fn generate(
     genForward2(writer, "net_listen", "listen");
     genNetAccept(writer);
     genForward3(writer, "net_connect", "connect", true);
-    genForward1(writer, "net_set_reuse_addr", "setsockopt");
-    genForward1(writer, "set_nonblocking", "fcntl");
+    genNetSetReuseAddr(writer);
+    genSetNonblocking(writer);
     genForward2(writer, "poll_read", "poll");
 
     // Event loop
@@ -204,11 +209,11 @@ pub fn generate(
     genReturnsNeg1(writer, "epoll_wait", 3);
 
     // Process
-    genForward1(writer, "cot_waitpid", "waitpid");
-    genForward0(writer, "cot_pipe", "pipe");
-    genForward0(writer, "cot_openpty", "openpty");
+    genCotWaitpid(writer);
+    genCotPipe(writer);
+    genCotOpenpty(writer);
     genForward3(writer, "cot_ioctl_winsize", "ioctl", true);
-    genForward1(writer, "cot_ioctl_set_ctty", "ioctl");
+    genIoctlSetCtty(writer);
 }
 
 // ============================================================================
@@ -306,6 +311,137 @@ fn genForward1WithErrno(writer: *CirWriter, name: []const u8, libc_name: []const
     b.ret(neg_errno);
     writer.endBlock();
 
+    writer.endFunc();
+}
+
+// net_set_reuse_addr(fd) → setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &val, sizeof(int))
+fn genNetSetReuseAddr(writer: *CirWriter) void {
+    const name_off = writer.internString("net_set_reuse_addr");
+    const setsockopt_off = writer.internString("setsockopt");
+
+    writer.beginFuncWithSig(name_off, &.{CIR_I64}, &.{CIR_I64}, 1, 0);
+    writer.beginBlock(0, 0, &.{}, &.{});
+    var b = B{ .writer = writer };
+    b.stackSlot(0, 8, 4);
+    const fd = b.arg(0);
+    // Store val=1 to stack
+    const val_addr = b.localAddr(0);
+    const v_one = b.iconst(1);
+    b.store32(val_addr, v_one);
+    // setsockopt(fd, SOL_SOCKET=0xFFFF, SO_REUSEADDR=2, &val, 4)
+    const v_sol = b.iconst(0xFFFF);
+    const v_reuse = b.iconst(2);
+    const v_size = b.iconst(4);
+    const result = b.call1(setsockopt_off, &.{ fd, v_sol, v_reuse, val_addr, v_size });
+    b.ret(result);
+    writer.endBlock();
+    writer.endFunc();
+}
+
+// set_nonblocking(fd) → fcntl(fd, F_SETFL, O_NONBLOCK)
+fn genSetNonblocking(writer: *CirWriter) void {
+    const name_off = writer.internString("set_nonblocking");
+    const fcntl_off = writer.internString("fcntl");
+
+    writer.beginFuncWithSig(name_off, &.{CIR_I64}, &.{CIR_I64}, 1, 0);
+    writer.beginBlock(0, 0, &.{}, &.{});
+    var b = B{ .writer = writer };
+    const fd = b.arg(0);
+    // fcntl(fd, F_SETFL=4, O_NONBLOCK=4(macOS)/2048(Linux))
+    const v_setfl = b.iconst(4); // F_SETFL
+    const v_nonblock = b.iconst(4); // O_NONBLOCK (macOS) — Linux=2048 but we emit one binary
+    const result = b.call1(fcntl_off, &.{ fd, v_setfl, v_nonblock });
+    b.ret(result);
+    writer.endBlock();
+    writer.endFunc();
+}
+
+// cot_ioctl_set_ctty(fd) → ioctl(fd, TIOCSCTTY, 0)
+fn genIoctlSetCtty(writer: *CirWriter) void {
+    const name_off = writer.internString("cot_ioctl_set_ctty");
+    const ioctl_off = writer.internString("ioctl");
+
+    writer.beginFuncWithSig(name_off, &.{CIR_I64}, &.{CIR_I64}, 1, 0);
+    writer.beginBlock(0, 0, &.{}, &.{});
+    var b = B{ .writer = writer };
+    const fd = b.arg(0);
+    const v_tiocsctty = b.iconst(0x20007461); // macOS TIOCSCTTY
+    const v_zero = b.iconst(0);
+    const result = b.call1(ioctl_off, &.{ fd, v_tiocsctty, v_zero });
+    b.ret(result);
+    writer.endBlock();
+    writer.endFunc();
+}
+
+// cot_waitpid(pid) → i64: calls waitpid(pid, &status, 0), returns status
+fn genCotWaitpid(writer: *CirWriter) void {
+    const name_off = writer.internString("cot_waitpid");
+    const wp_off = writer.internString("c_waitpid");
+
+    writer.beginFuncWithSig(name_off, &.{CIR_I64}, &.{CIR_I64}, 1, 0);
+    writer.beginBlock(0, 0, &.{}, &.{});
+    var b = B{ .writer = writer };
+    b.stackSlot(0, 4, 4); // int status
+    const pid = b.arg(0);
+    const status_addr = b.localAddr(0);
+    const v_zero = b.iconst(0); // options = 0
+    _ = b.call1(wp_off, &.{ pid, status_addr, v_zero }); // waitpid(pid, &status, 0)
+    const status = b.load32(status_addr);
+    const result = b.uextend(status);
+    b.ret(result);
+    writer.endBlock();
+    writer.endFunc();
+}
+
+// cot_openpty() → i64: calls openpty(&master, &slave, NULL, NULL, NULL), packs master | (slave << 32)
+fn genCotOpenpty(writer: *CirWriter) void {
+    const name_off = writer.internString("cot_openpty");
+    const pty_off = writer.internString("c_openpty");
+
+    writer.beginFuncWithSig(name_off, &.{}, &.{CIR_I64}, 1, 0);
+    writer.beginBlock(0, 0, &.{}, &.{});
+    var b = B{ .writer = writer };
+    b.stackSlot(0, 4, 4); // int master
+    b.stackSlot(1, 4, 4); // int slave
+    const master_addr = b.localAddr(0);
+    const slave_addr = b.localAddr(1);
+    const v_null = b.iconst(0);
+    _ = b.call1(pty_off, &.{ master_addr, slave_addr, v_null, v_null, v_null });
+    const master_i32 = b.load32(master_addr);
+    const slave_i32 = b.load32(slave_addr);
+    const master = b.uextend(master_i32);
+    const slave = b.uextend(slave_i32);
+    const v_32 = b.iconst(32);
+    const slave_shifted = b.shl(slave, v_32);
+    const result = b.bor(master, slave_shifted);
+    b.ret(result);
+    writer.endBlock();
+    writer.endFunc();
+}
+
+// cot_pipe() → i64: calls pipe(fds), packs read_fd | (write_fd << 32)
+fn genCotPipe(writer: *CirWriter) void {
+    const name_off = writer.internString("cot_pipe");
+    const pipe_off = writer.internString("c_pipe");
+
+    writer.beginFuncWithSig(name_off, &.{}, &.{CIR_I64}, 1, 0);
+    writer.beginBlock(0, 0, &.{}, &.{});
+    var b = B{ .writer = writer };
+    b.stackSlot(0, 8, 4); // int fds[2]
+    const fds_addr = b.localAddr(0);
+    _ = b.call1(pipe_off, &.{fds_addr}); // pipe(fds)
+    const read_fd_i32 = b.load32(fds_addr); // fds[0]
+    const v_4 = b.iconst(4);
+    const fds1_addr = b.add(fds_addr, v_4);
+    const write_fd_i32 = b.load32(fds1_addr); // fds[1]
+    // uextend i32 → i64
+    const read_fd = b.uextend(read_fd_i32);
+    const write_fd = b.uextend(write_fd_i32);
+    const v_32 = b.iconst(32);
+    const write_shifted = b.shl(write_fd, v_32);
+    const result = b.bor(read_fd, write_shifted);
+    b.ret(result);
+    writer.endBlock();
     writer.endFunc();
 }
 
@@ -547,7 +683,6 @@ fn genNextSliceCap(writer: *CirWriter) void {
     writer.beginBlock(1, 0, &.{ 4, 2 }, &.{0});
     const threshold = b.iconst(256);
     const cond2 = b.icmp_slt(oldCap, threshold);
-    _ = cond2;
     // For ret block, we'll use doublecap
     b.brif(cond2, 4, 2);
     writer.endBlock();
@@ -567,9 +702,8 @@ fn genNextSliceCap(writer: *CirWriter) void {
     writer.beginBlock(3, 0, &.{4}, &.{2});
     const zero = b.iconst(0);
     const cond4 = b.icmp_slt(newcap, zero);
-    _ = cond4;
     // If overflow, return newLen, else return newcap
-    const final_cap = b.select(cond4, newLen, newcap);
+    _ = b.select(cond4, newLen, newcap);
     b.jump(4);
     writer.endBlock();
 
@@ -585,9 +719,9 @@ fn genNextSliceCap(writer: *CirWriter) void {
 // ============================================================================
 // args_count() -> i64
 // ============================================================================
-fn genArgsCount(writer: *CirWriter, argc_symbol_idx: u32) void {
+fn genArgsCount(writer: *CirWriter, _: u32) void {
     const name_off = writer.internString("args_count");
-    const argc_name = writer.internString("_cot_argc");
+    const argc_name = writer.internString("cot_argc");
 
     writer.beginFuncWithSig(name_off, &.{}, &.{CIR_I64}, 1, 0);
     writer.beginBlock(0, 0, &.{}, &.{});
@@ -603,9 +737,9 @@ fn genArgsCount(writer: *CirWriter, argc_symbol_idx: u32) void {
 // ============================================================================
 // arg_len(n) -> i64
 // ============================================================================
-fn genArgLen(writer: *CirWriter, argv_symbol_idx: u32) void {
+fn genArgLen(writer: *CirWriter, _: u32) void {
     const name_off = writer.internString("arg_len");
-    const argv_name = writer.internString("_cot_argv");
+    const argv_name = writer.internString("cot_argv");
     const strlen_name = writer.internString("strlen");
 
     writer.beginFuncWithSig(name_off, &.{CIR_I64}, &.{CIR_I64}, 1, 0);
@@ -628,9 +762,9 @@ fn genArgLen(writer: *CirWriter, argv_symbol_idx: u32) void {
 // ============================================================================
 // arg_ptr(n) -> i64
 // ============================================================================
-fn genArgPtr(writer: *CirWriter, argv_symbol_idx: u32) void {
+fn genArgPtr(writer: *CirWriter, _: u32) void {
     const name_off = writer.internString("arg_ptr");
-    const argv_name = writer.internString("_cot_argv");
+    const argv_name = writer.internString("cot_argv");
 
     writer.beginFuncWithSig(name_off, &.{CIR_I64}, &.{CIR_I64}, 1, 0);
     writer.beginBlock(0, 0, &.{}, &.{});
@@ -651,9 +785,9 @@ fn genArgPtr(writer: *CirWriter, argv_symbol_idx: u32) void {
 // ============================================================================
 // environ_count() -> i64
 // ============================================================================
-fn genEnvironCount(writer: *CirWriter, envp_symbol_idx: u32, lib_mode: bool) void {
+fn genEnvironCount(writer: *CirWriter, _: u32, lib_mode: bool) void {
     const name_off = writer.internString("environ_count");
-    const envp_name = if (lib_mode) writer.internString("_environ") else writer.internString("_cot_envp");
+    const envp_name = if (lib_mode) writer.internString("environ") else writer.internString("cot_envp");
 
     writer.beginFuncWithSig(name_off, &.{}, &.{CIR_I64}, 3, 0);
 
@@ -687,9 +821,9 @@ fn genEnvironCount(writer: *CirWriter, envp_symbol_idx: u32, lib_mode: bool) voi
     writer.endFunc();
 }
 
-fn genEnvironLen(writer: *CirWriter, envp_symbol_idx: u32, lib_mode: bool) void {
+fn genEnvironLen(writer: *CirWriter, _: u32, lib_mode: bool) void {
     const name_off = writer.internString("environ_len");
-    const envp_name = if (lib_mode) writer.internString("_environ") else writer.internString("_cot_envp");
+    const envp_name = if (lib_mode) writer.internString("environ") else writer.internString("cot_envp");
     const strlen_name = writer.internString("strlen");
 
     writer.beginFuncWithSig(name_off, &.{CIR_I64}, &.{CIR_I64}, 1, 0);
@@ -709,9 +843,9 @@ fn genEnvironLen(writer: *CirWriter, envp_symbol_idx: u32, lib_mode: bool) void 
     writer.endFunc();
 }
 
-fn genEnvironPtr(writer: *CirWriter, envp_symbol_idx: u32, lib_mode: bool) void {
+fn genEnvironPtr(writer: *CirWriter, _: u32, lib_mode: bool) void {
     const name_off = writer.internString("environ_ptr");
-    const envp_name = if (lib_mode) writer.internString("_environ") else writer.internString("_cot_envp");
+    const envp_name = if (lib_mode) writer.internString("environ") else writer.internString("cot_envp");
 
     writer.beginFuncWithSig(name_off, &.{CIR_I64}, &.{CIR_I64}, 1, 0);
     writer.beginBlock(0, 0, &.{}, &.{});

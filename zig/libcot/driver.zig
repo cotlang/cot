@@ -27,12 +27,6 @@ const copyelim = @import("ssa/passes/copyelim.zig");
 const async_split = @import("ssa/passes/async_split.zig");
 const phielim = @import("ssa/passes/phielim.zig");
 const cse_pass = @import("ssa/passes/cse.zig");
-const ssa_to_clif = @import("codegen/native/ssa_to_clif.zig");
-const arc_native = @import("codegen/native/arc_native.zig");
-const io_native = @import("codegen/native/io_native.zig");
-const print_native = @import("codegen/native/print_native.zig");
-const test_native_rt = @import("codegen/native/test_native.zig");
-const signal_native = @import("codegen/native/signal_native.zig");
 const target_mod = @import("frontend/target.zig");
 const debug = @import("pipeline_debug.zig");
 
@@ -48,15 +42,13 @@ const test_runtime = @import("codegen/test_runtime.zig"); // Test runtime (Zig)
 const bench_runtime = @import("codegen/bench_runtime.zig"); // Bench runtime (Go testing.B)
 const executor_runtime = @import("codegen/executor_runtime.zig"); // Executor runtime (Swift CooperativeExecutor)
 
-// Native codegen modules (Cranelift-style AOT compiler)
+// Native codegen — ONLY used by --backend=zig path and wasm-from-native path.
+// The CIR path (--backend=cranelift, default) does NOT use any of these.
 const native_compile = @import("codegen/native/compile.zig");
 const wasm_parser = @import("codegen/native/wasm_parser.zig");
 const clif = @import("ir/clif/mod.zig");
-const macho = @import("codegen/native/macho.zig");
-const elf = @import("codegen/native/elf.zig");
 const object_module = @import("codegen/native/object_module.zig");
 const dwarf_mod = @import("codegen/native/dwarf.zig");
-const buffer_mod = @import("codegen/native/machinst/buffer.zig");
 
 const project_mod = @import("project.zig");
 
@@ -114,8 +106,6 @@ pub const Driver = struct {
     /// Native backend: true = rust/libclif (real Cranelift), false = zig/libclif (hand-ported).
     /// Controlled by --backend=zig CLI flag. Default: cranelift (rust).
     use_cranelift: bool = true,
-    /// Extra .o file path (runtime functions) produced by CIR path. Linked alongside user .o.
-    cir_runtime_obj_path: ?[]const u8 = null,
 
     pub fn init(allocator: Allocator) Driver {
         var d = Driver{ .allocator = allocator };
@@ -1309,6 +1299,13 @@ pub const Driver = struct {
     /// Pipeline: IR funcs → SSA → passes → lower_native → ssa_to_clif → CLIF →
     ///           compile.zig → CompiledCode → object file
     fn generateNativeCode(self: *Driver, funcs: []const ir_mod.Func, globals: []const ir_mod.Global, type_reg: *types_mod.TypeRegistry) ![]u8 {
+        const ssa_to_clif = @import("codegen/native/ssa_to_clif.zig");
+        const arc_native = @import("codegen/native/arc_native.zig");
+        const io_native = @import("codegen/native/io_native.zig");
+        const print_native = @import("codegen/native/print_native.zig");
+        const test_native_rt = @import("codegen/native/test_native.zig");
+        const signal_native = @import("codegen/native/signal_native.zig");
+
         debug.log(.codegen, "driver: direct native path for {d} functions", .{funcs.len});
 
         // Select ISA based on target
@@ -1733,12 +1730,18 @@ pub const Driver = struct {
     /// Native codegen via CIR → rust/libclif (real Cranelift).
     /// Same SSA pipeline as generateNativeCode, but replaces compile+package with CIR→libclif.
     fn generateNativeCodeViaCIR(self: *Driver, funcs: []const ir_mod.Func, globals: []const ir_mod.Global, type_reg: *types_mod.TypeRegistry) ![]u8 {
-        const cir_write = @import("codegen/native/cir_write.zig");
-        const libclif = @import("codegen/native/libclif.zig");
+        const ssa_to_cir = @import("codegen/ssa_to_cir.zig");
+        const CirWriter = ssa_to_cir.CirWriter;
+        const libclif = @import("codegen/libclif.zig");
+        const arc_runtime_cir = @import("codegen/arc_runtime.zig");
+        const io_runtime_cir = @import("codegen/io_runtime.zig");
+        const print_runtime_cir = @import("codegen/print_runtime_native.zig");
+        const test_runtime_cir = @import("codegen/test_runtime_native.zig");
+        const signal_runtime_cir = @import("codegen/signal_runtime.zig");
 
         debug.log(.codegen, "driver: CIR native path for {d} functions", .{funcs.len});
 
-        // --- Identical to generateNativeCode: string collection + func_index_map ---
+        // --- String collection + func_index_map (identical to generateNativeCode) ---
         var string_offsets = std.StringHashMap(i32).init(self.allocator);
         defer string_offsets.deinit();
         var string_data = std.ArrayListUnmanaged(u8){};
@@ -1762,8 +1765,7 @@ pub const Driver = struct {
             try func_index_map.put(self.allocator, ir_func.name, @intCast(idx));
         }
 
-        // Register runtime function names — identical to generateNativeCode.
-        // ssa_to_clif needs these to resolve call targets.
+        // Register runtime function names — ssa_to_cir needs these to resolve call targets.
         const runtime_func_names = [_][]const u8{
             "alloc",         "dealloc",
             "alloc_raw",     "realloc_raw",   "dealloc_raw",
@@ -1812,7 +1814,7 @@ pub const Driver = struct {
                 try func_index_map.put(self.allocator, name, runtime_start_idx + @as(u32, @intCast(i)));
             }
         }
-        // Aliases (identical to generateNativeCode)
+        // Aliases
         if (func_index_map.get("cot_waitpid")) |idx| try func_index_map.put(self.allocator, "waitpid", idx);
         if (func_index_map.get("cot_pipe")) |idx| try func_index_map.put(self.allocator, "pipe", idx);
         if (func_index_map.get("cot_openpty")) |idx| try func_index_map.put(self.allocator, "openpty", idx);
@@ -1844,12 +1846,7 @@ pub const Driver = struct {
             try global_symbol_map.put(self.allocator, g.name, globals_base_idx + @as(u32, @intCast(i)));
         }
 
-        // --- CIR writer ---
-        var writer = cir_write.CirWriter.init(self.allocator);
-        defer writer.deinit();
-
-        // Build reverse name resolver for call resolution AND data symbol resolution
-        // First, register data symbols in the func_index_map so the resolver can find them
+        // Register data symbols in func_index_map for call/symbol resolution
         if (string_data_symbol_idx) |idx| {
             try func_index_map.put(self.allocator, "cot_string_data", idx);
         }
@@ -1866,36 +1863,42 @@ pub const Driver = struct {
             try func_index_map.put(self.allocator, "cot_funcnames", ctxt_base + 8);
         }
         for (globals, 0..) |g, i| {
-            // globals_base_idx already in global_symbol_map, add to func_index_map too
             if (!func_index_map.contains(g.name)) {
                 try func_index_map.put(self.allocator, g.name, globals_base_idx + @as(u32, @intCast(i)));
             }
         }
 
-        // Build resolver from both func_index_map (functions) and global_symbol_map (data symbols)
-        // Both namespaces use ExternalName.initUser(0, index) so the resolver must cover both.
-        var combined_map = std.AutoHashMapUnmanaged(u32, []const u8){};
-        defer combined_map.deinit(self.allocator);
+        // Build reverse map: index → name (needed by ssa_to_cir for call target resolution)
+        // Prefer cot_ prefixed names over aliases to avoid CIR name collisions
+        // (e.g., "mkdir" alias should resolve to "cot_mkdir", not "mkdir")
+        var reverse_map = std.AutoHashMapUnmanaged(u32, []const u8){};
+        defer reverse_map.deinit(self.allocator);
         {
+            // First pass: add all names
             var it = func_index_map.iterator();
             while (it.next()) |entry| {
-                combined_map.put(self.allocator, entry.value_ptr.*, entry.key_ptr.*) catch {};
+                reverse_map.put(self.allocator, entry.value_ptr.*, entry.key_ptr.*) catch {};
+            }
+            // Second pass: overwrite with cot_ prefixed names (canonical)
+            it = func_index_map.iterator();
+            while (it.next()) |entry| {
+                if (std.mem.startsWith(u8, entry.key_ptr.*, "cot_")) {
+                    reverse_map.put(self.allocator, entry.value_ptr.*, entry.key_ptr.*) catch {};
+                }
             }
         }
         {
             var it = global_symbol_map.iterator();
             while (it.next()) |entry| {
-                combined_map.put(self.allocator, entry.value_ptr.*, entry.key_ptr.*) catch {};
+                reverse_map.put(self.allocator, entry.value_ptr.*, entry.key_ptr.*) catch {};
             }
         }
-        var resolver = cir_write.FuncNameResolver.initFromReversed(self.allocator, &combined_map);
-        defer resolver.deinit();
 
-        // --- Phase 1: For each function, build SSA → passes → CLIF → serialize to CIR ---
-        // String heap is assembled at finish() time — no need to pre-intern names.
-        // All strings interned during function serialization are automatically included.
-        writer.beginFuncDefs();
+        // --- Create ONE CirWriter for everything (user + runtime functions) ---
+        var writer = CirWriter.init(self.allocator);
+        defer writer.deinit();
 
+        // --- Phase 1: For each user function, build SSA → passes → CIR directly ---
         for (funcs) |*ir_func| {
             debug.log(.codegen, "driver: CIR compiling '{s}'", .{ir_func.name});
 
@@ -1904,13 +1907,13 @@ pub const Driver = struct {
             defer func_arena.deinit();
             const func_alloc = func_arena.allocator();
 
-            // Build SSA from IR (identical to generateNativeCode)
+            // Build SSA from IR
             var ssa_builder = try ssa_builder_mod.SSABuilder.init(func_alloc, ir_func, globals, type_reg, self.target);
             const ssa_func = try ssa_builder.build();
             ssa_builder.deinit();
             ssa_func.type_idx = ir_func.type_idx;
 
-            // Run SSA passes (identical to generateNativeCode)
+            // Run SSA passes
             try rewritegeneric.rewrite(func_alloc, ssa_func, &string_offsets);
             try decompose_builtin.decompose(func_alloc, ssa_func, type_reg);
             try rewritedec.rewrite(func_alloc, ssa_func);
@@ -1919,193 +1922,150 @@ pub const Driver = struct {
             try layout.layout(ssa_func);
             try lower_native.lower(ssa_func);
 
-            // Translate SSA → CLIF IR (identical to generateNativeCode)
-            var clif_func = clif.Function.init(self.allocator);
-            defer clif_func.deinit();
-
-            ssa_to_clif.translate(ssa_func, &clif_func, type_reg, ir_func.params, ir_func.return_type, &func_index_map, funcs, self.allocator, string_data_symbol_idx, ctxt_symbol_idx, &global_symbol_map) catch |e| {
-                debug.log(.codegen, "driver: SSA→CLIF error for '{s}': {any}", .{ ir_func.name, e });
-                return error.SsaToClifError;
+            // Translate SSA → CIR directly (no intermediate CLIF IR)
+            ssa_to_cir.translateFunc(
+                self.allocator,
+                ssa_func,
+                &writer,
+                type_reg,
+                ir_func.params,
+                ir_func.return_type,
+                &func_index_map,
+                funcs,
+                string_data_symbol_idx,
+                ctxt_symbol_idx,
+                &global_symbol_map,
+                &reverse_map,
+            ) catch |e| {
+                debug.log(.codegen, "driver: SSA→CIR error for '{s}': {any}", .{ ir_func.name, e });
+                return error.SsaToCirError;
             };
+        }
 
-            // --- NEW: serialize CLIF IR → CIR (instead of native_compile.compile) ---
-            const name_off = writer.internString(ir_func.name);
-            const is_export: u32 = if (std.mem.eql(u8, ir_func.name, "main")) 0x02 else 0x00;
+        // --- Phase 2: Append runtime functions as CIR ---
+        const rt_argc_symbol_idx: u32 = ctxt_symbol_idx + 1;
+        const rt_argv_symbol_idx: u32 = ctxt_symbol_idx + 2;
+        const rt_envp_symbol_idx: u32 = ctxt_symbol_idx + 3;
 
-            // Build param and return type arrays from CLIF signature
-            var param_types_buf: [64]u32 = undefined;
-            for (clif_func.signature.params.items, 0..) |p, pi| {
-                param_types_buf[pi] = cir_write.mapClifType(p.value_type);
+        arc_runtime_cir.generate(&writer);
+        io_runtime_cir.generate(&writer, rt_argc_symbol_idx, rt_argv_symbol_idx, rt_envp_symbol_idx, self.lib_mode, switch (self.target.os) {
+            .macos => .macos,
+            .linux => .linux,
+            else => .macos,
+        });
+        print_runtime_cir.generate(&writer);
+        signal_runtime_cir.generate(&writer);
+        if (self.test_mode) test_runtime_cir.generate(&writer);
+
+        // --- Phase 3: Emit data definitions into CIR ---
+        // String data blob
+        if (string_data.items.len > 0) {
+            writer.defineData("cot_string_data", string_data.items, false, true);
+        }
+        // Context, argc, argv, envp globals (8 bytes each, zero-init, writable)
+        writer.defineZeroData("cot_ctxt", 8, true, true);
+        writer.defineZeroData("cot_argc", 8, true, true);
+        writer.defineZeroData("cot_argv", 8, true, true);
+        writer.defineZeroData("cot_envp", 8, true, true);
+        // Source map placeholders
+        writer.defineZeroData("cot_pctab", 8, false, true);
+        writer.defineZeroData("cot_functab", 8, false, true);
+        writer.defineZeroData("cot_functab_count", 4, false, true);
+        writer.defineZeroData("cot_filetab", 8, false, true);
+        writer.defineZeroData("cot_funcnames", 8, false, true);
+        // User globals
+        for (globals) |g| {
+            const size = @max(g.size, 8);
+            const zeroes = try self.allocator.alloc(u8, size);
+            defer self.allocator.free(zeroes);
+            @memset(zeroes, 0);
+            writer.defineData(g.name, zeroes, true, true);
+        }
+
+        // --- Phase 3b: Entry wrapper as CIR function ---
+        // __cot_entry(argc, argv, envp) → i64: stores globals, calls _cot_main, returns 0
+        if (!self.lib_mode) {
+            var main_returns_void: bool = false;
+            for (funcs) |*ir_func| {
+                if (std.mem.eql(u8, ir_func.name, "main")) {
+                    main_returns_void = (ir_func.return_type == 12);
+                    break;
+                }
             }
-            var return_types_buf: [16]u32 = undefined;
-            for (clif_func.signature.returns.items, 0..) |r, ri| {
-                return_types_buf[ri] = cir_write.mapClifType(r.value_type);
+            const OP_ARG: u16 = 0x0092;
+            const OP_CONST_INT: u16 = 0x0001;
+            const OP_STORE: u16 = 0x0071;
+            const OP_GLOBAL_VALUE: u16 = 0x0081;
+            const OP_GLOBAL_VALUE_SYMBOL: u16 = 0x00B1;
+            const OP_STATIC_CALL: u16 = 0x0093;
+            const OP_RET: u16 = 0x0097;
+            const CIR_I64: u32 = ssa_to_cir.CIR_I64;
+
+            const entry_name = writer.internString("__cot_entry");
+            const argc_name = writer.internString("cot_argc");
+            const argv_name = writer.internString("cot_argv");
+            const envp_name = writer.internString("cot_envp");
+            const main_name = writer.internString("_cot_main");
+
+            writer.beginFuncWithSig(entry_name, &.{ CIR_I64, CIR_I64, CIR_I64 }, &.{CIR_I64}, 1, 0x02); // export
+            writer.beginBlock(0, 0, &.{}, &.{});
+
+            // args
+            writer.emit(OP_ARG, &.{ 100, CIR_I64, 0 }); // argc
+            writer.emit(OP_ARG, &.{ 101, CIR_I64, 1 }); // argv
+            writer.emit(OP_ARG, &.{ 102, CIR_I64, 2 }); // envp
+
+            // global symbols
+            writer.emit(OP_GLOBAL_VALUE_SYMBOL, &.{ 0, argc_name, 0, 0, 1 });
+            writer.emit(OP_GLOBAL_VALUE, &.{ 103, CIR_I64, 0 });
+            writer.emit(OP_STORE, &.{ CIR_I64, 103, 100 }); // *cot_argc = argc
+
+            writer.emit(OP_GLOBAL_VALUE_SYMBOL, &.{ 1, argv_name, 0, 0, 1 });
+            writer.emit(OP_GLOBAL_VALUE, &.{ 104, CIR_I64, 1 });
+            writer.emit(OP_STORE, &.{ CIR_I64, 104, 101 }); // *cot_argv = argv
+
+            writer.emit(OP_GLOBAL_VALUE_SYMBOL, &.{ 2, envp_name, 0, 0, 1 });
+            writer.emit(OP_GLOBAL_VALUE, &.{ 105, CIR_I64, 2 });
+            writer.emit(OP_STORE, &.{ CIR_I64, 105, 102 }); // *cot_envp = envp
+
+            // call _cot_main()
+            if (main_returns_void) {
+                writer.emit(OP_STATIC_CALL, &.{ 0, main_name, 0 }); // no result, no args
+                writer.emit(OP_CONST_INT, &.{ 106, CIR_I64, 0, 0 }); // return 0
+                writer.emit(OP_RET, &.{106});
+            } else {
+                writer.emit(OP_STATIC_CALL, &.{ 1, 107, CIR_I64, main_name, 0 }); // 1 result
+                writer.emit(OP_RET, &.{107});
             }
 
-            // Count blocks
-            var block_count: u32 = 0;
-            {
-                var bit = clif_func.layout.blocks();
-                while (bit.next()) |_| block_count += 1;
-            }
-
-            writer.beginFuncWithSig(
-                name_off,
-                param_types_buf[0..clif_func.signature.params.items.len],
-                return_types_buf[0..clif_func.signature.returns.items.len],
-                block_count,
-                is_export,
-            );
-
-            // Serialize each block and its instructions
-            try cir_write.serializeClifFunction(&writer, &clif_func, &resolver);
-
+            writer.endBlock();
             writer.endFunc();
         }
 
+        // --- Phase 4: Serialize CIR and compile via libclif → single .o ---
         const cir_bytes = writer.finish();
-        debug.log(.codegen, "driver: CIR serialized ({d} bytes, {d} functions)", .{ cir_bytes.len, funcs.len });
+        debug.log(.codegen, "driver: CIR serialized ({d} bytes, {d} user + runtime functions)", .{ cir_bytes.len, funcs.len });
 
-        // --- Phase 2: Call libclif to compile CIR → .o (user functions only) ---
         const target_str: []const u8 = switch (self.target.os) {
             .macos => "arm64-macos",
             .linux => "x64-linux",
             else => "native",
         };
         const obj_bytes = try libclif.compileToObject(cir_bytes, target_str);
-        debug.log(.codegen, "driver: libclif produced user .o ({d} bytes)", .{obj_bytes.len});
+        debug.log(.codegen, "driver: libclif produced .o ({d} bytes)", .{obj_bytes.len});
 
         const result = try self.allocator.alloc(u8, obj_bytes.len);
         @memcpy(result, obj_bytes);
         libclif.freeObjectBytes(obj_bytes);
 
-        // --- Phase 3: Generate runtime .o using old native path ---
-        // Runtime functions (ARC, I/O, print, signal, test) are compiled via the Zig native
-        // compiler and packaged into a separate .o file linked alongside the CIR .o.
-        const isa = switch (self.target.arch) {
-            .arm64 => native_compile.TargetIsa{ .aarch64 = native_compile.AArch64Backend.default },
-            .amd64 => native_compile.TargetIsa{ .x64 = native_compile.X64Backend.default },
-            .wasm32 => return error.InvalidTargetForNative,
-        };
-
-        var ctrl_plane = native_compile.ControlPlane.init();
-
-        var compiled_rt_funcs = std.ArrayListUnmanaged(native_compile.CompiledCode){};
-        defer {
-            for (compiled_rt_funcs.items) |*cf| cf.deinit();
-            compiled_rt_funcs.deinit(self.allocator);
-        }
-        var rt_func_names = std.ArrayListUnmanaged([]const u8){};
-        defer rt_func_names.deinit(self.allocator);
-
-        // Symbol indices for argc/argv/envp (needed by io_native and signal_native)
-        const rt_argc_symbol_idx: u32 = ctxt_symbol_idx + 1;
-        const rt_argv_symbol_idx: u32 = ctxt_symbol_idx + 2;
-        const rt_envp_symbol_idx: u32 = ctxt_symbol_idx + 3;
-        const pctab_symbol_idx: u32 = ctxt_symbol_idx + 4;
-        const functab_symbol_idx: u32 = ctxt_symbol_idx + 5;
-        const functab_count_symbol_idx: u32 = ctxt_symbol_idx + 6;
-        const filetab_symbol_idx: u32 = ctxt_symbol_idx + 7;
-        const funcnames_symbol_idx: u32 = ctxt_symbol_idx + 8;
-
-        {
-            // ARC runtime
-            var arc_funcs = try arc_native.generate(self.allocator, isa, &ctrl_plane, &func_index_map);
-            defer arc_funcs.deinit(self.allocator);
-            for (arc_funcs.items) |rf| {
-                try compiled_rt_funcs.append(self.allocator, rf.compiled);
-                try rt_func_names.append(self.allocator, rf.name);
-            }
-
-            // I/O runtime
-            var io_funcs = try io_native.generate(self.allocator, isa, &ctrl_plane, &func_index_map, rt_argc_symbol_idx, rt_argv_symbol_idx, rt_envp_symbol_idx, self.lib_mode, self.target.os);
-            defer io_funcs.deinit(self.allocator);
-            for (io_funcs.items) |rf| {
-                try compiled_rt_funcs.append(self.allocator, rf.compiled);
-                try rt_func_names.append(self.allocator, rf.name);
-            }
-
-            // Print runtime
-            var print_funcs = try print_native.generate(self.allocator, isa, &ctrl_plane, &func_index_map);
-            defer print_funcs.deinit(self.allocator);
-            for (print_funcs.items) |rf| {
-                try compiled_rt_funcs.append(self.allocator, rf.compiled);
-                try rt_func_names.append(self.allocator, rf.name);
-            }
-
-            // Signal handler runtime
-            var signal_funcs = try signal_native.generate(self.allocator, isa, &ctrl_plane, &func_index_map, self.target.os, pctab_symbol_idx, functab_symbol_idx, functab_count_symbol_idx, filetab_symbol_idx, funcnames_symbol_idx);
-            defer signal_funcs.deinit(self.allocator);
-            for (signal_funcs.items) |rf| {
-                try compiled_rt_funcs.append(self.allocator, rf.compiled);
-                try rt_func_names.append(self.allocator, rf.name);
-            }
-
-            // Test runtime (conditional)
-            if (self.test_mode) {
-                var test_funcs = try test_native_rt.generate(self.allocator, isa, &ctrl_plane, &func_index_map);
-                defer test_funcs.deinit(self.allocator);
-                for (test_funcs.items) |rf| {
-                    try compiled_rt_funcs.append(self.allocator, rf.compiled);
-                    try rt_func_names.append(self.allocator, rf.name);
-                }
-            }
-        }
-
-        debug.log(.codegen, "driver: compiled {d} runtime functions", .{compiled_rt_funcs.items.len});
-
-        // Track main function for entry wrapper
-        var main_func_index: ?usize = null;
-        var main_returns_void: bool = false;
-        for (funcs, 0..) |*ir_func, i| {
-            if (std.mem.eql(u8, ir_func.name, "main")) {
-                main_func_index = i;
-                main_returns_void = (ir_func.return_type == 12); // TYPE_VOID
-                break;
-            }
-        }
-
-        // Package runtime into .o using generateCIRRuntimeObj
-        const runtime_obj = try self.generateCIRRuntimeObj(
-            compiled_rt_funcs.items,
-            rt_func_names.items,
-            funcs,
-            main_returns_void,
-            string_data.items,
-            string_data_symbol_idx,
-            ctxt_symbol_idx,
-            rt_argc_symbol_idx,
-            rt_argv_symbol_idx,
-            rt_envp_symbol_idx,
-            pctab_symbol_idx,
-            functab_symbol_idx,
-            functab_count_symbol_idx,
-            filetab_symbol_idx,
-            funcnames_symbol_idx,
-            &func_index_map,
-            globals,
-            globals_base_idx,
-        );
-
-        // Write runtime .o to temp file
-        const runtime_obj_path = "/tmp/cot_cir_runtime.o";
-        std.fs.cwd().writeFile(.{ .sub_path = runtime_obj_path, .data = runtime_obj }) catch |e| {
-            debug.log(.codegen, "driver: failed to write runtime .o: {any}", .{e});
-            return error.RuntimeObjWriteFailed;
-        };
-        self.cir_runtime_obj_path = runtime_obj_path;
-        debug.log(.codegen, "driver: runtime .o written ({d} bytes) to {s}", .{ runtime_obj.len, runtime_obj_path });
-
         return result;
     }
 
-    /// Generate runtime .o for CIR path.
-    /// Contains: runtime functions (exported), entry wrapper, data sections, globals.
-    /// User functions (__cot_main, __cot_init_globals, __cot_init_metadata) are Import symbols.
-    fn generateCIRRuntimeObj(
+    /// Generate data-section .o for CIR path.
+    /// Contains: entry wrapper, data sections (string data, ctxt, globals), external name declarations.
+    /// All user and runtime functions are in the CIR .o (compiled by libclif/Cranelift).
+    fn generateDataSectionObj(
         self: *Driver,
-        compiled_rt_funcs: []const native_compile.CompiledCode,
-        rt_func_names: []const []const u8,
         user_funcs: []const ir_mod.Func,
         main_returns_void: bool,
         string_data: []const u8,
@@ -2138,7 +2098,7 @@ pub const Driver = struct {
 
         const is_macos = self.target.os == .macos;
 
-        // Pass 1: Declare user functions as Import (they're in the CIR .o)
+        // Declare user functions as Import (they're in the CIR .o)
         for (user_funcs, 0..) |*ir_func, i| {
             const is_main = std.mem.eql(u8, ir_func.name, "main");
             const mangled = if (is_main)
@@ -2149,32 +2109,11 @@ pub const Driver = struct {
                 try self.allocator.dupe(u8, ir_func.name);
             defer self.allocator.free(mangled);
 
-            // Declare as Import — linker will resolve from CIR .o
             _ = try module.declareFunction(mangled, .Import);
             try module.declareExternalName(@intCast(i), mangled);
         }
 
-        // Pass 2: Declare + define runtime functions
-        const rt_base = @as(u32, @intCast(user_funcs.len));
-        var rt_func_ids = try self.allocator.alloc(object_module.FuncId, compiled_rt_funcs.len);
-        defer self.allocator.free(rt_func_ids);
-
-        for (rt_func_names, 0..) |name, i| {
-            const mangled = if (is_macos)
-                try std.fmt.allocPrint(self.allocator, "_{s}", .{name})
-            else
-                try self.allocator.dupe(u8, name);
-            defer self.allocator.free(mangled);
-
-            rt_func_ids[i] = try module.declareFunction(mangled, .Export);
-            try module.declareExternalName(rt_base + @as(u32, @intCast(i)), mangled);
-        }
-
-        for (compiled_rt_funcs, 0..) |*cf, i| {
-            try module.defineFunctionBytes(rt_func_ids[i], cf.code(), cf.relocations());
-        }
-
-        // Pass 3: Data sections — string data, ctxt, argc/argv/envp, globals
+        // Data sections — string data, ctxt, argc/argv/envp, globals
         if (string_data.len > 0) {
             const sym_name: []const u8 = if (is_macos) "_cot_string_data" else "cot_string_data";
             const did = try module.declareData(sym_name, .Export, false);
@@ -2240,21 +2179,20 @@ pub const Driver = struct {
             try module.declareExternalName(globals_base_idx + @as(u32, @intCast(i)), gname);
         }
 
-        // Register external names for libc symbols
+        // Register external names for libc symbols (skip user functions — already registered)
+        const user_func_count: u32 = @intCast(user_funcs.len);
         {
             var it = func_index_map.iterator();
             while (it.next()) |entry| {
                 const name = entry.key_ptr.*;
                 const idx = entry.value_ptr.*;
 
-                // Skip symbols we've already declared
-                if (idx < rt_base + @as(u32, @intCast(compiled_rt_funcs.len))) continue;
+                // Skip user function indices — already registered with correct mangling
+                if (idx < user_func_count) continue;
 
-                // Mangle libc names
                 var mangled_name: []const u8 = undefined;
                 var needs_free = false;
                 if (std.mem.startsWith(u8, name, "c_")) {
-                    // c_waitpid → _waitpid (macOS) or waitpid (Linux)
                     if (is_macos) {
                         mangled_name = try std.fmt.allocPrint(self.allocator, "_{s}", .{name[2..]});
                         needs_free = true;
@@ -2274,8 +2212,6 @@ pub const Driver = struct {
         }
 
         // Entry point wrapper (_main)
-        // In test/bench mode, there's no fn main() but _cot_main still exists
-        // (generated by the test/bench runner). Always emit _main wrapper unless lib mode.
         var has_main = false;
         var main_idx: u32 = 0;
         for (user_funcs, 0..) |*ir_func, i| {
@@ -2285,10 +2221,9 @@ pub const Driver = struct {
                 break;
             }
         }
-        // Test/bench mode: no fn main() but _cot_main IS generated as the entry point
         if (!has_main and !self.lib_mode and user_funcs.len > 0) {
             has_main = true;
-            main_idx = 0; // _cot_main will be at index 0 or resolved by name
+            main_idx = 0;
         }
 
         if (has_main) {
@@ -2314,7 +2249,7 @@ pub const Driver = struct {
                         0xFD, 0x7B, 0xC1, 0xA8, // 52: ldp x29, x30, [sp], #16
                         0xC0, 0x03, 0x5F, 0xD6, // 56: ret
                     };
-                    const relocs = [_]buffer_mod.FinalizedMachReloc{
+                    const relocs = [_]object_module.FinalizedMachReloc{
                         .{ .offset = 8, .kind = .Aarch64AdrPrelPgHi21, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = argc_symbol_idx } } }, .addend = 0 },
                         .{ .offset = 12, .kind = .Aarch64AddAbsLo12Nc, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = argc_symbol_idx } } }, .addend = 0 },
                         .{ .offset = 20, .kind = .Aarch64AdrPrelPgHi21, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = argv_symbol_idx } } }, .addend = 0 },
@@ -2341,7 +2276,7 @@ pub const Driver = struct {
                         0xFD, 0x7B, 0xC1, 0xA8,
                         0xC0, 0x03, 0x5F, 0xD6,
                     };
-                    const relocs = [_]buffer_mod.FinalizedMachReloc{
+                    const relocs = [_]object_module.FinalizedMachReloc{
                         .{ .offset = 8, .kind = .Aarch64AdrPrelPgHi21, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = argc_symbol_idx } } }, .addend = 0 },
                         .{ .offset = 12, .kind = .Aarch64AddAbsLo12Nc, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = argc_symbol_idx } } }, .addend = 0 },
                         .{ .offset = 20, .kind = .Aarch64AdrPrelPgHi21, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = argv_symbol_idx } } }, .addend = 0 },
@@ -2606,7 +2541,7 @@ pub const Driver = struct {
                         0xFD, 0x7B, 0xC1, 0xA8, // 52: ldp x29, x30, [sp], #16
                         0xC0, 0x03, 0x5F, 0xD6, // 56: ret
                     };
-                    const relocs = [_]buffer_mod.FinalizedMachReloc{
+                    const relocs = [_]object_module.FinalizedMachReloc{
                         .{ .offset = 8, .kind = .Aarch64AdrPrelPgHi21, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = argc_symbol_idx } } }, .addend = 0 },
                         .{ .offset = 12, .kind = .Aarch64AddAbsLo12Nc, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = argc_symbol_idx } } }, .addend = 0 },
                         .{ .offset = 20, .kind = .Aarch64AdrPrelPgHi21, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = argv_symbol_idx } } }, .addend = 0 },
@@ -2634,7 +2569,7 @@ pub const Driver = struct {
                         0xFD, 0x7B, 0xC1, 0xA8, // 48: ldp x29, x30, [sp], #16
                         0xC0, 0x03, 0x5F, 0xD6, // 52: ret
                     };
-                    const relocs = [_]buffer_mod.FinalizedMachReloc{
+                    const relocs = [_]object_module.FinalizedMachReloc{
                         .{ .offset = 8, .kind = .Aarch64AdrPrelPgHi21, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = argc_symbol_idx } } }, .addend = 0 },
                         .{ .offset = 12, .kind = .Aarch64AddAbsLo12Nc, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = argc_symbol_idx } } }, .addend = 0 },
                         .{ .offset = 20, .kind = .Aarch64AdrPrelPgHi21, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = argv_symbol_idx } } }, .addend = 0 },
@@ -2664,7 +2599,7 @@ pub const Driver = struct {
                         0x5D, // 35: pop rbp
                         0xC3, // 36: ret
                     };
-                    const relocs = [_]buffer_mod.FinalizedMachReloc{
+                    const relocs = [_]object_module.FinalizedMachReloc{
                         .{ .offset = 10, .kind = .X86PCRel4, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = argc_symbol_idx } } }, .addend = -4 },
                         .{ .offset = 17, .kind = .X86PCRel4, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = argv_symbol_idx } } }, .addend = -4 },
                         .{ .offset = 24, .kind = .X86PCRel4, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = envp_symbol_idx } } }, .addend = -4 },
@@ -2684,7 +2619,7 @@ pub const Driver = struct {
                         0x5D, // 33: pop rbp
                         0xC3, // 34: ret
                     };
-                    const relocs = [_]buffer_mod.FinalizedMachReloc{
+                    const relocs = [_]object_module.FinalizedMachReloc{
                         .{ .offset = 10, .kind = .X86PCRel4, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = argc_symbol_idx } } }, .addend = -4 },
                         .{ .offset = 17, .kind = .X86PCRel4, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = argv_symbol_idx } } }, .addend = -4 },
                         .{ .offset = 24, .kind = .X86PCRel4, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = envp_symbol_idx } } }, .addend = -4 },
@@ -4160,10 +4095,10 @@ pub const Driver = struct {
         }.f;
 
         // Relocation types
-        const FinalizedMachReloc = buffer_mod.FinalizedMachReloc;
-        const FinalizedRelocTarget = buffer_mod.FinalizedRelocTarget;
-        const Reloc = buffer_mod.Reloc;
-        const ExternalName = buffer_mod.ExternalName;
+        const FinalizedMachReloc = object_module.FinalizedMachReloc;
+        const FinalizedRelocTarget = object_module.FinalizedRelocTarget;
+        const Reloc = object_module.Reloc;
+        const ExternalName = object_module.ExternalName;
 
         // External name indices (must not collide with function indices 0..num_funcs-1)
         const vmctx_ext_idx: u32 = num_funcs;
@@ -4777,10 +4712,10 @@ pub const Driver = struct {
             }
         }.f;
 
-        const FinalizedMachReloc = buffer_mod.FinalizedMachReloc;
-        const FinalizedRelocTarget = buffer_mod.FinalizedRelocTarget;
-        const Reloc = buffer_mod.Reloc;
-        const ExternalName = buffer_mod.ExternalName;
+        const FinalizedMachReloc = object_module.FinalizedMachReloc;
+        const FinalizedRelocTarget = object_module.FinalizedRelocTarget;
+        const Reloc = object_module.Reloc;
+        const ExternalName = object_module.ExternalName;
 
         // =================================================================
         // Step 1: Create static vmctx data section (same as executable)
@@ -5894,10 +5829,10 @@ pub const Driver = struct {
     /// The wrapper initializes vmctx, installs signal handlers, and calls __wasm_main.
     fn generateMainWrapperElf(self: *Driver, module: *object_module.ObjectModule, data_segments: []const wasm_parser.DataSegment, globals: []const wasm_parser.GlobalType, num_funcs: u32) !void {
         // Relocation types
-        const FinalizedMachReloc = buffer_mod.FinalizedMachReloc;
-        const FinalizedRelocTarget = buffer_mod.FinalizedRelocTarget;
-        const Reloc = buffer_mod.Reloc;
-        const ExternalName = buffer_mod.ExternalName;
+        const FinalizedMachReloc = object_module.FinalizedMachReloc;
+        const FinalizedRelocTarget = object_module.FinalizedRelocTarget;
+        const Reloc = object_module.Reloc;
+        const ExternalName = object_module.ExternalName;
 
         // External name indices
         const vmctx_ext_idx: u32 = num_funcs;

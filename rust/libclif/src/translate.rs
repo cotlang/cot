@@ -34,7 +34,13 @@ pub fn translate_module(
     let mut func_names_vec: Vec<String> = Vec::new();
     for cir_func in &module.functions {
         let raw_name = module.strings.get(cir_func.name_offset);
-        let name = if raw_name == "main" { "_cot_main".to_string() } else { raw_name.to_string() };
+        let name = if raw_name == "main" {
+            "_cot_main".to_string()
+        } else if raw_name == "__cot_entry" {
+            "main".to_string() // OS entry point
+        } else {
+            raw_name.to_string()
+        };
         // Skip duplicate definitions (e.g., async function wrappers with same name)
         let func_id = if let Some(&existing_id) = module_func_ids.get(&name) {
             existing_id
@@ -92,6 +98,32 @@ pub fn translate_module(
             eprintln!("{e:#}");
             return Err(format!("compile {name}: {e:#}"));
         }
+    }
+
+    // Process global/data definitions from CIR Section 0x04
+    let mut defined_data: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for global in &module.globals {
+        let name = module.strings.get(global.name_offset);
+        if !defined_data.insert(name.to_string()) {
+            continue; // skip duplicates
+        }
+        let writable = (global.flags & 1) != 0;
+        let zero_init = (global.flags & 2) != 0;
+        let _export = (global.flags & 4) != 0;
+
+        let data_id = obj_module
+            .declare_data(name, Linkage::Export, writable, false)
+            .map_err(|e| format!("declare data {name}: {e}"))?;
+
+        let mut desc = cranelift_module::DataDescription::new();
+        if zero_init || global.data.is_empty() {
+            desc.define_zeroinit(global.size as usize);
+        } else {
+            desc.define(global.data.clone().into_boxed_slice());
+        }
+
+        obj_module.define_data(data_id, &desc)
+            .map_err(|e| format!("define data {name}: {e}"))?;
     }
 
     let product = obj_module.finish();
@@ -680,8 +712,11 @@ fn translate_instruction(
                         }
                     }
                     let sig_ref = builder.import_signature(sig);
+                    // Strip c_ prefix for libc functions (e.g., c_mkdir → mkdir)
+                    // This avoids name collision between Cot wrappers and libc functions in CIR
+                    let import_name = if func_name.starts_with("c_") { &func_name[2..] } else { &func_name };
                     let fid = obj_module
-                        .declare_function(&func_name, Linkage::Import, &builder.func.stencil.dfg.signatures[sig_ref])
+                        .declare_function(import_name, Linkage::Import, &builder.func.stencil.dfg.signatures[sig_ref])
                         .map_err(|e| format!("declare callee {func_name}: {e}"))?;
                     module_func_ids.insert(func_name.clone(), fid);
                     fid
