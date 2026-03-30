@@ -59,6 +59,7 @@ fn compileAndRun(allocator: std.mem.Allocator, code: []const u8, test_name: []co
 
     var driver = Driver.init(allocator);
     driver.setTarget(Target.native());
+    driver.use_cranelift = false; // Use hand-ported backend for standalone e2e tests
 
     const obj_code = driver.compileSource(code) catch |e| {
         const msg = std.fmt.allocPrint(allocator, "compile error: {any}", .{e}) catch "compile error";
@@ -232,6 +233,7 @@ fn compileAndRunWithStdin(allocator: std.mem.Allocator, code: []const u8, stdin_
 
     var driver = Driver.init(allocator);
     driver.setTarget(Target.native());
+    driver.use_cranelift = false; // Use hand-ported backend for standalone e2e tests
 
     const obj_code = driver.compileSource(code) catch |e| {
         const msg = std.fmt.allocPrint(allocator, "compile error: {any}", .{e}) catch "compile error";
@@ -379,6 +381,7 @@ fn compileAndRunTestMode(allocator: std.mem.Allocator, code: []const u8, test_na
 
     var driver = Driver.init(allocator);
     driver.setTarget(Target.native());
+    driver.use_cranelift = false; // Use hand-ported backend for standalone e2e tests
     driver.setTestMode(true);
 
     const obj_code = driver.compileSource(code) catch |e| {
