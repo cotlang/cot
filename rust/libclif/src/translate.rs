@@ -583,22 +583,26 @@ fn translate_instruction(
                 // Void function — ignore the return value, just return
                 builder.ins().return_(&[]);
             } else {
-                let val_id = inst.words[0];
-                let mut val = use_value(val_id, builder, value_map, var_map)
-                    .map_err(|e| format!("RET: {e}"))?;
-                // Coerce return value type if needed
-                let ret_ty = builder.func.signature.returns[0].value_type;
-                let val_ty = builder.func.dfg.value_type(val);
-                if val_ty != ret_ty && val_ty.is_int() && ret_ty.is_int() {
-                    if val_ty.bits() > ret_ty.bits() {
-                        val = builder.ins().ireduce(ret_ty, val);
-                    } else {
-                        val = builder.ins().uextend(ret_ty, val);
+                // Read all return values from the CIR instruction
+                let mut ret_vals = Vec::with_capacity(sig_ret_count);
+                for i in 0..inst.words.len().min(sig_ret_count) {
+                    let val_id = inst.words[i];
+                    let mut val = use_value(val_id, builder, value_map, var_map)
+                        .map_err(|e| format!("RET[{i}]: {e}"))?;
+                    // Coerce return value type if needed
+                    let ret_ty = builder.func.signature.returns[i].value_type;
+                    let val_ty = builder.func.dfg.value_type(val);
+                    if val_ty != ret_ty && val_ty.is_int() && ret_ty.is_int() {
+                        if val_ty.bits() > ret_ty.bits() {
+                            val = builder.ins().ireduce(ret_ty, val);
+                        } else {
+                            val = builder.ins().uextend(ret_ty, val);
+                        }
                     }
+                    ret_vals.push(val);
                 }
-                // Pad return values to match signature (Zig CLIF may return fewer than declared)
-                let mut ret_vals = vec![val];
-                for i in 1..sig_ret_count {
+                // Pad remaining return values if CIR has fewer than signature
+                for i in ret_vals.len()..sig_ret_count {
                     let pad_ty = builder.func.signature.returns[i].value_type;
                     let pad = builder.ins().iconst(pad_ty, 0);
                     ret_vals.push(pad);

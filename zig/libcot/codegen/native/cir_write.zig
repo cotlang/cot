@@ -716,13 +716,20 @@ fn serializeInstruction(writer: *CirWriter, data: clif.InstructionData, result_i
         },
 
         .multi_ary => |d| {
-            // return with args
+            // return with args — emit ALL return values for multi-return functions
             if (d.opcode == .@"return") {
                 const args = func.dfg.value_lists.getSlice(d.args);
-                if (args.len > 0) {
+                if (args.len == 0) {
+                    writer.emit(OP_RET_VOID, &.{});
+                } else if (args.len == 1) {
                     writer.emit(OP_RET, &.{args[0].asU32()});
                 } else {
-                    writer.emit(OP_RET_VOID, &.{});
+                    // Multi-return: emit OP_RET with all value IDs
+                    var operands_buf: [16]u32 = undefined;
+                    for (args, 0..) |a, i| {
+                        operands_buf[i] = a.asU32();
+                    }
+                    writer.emit(OP_RET, operands_buf[0..args.len]);
                 }
             }
         },
