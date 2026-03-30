@@ -7,6 +7,7 @@
 const std = @import("std");
 const clif = @import("../../ir/clif/mod.zig");
 const types_mod = @import("../../frontend/types.zig");
+const debug = @import("../../pipeline_debug.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -253,6 +254,16 @@ pub const FuncNameResolver = struct {
         return .{ .names = names, .allocator = allocator };
     }
 
+    /// Build from a pre-inverted map (index → name).
+    pub fn initFromReversed(allocator: Allocator, reversed: *const std.AutoHashMapUnmanaged(u32, []const u8)) FuncNameResolver {
+        var names = std.AutoHashMapUnmanaged(u32, []const u8){};
+        var it = reversed.iterator();
+        while (it.next()) |entry| {
+            names.put(allocator, entry.key_ptr.*, entry.value_ptr.*) catch {};
+        }
+        return .{ .names = names, .allocator = allocator };
+    }
+
     pub fn deinit(self: *FuncNameResolver) void {
         self.names.deinit(self.allocator);
     }
@@ -306,7 +317,13 @@ pub fn serializeClifFunction(writer: *CirWriter, func: *const clif.Function, res
                     .symbol => |sym| {
                         // Resolve symbol name from ExternalName
                         const sym_name = switch (sym.name) {
-                            .user => |u| resolver.resolve(u.index),
+                            .user => |u| blk: {
+                                const resolved = resolver.resolve(u.index);
+                                if (std.mem.eql(u8, resolved, "__unknown")) {
+                                    debug.log(.codegen, "CIR: unresolved global symbol at user index {d}", .{u.index});
+                                }
+                                break :blk resolved;
+                            },
                             .libcall => |n| n,
                         };
                         const name_off = writer.internString(sym_name);
@@ -595,7 +612,13 @@ fn serializeInstruction(writer: *CirWriter, data: clif.InstructionData, result_i
             // Resolve function name from FuncRef using the resolver
             const ext_func = func.ext_funcs.items[d.func_ref.index];
             const name = switch (ext_func.name) {
-                .user => |u| resolver.resolve(u.index),
+                .user => |u| blk: {
+                    const resolved = resolver.resolve(u.index);
+                    if (std.mem.eql(u8, resolved, "__unknown")) {
+                        debug.log(.codegen, "CIR: unresolved call target at user index {d} (func_ref={d})", .{ u.index, d.func_ref.index });
+                    }
+                    break :blk resolved;
+                },
                 .libcall => |n| n,
             };
             const name_off = writer.internString(name);
@@ -708,7 +731,13 @@ fn serializeInstruction(writer: *CirWriter, data: clif.InstructionData, result_i
             // Function address — emit name + full signature so Rust side can declare correctly
             const ext_func = func.ext_funcs.items[d.func_ref.index];
             const name = switch (ext_func.name) {
-                .user => |u| resolver.resolve(u.index),
+                .user => |u| blk: {
+                    const resolved = resolver.resolve(u.index);
+                    if (std.mem.eql(u8, resolved, "__unknown")) {
+                        debug.log(.codegen, "CIR: unresolved func_addr at user index {d} (func_ref={d})", .{ u.index, d.func_ref.index });
+                    }
+                    break :blk resolved;
+                },
                 .libcall => |n| n,
             };
             const name_off = writer.internString(name);

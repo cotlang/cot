@@ -1863,7 +1863,23 @@ pub const Driver = struct {
             }
         }
 
-        var resolver = cir_write.FuncNameResolver.init(self.allocator, &func_index_map);
+        // Build resolver from both func_index_map (functions) and global_symbol_map (data symbols)
+        // Both namespaces use ExternalName.initUser(0, index) so the resolver must cover both.
+        var combined_map = std.AutoHashMapUnmanaged(u32, []const u8){};
+        defer combined_map.deinit(self.allocator);
+        {
+            var it = func_index_map.iterator();
+            while (it.next()) |entry| {
+                combined_map.put(self.allocator, entry.value_ptr.*, entry.key_ptr.*) catch {};
+            }
+        }
+        {
+            var it = global_symbol_map.iterator();
+            while (it.next()) |entry| {
+                combined_map.put(self.allocator, entry.value_ptr.*, entry.key_ptr.*) catch {};
+            }
+        }
+        var resolver = cir_write.FuncNameResolver.initFromReversed(self.allocator, &combined_map);
         defer resolver.deinit();
 
         // --- Phase 1: For each function, build SSA → passes → CLIF → serialize to CIR ---
