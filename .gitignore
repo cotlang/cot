@@ -19,3 +19,4 @@ zig_type_err
 
 *.ssa.html
 .claude/
+test/ts/test262
