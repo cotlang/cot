@@ -42,7 +42,6 @@ jobs:
         run: zig build test
 
       - name: Cot tests (native)
-        continue-on-error: true
         if: matrix.os == 'macos-14'
         run: COT="./zig-out/bin/cot" ./test/run_all.sh
 

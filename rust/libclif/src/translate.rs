@@ -347,10 +347,12 @@ fn translate_instruction(
             let type_idx = inst.words[1];
             let clif_type = cir_type_to_clif(type_idx);
             let imm = if inst.words.len() >= 4 {
-                // 64-bit immediate
-                (inst.words[3] as i64) << 32 | (inst.words[2] as i64)
+                // 64-bit immediate: combine two u32 words
+                ((inst.words[3] as u64) << 32 | (inst.words[2] as u64)) as i64
             } else {
-                inst.words[2] as i32 as i64
+                // 32-bit immediate: zero-extend, not sign-extend
+                // (u32 values like 3000000000 must not become negative)
+                inst.words[2] as u64 as i64
             };
             let val = builder.ins().iconst(clif_type, imm);
             def_value(result_id, val, builder, value_map, var_map, next_var);
