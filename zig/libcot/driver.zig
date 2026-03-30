@@ -394,6 +394,10 @@ pub const Driver = struct {
         // Generate test runner if in test mode
         if (self.test_mode and lowerer.test_names.items.len > 0) {
             try lowerer.generateTestRunner();
+        } else if (self.test_mode and lowerer.test_names.items.len == 0) {
+            // No test blocks in this file — nothing to compile
+            std.debug.print("\nok | 0 passed\n", .{});
+            return &.{};
         }
 
         try self.emitVWTWitnesses(&lowerer.builder, &type_reg);
@@ -997,6 +1001,10 @@ pub const Driver = struct {
         }
 
         // Generate test runner if in test mode
+        if (self.test_mode and all_test_names.items.len == 0) {
+            std.debug.print("\nok | 0 passed\n", .{});
+            return &.{};
+        }
         if (self.test_mode and all_test_names.items.len > 0) {
             var dummy_err = errors_mod.ErrorReporter.init(&parsed_files.items[0].source, null);
             var runner = lower_mod.Lowerer.initWithBuilder(self.allocator, &parsed_files.items[0].tree, &type_reg, &dummy_err, &checkers.items[0], shared_builder, self.target);

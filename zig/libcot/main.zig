@@ -1354,6 +1354,11 @@ fn compileAndLinkFull(
     };
     defer allocator.free(code);
 
+    // Empty code = no tests/benches to run (already printed "0 passed")
+    if (code.len == 0) {
+        std.process.exit(0);
+    }
+
     // For Wasm target, output .wasm directly (no linking needed)
     if (compile_target.isWasm()) {
         const wasm_path = if (std.mem.endsWith(u8, output_name, ".wasm"))
