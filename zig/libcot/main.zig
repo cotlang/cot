@@ -1805,7 +1805,11 @@ test {
 test {
     _ = @import("frontend/e2e_test.zig");
     _ = @import("frontend/integration_test.zig");
-    _ = @import("codegen/native_e2e_test.zig");
+    // Native e2e tests exercise the hand-ported Cranelift backend (zig/libclif).
+    // Currently only validated on ARM64 macOS. x64 Linux uses real Cranelift via CIR.
+    if (@import("builtin").cpu.arch == .aarch64) {
+        _ = @import("codegen/native_e2e_test.zig");
+    }
 }
 
 test "main: findRuntimePath returns error when not found" {
