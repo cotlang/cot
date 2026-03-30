@@ -107,7 +107,7 @@ compiler/
 │
 ├── driver.zig              # Orchestrates compilation
 ├── main.zig                # CLI entry point
-└── pipeline_debug.zig      # Debug logging
+└── debug.zig      # Debug logging
 ```
 
 ---

@@ -29,7 +29,7 @@ const BlockKind = @import("../block.zig").BlockKind;
 const Value = @import("../value.zig").Value;
 const TypeIndex = @import("../value.zig").TypeIndex;
 const Op = @import("../op.zig").Op;
-const debug = @import("../../pipeline_debug.zig");
+const debug = @import("../../debug.zig");
 const TypeRegistry = @import("../../frontend/types.zig").TypeRegistry;
 
 const STATE_UNRESUMED: i64 = 0;

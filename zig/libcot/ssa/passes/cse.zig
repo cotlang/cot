@@ -12,7 +12,7 @@ const value_mod = @import("../value.zig");
 const Value = value_mod.Value;
 const Aux = value_mod.Aux;
 const Op = @import("../op.zig").Op;
-const debug = @import("../../pipeline_debug.zig");
+const debug = @import("../../debug.zig");
 
 /// Run CSE on a function.
 /// Reference: Go cse.go — hash-based value numbering, LogStat("CSE REWRITES", n).

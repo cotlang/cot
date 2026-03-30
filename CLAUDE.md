@@ -1,5 +1,26 @@
 # Claude AI Instructions
 
+## 🚨🚨🚨 MANDATORY: LEARN THE LANGUAGE BEFORE WRITING ANY CODE 🚨🚨🚨
+
+**Before doing ANY work on this project, you MUST:**
+
+1. **Read `docs/syntax.md` completely** — this is the full language syntax reference with examples for every feature. Commit every construct to memory: variables, types, structs, enums, unions, traits, generics, error handling, async/await, closures, `@safe` mode, builtins, operators, control flow.
+
+2. **Read representative stdlib files** — at minimum read `stdlib/list.cot`, `stdlib/map.cot`, `stdlib/string.cot`, and `stdlib/sys.cot` to see real idiomatic Cot code. These show how structs, generics, methods, error handling, and memory management work in practice.
+
+3. **Read `test/e2e/features.cot`** — 370 tests covering every language feature. This is the canonical reference for how the language actually works. If you're unsure about syntax, the answer is in this file.
+
+**WHY:** Claude agents repeatedly waste hours inventing syntax that doesn't exist, using patterns from other languages (Go, Rust, C++) instead of Cot's actual syntax, and guessing at features that are already implemented. Every hour spent flailing with wrong syntax is an hour not spent on real work. The language is well-documented — read it first.
+
+**If you skip this step, you WILL:**
+- Write `func` instead of `fn`
+- Write `[]int` instead of `[int]` or `List(int)`
+- Forget that `@safe` mode auto-injects `self` and auto-refs struct params
+- Miss that Cot has string interpolation (`"${x}"`), optional chaining (`?.`), error unions (`!T`)
+- Invent workarounds for features that already exist
+
+---
+
 ## 🚨 USE PIPELINE DEBUGGER FOR ALL BUGS — NO TEMPORARY PRINTS 🚨
 
 **NEVER add temporary `std.debug.print` or `eprintln` statements to debug.** Use the pipeline debug system instead:
@@ -10,7 +31,7 @@ COT_DEBUG=codegen ./zig-out/bin/cot build file.cot    # Codegen only
 COT_SSA=funcName ./zig-out/bin/cot build file.cot     # SSA HTML visualizer
 ```
 
-**Use `pipeline_debug.zig`** for ALL logging. Enhance the debug system with new categories/phases as needed — it's an investment, not a workaround.
+**Use `debug.zig`** for ALL logging. Enhance the debug system with new categories/phases as needed — it's an investment, not a workaround.
 
 ## 🚨 NEVER WORKAROUND, NEVER SIMPLIFY 🚨
 
@@ -220,7 +241,7 @@ zig build test                                    # Compiler unit tests (once)
 - Make incremental changes, verify each one
 
 **DO NOT:**
-- Add temporary `std.debug.print` — use `pipeline_debug.zig`
+- Add temporary `std.debug.print` — use `debug.zig`
 - Run tests redundantly — once per task
 - Invent approaches — copy references
 - Comment out failing tests or leave TODOs

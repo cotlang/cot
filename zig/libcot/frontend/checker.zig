@@ -9,7 +9,7 @@ const token = @import("token.zig");
 const comptime_mod = @import("comptime.zig");
 
 const target_mod = @import("target.zig");
-const debug = @import("../pipeline_debug.zig");
+const debug = @import("../debug.zig");
 
 pub const ComptimeValue = comptime_mod.ComptimeValue;
 

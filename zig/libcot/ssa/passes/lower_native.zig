@@ -12,7 +12,7 @@ const Value = @import("../value.zig").Value;
 const Block = @import("../block.zig").Block;
 const Func = @import("../func.zig").Func;
 const Op = @import("../op.zig").Op;
-const debug = @import("../../pipeline_debug.zig");
+const debug = @import("../../debug.zig");
 
 /// Lower a function's SSA ops for native CLIF translation.
 ///

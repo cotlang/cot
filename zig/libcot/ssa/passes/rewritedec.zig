@@ -25,7 +25,7 @@ const Block = @import("../block.zig").Block;
 const Func = @import("../func.zig").Func;
 const Op = @import("../op.zig").Op;
 const TypeRegistry = @import("../../frontend/types.zig").TypeRegistry;
-const debug = @import("../../pipeline_debug.zig");
+const debug = @import("../../debug.zig");
 
 /// Run the decomposition rewrite pass.
 /// Go reference: rewritedec.go main loop

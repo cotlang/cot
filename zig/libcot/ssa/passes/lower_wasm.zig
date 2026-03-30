@@ -20,7 +20,7 @@ const Func = @import("../func.zig").Func;
 const Op = @import("../op.zig").Op;
 const TypeIndex = @import("../value.zig").TypeIndex;
 const TypeRegistry = @import("../../frontend/types.zig").TypeRegistry;
-const debug = @import("../../pipeline_debug.zig");
+const debug = @import("../../debug.zig");
 
 /// Lower a function's generic ops to Wasm-specific ops.
 /// Decomposition should be done by rewritedec.zig BEFORE calling this.

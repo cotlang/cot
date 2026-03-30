@@ -15,7 +15,7 @@ const Func = @import("../func.zig").Func;
 const Op = @import("../op.zig").Op;
 const TypeIndex = @import("../value.zig").TypeIndex;
 const TypeRegistry = @import("../../frontend/types.zig").TypeRegistry;
-const debug = @import("../../pipeline_debug.zig");
+const debug = @import("../../debug.zig");
 
 /// String offset map type - maps string content to data section offset
 pub const StringOffsetMap = std.StringHashMap(i32);

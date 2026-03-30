@@ -11,7 +11,7 @@ const Block = @import("../block.zig").Block;
 const Value = @import("../value.zig").Value;
 const Op = @import("../op.zig").Op;
 const frontend_types = @import("../../frontend/types.zig");
-const debug = @import("../../pipeline_debug.zig");
+const debug = @import("../../debug.zig");
 
 /// Priority scores - lower numbers scheduled earlier.
 /// Go reference: schedule.go:16-28 (ScorePhi through ScoreControl).

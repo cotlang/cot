@@ -28,7 +28,7 @@ const SsaFunc = @import("../../ssa/func.zig").Func;
 const SsaOp = @import("../../ssa/op.zig").Op;
 
 const TypeRegistry = @import("../../frontend/types.zig").TypeRegistry;
-const debug = @import("../../pipeline_debug.zig");
+const debug = @import("../../debug.zig");
 
 /// Error type for code generation
 /// Uses explicit set to allow mutual recursion between getValue64 and ssaGenValueOnStack

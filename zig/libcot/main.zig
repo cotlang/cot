@@ -33,7 +33,7 @@ pub const ssa_lower_wasm = @import("ssa/passes/lower_wasm.zig");
 pub const ssa_layout = @import("ssa/passes/layout.zig");
 
 // Debug and pipeline
-pub const debug = @import("pipeline_debug.zig");
+pub const debug = @import("debug.zig");
 pub const driver = @import("driver.zig");
 pub const cli = @import("cli.zig");
 pub const project = @import("project.zig");
@@ -218,6 +218,10 @@ fn runOnce(allocator: std.mem.Allocator, input_file: []const u8, compile_target:
         const basename = std.fs.path.basename(input_file);
         break :blk if (std.mem.endsWith(u8, basename, ".cot"))
             basename[0 .. basename.len - 4]
+        else if (std.mem.endsWith(u8, basename, ".ts") or std.mem.endsWith(u8, basename, ".js"))
+            basename[0 .. basename.len - 3]
+        else if (std.mem.endsWith(u8, basename, ".tsx") or std.mem.endsWith(u8, basename, ".jsx"))
+            basename[0 .. basename.len - 4]
         else
             basename;
     };
@@ -304,6 +308,10 @@ fn testCommand(allocator: std.mem.Allocator, opts: cli.TestOptions) void {
         const basename = std.fs.path.basename(input_file);
         break :blk if (std.mem.endsWith(u8, basename, ".cot"))
             basename[0 .. basename.len - 4]
+        else if (std.mem.endsWith(u8, basename, ".ts") or std.mem.endsWith(u8, basename, ".js"))
+            basename[0 .. basename.len - 3]
+        else if (std.mem.endsWith(u8, basename, ".tsx") or std.mem.endsWith(u8, basename, ".jsx"))
+            basename[0 .. basename.len - 4]
         else
             basename;
     };
@@ -376,6 +384,10 @@ fn benchCommand(allocator: std.mem.Allocator, opts: cli.BenchOptions) void {
     const stem = blk: {
         const basename = std.fs.path.basename(input_file);
         break :blk if (std.mem.endsWith(u8, basename, ".cot"))
+            basename[0 .. basename.len - 4]
+        else if (std.mem.endsWith(u8, basename, ".ts") or std.mem.endsWith(u8, basename, ".js"))
+            basename[0 .. basename.len - 3]
+        else if (std.mem.endsWith(u8, basename, ".tsx") or std.mem.endsWith(u8, basename, ".jsx"))
             basename[0 .. basename.len - 4]
         else
             basename;

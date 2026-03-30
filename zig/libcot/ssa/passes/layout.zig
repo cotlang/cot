@@ -10,7 +10,7 @@ const std = @import("std");
 const Block = @import("../block.zig").Block;
 const BlockKind = @import("../block.zig").BlockKind;
 const Func = @import("../func.zig").Func;
-const debug = @import("../../pipeline_debug.zig");
+const debug = @import("../../debug.zig");
 
 /// Reorder blocks to minimize jumps.
 pub fn layout(f: *Func) !void {

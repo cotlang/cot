@@ -9,7 +9,7 @@ const ssa = @import("../ssa/func.zig");
 const ssa_block = @import("../ssa/block.zig");
 const ssa_value = @import("../ssa/value.zig");
 const ssa_op = @import("../ssa/op.zig");
-const debug = @import("../pipeline_debug.zig");
+const debug = @import("../debug.zig");
 
 const Allocator = std.mem.Allocator;
 const Target = target_mod.Target;

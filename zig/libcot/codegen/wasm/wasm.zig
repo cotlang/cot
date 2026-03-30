@@ -52,7 +52,7 @@ pub const memAddr = prog.memAddr;
 // Import SSA types
 const SsaFunc = @import("../../ssa/func.zig").Func;
 
-const debug = @import("../../pipeline_debug.zig");
+const debug = @import("../../debug.zig");
 
 /// Function index map type (re-export from gen)
 pub const FuncIndexMap = gen.FuncIndexMap;

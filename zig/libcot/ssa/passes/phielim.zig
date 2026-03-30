@@ -11,7 +11,7 @@ const Func = @import("../func.zig").Func;
 const Block = @import("../block.zig").Block;
 const Value = @import("../value.zig").Value;
 const Op = @import("../op.zig").Op;
-const debug = @import("../../pipeline_debug.zig");
+const debug = @import("../../debug.zig");
 
 /// phielim eliminates redundant phi values from f.
 /// A phi is redundant if its arguments are all equal (ignoring self-references).

@@ -26,7 +26,7 @@ const TypeIndex = types_mod.TypeIndex;
 const TypeRegistry = types_mod.TypeRegistry;
 const ir_mod = @import("../frontend/ir.zig");
 
-const debug = @import("../pipeline_debug.zig");
+const debug = @import("../debug.zig");
 
 // ============================================================================
 // CIR Constants (must match rust/libclif/src/cir.rs)

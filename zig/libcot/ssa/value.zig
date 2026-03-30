@@ -183,7 +183,7 @@ pub const Value = struct {
         if (idx < self.args.len) {
             self.args[idx].uses -= 1;
             if (self.args[idx].uses < 0) {
-                const debug = @import("../pipeline_debug.zig");
+                const debug = @import("../debug.zig");
                 debug.log(.codegen, "  USE WATCH: v{d}.setArg[{d}] decremented v{d} to uses={d}", .{ self.id, idx, self.args[idx].id, self.args[idx].uses });
             }
         }
@@ -192,7 +192,7 @@ pub const Value = struct {
     }
 
     pub fn resetArgs(self: *Value) void {
-        const debug = @import("../pipeline_debug.zig");
+        const debug = @import("../debug.zig");
         for (self.args) |arg| {
             arg.uses -= 1;
             if (arg.uses < 0) {
@@ -205,7 +205,7 @@ pub const Value = struct {
     }
 
     pub fn resetArgsFree(self: *Value, allocator: ?std.mem.Allocator) void {
-        const debug = @import("../pipeline_debug.zig");
+        const debug = @import("../debug.zig");
         for (self.args) |arg| {
             arg.uses -= 1;
             if (arg.uses < 0) {

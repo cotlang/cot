@@ -11,7 +11,7 @@ const comptime_mod = @import("comptime.zig");
 const token = @import("token.zig");
 const arc = @import("arc_insertion.zig");
 const target_mod = @import("target.zig");
-const debug = @import("../pipeline_debug.zig");
+const debug = @import("../debug.zig");
 
 const Allocator = std.mem.Allocator;
 const Ast = ast.Ast;

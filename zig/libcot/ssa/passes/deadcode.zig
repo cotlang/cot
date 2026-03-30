@@ -19,7 +19,7 @@ const Value = @import("../value.zig").Value;
 const ID = @import("../value.zig").ID;
 const Op = @import("../op.zig").Op;
 const copyelim_pass = @import("copyelim.zig");
-const debug = @import("../../pipeline_debug.zig");
+const debug = @import("../../debug.zig");
 
 /// deadcode removes dead code from f.
 /// Reference: Go deadcode.go — remove unreachable blocks and dead values.

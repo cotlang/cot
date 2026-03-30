@@ -12,6 +12,7 @@ const ir_mod = @import("frontend/ir.zig");
 const vwt_gen_mod = @import("frontend/vwt_gen.zig");
 const ssa_builder_mod = @import("frontend/ssa_builder.zig");
 const source_mod = @import("frontend/source.zig");
+const token_mod = @import("frontend/token.zig");
 // Native codegen imports (AOT compiler path)
 // NOTE: Native codegen is being rewritten with Cranelift architecture.
 // See CRANELIFT_PORT_MASTER_PLAN.md for status and progress.
@@ -28,7 +29,10 @@ const async_split = @import("ssa/passes/async_split.zig");
 const phielim = @import("ssa/passes/phielim.zig");
 const cse_pass = @import("ssa/passes/cse.zig");
 const target_mod = @import("frontend/target.zig");
-const debug = @import("pipeline_debug.zig");
+const debug = @import("debug.zig");
+
+// libts (TypeScript/JavaScript frontend)
+const libts = @import("libts");
 
 // Wasm codegen
 const wasm_old = @import("codegen/wasm.zig"); // CodeBuilder for runtime function emission
@@ -1168,18 +1172,36 @@ pub const Driver = struct {
         };
         errdefer self.allocator.free(source_text);
 
+        const is_ts = isTypeScriptFile(canonical_path);
+
         var src = source_mod.Source.init(self.allocator, path_copy, source_text);
         errdefer src.deinit();
-        var err_reporter = errors_mod.ErrorReporter.init(&src, null);
 
         var tree = ast_mod.Ast.init(self.allocator);
         errdefer tree.deinit();
-        var scan = scanner_mod.Scanner.initWithErrors(&src, &err_reporter);
-        var parser = parser_mod.Parser.init(self.allocator, &scan, &tree, &err_reporter);
-        // Project-level @safe: set parser safe_mode BEFORE parsing so syntax features work
-        if (self.isProjectSafe(canonical_path)) parser.safe_mode = true;
-        try parser.parseFile();
-        if (err_reporter.hasErrors()) return error.ParseError;
+
+        if (is_ts) {
+            // TypeScript/JavaScript path: libts scanner → parser → transform → Cot AST
+            var ts_src = libts.Source.init(self.allocator, path_copy, source_text);
+            var ts_p = libts.Parser.init(&ts_src, self.allocator);
+            ts_p.ensureInit();
+            ts_p.parseSourceFile() catch {
+                std.debug.print("TypeScript parse error: {s}\n", .{canonical_path});
+                return error.ParseError;
+            };
+
+            // Transform TS AST → Cot AST
+            try transformTsFile(&ts_p.ast, &tree, self.allocator, path_copy);
+        } else {
+            // Standard Cot path
+            var err_reporter = errors_mod.ErrorReporter.init(&src, null);
+            var scan = scanner_mod.Scanner.initWithErrors(&src, &err_reporter);
+            var parser = parser_mod.Parser.init(self.allocator, &scan, &tree, &err_reporter);
+            // Project-level @safe: set parser safe_mode BEFORE parsing so syntax features work
+            if (self.isProjectSafe(canonical_path)) parser.safe_mode = true;
+            try parser.parseFile();
+            if (err_reporter.hasErrors()) return error.ParseError;
+        }
 
         // Parse imports first (dependencies before dependents)
         const imports = try tree.getImports(self.allocator);
@@ -2543,6 +2565,675 @@ pub const Driver = struct {
         return output.toOwnedSlice(self.allocator);
     }
 };
+
+// ============================================================================
+// TypeScript/JavaScript support
+// ============================================================================
+
+fn isTypeScriptFile(path: []const u8) bool {
+    return std.mem.endsWith(u8, path, ".ts") or
+        std.mem.endsWith(u8, path, ".js") or
+        std.mem.endsWith(u8, path, ".tsx") or
+        std.mem.endsWith(u8, path, ".jsx");
+}
+
+/// Transform a parsed TS AST into a Cot AST.
+/// Produces Cot AST nodes that the checker and lowerer can process normally.
+fn transformTsFile(ts: *const libts.ts_ast.Ast, cot: *ast_mod.Ast, allocator: std.mem.Allocator, filename: []const u8) error{OutOfMemory}!void {
+    const sf = ts.source_file orelse return;
+
+    var top_decls = std.ArrayListUnmanaged(ast_mod.NodeIndex){};
+    var main_stmts = std.ArrayListUnmanaged(ast_mod.NodeIndex){};
+
+    for (sf.statements) |stmt_idx| {
+        const node = ts.getNode(stmt_idx) orelse continue;
+        switch (node.*) {
+            .decl => |d| switch (d) {
+                .function => |func| {
+                    const fn_idx = try transformTsFn(ts, cot, allocator, func);
+                    try top_decls.append(allocator, fn_idx);
+                },
+                .class => |cls| {
+                    try transformTsClass(ts, cot, allocator, cls, &top_decls);
+                },
+                .export_decl => |exp| {
+                    if (exp.declaration != libts.ts_ast.null_node) {
+                        const inner = ts.getNode(exp.declaration) orelse continue;
+                        switch (inner.*) {
+                            .decl => |inner_d| switch (inner_d) {
+                                .function => |func| {
+                                    var exported_func = func;
+                                    exported_func.is_export = true;
+                                    const fn_idx = try transformTsFn(ts, cot, allocator, exported_func);
+                                    try top_decls.append(allocator, fn_idx);
+                                },
+                                .class => |cls| {
+                                    try transformTsClass(ts, cot, allocator, cls, &top_decls);
+                                },
+                                else => {},
+                            },
+                            else => {},
+                        }
+                    }
+                },
+                else => {},
+            },
+            .stmt => |s| {
+                const cot_stmt = try transformTsStmt(ts, cot, allocator, s);
+                if (cot_stmt != ast_mod.null_node) {
+                    try main_stmts.append(allocator, cot_stmt);
+                }
+            },
+            else => {},
+        }
+    }
+
+    // Wrap top-level statements in fn main() void { ... }
+    if (main_stmts.items.len > 0) {
+        const owned_stmts = try allocator.dupe(ast_mod.NodeIndex, main_stmts.items);
+        const body = try cot.addExpr(.{ .block_expr = .{
+            .stmts = owned_stmts,
+            .expr = ast_mod.null_node,
+            .span = source_mod.Span.zero,
+        } });
+        const void_type = try cot.addExpr(.{ .type_expr = .{
+            .kind = .{ .named = "void" },
+            .span = source_mod.Span.zero,
+        } });
+        const main_fn = try cot.addDecl(.{ .fn_decl = .{
+            .name = "main",
+            .params = &.{},
+            .return_type = void_type,
+            .body = body,
+            .is_extern = false,
+            .span = source_mod.Span.zero,
+        } });
+        try top_decls.append(allocator, main_fn);
+    }
+
+    cot.file = .{
+        .filename = filename,
+        .decls = try allocator.dupe(ast_mod.NodeIndex, top_decls.items),
+        .span = source_mod.Span.zero,
+        .safe_mode = true, // TS classes use this→self, which requires @safe mode
+    };
+}
+
+fn transformTsFn(ts: *const libts.ts_ast.Ast, cot: *ast_mod.Ast, allocator: std.mem.Allocator, func: libts.ts_ast.Decl.FunctionDecl) error{OutOfMemory}!ast_mod.NodeIndex {
+    const name = func.name orelse "anonymous";
+    const params = try transformTsParams(ts, cot, allocator, func.params);
+    const return_type = if (func.return_type != libts.ts_ast.null_node)
+        try transformTsType(ts, cot, allocator, func.return_type)
+    else
+        try cot.addExpr(.{ .type_expr = .{ .kind = .{ .named = "void" }, .span = source_mod.Span.zero } });
+
+    const body = if (func.body != libts.ts_ast.null_node)
+        try transformTsBlock(ts, cot, allocator, func.body)
+    else
+        ast_mod.null_node;
+
+    return cot.addDecl(.{ .fn_decl = .{
+        .name = name,
+        .params = params,
+        .return_type = return_type,
+        .body = body,
+        .is_extern = false,
+        .is_async = func.is_async,
+        .span = source_mod.Span.zero,
+    } });
+}
+
+/// Transform TS class → Cot struct_decl + impl_block.
+/// Emits both the struct (fields) and the impl (methods) as separate top-level decls.
+fn transformTsClass(
+    ts: *const libts.ts_ast.Ast,
+    cot: *ast_mod.Ast,
+    allocator: std.mem.Allocator,
+    cls: libts.ts_ast.Decl.ClassDecl,
+    top_decls: *std.ArrayListUnmanaged(ast_mod.NodeIndex),
+) error{OutOfMemory}!void {
+    const class_name = cls.name orelse "AnonymousClass";
+
+    // Collect fields from property declarations
+    var fields = std.ArrayListUnmanaged(ast_mod.Field){};
+    var methods = std.ArrayListUnmanaged(ast_mod.NodeIndex){};
+
+    for (cls.members) |member_idx| {
+        const member_node = ts.getNode(member_idx) orelse continue;
+        switch (member_node.*) {
+            .class_member => |cm| switch (cm) {
+                .property => |prop| {
+                    // Get property name
+                    const prop_name = if (ts.getNode(prop.name)) |n| switch (n.*) {
+                        .expr => |e| switch (e) {
+                            .ident => |id| id.name,
+                            else => "_",
+                        },
+                        else => "_",
+                    } else "_";
+                    const type_expr = if (prop.type_ann != libts.ts_ast.null_node)
+                        try transformTsType(ts, cot, allocator, prop.type_ann)
+                    else
+                        ast_mod.null_node;
+                    const default_val = if (prop.init != libts.ts_ast.null_node)
+                        try transformTsExpr(ts, cot, allocator, prop.init)
+                    else
+                        ast_mod.null_node;
+                    try fields.append(allocator, .{
+                        .name = prop_name,
+                        .type_expr = type_expr,
+                        .default_value = default_val,
+                        .span = source_mod.Span.zero,
+                    });
+                },
+                .constructor => |ctor| {
+                    // constructor → init method. Inject self param (safe mode requires it at parse time).
+                    const user_params = try transformTsParams(ts, cot, allocator, ctor.params);
+                    const params = try prependSelfParam(cot, allocator, class_name, user_params);
+                    const body = if (ctor.body != libts.ts_ast.null_node)
+                        try transformTsBlock(ts, cot, allocator, ctor.body)
+                    else
+                        ast_mod.null_node;
+                    const void_type = try cot.addExpr(.{ .type_expr = .{
+                        .kind = .{ .named = "void" },
+                        .span = source_mod.Span.zero,
+                    } });
+                    const init_fn = try cot.addDecl(.{ .fn_decl = .{
+                        .name = "init",
+                        .params = params,
+                        .return_type = void_type,
+                        .body = body,
+                        .is_extern = false,
+                        .span = source_mod.Span.zero,
+                    } });
+                    try methods.append(allocator, init_fn);
+                },
+                .method => |method| {
+                    const method_name = if (ts.getNode(method.name)) |n| switch (n.*) {
+                        .expr => |e| switch (e) {
+                            .ident => |id| id.name,
+                            else => "method",
+                        },
+                        else => "method",
+                    } else "method";
+                    const user_params = try transformTsParams(ts, cot, allocator, method.params);
+                    // Inject self param for non-static methods
+                    const params = if (!method.is_static)
+                        try prependSelfParam(cot, allocator, class_name, user_params)
+                    else
+                        user_params;
+                    const return_type = if (method.return_type != libts.ts_ast.null_node)
+                        try transformTsType(ts, cot, allocator, method.return_type)
+                    else
+                        try cot.addExpr(.{ .type_expr = .{
+                            .kind = .{ .named = "void" },
+                            .span = source_mod.Span.zero,
+                        } });
+                    const body = if (method.body != libts.ts_ast.null_node)
+                        try transformTsBlock(ts, cot, allocator, method.body)
+                    else
+                        ast_mod.null_node;
+                    const fn_decl = try cot.addDecl(.{ .fn_decl = .{
+                        .name = method_name,
+                        .params = params,
+                        .return_type = return_type,
+                        .body = body,
+                        .is_extern = false,
+                        .is_async = method.is_async,
+                        .is_static = method.is_static,
+                        .span = source_mod.Span.zero,
+                    } });
+                    try methods.append(allocator, fn_decl);
+                },
+                else => {},
+            },
+            else => {},
+        }
+    }
+
+    // Emit struct declaration
+    const owned_fields = try allocator.dupe(ast_mod.Field, fields.items);
+    const struct_decl = try cot.addDecl(.{ .struct_decl = .{
+        .name = class_name,
+        .fields = owned_fields,
+        .span = source_mod.Span.zero,
+    } });
+    try top_decls.append(allocator, struct_decl);
+
+    // Emit impl block (if there are methods)
+    if (methods.items.len > 0) {
+        const owned_methods = try allocator.dupe(ast_mod.NodeIndex, methods.items);
+        const impl_block = try cot.addDecl(.{ .impl_block = .{
+            .type_name = class_name,
+            .methods = owned_methods,
+            .span = source_mod.Span.zero,
+        } });
+        try top_decls.append(allocator, impl_block);
+    }
+}
+
+fn transformTsStmt(ts: *const libts.ts_ast.Ast, cot: *ast_mod.Ast, allocator: std.mem.Allocator, stmt: libts.ts_ast.Stmt) error{OutOfMemory}!ast_mod.NodeIndex {
+    return switch (stmt) {
+        .expr_stmt => |es| blk: {
+            // Check if this is an assignment expression → emit assign_stmt
+            const inner = ts.getNode(es.expr) orelse break :blk ast_mod.null_node;
+            switch (inner.*) {
+                .expr => |e| switch (e) {
+                    .assign => |a| {
+                        const target = try transformTsExpr(ts, cot, allocator, a.left);
+                        const value = try transformTsExpr(ts, cot, allocator, a.right);
+                        const op: token_mod.Token = switch (a.op) {
+                            .assign => .assign,
+                            .add_assign => .add_assign,
+                            .sub_assign => .sub_assign,
+                            .mul_assign => .mul_assign,
+                            .div_assign => .quo_assign,
+                            .rem_assign => .rem_assign,
+                            else => .assign,
+                        };
+                        break :blk cot.addStmt(.{ .assign_stmt = .{
+                            .target = target,
+                            .value = value,
+                            .op = op,
+                            .span = source_mod.Span.zero,
+                        } });
+                    },
+                    .update => |u| {
+                        // i++ → i = i + 1, i-- → i = i - 1
+                        const operand = try transformTsExpr(ts, cot, allocator, u.operand);
+                        const one = try cot.addExpr(.{ .literal = .{
+                            .kind = .float,
+                            .value = "1.0",
+                            .span = source_mod.Span.zero,
+                        } });
+                        const bin_op: token_mod.Token = if (u.op == .increment) .add else .sub;
+                        const sum = try cot.addExpr(.{ .binary = .{
+                            .op = bin_op,
+                            .left = operand,
+                            .right = one,
+                            .span = source_mod.Span.zero,
+                        } });
+                        // Need a fresh reference for the target (can't reuse operand NodeIndex for both sides)
+                        const target = try transformTsExpr(ts, cot, allocator, u.operand);
+                        break :blk cot.addStmt(.{ .assign_stmt = .{
+                            .target = target,
+                            .value = sum,
+                            .op = .assign,
+                            .span = source_mod.Span.zero,
+                        } });
+                    },
+                    else => {},
+                },
+                else => {},
+            }
+            const expr = try transformTsExpr(ts, cot, allocator, es.expr);
+            break :blk cot.addStmt(.{ .expr_stmt = .{
+                .expr = expr,
+                .span = source_mod.Span.zero,
+            } });
+        },
+        .return_stmt => |rs| blk: {
+            const value = if (rs.value != libts.ts_ast.null_node)
+                try transformTsExpr(ts, cot, allocator, rs.value)
+            else
+                ast_mod.null_node;
+            break :blk cot.addStmt(.{ .return_stmt = .{
+                .value = value,
+                .span = source_mod.Span.zero,
+            } });
+        },
+        .if_stmt => |ifs| blk: {
+            const cond = try transformTsExpr(ts, cot, allocator, ifs.condition);
+            const then_b = try transformTsStmtNode(ts, cot, allocator, ifs.consequent);
+            const else_b = if (ifs.alternate != libts.ts_ast.null_node)
+                try transformTsStmtNode(ts, cot, allocator, ifs.alternate)
+            else
+                ast_mod.null_node;
+            break :blk cot.addStmt(.{ .if_stmt = .{
+                .condition = cond,
+                .then_branch = then_b,
+                .else_branch = else_b,
+                .span = source_mod.Span.zero,
+            } });
+        },
+        .while_stmt => |ws| blk: {
+            const cond = try transformTsExpr(ts, cot, allocator, ws.condition);
+            const body = try transformTsStmtNode(ts, cot, allocator, ws.body);
+            break :blk cot.addStmt(.{ .while_stmt = .{
+                .condition = cond,
+                .body = body,
+                .span = source_mod.Span.zero,
+            } });
+        },
+        .block => |bs| transformTsBlockStmt(ts, cot, allocator, bs),
+        .var_stmt => |vs| blk: {
+            const inner = ts.getNode(vs.decl) orelse break :blk ast_mod.null_node;
+            switch (inner.*) {
+                .decl => |d| switch (d) {
+                    .variable => |v| {
+                        if (v.declarators.len == 0) break :blk ast_mod.null_node;
+                        const decl = v.declarators[0];
+                        const vname = if (ts.getNode(decl.binding)) |bn| switch (bn.*) {
+                            .expr => |e| switch (e) {
+                                .ident => |id| id.name,
+                                else => "_",
+                            },
+                            else => "_",
+                        } else "_";
+                        const type_expr = if (decl.type_ann != libts.ts_ast.null_node)
+                            try transformTsType(ts, cot, allocator, decl.type_ann)
+                        else
+                            ast_mod.null_node;
+                        const value = if (decl.init != libts.ts_ast.null_node)
+                            try transformTsExpr(ts, cot, allocator, decl.init)
+                        else
+                            ast_mod.null_node;
+                        break :blk cot.addStmt(.{ .var_stmt = .{
+                            .name = vname,
+                            .type_expr = type_expr,
+                            .value = value,
+                            .is_const = v.kind == .const_kw,
+                            .span = source_mod.Span.zero,
+                        } });
+                    },
+                    else => {},
+                },
+                else => {},
+            }
+            break :blk ast_mod.null_node;
+        },
+        else => ast_mod.null_node,
+    };
+}
+
+fn transformTsStmtNode(ts: *const libts.ts_ast.Ast, cot: *ast_mod.Ast, allocator: std.mem.Allocator, idx: libts.ts_ast.NodeIndex) error{OutOfMemory}!ast_mod.NodeIndex {
+    const node = ts.getNode(idx) orelse return ast_mod.null_node;
+    switch (node.*) {
+        .stmt => |s| return transformTsStmt(ts, cot, allocator, s),
+        else => return ast_mod.null_node,
+    }
+}
+
+fn transformTsBlock(ts: *const libts.ts_ast.Ast, cot: *ast_mod.Ast, allocator: std.mem.Allocator, idx: libts.ts_ast.NodeIndex) error{OutOfMemory}!ast_mod.NodeIndex {
+    const node = ts.getNode(idx) orelse return ast_mod.null_node;
+    switch (node.*) {
+        .stmt => |s| switch (s) {
+            .block => |bs| return transformTsBlockStmt(ts, cot, allocator, bs),
+            else => {},
+        },
+        else => {},
+    }
+    return ast_mod.null_node;
+}
+
+fn transformTsBlockStmt(ts: *const libts.ts_ast.Ast, cot: *ast_mod.Ast, allocator: std.mem.Allocator, bs: libts.ts_ast.Stmt.BlockStmt) error{OutOfMemory}!ast_mod.NodeIndex {
+    var stmts = std.ArrayListUnmanaged(ast_mod.NodeIndex){};
+    for (bs.stmts) |stmt_idx| {
+        const cot_stmt = try transformTsStmtNode(ts, cot, allocator, stmt_idx);
+        if (cot_stmt != ast_mod.null_node) {
+            try stmts.append(allocator, cot_stmt);
+        }
+    }
+    const owned = try allocator.dupe(ast_mod.NodeIndex, stmts.items);
+    return cot.addExpr(.{ .block_expr = .{
+        .stmts = owned,
+        .expr = ast_mod.null_node,
+        .span = source_mod.Span.zero,
+    } });
+}
+
+fn transformTsExpr(ts: *const libts.ts_ast.Ast, cot: *ast_mod.Ast, allocator: std.mem.Allocator, idx: libts.ts_ast.NodeIndex) error{OutOfMemory}!ast_mod.NodeIndex {
+    const node = ts.getNode(idx) orelse return ast_mod.null_node;
+    switch (node.*) {
+        .expr => |e| return transformTsExprNode(ts, cot, allocator, e),
+        else => return ast_mod.null_node,
+    }
+}
+
+fn transformTsExprNode(ts: *const libts.ts_ast.Ast, cot: *ast_mod.Ast, allocator: std.mem.Allocator, expr: libts.ts_ast.Expr) error{OutOfMemory}!ast_mod.NodeIndex {
+    return switch (expr) {
+        .ident => |id| cot.addExpr(.{ .ident = .{
+            .name = id.name,
+            .span = source_mod.Span.zero,
+        } }),
+        .literal => |lit| blk: {
+            // In TS, all numbers are f64. Emit integer-looking literals as floats
+            // so Cot's type checker sees them as f64, not int.
+            const kind: ast_mod.LiteralKind = switch (lit.kind) {
+                .string => .string,
+                .number => .float, // TS number = f64, always
+                .bigint => .int,
+                .boolean => if (std.mem.eql(u8, lit.value, "true")) .true_lit else .false_lit,
+                .null_lit => .null_lit,
+                .undefined => .undefined_lit,
+                .regex => .string,
+            };
+            // For number literals without a decimal point, append ".0" so the
+            // Cot checker sees "42.0" (float) instead of "42" (int).
+            var value = lit.value;
+            if (lit.kind == .number and std.mem.indexOf(u8, lit.value, ".") == null and
+                std.mem.indexOf(u8, lit.value, "e") == null and
+                std.mem.indexOf(u8, lit.value, "E") == null)
+            {
+                value = std.fmt.allocPrint(allocator, "{s}.0", .{lit.value}) catch lit.value;
+            }
+            break :blk cot.addExpr(.{ .literal = .{
+                .kind = kind,
+                .value = value,
+                .span = source_mod.Span.zero,
+            } });
+        },
+        .call => |c| blk: {
+            // console.log → println, console.error → eprintln
+            const callee = if (isConsoleMethod(ts, c.callee, "log"))
+                try cot.addExpr(.{ .ident = .{ .name = "println", .span = source_mod.Span.zero } })
+            else if (isConsoleMethod(ts, c.callee, "error"))
+                try cot.addExpr(.{ .ident = .{ .name = "eprintln", .span = source_mod.Span.zero } })
+            else
+                try transformTsExpr(ts, cot, allocator, c.callee);
+
+            var args = std.ArrayListUnmanaged(ast_mod.NodeIndex){};
+            for (c.args) |arg_idx| {
+                const a = try transformTsExpr(ts, cot, allocator, arg_idx);
+                try args.append(allocator, a);
+            }
+            const owned_args = try allocator.dupe(ast_mod.NodeIndex, args.items);
+            break :blk cot.addExpr(.{ .call = .{
+                .callee = callee,
+                .args = owned_args,
+                .span = source_mod.Span.zero,
+            } });
+        },
+        .member => |m| blk: {
+            const base = try transformTsExpr(ts, cot, allocator, m.object);
+            break :blk cot.addExpr(.{ .field_access = .{
+                .base = base,
+                .field = m.property,
+                .span = source_mod.Span.zero,
+            } });
+        },
+        .binary => |b| blk: {
+            const left = try transformTsExpr(ts, cot, allocator, b.left);
+            const right = try transformTsExpr(ts, cot, allocator, b.right);
+            const op: token_mod.Token = switch (b.op) {
+                .add => .add,
+                .sub => .sub,
+                .mul => .mul,
+                .div => .quo,
+                .rem => .rem,
+                .eql, .strict_eql => .eql,
+                .neq, .strict_neq => .neq,
+                .lt => .lss,
+                .lte => .leq,
+                .gt => .gtr,
+                .gte => .geq,
+                .land => .land,
+                .lor => .lor,
+                .nullish_coalesce => .kw_orelse,
+                else => .add,
+            };
+            break :blk cot.addExpr(.{ .binary = .{
+                .op = op,
+                .left = left,
+                .right = right,
+                .span = source_mod.Span.zero,
+            } });
+        },
+        .unary => |u| blk: {
+            const operand = try transformTsExpr(ts, cot, allocator, u.operand);
+            const op: token_mod.Token = switch (u.op) {
+                .neg => .sub,
+                .pos => .add,
+                .lnot => .lnot,
+                .bitnot => .not,
+                else => .sub,
+            };
+            break :blk cot.addExpr(.{ .unary = .{
+                .op = op,
+                .operand = operand,
+                .span = source_mod.Span.zero,
+            } });
+        },
+        .new_expr => |n| blk: {
+            const type_name = if (ts.getNode(n.callee)) |cn| switch (cn.*) {
+                .expr => |e| switch (e) {
+                    .ident => |id| id.name,
+                    else => "Unknown",
+                },
+                else => "Unknown",
+            } else "Unknown";
+            var args = std.ArrayListUnmanaged(ast_mod.NodeIndex){};
+            for (n.args) |arg_idx| {
+                const a = try transformTsExpr(ts, cot, allocator, arg_idx);
+                try args.append(allocator, a);
+            }
+            const owned_args = try allocator.dupe(ast_mod.NodeIndex, args.items);
+            break :blk cot.addExpr(.{ .new_expr = .{
+                .type_name = type_name,
+                .fields = &.{},
+                .constructor_args = owned_args,
+                .is_constructor = true,
+                .span = source_mod.Span.zero,
+            } });
+        },
+        .this_expr => cot.addExpr(.{ .ident = .{ .name = "self", .span = source_mod.Span.zero } }),
+        .paren => |p| blk: {
+            if (p.inner == libts.ts_ast.null_node) break :blk ast_mod.null_node;
+            break :blk transformTsExpr(ts, cot, allocator, p.inner);
+        },
+        .template => |t| blk: {
+            // Simple template with no substitutions → string literal
+            if (t.expressions.len == 0 and t.quasis.len == 1) {
+                const raw = t.quasis[0];
+                const stripped = if (raw.len >= 2 and raw[0] == '`' and raw[raw.len - 1] == '`')
+                    raw[1 .. raw.len - 1]
+                else
+                    raw;
+                const quoted = try std.fmt.allocPrint(allocator, "\"{s}\"", .{stripped});
+                break :blk cot.addExpr(.{ .literal = .{
+                    .kind = .string,
+                    .value = quoted,
+                    .span = source_mod.Span.zero,
+                } });
+            }
+            break :blk cot.addExpr(.{ .literal = .{
+                .kind = .string,
+                .value = "\"[template]\"",
+                .span = source_mod.Span.zero,
+            } });
+        },
+        else => ast_mod.null_node,
+    };
+}
+
+fn transformTsType(ts: *const libts.ts_ast.Ast, cot: *ast_mod.Ast, _: std.mem.Allocator, idx: libts.ts_ast.NodeIndex) error{OutOfMemory}!ast_mod.NodeIndex {
+    const node = ts.getNode(idx) orelse return ast_mod.null_node;
+    switch (node.*) {
+        .type_node => |t| switch (t) {
+            .keyword => |kw| {
+                const name: []const u8 = switch (kw.kind) {
+                    .number => "f64",
+                    .string => "string",
+                    .boolean => "bool",
+                    .void_kw, .null_kw, .undefined => "void",
+                    .any, .unknown, .object, .symbol, .bigint => "i64",
+                    .never => "noreturn",
+                };
+                return cot.addExpr(.{ .type_expr = .{ .kind = .{ .named = name }, .span = source_mod.Span.zero } });
+            },
+            .reference => |ref| return cot.addExpr(.{ .type_expr = .{ .kind = .{ .named = ref.name }, .span = source_mod.Span.zero } }),
+            else => return cot.addExpr(.{ .type_expr = .{ .kind = .{ .named = "i64" }, .span = source_mod.Span.zero } }),
+        },
+        else => return ast_mod.null_node,
+    }
+}
+
+fn transformTsParams(ts: *const libts.ts_ast.Ast, cot: *ast_mod.Ast, allocator: std.mem.Allocator, params: []const libts.ts_ast.Param) error{OutOfMemory}![]const ast_mod.Field {
+    var fields = std.ArrayListUnmanaged(ast_mod.Field){};
+    for (params) |p| {
+        const name = if (ts.getNode(p.binding)) |bn| switch (bn.*) {
+            .expr => |e| switch (e) {
+                .ident => |id| id.name,
+                else => "_",
+            },
+            else => "_",
+        } else "_";
+        const type_expr = if (p.type_ann != libts.ts_ast.null_node)
+            try transformTsType(ts, cot, allocator, p.type_ann)
+        else
+            ast_mod.null_node;
+        const default_value = if (p.default_value != libts.ts_ast.null_node)
+            try transformTsExpr(ts, cot, allocator, p.default_value)
+        else
+            ast_mod.null_node;
+        try fields.append(allocator, .{
+            .name = name,
+            .type_expr = type_expr,
+            .default_value = default_value,
+            .span = source_mod.Span.zero,
+        });
+    }
+    return allocator.dupe(ast_mod.Field, fields.items);
+}
+
+/// Prepend `self: TypeName` parameter to a method's param list.
+/// Mirrors what the Cot parser does in @safe mode for impl block methods.
+fn prependSelfParam(cot: *ast_mod.Ast, allocator: std.mem.Allocator, type_name: []const u8, user_params: []const ast_mod.Field) error{OutOfMemory}![]const ast_mod.Field {
+    const self_type = try cot.addExpr(.{ .type_expr = .{
+        .kind = .{ .named = type_name },
+        .span = source_mod.Span.zero,
+    } });
+    var new_params = try allocator.alloc(ast_mod.Field, user_params.len + 1);
+    new_params[0] = .{
+        .name = "self",
+        .type_expr = self_type,
+        .default_value = ast_mod.null_node,
+        .span = source_mod.Span.zero,
+    };
+    @memcpy(new_params[1..], user_params);
+    return new_params;
+}
+
+fn isConsoleMethod(ts: *const libts.ts_ast.Ast, idx: libts.ts_ast.NodeIndex, method: []const u8) bool {
+    const node = ts.getNode(idx) orelse return false;
+    switch (node.*) {
+        .expr => |e| switch (e) {
+            .member => |m| {
+                if (!std.mem.eql(u8, m.property, method)) return false;
+                const base = ts.getNode(m.object) orelse return false;
+                switch (base.*) {
+                    .expr => |be| switch (be) {
+                        .ident => |id| return std.mem.eql(u8, id.name, "console"),
+                        else => return false,
+                    },
+                    else => return false,
+                }
+            },
+            else => return false,
+        },
+        else => return false,
+    }
+}
 
 // ============================================================================
 // ============================================================================

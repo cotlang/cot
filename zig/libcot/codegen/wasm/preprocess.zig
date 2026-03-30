@@ -23,7 +23,7 @@ const Addr = prog.Addr;
 const Symbol = prog.Symbol;
 
 // Debug logging
-const debug = @import("../../pipeline_debug.zig");
+const debug = @import("../../debug.zig");
 
 /// Preprocess a function's instruction chain.
 ///

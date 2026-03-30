@@ -20,7 +20,7 @@ const prog = @import("prog.zig");
 const assemble = @import("assemble.zig");
 const Symbol = prog.Symbol;
 
-const debug = @import("../../pipeline_debug.zig");
+const debug = @import("../../debug.zig");
 fn debugLog(comptime fmt: []const u8, args: anytype) void {
     debug.log(.codegen, fmt, args);
 }
