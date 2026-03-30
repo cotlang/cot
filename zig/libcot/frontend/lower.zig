@@ -12552,8 +12552,9 @@ pub const Lowerer = struct {
         // Eager tasks (0 awaits) have 0 at frame[16] and complete immediately.
         // Swift reference: Task.value getter suspends until task completes.
         // Rust reference: block_on() polls future in loop until Ready.
-        if (self.target.isWasm()) {
-            // Wasm: cooperative polling via run_until_task_done (uses call_indirect).
+        {
+            // Cooperative polling via run_until_task_done.
+            // Works on both Wasm (call_indirect) and native (direct call via Cranelift).
             const task_ptr_for_poll = try fb.emitLoadLocal(await_task_local, TypeRegistry.I64, ae.span);
             const sixteen = try fb.emitConstInt(16, TypeRegistry.I64, ae.span);
             const poll_fn_addr = try fb.emitBinary(.add, task_ptr_for_poll, sixteen, TypeRegistry.I64, ae.span);

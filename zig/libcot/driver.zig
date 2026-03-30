@@ -802,9 +802,9 @@ pub const Driver = struct {
             }
         }
 
-        // Register module names for auto-imported async infrastructure (Wasm only).
+        // Register module names for auto-imported async infrastructure (all targets).
         for (parsed_files.items) |*pf| {
-            if (pf.tree.hasAsyncFunctions() and self.target.isWasm()) {
+            if (pf.tree.hasAsyncFunctions()) {
                 const async_deps = [_][]const u8{ "std/task_queue", "std/executor" };
                 const pf_dir = std.fs.path.dirname(pf.path) orelse ".";
                 for (&async_deps) |dep| {
@@ -1222,11 +1222,10 @@ pub const Driver = struct {
             try self.parseFileRecursive(full_path, parsed_files, seen_files, in_progress);
         }
 
-        // Auto-import cooperative executor for async files targeting Wasm.
-        // Wasm await sites call run_until_task_done() for cooperative scheduling
+        // Auto-import cooperative executor for async files (all targets).
+        // Await sites call run_until_task_done() for cooperative scheduling
         // (Rust poll model: coroutine.rs block_on pattern).
-        // Native uses eager evaluation and doesn't need the executor.
-        if (tree.hasAsyncFunctions() and self.target.isWasm()) {
+        if (tree.hasAsyncFunctions()) {
             const async_deps = [_][]const u8{ "std/task_queue", "std/executor" };
             for (&async_deps) |dep| {
                 const dep_path = try self.resolveStdImport(dep, file_dir);
@@ -1567,9 +1566,11 @@ pub const Driver = struct {
             }
 
             // Run SSA passes (native path)
-            // Skip async state machine splitting on native — CLIF can't handle jump_table dispatch.
-            // Native async functions use eager evaluation (body runs inline).
-            // async_split only runs on the Wasm path where br_table dispatch works.
+            // Async state machine splitting — real Cranelift handles br_table dispatch.
+            // Transforms async functions with multiple await points into state machines.
+            // asyncSplit checks internally whether the function needs splitting.
+            try async_split.asyncSplit(ssa_func, type_reg);
+            if (html_writer_native != null) html_writer_native.?.writePhase("async_split", "async_split", ssa_func);
 
             try rewritegeneric.rewrite(func_alloc, ssa_func, &string_offsets);
             if (html_writer_native != null) html_writer_native.?.writePhase("rewritegeneric", "rewritegeneric", ssa_func);
