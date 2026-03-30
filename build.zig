@@ -33,7 +33,7 @@ pub fn build(b: *std.Build) void {
     const dwarf_obj = b.addObject(.{
         .name = "dwarf_reader",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("zig/libcot/codegen/native/dwarf_reader.zig"),
+            .root_source_file = b.path("zig/libclif/dwarf_reader.zig"),
             .target = b.resolveTargetQuery(.{
                 .cpu_arch = native_arch,
                 .os_tag = native_os,

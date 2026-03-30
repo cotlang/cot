@@ -41,13 +41,6 @@ pub const lsp_main = @import("lsp/main.zig");
 pub const mcp_main = @import("lsp/mcp_main.zig");
 
 // Native codegen (AOT compiler path)
-// Cranelift-style pipeline: Wasm → CLIF IR → MachInst → ARM64/x64
-// See CRANELIFT_PORT_MASTER_PLAN.md for architecture details.
-pub const native_dwarf = @import("codegen/native/dwarf.zig");
-pub const native_macho = @import("codegen/native/macho.zig");
-pub const native_elf = @import("codegen/native/elf.zig");
-pub const native_wasm_parser = @import("codegen/native/wasm_parser.zig");
-
 // Wasm codegen
 pub const wasm = @import("codegen/wasm.zig");
 pub const wasm_opcodes = @import("codegen/wasm_opcodes.zig");
@@ -1320,7 +1313,7 @@ fn compileAndLinkFull(
     lib_mode: bool,
     debug_mode: bool,
     ssa_html_name: ?[]const u8,
-    backend: cli.NativeBackend,
+    _: cli.NativeBackend, // backend selection handled at link time
 ) void {
     // Load cot.json for project-level link settings (libs, etc.)
     var project_config = project.loadConfig(allocator, null) catch null;
@@ -1330,7 +1323,7 @@ fn compileAndLinkFull(
     compile_driver.setTarget(compile_target);
     compile_driver.release_mode = release_mode;
     compile_driver.debug_mode = debug_mode;
-    compile_driver.use_cranelift = (backend == .cranelift);
+    // Backend selection (cranelift vs zig) is handled at link time — both use CIR
     // --ssa=funcname overrides COT_SSA env var
     if (ssa_html_name) |sf| compile_driver.ssa_html_func = sf;
     compile_driver.lib_mode = lib_mode;
@@ -1797,11 +1790,6 @@ test {
 test {
     _ = @import("frontend/e2e_test.zig");
     _ = @import("frontend/integration_test.zig");
-    // Native e2e tests exercise the hand-ported Cranelift backend (zig/libclif).
-    // Currently only validated on ARM64 macOS. x64 Linux uses real Cranelift via CIR.
-    if (@import("builtin").cpu.arch == .aarch64) {
-        _ = @import("codegen/native_e2e_test.zig");
-    }
 }
 
 test "main: findRuntimePath returns error when not found" {
