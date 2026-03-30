@@ -17,3 +17,4 @@ test_catch_crash
 zig_compile_error
 zig_type_err
 
+*.ssa.html
