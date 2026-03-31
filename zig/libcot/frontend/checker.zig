@@ -2221,8 +2221,17 @@ pub const Checker = struct {
         if (callee != .func) { self.err.errorWithCode(c.span.start, .e300, "cannot call non-function"); return invalid_type; }
         const ft = callee.func;
         const is_instance_method = is_method and (method_info == null or !method_info.?.is_static);
-        const expected_args = if (is_instance_method and ft.params.len > 0) ft.params.len - 1 else ft.params.len;
-        if (c.args.len != expected_args) { self.err.errorWithCode(c.span.start, .e300, "wrong number of arguments"); return invalid_type; }
+        const total_params = if (is_instance_method and ft.params.len > 0) ft.params.len - 1 else ft.params.len;
+        // Count required params (those without defaults)
+        var required_params: usize = 0;
+        const param_start: usize = if (is_instance_method) 1 else 0;
+        for (ft.params[param_start..]) |p| {
+            if (!p.has_default) required_params += 1 else break; // defaults must be trailing
+        }
+        if (c.args.len < required_params or c.args.len > total_params) {
+            self.err.errorWithCode(c.span.start, .e300, "wrong number of arguments");
+            return invalid_type;
+        }
         const param_offset: usize = if (is_instance_method) 1 else 0;
         for (c.args, 0..) |arg_idx, i| {
             // Zig Sema pattern: set expected_type from parameter type for result location inference
@@ -3158,8 +3167,14 @@ pub const Checker = struct {
             if (func_type == .func) {
                 const init_params = func_type.func.params;
                 // init's first param is self, constructor args map to params[1..]
-                const expected_args = if (init_params.len > 0) init_params.len - 1 else 0;
-                if (ne.constructor_args.len != expected_args) {
+                const total_ctor_params = if (init_params.len > 0) init_params.len - 1 else 0;
+                var required_ctor_params: usize = 0;
+                if (init_params.len > 1) {
+                    for (init_params[1..]) |ip| {
+                        if (!ip.has_default) required_ctor_params += 1 else break;
+                    }
+                }
+                if (ne.constructor_args.len < required_ctor_params or ne.constructor_args.len > total_ctor_params) {
                     self.err.errorWithCode(ne.span.start, .e300, "wrong number of constructor arguments");
                 } else {
                     for (ne.constructor_args, 0..) |arg_idx, i| {
@@ -4675,7 +4690,7 @@ pub const Checker = struct {
             if (!is_substituted) type_idx = try self.safeWrapType(type_idx);
             // Swift SE-0430: propagate is_sending from AST to type system.
             // This enables use-after-send detection in checkCall().
-            try func_params.append(self.allocator, .{ .name = param.name, .type_idx = type_idx, .is_sending = param.is_sending });
+            try func_params.append(self.allocator, .{ .name = param.name, .type_idx = type_idx, .is_sending = param.is_sending, .has_default = param.default_value != null_node });
         }
         const ret_type = if (return_type_idx != null_node) try self.resolveTypeExpr(return_type_idx) else TypeRegistry.VOID;
         return try self.types.add(.{ .func = .{ .params = try self.allocator.dupe(types.FuncParam, func_params.items), .return_type = ret_type } });

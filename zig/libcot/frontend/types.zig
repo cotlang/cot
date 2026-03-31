@@ -113,6 +113,7 @@ pub const FuncParam = struct {
     name: []const u8,
     type_idx: TypeIndex,
     is_sending: bool = false, // Swift SE-0430: parameter transfers ownership
+    has_default: bool = false, // Parameter has a default value (can be omitted at call site)
 };
 pub const FuncType = struct { params: []const FuncParam, return_type: TypeIndex };
 

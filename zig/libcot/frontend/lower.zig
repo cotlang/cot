@@ -3786,6 +3786,22 @@ pub const Lowerer = struct {
     /// Follows Go's recursive s.addr() pattern for ODOT:
     ///   addr(o.inner) = addr(o) + offset(inner)
     /// This handles arbitrary nesting: o.a.b.c resolves to base_addr + offset(a) + offset(b).
+    /// Find the AST FnDecl params for a call target, to access default parameter values.
+    fn findFnDeclParamsForCall(self: *Lowerer, callee_idx: NodeIndex) ?[]const ast.Field {
+        const callee_node = self.tree.getNode(callee_idx) orelse return null;
+        const callee_expr = callee_node.asExpr() orelse return null;
+        if (callee_expr != .ident) return null;
+        const name = callee_expr.ident.name;
+        // Search all AST nodes for a matching fn_decl (covers all parsed files)
+        for (self.tree.nodes.items) |node| {
+            const decl = node.asDecl() orelse continue;
+            if (decl == .fn_decl and std.mem.eql(u8, decl.fn_decl.name, name)) {
+                return decl.fn_decl.params;
+            }
+        }
+        return null;
+    }
+
     fn resolveStructFieldAddr(self: *Lowerer, node_idx: NodeIndex) !ir.NodeIndex {
         const fb = self.current_func orelse return ir.null_node;
         const node = self.tree.getNode(node_idx) orelse return ir.null_node;
@@ -9731,6 +9747,25 @@ pub const Lowerer = struct {
                     }
                 } else {
                     try args.append(self.allocator, arg_node);
+                }
+            }
+        }
+
+        // Default parameter injection: if fewer args than params, lower defaults.
+        // The AST fn_decl stores default_value on each Field. Look up the declaration
+        // and lower any defaults for params beyond the provided args.
+        if (param_types) |params| {
+            const provided = call.args.len;
+            if (provided < params.len) {
+                // Find the function declaration AST node to get default values
+                const fn_params = self.findFnDeclParamsForCall(call.callee);
+                if (fn_params) |fp| {
+                    for (fp[provided..]) |param| {
+                        if (param.default_value != null_node) {
+                            const default_val = try self.lowerExprNode(param.default_value);
+                            try args.append(self.allocator, default_val);
+                        }
+                    }
                 }
             }
         }
