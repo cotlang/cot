@@ -1964,6 +1964,56 @@ pub const Parser = struct {
         return self.at() == .arrow;
     }
 
+    /// Lookahead: does `(` start a function type like `(x: number) => number`?
+    /// Checks for `name:` pattern inside parens followed by `)` then `=>`.
+    fn isFunctionTypeStart(self: *Parser) bool {
+        const saved_tok = self.tok;
+        const saved_prev_end = self.prev_end;
+        const saved_pos = self.scanner.pos;
+        const saved_ch = self.scanner.ch;
+        const saved_prev_token = self.scanner.prev_token;
+        const saved_in_template = self.scanner.in_template_expr;
+        const saved_depth = self.scanner.template_brace_depth;
+
+        defer {
+            self.tok = saved_tok;
+            self.prev_end = saved_prev_end;
+            self.scanner.pos = saved_pos;
+            self.scanner.ch = saved_ch;
+            self.scanner.prev_token = saved_prev_token;
+            self.scanner.in_template_expr = saved_in_template;
+            self.scanner.template_brace_depth = saved_depth;
+        }
+
+        if (self.at() != .lparen) return false;
+        self.advance(); // consume (
+
+        // () => is a function type
+        if (self.at() == .rparen) {
+            self.advance();
+            return self.at() == .arrow;
+        }
+
+        // Check for `name:` or `...name:` pattern (function params, not a type)
+        if (self.at() == .ellipsis) return true; // rest param → definitely function type
+        if (self.at() == .ident or self.at().isKeyword()) {
+            self.advance();
+            // If followed by `:` or `?:` or `,` or `)`, it's a function type param
+            if (self.at() == .colon or self.at() == .question or self.at() == .comma or self.at() == .rparen) {
+                // Scan past balanced parens to check for =>
+                var depth: u32 = 1;
+                // rewind isn't needed — just scan forward
+                while (depth > 0 and self.at() != .eof) {
+                    if (self.at() == .lparen) depth += 1;
+                    if (self.at() == .rparen) depth -= 1;
+                    self.advance();
+                }
+                return self.at() == .arrow;
+            }
+        }
+        return false;
+    }
+
     fn parseArrowFunction(self: *Parser, is_async: bool) !NodeIndex {
         const start = self.tok.span.start;
         if (is_async) self.advance(); // consume 'async'
@@ -2381,20 +2431,21 @@ pub const Parser = struct {
             },
             .lparen => blk: {
                 // Function type: (params) => ReturnType  or  parenthesized type
-                self.advance();
-                if (self.at() == .rparen) {
-                    self.advance();
+                // Use lookahead to detect function type: if we see `name:` or `)` `=>`
+                if (self.isFunctionTypeStart()) {
+                    // Parse as function type with full parameter list
+                    const params = try self.parseParameterList();
                     self.expect(.arrow);
                     const ret = try self.parseType();
-                    break :blk self.ast.addType(.{ .function_type = .{ .return_type = ret } });
+                    break :blk self.ast.addType(.{ .function_type = .{
+                        .params = params,
+                        .return_type = ret,
+                    } });
                 }
+                // Parenthesized type
+                self.advance();
                 const inner = try self.parseType();
                 self.expect(.rparen);
-                if (self.at() == .arrow) {
-                    self.advance();
-                    const ret = try self.parseType();
-                    break :blk self.ast.addType(.{ .function_type = .{ .return_type = ret } });
-                }
                 break :blk self.ast.addType(.{ .parenthesized = .{ .inner = inner } });
             },
             .lbrack => blk: {

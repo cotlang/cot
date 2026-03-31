@@ -2858,8 +2858,12 @@ fn transformTsFn(ts: *const libts.ts_ast.Ast, cot: *ast_mod.Ast, allocator: std.
     else
         ast_mod.null_node;
 
+    // Extract generic type parameter names: <T, U> → ["T", "U"]
+    const type_params = try extractTypeParamNames(ts, allocator, func.type_params);
+
     return cot.addDecl(.{ .fn_decl = .{
         .name = name,
+        .type_params = type_params,
         .params = params,
         .return_type = return_type,
         .body = body,
@@ -3499,6 +3503,43 @@ fn transformTsStmtNode(ts: *const libts.ts_ast.Ast, cot: *ast_mod.Ast, allocator
     const node = ts.getNode(idx) orelse return ast_mod.null_node;
     switch (node.*) {
         .stmt => |s| return transformTsStmt(ts, cot, allocator, s),
+        .decl => |d| switch (d) {
+            .variable => |v| {
+                if (v.declarators.len == 0) return ast_mod.null_node;
+                const decl = v.declarators[0];
+                const vname = if (ts.getNode(decl.binding)) |bn| switch (bn.*) {
+                    .expr => |e| switch (e) {
+                        .ident => |id| id.name,
+                        else => @as([]const u8, "_"),
+                    },
+                    else => "_",
+                } else "_";
+                const type_expr = if (decl.type_ann != libts.ts_ast.null_node)
+                    try transformTsType(ts, cot, allocator, decl.type_ann)
+                else
+                    ast_mod.null_node;
+                const value = if (decl.init != libts.ts_ast.null_node)
+                    try transformTsExpr(ts, cot, allocator, decl.init)
+                else
+                    ast_mod.null_node;
+                return cot.addStmt(.{ .var_stmt = .{
+                    .name = vname,
+                    .type_expr = type_expr,
+                    .value = value,
+                    .is_const = v.kind == .const_kw,
+                    .span = source_mod.Span.zero,
+                } });
+            },
+            .function => |func| return transformTsFn(ts, cot, allocator, func),
+            else => return ast_mod.null_node,
+        },
+        .expr => |e| {
+            const expr = try transformTsExprNode(ts, cot, allocator, e);
+            return cot.addStmt(.{ .expr_stmt = .{
+                .expr = expr,
+                .span = source_mod.Span.zero,
+            } });
+        },
         else => return ast_mod.null_node,
     }
 }
@@ -4110,6 +4151,24 @@ fn prependSelfParam(cot: *ast_mod.Ast, allocator: std.mem.Allocator, type_name: 
     };
     @memcpy(new_params[1..], user_params);
     return new_params;
+}
+
+/// Extract type parameter names from TS type parameter nodes.
+/// TS stores type params as AST nodes; Cot stores them as string names.
+fn extractTypeParamNames(ts: *const libts.ts_ast.Ast, allocator: std.mem.Allocator, type_params: libts.ts_ast.NodeList) error{OutOfMemory}![]const []const u8 {
+    if (type_params.len == 0) return &.{};
+    var names = std.ArrayListUnmanaged([]const u8){};
+    for (type_params) |tp_idx| {
+        const tp_node = ts.getNode(tp_idx) orelse continue;
+        switch (tp_node.*) {
+            .type_node => |t| switch (t) {
+                .reference => |ref| try names.append(allocator, ref.name),
+                else => try names.append(allocator, "T"),
+            },
+            else => try names.append(allocator, "T"),
+        }
+    }
+    return allocator.dupe([]const u8, names.items);
 }
 
 fn isConsoleMethod(ts: *const libts.ts_ast.Ast, idx: libts.ts_ast.NodeIndex, method: []const u8) bool {
