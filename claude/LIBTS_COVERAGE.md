@@ -11,14 +11,14 @@
 |----------|------|-------|---|
 | Tokens & Operators | 60 | 71 | 85% |
 | Keywords | 60 | 94 | 64% |
-| Declarations | 12 | 17 | 71% |
-| Statements | 18 | 21 | 86% |
-| Expressions | 30 | 32 | 94% |
-| Type Annotations | 16 | 26 | 62% |
-| Class Features | 6 | 14 | 43% |
-| Module System | 3 | 10 | 30% |
-| Transform Rules | 24 | 35 | 69% |
-| **TOTAL** | **229** | **320** | **72%** |
+| Declarations | 14 | 17 | 82% |
+| Statements | 19 | 21 | 90% |
+| Expressions | 31 | 32 | 97% |
+| Type Annotations | 18 | 26 | 69% |
+| Class Features | 10 | 14 | 71% |
+| Module System | 5 | 10 | 50% |
+| Transform Rules | 28 | 35 | 80% |
+| **TOTAL** | **245** | **320** | **77%** |
 
 ---
 

@@ -180,7 +180,21 @@ pub fn transformFile(ts: *const ts_ast.Ast, cot: *cot_ast.Ast, allocator: std.me
     }
 
     // Wrap top-level statements in fn main() void { ... }
-    if (main_stmts.items.len > 0) {
+    // Skip if the user already declared a main function.
+    var has_user_main = false;
+    for (sf.statements) |stmt_idx| {
+        const node = ts.getNode(stmt_idx) orelse continue;
+        switch (node.*) {
+            .decl => |d| switch (d) {
+                .function => |func| {
+                    if (func.name != null and std.mem.eql(u8, func.name.?, "main")) has_user_main = true;
+                },
+                else => {},
+            },
+            else => {},
+        }
+    }
+    if (main_stmts.items.len > 0 and !has_user_main) {
         const owned_stmts = try allocator.dupe(cot_ast.NodeIndex, main_stmts.items);
         const body = try cot.addExpr(.{ .block_expr = .{
             .stmts = owned_stmts,
