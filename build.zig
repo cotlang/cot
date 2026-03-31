@@ -58,10 +58,13 @@ pub fn build(b: *std.Build) void {
     });
     exe.root_module.addOptions("build_options", options);
 
-    // libts module (TypeScript/JavaScript frontend — single module with root.zig)
-    exe.root_module.addImport("libts", b.createModule(.{
+    // libts module (TypeScript/JavaScript frontend)
+    // The transform layer imports Cot AST types across the boundary.
+    const libts_mod = b.createModule(.{
         .root_source_file = b.path("zig/libts/root.zig"),
-    }));
+    });
+    exe.root_module.addImport("libts", libts_mod);
+
 
     // Link against rust/libclif (Cranelift native backend)
     exe.addLibraryPath(.{ .cwd_relative = "rust/libclif/target/release" });
@@ -92,9 +95,10 @@ pub fn build(b: *std.Build) void {
     tests.root_module.addAnonymousImport("dwarf_reader_native_o", .{
         .root_source_file = dwarf_obj.getEmittedBin(),
     });
-    tests.root_module.addImport("libts", b.createModule(.{
+    const libts_test_mod = b.createModule(.{
         .root_source_file = b.path("zig/libts/root.zig"),
-    }));
+    });
+    tests.root_module.addImport("libts", libts_test_mod);
     tests.addLibraryPath(.{ .cwd_relative = "rust/libclif/target/release" });
     tests.linkSystemLibrary("clif");
     tests.linkLibC();

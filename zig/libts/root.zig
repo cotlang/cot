@@ -1,7 +1,7 @@
 //! libts — TypeScript/JavaScript frontend for Cot.
 //!
-//! Parses .ts/.js/.tsx/.jsx files and produces TS AST nodes
-//! that are transformed to Cot AST by the driver.
+//! Parses .ts/.js/.tsx/.jsx files, produces TS AST nodes,
+//! and transforms them to Cot AST across the libts→libcot boundary.
 
 pub const token = @import("token.zig");
 pub const scanner = @import("scanner.zig");
@@ -9,6 +9,8 @@ pub const parser = @import("parser.zig");
 pub const ts_ast = @import("ts_ast.zig");
 pub const source = @import("source.zig");
 pub const debug = @import("debug.zig");
+// transform is a separate module (imports both libts and libcot types)
+// accessed via @import("libts_transform") from the exe module
 
 pub const Token = token.Token;
 pub const Scanner = scanner.Scanner;
