@@ -269,8 +269,29 @@ fn transformTsClass(
     var fields = std.ArrayListUnmanaged(cot_ast.Field){};
     var methods = std.ArrayListUnmanaged(cot_ast.NodeIndex){};
 
+    // Collect child method names for override detection
+    var child_method_names = std.ArrayListUnmanaged([]const u8){};
+    for (cls.members) |cm_idx| {
+        const cm_node = ts.getNode(cm_idx) orelse continue;
+        switch (cm_node.*) {
+            .class_member => |cm| switch (cm) {
+                .method => |m| {
+                    if (ts.getNode(m.name)) |n| switch (n.*) {
+                        .expr => |e| switch (e) {
+                            .ident => |id| try child_method_names.append(allocator, id.name),
+                            else => {},
+                        },
+                        else => {},
+                    };
+                },
+                else => {},
+            },
+            else => {},
+        }
+    }
+
     if (cls.extends != ts_ast.null_node) {
-        // Find base class name and copy its fields
+        // Find base class name and copy its fields + non-overridden methods
         const base_name = if (ts.getNode(cls.extends)) |bn| switch (bn.*) {
             .expr => |e| switch (e) {
                 .ident => |id| id.name,
@@ -308,11 +329,17 @@ fn transformTsClass(
                                                     });
                                                 },
                                                 .method => |bm| {
-                                                    // Inherit base method into child impl
+                                                    // Inherit base method into child impl — skip if child overrides
                                                     const bm_name = if (ts.getNode(bm.name)) |n| switch (n.*) {
                                                         .expr => |e| switch (e) { .ident => |id| id.name, else => "method" },
                                                         else => "method",
                                                     } else "method";
+                                                    // Skip if child has a method with the same name
+                                                    var overridden = false;
+                                                    for (child_method_names.items) |cn| {
+                                                        if (std.mem.eql(u8, cn, bm_name)) { overridden = true; break; }
+                                                    }
+                                                    if (overridden) continue;
                                                     const bm_params = try transformTsParams(ts, cot, allocator, bm.params);
                                                     const params_with_self = if (!bm.is_static)
                                                         try prependSelfParam(cot, allocator, class_name, bm_params)
