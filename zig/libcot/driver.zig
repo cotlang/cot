@@ -767,12 +767,32 @@ pub const Driver = struct {
                 const full_path = if (std.mem.startsWith(u8, import_path, "std/"))
                     try self.resolveStdImport(import_path, file_dir)
                 else blk: {
-                    const name = if (std.mem.endsWith(u8, import_path, ".cot"))
-                        import_path
-                    else
-                        try std.fmt.allocPrint(self.allocator, "{s}.cot", .{import_path});
-                    defer if (!std.mem.endsWith(u8, import_path, ".cot")) self.allocator.free(name);
-                    break :blk try std.fs.path.join(self.allocator, &.{ file_dir, name });
+                    const has_ext = std.mem.endsWith(u8, import_path, ".cot") or
+                        std.mem.endsWith(u8, import_path, ".ts") or
+                        std.mem.endsWith(u8, import_path, ".js");
+                    if (has_ext) {
+                        break :blk try std.fs.path.join(self.allocator, &.{ file_dir, import_path });
+                    }
+                    // Try .ts first, then .js, then .cot
+                    const ts_name = try std.fmt.allocPrint(self.allocator, "{s}.ts", .{import_path});
+                    const ts_path = try std.fs.path.join(self.allocator, &.{ file_dir, ts_name });
+                    self.allocator.free(ts_name);
+                    if (std.fs.cwd().access(ts_path, .{})) |_| {
+                        break :blk ts_path;
+                    } else |_| {
+                        self.allocator.free(ts_path);
+                    }
+                    const js_name = try std.fmt.allocPrint(self.allocator, "{s}.js", .{import_path});
+                    const js_path = try std.fs.path.join(self.allocator, &.{ file_dir, js_name });
+                    self.allocator.free(js_name);
+                    if (std.fs.cwd().access(js_path, .{})) |_| {
+                        break :blk js_path;
+                    } else |_| {
+                        self.allocator.free(js_path);
+                    }
+                    const cot_name = try std.fmt.allocPrint(self.allocator, "{s}.cot", .{import_path});
+                    defer self.allocator.free(cot_name);
+                    break :blk try std.fs.path.join(self.allocator, &.{ file_dir, cot_name });
                 };
                 defer self.allocator.free(full_path);
                 const canonical = try self.normalizePath(full_path);
@@ -1087,9 +1107,13 @@ pub const Driver = struct {
     /// dots (file extensions are stripped). If import paths with dots are ever supported,
     /// add Go-style escaping to avoid ambiguity with the `module.funcName` separator.
     fn deriveModuleName(self: *Driver, import_path: []const u8) ![]const u8 {
-        // Strip .cot extension if present
+        // Strip file extension if present
         const path = if (std.mem.endsWith(u8, import_path, ".cot"))
             import_path[0 .. import_path.len - 4]
+        else if (std.mem.endsWith(u8, import_path, ".ts"))
+            import_path[0 .. import_path.len - 3]
+        else if (std.mem.endsWith(u8, import_path, ".js"))
+            import_path[0 .. import_path.len - 3]
         else
             import_path;
         // Replace '/' with '.'
@@ -1115,12 +1139,32 @@ pub const Driver = struct {
             const full_path = if (std.mem.startsWith(u8, import_path, "std/"))
                 try self.resolveStdImport(import_path, file_dir)
             else blk: {
-                const name = if (std.mem.endsWith(u8, import_path, ".cot"))
-                    import_path
-                else
-                    try std.fmt.allocPrint(self.allocator, "{s}.cot", .{import_path});
-                defer if (!std.mem.endsWith(u8, import_path, ".cot")) self.allocator.free(name);
-                break :blk try std.fs.path.join(self.allocator, &.{ file_dir, name });
+                const has_ext = std.mem.endsWith(u8, import_path, ".cot") or
+                    std.mem.endsWith(u8, import_path, ".ts") or
+                    std.mem.endsWith(u8, import_path, ".js");
+                if (has_ext) {
+                    break :blk try std.fs.path.join(self.allocator, &.{ file_dir, import_path });
+                }
+                // Try .ts first, then .js, then .cot (same order as parseFileRecursive)
+                const ts_name = try std.fmt.allocPrint(self.allocator, "{s}.ts", .{import_path});
+                const ts_path = try std.fs.path.join(self.allocator, &.{ file_dir, ts_name });
+                self.allocator.free(ts_name);
+                if (std.fs.cwd().access(ts_path, .{})) |_| {
+                    break :blk ts_path;
+                } else |_| {
+                    self.allocator.free(ts_path);
+                }
+                const js_name = try std.fmt.allocPrint(self.allocator, "{s}.js", .{import_path});
+                const js_path = try std.fs.path.join(self.allocator, &.{ file_dir, js_name });
+                self.allocator.free(js_name);
+                if (std.fs.cwd().access(js_path, .{})) |_| {
+                    break :blk js_path;
+                } else |_| {
+                    self.allocator.free(js_path);
+                }
+                const cot_name = try std.fmt.allocPrint(self.allocator, "{s}.cot", .{import_path});
+                defer self.allocator.free(cot_name);
+                break :blk try std.fs.path.join(self.allocator, &.{ file_dir, cot_name });
             };
             defer self.allocator.free(full_path);
             const canonical = try self.normalizePath(full_path);
@@ -1211,13 +1255,35 @@ pub const Driver = struct {
             const full_path = if (std.mem.startsWith(u8, import_path, "std/"))
                 try self.resolveStdImport(import_path, file_dir)
             else blk: {
-                // Auto-append .cot extension if not present (like std/ imports do)
-                const name = if (std.mem.endsWith(u8, import_path, ".cot"))
-                    import_path
-                else
-                    try std.fmt.allocPrint(self.allocator, "{s}.cot", .{import_path});
-                defer if (!std.mem.endsWith(u8, import_path, ".cot")) self.allocator.free(name);
-                break :blk try std.fs.path.join(self.allocator, &.{ file_dir, name });
+                // Auto-append extension if not present
+                const has_ext = std.mem.endsWith(u8, import_path, ".cot") or
+                    std.mem.endsWith(u8, import_path, ".ts") or
+                    std.mem.endsWith(u8, import_path, ".js");
+                if (has_ext) {
+                    break :blk try std.fs.path.join(self.allocator, &.{ file_dir, import_path });
+                }
+                // Try .ts first (for TS projects), then .cot
+                const ts_name = try std.fmt.allocPrint(self.allocator, "{s}.ts", .{import_path});
+                const ts_path = try std.fs.path.join(self.allocator, &.{ file_dir, ts_name });
+                self.allocator.free(ts_name);
+                if (std.fs.cwd().access(ts_path, .{})) |_| {
+                    break :blk ts_path;
+                } else |_| {
+                    self.allocator.free(ts_path);
+                }
+                // Try .js
+                const js_name = try std.fmt.allocPrint(self.allocator, "{s}.js", .{import_path});
+                const js_path = try std.fs.path.join(self.allocator, &.{ file_dir, js_name });
+                self.allocator.free(js_name);
+                if (std.fs.cwd().access(js_path, .{})) |_| {
+                    break :blk js_path;
+                } else |_| {
+                    self.allocator.free(js_path);
+                }
+                // Fall back to .cot
+                const cot_name = try std.fmt.allocPrint(self.allocator, "{s}.cot", .{import_path});
+                defer self.allocator.free(cot_name);
+                break :blk try std.fs.path.join(self.allocator, &.{ file_dir, cot_name });
             };
             defer self.allocator.free(full_path);
             try self.parseFileRecursive(full_path, parsed_files, seen_files, in_progress);
@@ -2596,6 +2662,26 @@ fn transformTsFile(ts: *const libts.ts_ast.Ast, cot: *ast_mod.Ast, allocator: st
                 .class => |cls| {
                     try transformTsClass(ts, cot, allocator, cls, &top_decls);
                 },
+                .import_decl => |imp| {
+                    // Transform TS import → Cot import_decl
+                    // Strip quotes from module specifier and resolve to file path
+                    var spec = imp.module_specifier;
+                    if (spec.len >= 2 and (spec[0] == '\'' or spec[0] == '"')) {
+                        spec = spec[1 .. spec.len - 1];
+                    }
+                    const import_idx = try cot.addDecl(.{ .import_decl = .{
+                        .path = spec,
+                        .span = source_mod.Span.zero,
+                    } });
+                    try top_decls.append(allocator, import_idx);
+                },
+                .interface => |iface| {
+                    try transformTsInterface(ts, cot, allocator, iface, &top_decls);
+                },
+                .enum_decl => |en| {
+                    const enum_idx = try transformTsEnum(ts, cot, allocator, en);
+                    try top_decls.append(allocator, enum_idx);
+                },
                 .export_decl => |exp| {
                     if (exp.declaration != libts.ts_ast.null_node) {
                         const inner = ts.getNode(exp.declaration) orelse continue;
@@ -2678,6 +2764,7 @@ fn transformTsFn(ts: *const libts.ts_ast.Ast, cot: *ast_mod.Ast, allocator: std.
         .return_type = return_type,
         .body = body,
         .is_extern = false,
+        .is_export = func.is_export,
         .is_async = func.is_async,
         .span = source_mod.Span.zero,
     } });
@@ -2694,9 +2781,64 @@ fn transformTsClass(
 ) error{OutOfMemory}!void {
     const class_name = cls.name orelse "AnonymousClass";
 
-    // Collect fields from property declarations
+    // Collect fields from property declarations.
+    // If class extends a base, find and copy base fields first.
     var fields = std.ArrayListUnmanaged(ast_mod.Field){};
     var methods = std.ArrayListUnmanaged(ast_mod.NodeIndex){};
+
+    if (cls.extends != libts.ts_ast.null_node) {
+        // Find base class name and copy its fields
+        const base_name = if (ts.getNode(cls.extends)) |bn| switch (bn.*) {
+            .expr => |e| switch (e) {
+                .ident => |id| id.name,
+                else => @as(?[]const u8, null),
+            },
+            else => null,
+        } else null;
+        if (base_name) |bname| {
+            // Search TS AST for the base class declaration to copy fields
+            if (ts.source_file) |sf| {
+                for (sf.statements) |s_idx| {
+                    const s_node = ts.getNode(s_idx) orelse continue;
+                    switch (s_node.*) {
+                        .decl => |d| switch (d) {
+                            .class => |base_cls| {
+                                if (base_cls.name != null and std.mem.eql(u8, base_cls.name.?, bname)) {
+                                    for (base_cls.members) |bm_idx| {
+                                        const bm_node = ts.getNode(bm_idx) orelse continue;
+                                        switch (bm_node.*) {
+                                            .class_member => |bcm| switch (bcm) {
+                                                .property => |bp| {
+                                                    const bp_name = if (ts.getNode(bp.name)) |n| switch (n.*) {
+                                                        .expr => |e| switch (e) { .ident => |id| id.name, else => "_" },
+                                                        else => "_",
+                                                    } else "_";
+                                                    const bp_type = if (bp.type_ann != libts.ts_ast.null_node)
+                                                        try transformTsType(ts, cot, allocator, bp.type_ann)
+                                                    else
+                                                        ast_mod.null_node;
+                                                    try fields.append(allocator, .{
+                                                        .name = bp_name,
+                                                        .type_expr = bp_type,
+                                                        .default_value = ast_mod.null_node,
+                                                        .span = source_mod.Span.zero,
+                                                    });
+                                                },
+                                                else => {},
+                                            },
+                                            else => {},
+                                        }
+                                    }
+                                }
+                            },
+                            else => {},
+                        },
+                        else => {},
+                    }
+                }
+            }
+        }
+    }
 
     for (cls.members) |member_idx| {
         const member_node = ts.getNode(member_idx) orelse continue;
@@ -2810,6 +2952,70 @@ fn transformTsClass(
         } });
         try top_decls.append(allocator, impl_block);
     }
+}
+
+/// Transform TS interface → Cot trait_decl.
+fn transformTsInterface(
+    ts: *const libts.ts_ast.Ast,
+    cot: *ast_mod.Ast,
+    allocator: std.mem.Allocator,
+    iface: libts.ts_ast.Decl.InterfaceDecl,
+    top_decls: *std.ArrayListUnmanaged(ast_mod.NodeIndex),
+) error{OutOfMemory}!void {
+    var methods = std.ArrayListUnmanaged(ast_mod.NodeIndex){};
+    for (iface.members) |member| {
+        if (member.kind == .method) {
+            const params = try transformTsParams(ts, cot, allocator, member.params);
+            const return_type = if (member.return_type != libts.ts_ast.null_node)
+                try transformTsType(ts, cot, allocator, member.return_type)
+            else
+                try cot.addExpr(.{ .type_expr = .{ .kind = .{ .named = "void" }, .span = source_mod.Span.zero } });
+            const fn_decl = try cot.addDecl(.{ .fn_decl = .{
+                .name = member.name orelse "method",
+                .params = params,
+                .return_type = return_type,
+                .body = ast_mod.null_node, // trait methods have no body
+                .is_extern = false,
+                .span = source_mod.Span.zero,
+            } });
+            try methods.append(allocator, fn_decl);
+        }
+    }
+
+    const trait_decl = try cot.addDecl(.{ .trait_decl = .{
+        .name = iface.name,
+        .methods = try allocator.dupe(ast_mod.NodeIndex, methods.items),
+        .span = source_mod.Span.zero,
+    } });
+    try top_decls.append(allocator, trait_decl);
+}
+
+/// Transform TS enum → Cot enum_decl (using const Name = enum { ... } pattern).
+fn transformTsEnum(
+    ts: *const libts.ts_ast.Ast,
+    cot: *ast_mod.Ast,
+    allocator: std.mem.Allocator,
+    en: libts.ts_ast.Decl.EnumDecl,
+) error{OutOfMemory}!ast_mod.NodeIndex {
+    var variants = std.ArrayListUnmanaged(ast_mod.EnumVariant){};
+    for (en.members) |member| {
+        const value = if (member.init != libts.ts_ast.null_node)
+            try transformTsExpr(ts, cot, allocator, member.init)
+        else
+            ast_mod.null_node;
+        try variants.append(allocator, .{
+            .name = member.name,
+            .value = value,
+            .span = source_mod.Span.zero,
+        });
+    }
+
+    return cot.addDecl(.{ .enum_decl = .{
+        .name = en.name,
+        .backing_type = ast_mod.null_node,
+        .variants = try allocator.dupe(ast_mod.EnumVariant, variants.items),
+        .span = source_mod.Span.zero,
+    } });
 }
 
 fn transformTsStmt(ts: *const libts.ts_ast.Ast, cot: *ast_mod.Ast, allocator: std.mem.Allocator, stmt: libts.ts_ast.Stmt) error{OutOfMemory}!ast_mod.NodeIndex {
@@ -2941,6 +3147,129 @@ fn transformTsStmt(ts: *const libts.ts_ast.Ast, cot: *ast_mod.Ast, allocator: st
                 else => {},
             }
             break :blk ast_mod.null_node;
+        },
+        .for_of => |fo| blk: {
+            // for (const item of items) → for item in items
+            const binding = ts.getNode(fo.left) orelse break :blk ast_mod.null_node;
+            var iter_var: []const u8 = "_";
+            // Extract variable name from binding (could be var_stmt wrapping a var decl)
+            switch (binding.*) {
+                .decl => |d| switch (d) {
+                    .variable => |v| {
+                        if (v.declarators.len > 0) {
+                            if (ts.getNode(v.declarators[0].binding)) |bn| switch (bn.*) {
+                                .expr => |e| switch (e) {
+                                    .ident => |id| {
+                                        iter_var = id.name;
+                                    },
+                                    else => {},
+                                },
+                                else => {},
+                            };
+                        }
+                    },
+                    else => {},
+                },
+                .expr => |e| switch (e) {
+                    .ident => |id| {
+                        iter_var = id.name;
+                    },
+                    else => {},
+                },
+                else => {},
+            }
+            const collection = try transformTsExpr(ts, cot, allocator, fo.right);
+            const body = try transformTsStmtNode(ts, cot, allocator, fo.body);
+            break :blk cot.addStmt(.{ .for_stmt = .{
+                .binding = iter_var,
+                .iterable = collection,
+                .body = body,
+                .span = source_mod.Span.zero,
+            } });
+        },
+        .for_stmt => |fs| blk: {
+            // for (init; cond; update) → init; while(cond) { body; update; }
+            // Emit init as a separate statement, then while loop
+            var stmts = std.ArrayListUnmanaged(ast_mod.NodeIndex){};
+            if (fs.init != libts.ts_ast.null_node) {
+                const init = try transformTsStmtNode(ts, cot, allocator, fs.init);
+                if (init != ast_mod.null_node) try stmts.append(allocator, init);
+            }
+            const cond = if (fs.condition != libts.ts_ast.null_node)
+                try transformTsExpr(ts, cot, allocator, fs.condition)
+            else
+                try cot.addExpr(.{ .literal = .{ .kind = .true_lit, .value = "true", .span = source_mod.Span.zero } });
+
+            // Build while body: original body + update
+            var body_stmts = std.ArrayListUnmanaged(ast_mod.NodeIndex){};
+            const inner_body = try transformTsStmtNode(ts, cot, allocator, fs.body);
+            if (inner_body != ast_mod.null_node) try body_stmts.append(allocator, inner_body);
+            if (fs.update != libts.ts_ast.null_node) {
+                const update_node = ts.getNode(fs.update) orelse break :blk ast_mod.null_node;
+                switch (update_node.*) {
+                    .expr => |e| switch (e) {
+                        .update => |u| {
+                            const operand = try transformTsExpr(ts, cot, allocator, u.operand);
+                            const one = try cot.addExpr(.{ .literal = .{ .kind = .float, .value = "1.0", .span = source_mod.Span.zero } });
+                            const bin_op: token_mod.Token = if (u.op == .increment) .add else .sub;
+                            const sum = try cot.addExpr(.{ .binary = .{ .op = bin_op, .left = operand, .right = one, .span = source_mod.Span.zero } });
+                            const target = try transformTsExpr(ts, cot, allocator, u.operand);
+                            const assign = try cot.addStmt(.{ .assign_stmt = .{ .target = target, .value = sum, .op = .assign, .span = source_mod.Span.zero } });
+                            try body_stmts.append(allocator, assign);
+                        },
+                        else => {
+                            const update_expr = try transformTsExpr(ts, cot, allocator, fs.update);
+                            const update_stmt = try cot.addStmt(.{ .expr_stmt = .{ .expr = update_expr, .span = source_mod.Span.zero } });
+                            try body_stmts.append(allocator, update_stmt);
+                        },
+                    },
+                    else => {},
+                }
+            }
+            const while_body = try cot.addExpr(.{ .block_expr = .{
+                .stmts = try allocator.dupe(ast_mod.NodeIndex, body_stmts.items),
+                .expr = ast_mod.null_node,
+                .span = source_mod.Span.zero,
+            } });
+            const while_stmt = try cot.addStmt(.{ .while_stmt = .{
+                .condition = cond,
+                .body = while_body,
+                .span = source_mod.Span.zero,
+            } });
+            try stmts.append(allocator, while_stmt);
+
+            // Wrap init + while in a block
+            break :blk cot.addExpr(.{ .block_expr = .{
+                .stmts = try allocator.dupe(ast_mod.NodeIndex, stmts.items),
+                .expr = ast_mod.null_node,
+                .span = source_mod.Span.zero,
+            } });
+        },
+        .throw_stmt => |ts_throw| blk: {
+            // throw expr → return error.TsError
+            _ = ts_throw;
+            break :blk cot.addStmt(.{ .return_stmt = .{
+                .value = try cot.addExpr(.{ .error_literal = .{
+                    .error_name = "TsError",
+                    .span = source_mod.Span.zero,
+                } }),
+                .span = source_mod.Span.zero,
+            } });
+        },
+        .break_stmt => |bs| blk: {
+            _ = bs;
+            break :blk cot.addStmt(.{ .break_stmt = .{
+                .label = null,
+                .value = ast_mod.null_node,
+                .span = source_mod.Span.zero,
+            } });
+        },
+        .continue_stmt => |cs| blk: {
+            _ = cs;
+            break :blk cot.addStmt(.{ .continue_stmt = .{
+                .label = null,
+                .span = source_mod.Span.zero,
+            } });
         },
         else => ast_mod.null_node,
     };
