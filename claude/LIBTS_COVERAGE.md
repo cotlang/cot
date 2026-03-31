@@ -203,20 +203,20 @@
 - [ ] `readonly` modifier on types
 - [ ] `Partial<T>`, `Required<T>`, `Pick<T,K>` utility types
 
-## 7. Class Features (6/14)
+## 7. Class Features (10/14)
 
 - [x] Class declaration with fields
 - [x] Constructor → `init` method
 - [x] Instance methods
 - [x] `this` → `self` in methods
-- [x] `extends` (field inheritance)
+- [x] `extends` (field + method inheritance, single level)
 - [x] `new ClassName(args)`
-- [ ] Static methods (parsed, `is_static` set, not tested)
-- [ ] Private fields (`#name`)
+- [x] Static methods
+- [x] Private fields (modifier parsed, no runtime enforcement)
+- [x] `implements` → impl trait
+- [x] Method overriding (child method replaces base method)
 - [ ] Getter/setter (`get`/`set`)
 - [ ] Abstract methods
-- [ ] `implements` → impl trait
-- [ ] Method overriding
 - [ ] Class expressions
 - [ ] Computed property names
 
@@ -304,3 +304,15 @@
 18. Decorators
 19. `export default`
 20. Dynamic `import()`
+
+---
+
+## Known Bugs
+
+| Bug | Impact | Root Cause |
+|-----|--------|------------|
+| Multi-level extends fails (`C extends B extends A`) | Medium | `transformTsClass` only copies one level of base class fields/methods. Need recursive base chain resolution. |
+| `optional params` (`title?: string`) crash in codegen | Low | `?string` compound optional decomposes to 3 words at ABI level, but default null injection only adds 1 value. Needs ABI-aware default injection in lowerer. |
+| `do-while` may infinite loop | Low | Condition negation for the break check may not work correctly with f64 comparisons. |
+| Multiple async functions in same file conflict | Low | Auto-imported executor dependencies (`std/task_queue`, `std/executor`) cause "redefined identifier" when multiple async fns exist. |
+| Generic function calls require explicit type args | Low | Cot checker requires `identity(string)("hello")`, TS expects `identity("hello")` with inference. Needs checker-level type inference for generic calls. |
