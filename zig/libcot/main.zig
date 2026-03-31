@@ -1513,6 +1513,17 @@ fn compileAndLinkFull(
         } else |_| {}
     }
 
+    // Float format helper — linked into every native program (Cranelift can't do variadic float calls)
+    if (!compile_target.isWasm()) {
+        const float_fmt_bytes: []const u8 = @embedFile("float_format_native_o");
+        const float_fmt_path = std.fs.path.join(allocator, &.{ std.fs.path.dirname(obj_path) orelse "/tmp", "float_format.o" }) catch "/tmp/float_format.o";
+        if (std.fs.cwd().createFile(float_fmt_path, .{})) |file| {
+            file.writeAll(float_fmt_bytes) catch {};
+            file.close();
+            link_args.append(allocator, float_fmt_path) catch {};
+        } else |_| {}
+    }
+
     if (compile_target.os == .macos) {
         link_args.appendSlice(allocator, &.{ "-Wl,-stack_size,0x10000000", "-lSystem" }) catch {
             std.debug.print("Error: Allocation failed\n", .{});

@@ -44,6 +44,23 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    // Float format helper — Cranelift can't pass floats in variadic C calls
+    // (confirmed by rustc_codegen_cranelift). Compiled as .o, embedded in compiler,
+    // linked into every user program at link time.
+    const float_fmt_obj = b.addObject(.{
+        .name = "float_format",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("zig/libcot/codegen/float_format.zig"),
+            .target = b.resolveTargetQuery(.{
+                .cpu_arch = native_arch,
+                .os_tag = native_os,
+                .abi = if (native_os == .linux) .gnu else null,
+            }),
+            .optimize = .ReleaseFast,
+            .link_libc = true,
+        }),
+    });
+
     // Compiler executable
     const exe = b.addExecutable(.{
         .name = "cot",
@@ -55,6 +72,9 @@ pub fn build(b: *std.Build) void {
     });
     exe.root_module.addAnonymousImport("dwarf_reader_native_o", .{
         .root_source_file = dwarf_obj.getEmittedBin(),
+    });
+    exe.root_module.addAnonymousImport("float_format_native_o", .{
+        .root_source_file = float_fmt_obj.getEmittedBin(),
     });
     exe.root_module.addOptions("build_options", options);
 
@@ -94,6 +114,9 @@ pub fn build(b: *std.Build) void {
     tests.root_module.addOptions("build_options", options);
     tests.root_module.addAnonymousImport("dwarf_reader_native_o", .{
         .root_source_file = dwarf_obj.getEmittedBin(),
+    });
+    tests.root_module.addAnonymousImport("float_format_native_o", .{
+        .root_source_file = float_fmt_obj.getEmittedBin(),
     });
     const libts_test_mod = b.createModule(.{
         .root_source_file = b.path("zig/libts/root.zig"),

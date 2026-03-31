@@ -11144,10 +11144,8 @@ pub const Lowerer = struct {
             _ = try fb.emitCall("write", &write_args, false, TypeRegistry.I64, call.span);
         } else if (is_float) {
             const float_val = try self.lowerExprNode(call.args[0]);
-            // print_float takes i64 bits (not f64). Reinterpret float → i64 for the call.
-            // Native CLIF handles this implicitly; Wasm needs explicit i64.reinterpret_f64.
-            const bits_val = try fb.emitUnary(.i64_reinterpret_f64, float_val, TypeRegistry.I64, call.span);
-            var print_args = [_]ir.NodeIndex{bits_val};
+            // print_float takes f64 directly — Cranelift handles the ABI (D registers on ARM64)
+            var print_args = [_]ir.NodeIndex{float_val};
             _ = try fb.emitCall(if (fd == 2) "eprint_float" else "print_float", &print_args, false, TypeRegistry.VOID, call.span);
         } else {
             const str_val = try self.lowerExprNode(call.args[0]);

@@ -99,6 +99,37 @@ const B = struct {
         self.writer.emit(OP_STATIC_CALL, buf[0..pos]);
         return result_id;
     }
+    /// Call with explicit type per arg: types and args are interleaved pairs.
+    fn call1_typed(self: *B, name_off: u32, typed_args: []const [2]u32) u32 {
+        const result_id = self.nextId();
+        var buf: [64]u32 = undefined;
+        var pos: usize = 0;
+        buf[pos] = 1; pos += 1; // has_result
+        buf[pos] = result_id; pos += 1;
+        buf[pos] = CIR_I64; pos += 1; // result type
+        buf[pos] = name_off; pos += 1;
+        buf[pos] = @intCast(typed_args.len); pos += 1;
+        for (typed_args) |ta| {
+            buf[pos] = ta[0]; pos += 1; // type
+            buf[pos] = ta[1]; pos += 1; // value
+        }
+        self.writer.emit(OP_STATIC_CALL, buf[0..pos]);
+        return result_id;
+    }
+
+    fn call0_typed(self: *B, name_off: u32, typed_args: []const [2]u32) void {
+        var buf: [64]u32 = undefined;
+        var pos: usize = 0;
+        buf[pos] = 0; pos += 1; // no result
+        buf[pos] = name_off; pos += 1;
+        buf[pos] = @intCast(typed_args.len); pos += 1;
+        for (typed_args) |ta| {
+            buf[pos] = ta[0]; pos += 1; // type
+            buf[pos] = ta[1]; pos += 1; // value
+        }
+        self.writer.emit(OP_STATIC_CALL, buf[0..pos]);
+    }
+
     fn call0(self: *B, name_off: u32, args: []const u32) void {
         var buf: [64]u32 = undefined;
         var pos: usize = 0;
@@ -328,40 +359,22 @@ fn genIntToString(writer: *CirWriter) void {
 // ============================================================================
 fn genPrintFloat(writer: *CirWriter, name: []const u8, fd: i64) void {
     const name_off = writer.internString(name);
-    const snprintf_name = writer.internString("snprintf");
-    const write_name = writer.internString("write");
+    const cot_write_float_name = writer.internString("cot_write_float");
 
-    // print_float takes i64 bits — the compiler bitcasts float → i64 before calling
-    writer.beginFuncWithSig(name_off, &.{CIR_I64}, &.{}, 1, 0);
+    // Delegate to cot_write_float(fd, value) — a non-variadic Zig function
+    // linked from float_format.o. Cranelift can't pass floats in variadic
+    // calls like snprintf (confirmed by rustc_codegen_cranelift source).
+    writer.beginFuncWithSig(name_off, &.{CIR_F64}, &.{}, 1, 0);
     writer.beginBlock(0, 0, &.{}, &.{});
     var b = B{ .writer = writer };
-    b.stackSlot(0, 32, 8);
-    b.stackSlot(1, 8, 8);
-    const val_bits = b.arg(0); // i64 bits of the float
-
-    // Store "%g\0" format string
-    const fmt_addr = b.localAddr(1);
-    const ch_pct = b.iconst8('%');
-    b.store8(fmt_addr, ch_pct);
-    const off1 = b.iconst(1);
-    const fmt1 = b.add(fmt_addr, off1);
-    const ch_g = b.iconst8('g');
-    b.store8(fmt1, ch_g);
-    const off2 = b.iconst(2);
-    const fmt2 = b.add(fmt_addr, off2);
-    const ch_0 = b.iconst8(0);
-    b.store8(fmt2, ch_0);
-
-    // snprintf(buf, 32, fmt, val_bits) — pass i64 bits directly
-    // On macOS ARM64, variadic args go in integer registers, so the f64 bits
-    // must be passed as i64 (NOT bitcast to f64 which would use d registers)
-    const buf = b.localAddr(0);
-    const v_32 = b.iconst(32);
-    const len = b.call1(snprintf_name, &.{ buf, v_32, fmt_addr, val_bits });
-
-    // write(fd, buf, len)
+    const f_val = b.argF64(0);
     const v_fd = b.iconst(fd);
-    _ = b.call1(write_name, &.{ v_fd, buf, len });
+
+    // cot_write_float(fd: i64, value: f64) -> void
+    b.call0_typed(cot_write_float_name, &.{
+        .{ CIR_I64, v_fd },
+        .{ CIR_F64, f_val },
+    });
     b.retVoid();
 
     writer.endBlock();
@@ -373,33 +386,21 @@ fn genPrintFloat(writer: *CirWriter, name: []const u8, fd: i64) void {
 // ============================================================================
 fn genFloatToString(writer: *CirWriter) void {
     const name_off = writer.internString("float_to_string");
-    const snprintf_name = writer.internString("snprintf");
+    const cot_format_float_name = writer.internString("cot_format_float");
 
-    // float_to_string: native passes f64 directly (SystemV ABI uses float registers)
+    // Delegate to cot_format_float(buf_ptr, buf_size, value) → length
     writer.beginFuncWithSig(name_off, &.{ CIR_F64, CIR_I64 }, &.{CIR_I64}, 1, 0);
     writer.beginBlock(0, 0, &.{}, &.{});
     var b = B{ .writer = writer };
-    b.stackSlot(0, 8, 8);
     const f_val = b.argF64(0);
     const buf_ptr = b.arg(1);
+    const v_64 = b.iconst(64); // buffer size
 
-    // Store "%g\0"
-    const fmt_addr = b.localAddr(0);
-    const ch_pct = b.iconst8('%');
-    b.store8(fmt_addr, ch_pct);
-    const off1 = b.iconst(1);
-    const fmt1 = b.add(fmt_addr, off1);
-    const ch_g = b.iconst8('g');
-    b.store8(fmt1, ch_g);
-    const off2 = b.iconst(2);
-    const fmt2 = b.add(fmt_addr, off2);
-    const ch_0 = b.iconst8(0);
-    b.store8(fmt2, ch_0);
-
-    // Bitcast f64 → i64 bits for snprintf variadic (macOS ARM64: variadic args in int registers)
-    const val_bits = b.bitcast_i64(f_val);
-    const v_32 = b.iconst(32);
-    const len = b.call1(snprintf_name, &.{ buf_ptr, v_32, fmt_addr, val_bits });
+    const len = b.call1_typed(cot_format_float_name, &.{
+        .{ CIR_I64, buf_ptr },
+        .{ CIR_I64, v_64 },
+        .{ CIR_F64, f_val },
+    });
     b.ret(len);
 
     writer.endBlock();
