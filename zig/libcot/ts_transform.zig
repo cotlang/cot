@@ -307,6 +307,37 @@ fn transformTsClass(
                                                         .span = cot_source.Span.zero,
                                                     });
                                                 },
+                                                .method => |bm| {
+                                                    // Inherit base method into child impl
+                                                    const bm_name = if (ts.getNode(bm.name)) |n| switch (n.*) {
+                                                        .expr => |e| switch (e) { .ident => |id| id.name, else => "method" },
+                                                        else => "method",
+                                                    } else "method";
+                                                    const bm_params = try transformTsParams(ts, cot, allocator, bm.params);
+                                                    const params_with_self = if (!bm.is_static)
+                                                        try prependSelfParam(cot, allocator, class_name, bm_params)
+                                                    else
+                                                        bm_params;
+                                                    const bm_ret = if (bm.return_type != ts_ast.null_node)
+                                                        try transformTsType(ts, cot, allocator, bm.return_type)
+                                                    else
+                                                        try cot.addExpr(.{ .type_expr = .{ .kind = .{ .named = "void" }, .span = cot_source.Span.zero } });
+                                                    const bm_body = if (bm.body != ts_ast.null_node)
+                                                        try transformTsBlock(ts, cot, allocator, bm.body)
+                                                    else
+                                                        cot_ast.null_node;
+                                                    const fn_decl = try cot.addDecl(.{ .fn_decl = .{
+                                                        .name = bm_name,
+                                                        .params = params_with_self,
+                                                        .return_type = bm_ret,
+                                                        .body = bm_body,
+                                                        .is_extern = false,
+                                                        .is_async = bm.is_async,
+                                                        .is_static = bm.is_static,
+                                                        .span = cot_source.Span.zero,
+                                                    } });
+                                                    try methods.append(allocator, fn_decl);
+                                                },
                                                 else => {},
                                             },
                                             else => {},
@@ -909,7 +940,33 @@ fn transformTsStmtNode(ts: *const ts_ast.Ast, cot: *cot_ast.Ast, allocator: std.
                     .span = cot_source.Span.zero,
                 } });
             },
-            .function => |func| return transformTsFn(ts, cot, allocator, func),
+            .function => |func| {
+                // Nested function → const name = fn(params) { body }
+                // (top-level fn_decl would create a separate symbol the linker can't find)
+                const name = func.name orelse "anonymous";
+                const params = try transformTsParams(ts, cot, allocator, func.params);
+                const return_type = if (func.return_type != ts_ast.null_node)
+                    try transformTsType(ts, cot, allocator, func.return_type)
+                else
+                    cot_ast.null_node;
+                const body = if (func.body != ts_ast.null_node)
+                    try transformTsBlock(ts, cot, allocator, func.body)
+                else
+                    cot_ast.null_node;
+                const closure = try cot.addExpr(.{ .closure_expr = .{
+                    .params = params,
+                    .return_type = return_type,
+                    .body = body,
+                    .span = cot_source.Span.zero,
+                } });
+                return cot.addStmt(.{ .var_stmt = .{
+                    .name = name,
+                    .type_expr = cot_ast.null_node,
+                    .value = closure,
+                    .is_const = true,
+                    .span = cot_source.Span.zero,
+                } });
+            },
             else => return cot_ast.null_node,
         },
         .expr => |e| {
@@ -1496,14 +1553,29 @@ fn transformTsParams(ts: *const ts_ast.Ast, cot: *cot_ast.Ast, allocator: std.me
             },
             else => "_",
         } else "_";
-        const type_expr = if (p.type_ann != ts_ast.null_node)
+        var type_expr = if (p.type_ann != ts_ast.null_node)
             try transformTsType(ts, cot, allocator, p.type_ann)
         else
             cot_ast.null_node;
-        const default_value = if (p.default_value != ts_ast.null_node)
+        // Optional params (title?: string) → wrap type in optional + default null
+        if (p.is_optional and type_expr != cot_ast.null_node) {
+            type_expr = try cot.addExpr(.{ .type_expr = .{
+                .kind = .{ .optional = type_expr },
+                .span = cot_source.Span.zero,
+            } });
+        }
+        var default_value = if (p.default_value != ts_ast.null_node)
             try transformTsExpr(ts, cot, allocator, p.default_value)
         else
             cot_ast.null_node;
+        // Optional params without explicit default → default to null
+        if (p.is_optional and default_value == cot_ast.null_node) {
+            default_value = try cot.addExpr(.{ .literal = .{
+                .kind = .null_lit,
+                .value = "null",
+                .span = cot_source.Span.zero,
+            } });
+        }
         try fields.append(allocator, .{
             .name = name,
             .type_expr = type_expr,

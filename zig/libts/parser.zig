@@ -141,7 +141,14 @@ pub const Parser = struct {
             .kw_interface => self.parseInterfaceDeclaration(false),
             .kw_type => self.parseTypeAliasDeclaration(false),
             .kw_enum => self.parseEnumDeclaration(false, false),
-            .kw_var, .kw_let, .kw_const => self.parseVariableStatement(false),
+            .kw_var, .kw_let => self.parseVariableStatement(false),
+            .kw_const => blk: {
+                // const enum → enum declaration, not variable
+                if (self.peekToken() == .kw_enum) {
+                    break :blk self.parseEnumDeclaration(true, false);
+                }
+                break :blk self.parseVariableStatement(false);
+            },
             .kw_import => self.parseImportDeclaration(),
             .kw_export => self.parseExportDeclaration(),
             .kw_if => self.parseIfStatement(),
